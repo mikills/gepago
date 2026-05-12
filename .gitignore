@@ -1,0 +1,9 @@
+*.html
+!docs/architecture.html
+
+# Private unless specified
+usecases/**
+
+.diago/
+.DS_Store
+.notes/

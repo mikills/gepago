@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>gepago architecture</title>
+<style>
+  :root {
+    --ink: #1f2937;
+    --muted: #6b7280;
+    --blue: #dbeafe;
+    --green: #dcfce7;
+    --yellow: #fef3c7;
+    --purple: #ede9fe;
+    --pink: #fce7f3;
+    --orange: #ffedd5;
+    --line: #374151;
+  }
+  html, body { margin: 0; background: #faf7ef; color: var(--ink); }
+  body { font-family: "Virgil", "Comic Sans MS", "Segoe Print", system-ui, sans-serif; }
+  .page { width: 1800px; height: 1200px; position: relative; overflow: hidden; }
+  svg { width: 1800px; height: 1200px; display: block; }
+  .title { font-size: 46px; font-weight: 700; fill: var(--ink); }
+  .subtitle { font-size: 24px; fill: var(--muted); }
+  .label { font-size: 24px; font-weight: 700; fill: var(--ink); }
+  .small { font-size: 18px; fill: var(--ink); }
+  .tiny { font-size: 15px; fill: var(--muted); }
+  .box { stroke: var(--line); stroke-width: 3; rx: 18; ry: 18; filter: url(#roughShadow); }
+  .inner { stroke: var(--line); stroke-width: 2; rx: 12; ry: 12; }
+  .arrow { stroke: var(--line); stroke-width: 3; fill: none; marker-end: url(#arrow); }
+  .dashed { stroke-dasharray: 10 9; }
+  .note { fill: #fff7ed; stroke: #9a3412; stroke-width: 2; rx: 14; ry: 14; }
+</style>
+</head>
+<body>
+<div class="page">
+<svg viewBox="0 0 1800 1200" role="img" aria-label="gepago architecture diagram">
+  <defs>
+    <filter id="roughShadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="4" dy="5" stdDeviation="0" flood-color="#111827" flood-opacity="0.16" />
+    </filter>
+    <marker id="arrow" markerWidth="16" markerHeight="16" refX="13" refY="8" orient="auto">
+      <path d="M2,2 L14,8 L2,14 Z" fill="#374151" />
+    </marker>
+  </defs>
+
+  <text x="70" y="78" class="title">gepago architecture</text>
+  <text x="72" y="116" class="subtitle">GEPA-style reflective optimisation with optional agents and model providers</text>
+
+  <!-- caller -->
+  <rect x="70" y="180" width="280" height="170" class="box" fill="#ffffff" />
+  <text x="105" y="225" class="label">Your app</text>
+  <text x="105" y="263" class="small">• candidates</text>
+  <text x="105" y="294" class="small">• examples</text>
+  <text x="105" y="325" class="small">• evaluator / metric</text>
+
+  <!-- core -->
+  <rect x="460" y="150" width="620" height="430" class="box" fill="var(--blue)" />
+  <text x="500" y="200" class="label">Core package: github.com/mikills/gepago</text>
+  <text x="500" y="235" class="tiny">provider-neutral, agent-runtime-neutral</text>
+
+  <rect x="500" y="270" width="240" height="95" class="inner" fill="#eff6ff" />
+  <text x="530" y="306" class="small">Signature + Predict</text>
+  <text x="530" y="335" class="tiny">structured inputs → outputs</text>
+
+  <rect x="800" y="270" width="230" height="95" class="inner" fill="#eff6ff" />
+  <text x="830" y="306" class="small">Metrics</text>
+  <text x="830" y="335" class="tiny">exact / contains / numeric</text>
+
+  <rect x="500" y="410" width="530" height="120" class="inner" fill="#eff6ff" />
+  <text x="530" y="450" class="small">Optimizer</text>
+  <text x="530" y="480" class="tiny">candidate pool • minibatches • reflection • acceptance</text>
+  <text x="530" y="507" class="tiny">Pareto frontier weighted by per-instance wins</text>
+
+  <!-- providers -->
+  <rect x="1190" y="155" width="510" height="235" class="box" fill="var(--purple)" />
+  <text x="1230" y="205" class="label">providers/*</text>
+  <rect x="1230" y="240" width="195" height="90" class="inner" fill="#f5f3ff" />
+  <text x="1260" y="276" class="small">openai</text>
+  <text x="1260" y="304" class="tiny">OpenAI-compatible</text>
+  <rect x="1470" y="240" width="185" height="90" class="inner" fill="#f5f3ff" />
+  <text x="1505" y="276" class="small">claude</text>
+  <text x="1505" y="304" class="tiny">Anthropic SDK</text>
+
+  <!-- agents -->
+  <rect x="1190" y="475" width="510" height="300" class="box" fill="var(--green)" />
+  <text x="1230" y="525" class="label">agents package</text>
+  <text x="1230" y="558" class="tiny">optional runtime for tool-calling workflows</text>
+  <rect x="1230" y="595" width="190" height="90" class="inner" fill="#f0fdf4" />
+  <text x="1260" y="632" class="small">Agent loop</text>
+  <text x="1260" y="660" class="tiny">chat + tools</text>
+  <rect x="1465" y="595" width="190" height="90" class="inner" fill="#f0fdf4" />
+  <text x="1495" y="632" class="small">TraceRecorder</text>
+  <text x="1495" y="660" class="tiny">events + spans</text>
+  <rect x="1320" y="710" width="240" height="45" class="inner" fill="#f0fdf4" />
+  <text x="1350" y="740" class="tiny">TraceDatasetBuilder</text>
+
+  <!-- workflow -->
+  <rect x="105" y="680" width="1010" height="360" class="box" fill="var(--yellow)" />
+  <text x="145" y="730" class="label">Optimisation loop</text>
+
+  <rect x="150" y="780" width="145" height="80" class="inner" fill="#fffbeb" />
+  <text x="180" y="815" class="small">Seed</text>
+  <text x="170" y="843" class="tiny">prompt/program</text>
+
+  <rect x="350" y="780" width="155" height="80" class="inner" fill="#fffbeb" />
+  <text x="380" y="815" class="small">Evaluate</text>
+  <text x="374" y="843" class="tiny">score + feedback</text>
+
+  <rect x="565" y="780" width="165" height="80" class="inner" fill="#fffbeb" />
+  <text x="595" y="815" class="small">Reflect</text>
+  <text x="590" y="843" class="tiny">LLM proposes patch</text>
+
+  <rect x="790" y="780" width="165" height="80" class="inner" fill="#fffbeb" />
+  <text x="820" y="815" class="small">Accept?</text>
+  <text x="813" y="843" class="tiny">minibatch improves</text>
+
+  <rect x="565" y="925" width="220" height="80" class="inner" fill="#fffbeb" />
+  <text x="595" y="960" class="small">Validate</text>
+  <text x="592" y="988" class="tiny">update Pareto frontier</text>
+
+  <path d="M295 820 C315 820, 330 820, 350 820" class="arrow" />
+  <path d="M505 820 C530 820, 545 820, 565 820" class="arrow" />
+  <path d="M730 820 C755 820, 770 820, 790 820" class="arrow" />
+  <path d="M875 860 C865 910, 825 955, 785 965" class="arrow" />
+  <path d="M565 965 C365 960, 205 900, 220 862" class="arrow dashed" />
+  <text x="245" y="925" class="tiny">repeat until metric-call budget is spent</text>
+
+  <!-- reports -->
+  <rect x="1225" y="860" width="430" height="170" class="box" fill="var(--pink)" />
+  <text x="1265" y="910" class="label">Outputs</text>
+  <text x="1265" y="950" class="small">• best candidate / compiled program</text>
+  <text x="1265" y="982" class="small">• optimisation state + persistence</text>
+  <text x="1265" y="1014" class="small">• self-contained HTML report</text>
+
+  <!-- arrows between areas -->
+  <path d="M350 260 C395 250, 420 250, 460 250" class="arrow" />
+  <path d="M1080 250 C1125 245, 1150 245, 1190 250" class="arrow" />
+  <path d="M1445 390 C1445 420, 1445 445, 1445 475" class="arrow dashed" />
+  <path d="M1080 500 C1120 570, 1140 625, 1190 640" class="arrow dashed" />
+  <path d="M1000 580 C980 630, 940 665, 900 705" class="arrow" />
+  <path d="M1115 860 C1155 875, 1185 900, 1225 930" class="arrow" />
+
+  <!-- notes -->
+  <rect x="70" y="420" width="315" height="125" class="note" />
+  <text x="100" y="462" class="small">Traces are optional, not lost.</text>
+  <text x="100" y="492" class="tiny">Core accepts Trace as any;</text>
+  <text x="100" y="520" class="tiny">agents adds structured summaries.</text>
+
+  <rect x="1190" y="405" width="510" height="45" class="note" />
+  <text x="1230" y="435" class="tiny">Providers only implement LanguageModel.Generate(ctx, prompt)</text>
+</svg>
+</div>
+</body>
+</html>

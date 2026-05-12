@@ -1,0 +1,27 @@
+Source: SEC EDGAR, Tesla, Inc. 2023 Form 10-K, accession 0001628280-24-002390.
+URL: https://www.sec.gov/Archives/edgar/data/1318605/000162828024002390/tsla-20231231.htm
+
+Tesla, Inc.
+Consolidated Balance Sheets
+(in millions, except per share data)
+December 31, 2023 and December 31, 2022
+
+Assets
+Current assets
+Cash and cash equivalents                  $ 16,398    $ 16,253
+Short-term investments                       12,696       5,932
+Accounts receivable, net                      3,508       2,952
+Inventory                                    13,626      12,839
+Prepaid expenses and other current assets     3,388       2,941
+Total current assets                         49,616      40,917
+
+Operating lease vehicles, net                 5,989       5,035
+Solar energy systems, net                     5,229       5,489
+Property, plant and equipment, net           29,725      23,548
+Operating lease right-of-use assets           4,180       2,563
+Digital assets, net                             184         184
+Intangible assets, net                          178         215
+Goodwill                                        253         194
+Deferred tax assets                           6,733         328
+Other non-current assets                      4,531       3,865
+Total assets                               $106,618    $ 82,338
