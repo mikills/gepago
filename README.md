@@ -7,6 +7,8 @@ using evaluation feedback, with optional agent traces and model providers.
 Original paper:
 [GEPA: Reflective Prompt Evolution Can Outperform Reinforcement Learning](https://arxiv.org/abs/2507.19457).
 
+![GEPAgo architecture](docs/architecture.png)
+
 ## What it can do
 
 - Run optional agent loops from the composable `agents` package.

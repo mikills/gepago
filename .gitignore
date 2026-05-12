@@ -1,5 +1,6 @@
 *.html
 !docs/architecture.html
+!docs/architecture.png
 
 # Private unless specified
 usecases/**
