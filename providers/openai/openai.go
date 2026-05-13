@@ -13,11 +13,12 @@ import (
 
 // Config controls OpenAI or OpenAI-compatible model access.
 type Config struct {
-	APIKey    string
-	BaseURL   string
-	Model     string
-	Headers   map[string]string
-	MaxTokens int
+	APIKey      string
+	BaseURL     string
+	Model       string
+	Headers     map[string]string
+	MaxTokens   int
+	Temperature *float64
 }
 
 // Validate checks the provider configuration.
@@ -33,10 +34,11 @@ func (c Config) Validate() error {
 
 // LanguageModel adapts OpenAI chat completions to gepa.LanguageModel.
 type LanguageModel struct {
-	client    openai.Client
-	model     string
-	maxTokens int
-	lastUsage gepa.Usage
+	client      openai.Client
+	model       string
+	maxTokens   int
+	temperature *float64
+	lastUsage   gepa.Usage
 }
 
 // NewLanguageModel constructs an OpenAI or OpenAI-compatible language model.
@@ -58,7 +60,12 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 	if maxTokens <= 0 {
 		maxTokens = 512
 	}
-	return &LanguageModel{client: openai.NewClient(opts...), model: config.Model, maxTokens: maxTokens}, nil
+	return &LanguageModel{
+		client:      openai.NewClient(opts...),
+		model:       config.Model,
+		maxTokens:   maxTokens,
+		temperature: config.Temperature,
+	}, nil
 }
 
 // Generate sends a prompt and returns the model's text response.
@@ -72,6 +79,9 @@ func (m *LanguageModel) Generate(ctx context.Context, prompt string) (string, er
 			openai.UserMessage(prompt),
 		},
 		MaxCompletionTokens: openai.Int(int64(m.maxTokens)),
+	}
+	if m.temperature != nil {
+		params.Temperature = openai.Float(*m.temperature)
 	}
 	completion, err := m.client.Chat.Completions.New(ctx, params)
 	if err != nil {

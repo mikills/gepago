@@ -137,6 +137,7 @@ func (e ProgramEvaluator) Evaluate(
 	_ bool,
 ) (EvaluationResult, error) {
 	items := make([]EvaluationItem, 0, len(examples))
+	usage := Usage{}
 	for _, example := range examples {
 		ioExample, ok := example.Input.(IOExample)
 		if !ok {
@@ -146,6 +147,7 @@ func (e ProgramEvaluator) Evaluate(
 		if err != nil {
 			return EvaluationResult{}, fmt.Errorf("evaluate example %q: run candidate: %w", example.ID, err)
 		}
+		usage = usage.Add(ProgramLastUsage(e.Program))
 		metricResult, err := e.Metric.Score(ctx, ioExample.Expected, actual)
 		if err != nil {
 			return EvaluationResult{}, fmt.Errorf("evaluate example %q: score prediction: %w", example.ID, err)
@@ -164,7 +166,16 @@ func (e ProgramEvaluator) Evaluate(
 			},
 		})
 	}
-	return EvaluationResult{Items: items}, nil
+	return EvaluationResult{Items: items, Usage: usage}, nil
+}
+
+// ProgramLastUsage returns the most recent model usage reported by a programme's language models.
+func ProgramLastUsage(program Program) Usage {
+	reporter, ok := program.(UsageReporter)
+	if !ok {
+		return Usage{}
+	}
+	return reporter.LastUsage()
 }
 
 func bestCandidateFromState(state OptimizationState) CandidateRecord {

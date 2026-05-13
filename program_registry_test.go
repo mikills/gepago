@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestProgramRegistryBuildAndNames(t *testing.T) {
+func TestProgramRegistry(t *testing.T) {
 	registry := NewProgramRegistry()
 	if err := registry.Register("zeta", func() (Program, error) { return artifactEchoProgram{}, nil }); err != nil {
 		t.Fatalf("Register() error = %v", err)
@@ -134,7 +134,7 @@ func TestProgramRegistryLoadOrTrain(t *testing.T) {
 	}
 }
 
-func TestProgramRegistryLoadOrTrainRejectsProgramVersionMismatch(t *testing.T) {
+func TestProgramRegistryVersionMismatch(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "program.json")
 	artifact := NewProgramArtifact("echo", Candidate{InstructionComponent: "trained"})
 	artifact.ProgramVersion = "v1"

@@ -66,6 +66,10 @@ func (c ChainOfThought) BuildPrompt(candidate Candidate, inputs Prediction) (str
 	return c.ToPredict().BuildPrompt(candidate, inputs)
 }
 
+func (c ChainOfThought) LastUsage() Usage {
+	return c.ToPredict().LastUsage()
+}
+
 func (c ChainOfThought) signatureWithReasoning(reasoningField string) Signature {
 	signature := c.Signature
 	for _, output := range signature.Outputs {

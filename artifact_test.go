@@ -27,7 +27,7 @@ func TestProgramArtifactRoundTrip(t *testing.T) {
 	}
 }
 
-func TestLoadCompiledProgramOverlaysArtifactOnSeed(t *testing.T) {
+func TestLoadCompiledProgramOverlay(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "scout.json")
 	if err := SaveProgramArtifact(path, NewProgramArtifact("echo", Candidate{InstructionComponent: "trained"})); err != nil {
 		t.Fatalf("SaveProgramArtifact() error = %v", err)

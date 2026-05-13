@@ -148,6 +148,17 @@ func TestOptimizerE2E(t *testing.T) {
 	if len(state.ProposalRecords) > 0 && len(state.ProposalRecords[0].Metadata) > 0 {
 		t.Logf("raw OpenAI proposal:\n%s", state.ProposalRecords[0].Metadata[0].RawOutput)
 	}
+	t.Logf(
+		"usage: model_calls=%d prompt_tokens=%d completion_tokens=%d total_tokens=%d spans=%d",
+		state.Ledger.ModelCalls,
+		state.Ledger.InputTokens,
+		state.Ledger.OutputTokens,
+		state.Ledger.TotalTokens,
+		len(state.Spans),
+	)
+	if state.Ledger.ModelCalls == 0 || state.Ledger.TotalTokens == 0 {
+		t.Fatalf("expected reflected OpenAI usage, ledger=%#v", state.Ledger)
+	}
 	if best.ValidationScore <= seedEval.AverageScore() {
 		t.Fatalf("best score %.3f did not improve over seed %.3f", best.ValidationScore, seedEval.AverageScore())
 	}

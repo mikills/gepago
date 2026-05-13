@@ -179,6 +179,43 @@ func TestMetrics(t *testing.T) {
 	})
 }
 
+func TestProgramEvaluatorUsage(t *testing.T) {
+	lm := &usageModel{
+		response: `{"label":"positive"}`,
+		usage:    Usage{PromptTokens: 3, CompletionTokens: 4, TotalTokens: 7},
+	}
+	evaluator := ProgramEvaluator{
+		Program: Predict{
+			Signature: Signature{
+				Name:    "sentiment",
+				Inputs:  []Field{{Name: "text"}},
+				Outputs: []Field{{Name: "label"}},
+			},
+			Instruction: "classify",
+			LM:          lm,
+		},
+		Metric: ExactMatchMetric{Fields: []string{"label"}},
+	}
+	result, err := evaluator.Evaluate(context.Background(), Candidate{InstructionComponent: "classify"}, []Example{
+		NewIOExample("one", Prediction{"text": "great"}, Prediction{"label": "positive"}),
+	}, false)
+	if err != nil {
+		t.Fatalf("Evaluate() error = %v", err)
+	}
+	if result.Usage.TotalTokens != 7 {
+		t.Fatalf("Usage = %#v", result.Usage)
+	}
+}
+
+type usageModel struct {
+	response string
+	usage    Usage
+}
+
+func (m *usageModel) Generate(context.Context, string) (string, error) { return m.response, nil }
+
+func (m *usageModel) LastUsage() Usage { return m.usage }
+
 func TestCompile(t *testing.T) {
 	lm := LanguageModelFunc(func(_ context.Context, prompt string) (string, error) {
 		if strings.Contains(prompt, "Evaluation records and traces") {

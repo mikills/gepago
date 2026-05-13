@@ -97,6 +97,14 @@ func (p PipelineProgram) RunCandidate(ctx context.Context, candidate Candidate, 
 	return clonePrediction(last), nil
 }
 
+func (p PipelineProgram) LastUsage() Usage {
+	usage := Usage{}
+	for _, step := range p.Steps {
+		usage = usage.Add(ProgramLastUsage(step.Program))
+	}
+	return usage
+}
+
 func stepCandidate(candidate Candidate, step PipelineStep) Candidate {
 	out := Candidate{}
 	prefix := strings.TrimSpace(step.Name) + "."

@@ -35,6 +35,7 @@ type EvaluationItem struct {
 // EvaluationResult contains per-example scores for one candidate evaluation.
 type EvaluationResult struct {
 	Items []EvaluationItem `json:"items"`
+	Usage Usage            `json:"usage,omitempty"`
 }
 
 // Validate checks that the result contains the expected number of items.
@@ -335,7 +336,8 @@ func (o *Optimizer) initializeState(ctx context.Context, valset []Example) (Opti
 	}
 	span := NewUsageSpan(state.RunID, "", "evaluator.validation", "seed")
 	seedEval, err := o.config.Evaluator.Evaluate(ctx, CloneCandidate(o.config.SeedCandidate), valset, false)
-	state.Spans = append(state.Spans, span.Finish(Usage{}, err))
+	state.Ledger = state.Ledger.AddUsage(seedEval.Usage)
+	state.Spans = append(state.Spans, span.Finish(seedEval.Usage, err))
 	if err != nil {
 		return state, err
 	}
@@ -517,7 +519,8 @@ func (o *Optimizer) evaluateBeforeProposal(
 ) (EvaluationResult, error) {
 	span := NewUsageSpan(state.RunID, "", "evaluator.train", parent.ID)
 	before, err := o.config.Evaluator.Evaluate(ctx, CloneCandidate(parent.Candidate), batch, true)
-	state.Spans = append(state.Spans, span.Finish(Usage{}, err))
+	state.Ledger = state.Ledger.AddUsage(before.Usage)
+	state.Spans = append(state.Spans, span.Finish(before.Usage, err))
 	if err != nil {
 		return EvaluationResult{}, err
 	}
@@ -562,7 +565,8 @@ func (o *Optimizer) evaluateAfterProposal(
 ) (EvaluationResult, error) {
 	span := NewUsageSpan(state.RunID, "", "evaluator.train", "proposal")
 	after, err := o.config.Evaluator.Evaluate(ctx, CloneCandidate(proposed), batch, false)
-	state.Spans = append(state.Spans, span.Finish(Usage{}, err))
+	state.Ledger = state.Ledger.AddUsage(after.Usage)
+	state.Spans = append(state.Spans, span.Finish(after.Usage, err))
 	if err != nil {
 		return EvaluationResult{}, err
 	}
@@ -673,7 +677,8 @@ func (o *Optimizer) evaluateValidation(
 ) (EvaluationResult, error) {
 	span := NewUsageSpan(state.RunID, "", "evaluator.validation", "proposal")
 	valEval, err := o.config.Evaluator.Evaluate(ctx, CloneCandidate(proposed), valBatch, false)
-	state.Spans = append(state.Spans, span.Finish(Usage{}, err))
+	state.Ledger = state.Ledger.AddUsage(valEval.Usage)
+	state.Spans = append(state.Spans, span.Finish(valEval.Usage, err))
 	if err != nil {
 		return EvaluationResult{}, err
 	}

@@ -26,7 +26,7 @@ func TestModelRouterFor(t *testing.T) {
 	}
 }
 
-func TestModelRouterWithDoesNotMutateOriginal(t *testing.T) {
+func TestModelRouterWith(t *testing.T) {
 	defaultModel := routerTestModel{name: "default"}
 	judgeModel := routerTestModel{name: "judge"}
 	original := ModelRouter{Default: defaultModel}

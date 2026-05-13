@@ -29,7 +29,7 @@ func (p echoProgram) RunCandidate(_ context.Context, candidate Candidate, inputs
 	return out, nil
 }
 
-func TestPipelineProgramSeedCandidateScopesStepComponents(t *testing.T) {
+func TestPipelineSeedCandidate(t *testing.T) {
 	program := PipelineProgram{Steps: []PipelineStep{
 		{
 			Name: "extract",
@@ -57,7 +57,7 @@ func TestPipelineProgramSeedCandidateScopesStepComponents(t *testing.T) {
 	}
 }
 
-func TestPipelineProgramRunCandidateFeedsPriorOutputs(t *testing.T) {
+func TestPipelineRunCandidate(t *testing.T) {
 	program := PipelineProgram{Steps: []PipelineStep{
 		{Name: "extract", Program: echoProgram{name: "extract"}},
 		{Name: "decide", Program: echoProgram{name: "decide"}, InputKeys: []string{"extract_instruction"}},
@@ -80,7 +80,7 @@ func TestPipelineProgramRunCandidateFeedsPriorOutputs(t *testing.T) {
 	}
 }
 
-func TestPipelineProgramRunCandidateFailsOnMissingStepInput(t *testing.T) {
+func TestPipelineMissingInput(t *testing.T) {
 	program := PipelineProgram{Steps: []PipelineStep{
 		{Name: "decide", Program: echoProgram{name: "decide"}, InputKeys: []string{"amount"}},
 	}}
@@ -91,7 +91,7 @@ func TestPipelineProgramRunCandidateFailsOnMissingStepInput(t *testing.T) {
 	}
 }
 
-func TestPipelineProgramReturnAllIncludesInputsAndOutputs(t *testing.T) {
+func TestPipelineReturnAll(t *testing.T) {
 	program := PipelineProgram{
 		ReturnAll: true,
 		Steps: []PipelineStep{
@@ -150,7 +150,7 @@ func TestPipelineProgramValidate(t *testing.T) {
 	}
 }
 
-func TestCompileComponentsReturnsNamespacedCandidates(t *testing.T) {
+func TestCompileComponents(t *testing.T) {
 	got := compileComponents(Candidate{
 		"decide.instruction":  "decide",
 		"extract.instruction": "extract",

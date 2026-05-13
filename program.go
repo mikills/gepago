@@ -114,6 +114,17 @@ func (p Predict) RunCandidate(ctx context.Context, candidate Candidate, inputs P
 }
 
 // BuildPrompt renders the signature, candidate text, demos, and inputs into a model prompt.
+func (p Predict) LastUsage() Usage {
+	return languageModelUsage(p.LM).Add(languageModelUsage(p.RepairLM))
+}
+
+func languageModelUsage(lm LanguageModel) Usage {
+	if reporter, ok := lm.(UsageReporter); ok {
+		return reporter.LastUsage()
+	}
+	return Usage{}
+}
+
 func (p Predict) BuildPrompt(candidate Candidate, inputs Prediction) (string, error) {
 	inputJSON, err := json.MarshalIndent(inputs, "", "  ")
 	if err != nil {

@@ -8,6 +8,8 @@ import (
 	"testing"
 )
 
+func floatPtr(value float64) *float64 { return &value }
+
 func TestLanguageModel(t *testing.T) {
 	t.Run("requires api key for default OpenAI endpoint", func(t *testing.T) {
 		_, err := NewLanguageModel(Config{Model: "gpt-test"})
@@ -34,6 +36,9 @@ func TestLanguageModel(t *testing.T) {
 			if request["model"] != "compatible-model" {
 				t.Fatalf("model = %#v", request["model"])
 			}
+			if request["temperature"] != float64(0) {
+				t.Fatalf("temperature = %#v", request["temperature"])
+			}
 			w.Header().Set("content-type", "application/json")
 			_, _ = w.Write([]byte(`{
 				"id":"chatcmpl-test",
@@ -51,8 +56,9 @@ func TestLanguageModel(t *testing.T) {
 		defer server.Close()
 
 		lm, err := NewLanguageModel(Config{
-			BaseURL: server.URL,
-			Model:   "compatible-model",
+			BaseURL:     server.URL,
+			Model:       "compatible-model",
+			Temperature: floatPtr(0),
 			Headers: map[string]string{
 				"Authorization":    "Bearer compatible-token",
 				"X-Provider-Route": "east",
