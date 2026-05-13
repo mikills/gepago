@@ -51,6 +51,48 @@ func (r *ProgramRegistry) Register(name string, factory ProgramFactory) error {
 	return nil
 }
 
+// Has reports whether a programme factory is registered.
+func (r *ProgramRegistry) Has(name string) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.factories[name]
+	return ok
+}
+
+// Unregister removes a programme factory from the registry.
+func (r *ProgramRegistry) Unregister(name string) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.factories[name]; !ok {
+		return false
+	}
+	delete(r.factories, name)
+	return true
+}
+
+// Replace sets a programme factory, overwriting any existing factory for the same name.
+func (r *ProgramRegistry) Replace(name string, factory ProgramFactory) error {
+	if name == "" {
+		return errors.New("program name is required")
+	}
+	if factory == nil {
+		return errors.New("program factory is required")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.factories == nil {
+		r.factories = map[string]ProgramFactory{}
+	}
+	r.factories[name] = factory
+	return nil
+}
+
 // Names returns registered programme names in deterministic order.
 func (r *ProgramRegistry) Names() []string {
 	if r == nil {

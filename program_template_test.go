@@ -8,8 +8,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 type echoTemplate struct{}
@@ -21,27 +22,18 @@ func (echoTemplate) DefaultMetric() Metric   { return ExactMatchMetric{Fields: [
 
 func TestProgramTemplateRegister(t *testing.T) {
 	registry := NewProgramRegistry()
-	if err := registry.RegisterTemplate(echoTemplate{}); err != nil {
-		t.Fatalf("RegisterTemplate() error = %v", err)
-	}
-	if got := registry.Names(); len(got) != 1 || got[0] != "echo" {
-		t.Fatalf("Names() = %#v", got)
-	}
+	require.NoError(t, registry.RegisterTemplate(echoTemplate{}))
+	require.Equal(t, []string{"echo"}, registry.Names())
 }
 
 func TestJSONLExamples(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "examples.jsonl")
 	data := `{"id":"one","input":{"text":"a"},"expected":{"label":"x"}}` + "\n"
-	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.WriteFile(path, []byte(data), 0o644))
 	examples, err := LoadJSONLExamples(path)
-	if err != nil {
-		t.Fatalf("LoadJSONLExamples() error = %v", err)
-	}
-	if len(examples) != 1 || examples[0].ID != "one" {
-		t.Fatalf("examples = %#v", examples)
-	}
+	require.NoError(t, err)
+	require.Len(t, examples, 1)
+	require.Equal(t, "one", examples[0].ID)
 }
 
 func TestProgramArtifactManifest(t *testing.T) {
@@ -50,72 +42,62 @@ func TestProgramArtifactManifest(t *testing.T) {
 	artifact := NewProgramArtifact("echo", Candidate{InstructionComponent: "trained"})
 	artifact.Version = "v1"
 	artifact.ProgramVersion = "pv1"
-	if err := SaveProgramArtifact(artifactPath, artifact); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, SaveProgramArtifact(artifactPath, artifact))
 	manifest, err := WriteProgramArtifactManifest(dir, filepath.Join(dir, "manifest.json"))
-	if err != nil {
-		t.Fatalf("WriteProgramArtifactManifest() error = %v", err)
-	}
-	if len(manifest.Artifacts) != 1 || manifest.Artifacts[0].Name != "echo" {
-		t.Fatalf("manifest = %#v", manifest)
-	}
+	require.NoError(t, err)
+	require.Len(t, manifest.Artifacts, 1)
+	require.Equal(t, "echo", manifest.Artifacts[0].Name)
+	loaded, err := LoadProgramArtifactManifest(filepath.Join(dir, "manifest.json"))
+	require.NoError(t, err)
+	entry, ok := loaded.Find("echo", "pv1")
+	require.True(t, ok)
+	require.Equal(t, "echo", entry.Name)
+	registry := NewProgramRegistry()
+	require.NoError(t, registry.Register("echo", func() (Program, error) { return artifactEchoProgram{}, nil }))
+	compiled, _, err := registry.LoadCompiledFromManifest(loaded, dir, "echo", "pv1")
+	require.NoError(t, err)
+	prediction, err := compiled.Run(context.Background(), Prediction{})
+	require.NoError(t, err)
+	require.Equal(t, "trained", prediction["instruction"])
 }
 
 func TestCandidateDiffReport(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "diff.md")
-	if err := WriteCandidateDiffReport(
+	require.NoError(t, WriteCandidateDiffReport(
 		path,
 		Candidate{InstructionComponent: "before"},
 		Candidate{InstructionComponent: "after"},
-	); err != nil {
-		t.Fatalf("WriteCandidateDiffReport() error = %v", err)
-	}
+	))
 	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(data), "before") || !strings.Contains(string(data), "after") {
-		t.Fatalf("report = %s", data)
-	}
+	require.NoError(t, err)
+	require.Contains(t, string(data), "before")
+	require.Contains(t, string(data), "after")
 }
 
 func TestProgramHTTPHandler(t *testing.T) {
 	dir := t.TempDir()
-	if err := SaveProgramArtifact(
+	require.NoError(t, SaveProgramArtifact(
 		filepath.Join(dir, "echo.program.json"),
 		NewProgramArtifact("echo", Candidate{InstructionComponent: "served"}),
-	); err != nil {
-		t.Fatal(err)
-	}
+	))
 	registry := NewProgramRegistry()
-	if err := registry.Register("echo", func() (Program, error) { return artifactEchoProgram{}, nil }); err != nil {
-		t.Fatal(err)
-	}
-	body, _ := json.Marshal(map[string]any{"input": map[string]any{}})
+	require.NoError(t, registry.Register("echo", func() (Program, error) { return artifactEchoProgram{}, nil }))
+	body, err := json.Marshal(map[string]any{"input": map[string]any{}})
+	require.NoError(t, err)
 	req := httptest.NewRequest(http.MethodPost, "/programs/echo/run", bytes.NewReader(body))
 	w := httptest.NewRecorder()
 	ProgramHTTPHandler{Registry: registry, ArtifactDir: dir}.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
-	}
-	if !strings.Contains(w.Body.String(), "served") {
-		t.Fatalf("body = %s", w.Body.String())
-	}
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Contains(t, w.Body.String(), "served")
 }
 
 func TestFileTrainLock(t *testing.T) {
 	lock := FileTrainLock{Path: filepath.Join(t.TempDir(), "train.lock")}
 	unlock, err := lock.Lock(context.Background())
-	if err != nil {
-		t.Fatalf("Lock() error = %v", err)
-	}
+	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := lock.Lock(ctx); err == nil {
-		t.Fatal("second Lock() succeeded with cancelled context")
-	}
-	if err := unlock(); err != nil {
-		t.Fatalf("unlock error = %v", err)
-	}
+	_, err = lock.Lock(ctx)
+	require.Error(t, err)
+	require.NoError(t, unlock())
 }

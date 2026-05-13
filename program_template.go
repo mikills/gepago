@@ -42,6 +42,32 @@ type ProgramArtifactManifestEntry struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
+// LoadProgramArtifactManifest reads an artifact manifest from disk.
+func LoadProgramArtifactManifest(path string) (ProgramArtifactManifest, error) {
+	var manifest ProgramArtifactManifest
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ProgramArtifactManifest{}, err
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return ProgramArtifactManifest{}, err
+	}
+	return manifest, nil
+}
+
+// Find returns the manifest entry for a programme name and optional version.
+func (m ProgramArtifactManifest) Find(name string, version string) (ProgramArtifactManifestEntry, bool) {
+	for _, entry := range m.Artifacts {
+		if entry.Name != name {
+			continue
+		}
+		if version == "" || entry.Version == version || entry.ProgramVersion == version {
+			return entry, true
+		}
+	}
+	return ProgramArtifactManifestEntry{}, false
+}
+
 // WriteProgramArtifactManifest scans dir for programme artifacts and writes manifestPath.
 func WriteProgramArtifactManifest(dir string, manifestPath string) (ProgramArtifactManifest, error) {
 	entries := []ProgramArtifactManifestEntry{}
@@ -139,6 +165,28 @@ func WriteCandidateDiffReport(path string, seed Candidate, trained Candidate) er
 		b.WriteString("### After\n\n```text\n" + trained[key] + "\n```\n\n")
 	}
 	return writeAtomic(path, []byte(b.String()))
+}
+
+// LoadCompiledFromManifest loads a registered programme using a manifest entry by name and version.
+func (r *ProgramRegistry) LoadCompiledFromManifest(
+	manifest ProgramArtifactManifest,
+	baseDir string,
+	name string,
+	version string,
+) (CompiledProgram, ProgramArtifact, error) {
+	entry, ok := manifest.Find(name, version)
+	if !ok {
+		return CompiledProgram{}, ProgramArtifact{}, fmt.Errorf(
+			"program artifact %q version %q not found",
+			name,
+			version,
+		)
+	}
+	path := entry.Path
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(baseDir, path)
+	}
+	return r.LoadCompiledVersion(path, entry.ProgramVersion)
 }
 
 // ProgramHTTPHandler serves compiled programmes from a registry and artifact directory.

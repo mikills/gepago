@@ -4,63 +4,52 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
-	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestProgramRegistry(t *testing.T) {
 	registry := NewProgramRegistry()
-	if err := registry.Register("zeta", func() (Program, error) { return artifactEchoProgram{}, nil }); err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
-	if err := registry.Register("alpha", func() (Program, error) { return artifactEchoProgram{}, nil }); err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
-	if got, want := registry.Names(), []string{"alpha", "zeta"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("Names() = %#v, want %#v", got, want)
-	}
+	require.NoError(t, registry.Register("zeta", func() (Program, error) { return artifactEchoProgram{}, nil }))
+	require.NoError(t, registry.Register("alpha", func() (Program, error) { return artifactEchoProgram{}, nil }))
+	require.Equal(t, []string{"alpha", "zeta"}, registry.Names())
 	program, err := registry.Build("alpha")
-	if err != nil {
-		t.Fatalf("Build() error = %v", err)
-	}
-	if program == nil {
-		t.Fatal("Build() returned nil program")
-	}
+	require.NoError(t, err)
+	require.NotNil(t, program)
+}
+
+func TestProgramRegistryLifecycle(t *testing.T) {
+	registry := NewProgramRegistry()
+	require.False(t, registry.Has("echo"))
+	require.NoError(t, registry.Replace("echo", func() (Program, error) { return artifactEchoProgram{}, nil }))
+	require.True(t, registry.Has("echo"))
+	require.True(t, registry.Unregister("echo"))
+	require.False(t, registry.Has("echo"))
 }
 
 func TestProgramRegistryLoadCompiled(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "program.json")
 	artifact := NewProgramArtifact("financial-scout", Candidate{InstructionComponent: "trained scout"})
-	if err := SaveProgramArtifact(path, artifact); err != nil {
-		t.Fatalf("SaveProgramArtifact() error = %v", err)
-	}
+	require.NoError(t, SaveProgramArtifact(path, artifact))
 	registry := NewProgramRegistry()
-	if err := registry.Register("financial-scout", func() (Program, error) { return artifactEchoProgram{}, nil }); err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
+	require.NoError(
+		t,
+		registry.Register("financial-scout", func() (Program, error) { return artifactEchoProgram{}, nil }),
+	)
 
 	compiled, loaded, err := registry.LoadCompiled(path)
-	if err != nil {
-		t.Fatalf("LoadCompiled() error = %v", err)
-	}
-	if loaded.Name != "financial-scout" {
-		t.Fatalf("loaded.Name = %q", loaded.Name)
-	}
+	require.NoError(t, err)
+	require.Equal(t, "financial-scout", loaded.Name)
 	prediction, err := compiled.Run(context.Background(), Prediction{})
-	if err != nil {
-		t.Fatalf("compiled.Run() error = %v", err)
-	}
-	if prediction["instruction"] != "trained scout" {
-		t.Fatalf("prediction = %#v", prediction)
-	}
+	require.NoError(t, err)
+	require.Equal(t, "trained scout", prediction["instruction"])
 }
 
 func TestProgramRegistryTrainAndSave(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "program.json")
 	registry := NewProgramRegistry()
-	if err := registry.Register("echo", func() (Program, error) { return artifactEchoProgram{}, nil }); err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
+	require.NoError(t, registry.Register("echo", func() (Program, error) { return artifactEchoProgram{}, nil }))
 	lm := LanguageModelFunc(func(context.Context, string) (string, error) {
 		return "```\ntrained\n```", nil
 	})
@@ -77,37 +66,22 @@ func TestProgramRegistryTrainAndSave(t *testing.T) {
 		MaxMetricCalls: 4,
 		MinibatchSize:  1,
 	})
-	if err != nil {
-		t.Fatalf("TrainAndSave() error = %v", err)
-	}
-	if state.MetricCalls == 0 {
-		t.Fatal("TrainAndSave() did not run optimisation")
-	}
-	if artifact.Name != "echo" || artifact.Version != "v1" {
-		t.Fatalf("artifact = %#v", artifact)
-	}
+	require.NoError(t, err)
+	require.NotZero(t, state.MetricCalls)
+	require.Equal(t, "echo", artifact.Name)
+	require.Equal(t, "v1", artifact.Version)
 	prediction, err := compiled.Run(context.Background(), Prediction{})
-	if err != nil {
-		t.Fatalf("compiled.Run() error = %v", err)
-	}
-	if prediction["instruction"] != "trained" {
-		t.Fatalf("prediction = %#v", prediction)
-	}
+	require.NoError(t, err)
+	require.Equal(t, "trained", prediction["instruction"])
 	loaded, err := LoadProgramArtifact(path)
-	if err != nil {
-		t.Fatalf("LoadProgramArtifact() error = %v", err)
-	}
-	if loaded.Candidate[InstructionComponent] != "trained" {
-		t.Fatalf("loaded candidate = %#v", loaded.Candidate)
-	}
+	require.NoError(t, err)
+	require.Equal(t, "trained", loaded.Candidate[InstructionComponent])
 }
 
 func TestProgramRegistryLoadOrTrain(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "program.json")
 	registry := NewProgramRegistry()
-	if err := registry.Register("echo", func() (Program, error) { return artifactEchoProgram{}, nil }); err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
+	require.NoError(t, registry.Register("echo", func() (Program, error) { return artifactEchoProgram{}, nil }))
 	config := ProgramTrainConfig{
 		Name:           "echo",
 		ArtifactPath:   path,
@@ -119,32 +93,22 @@ func TestProgramRegistryLoadOrTrain(t *testing.T) {
 	}
 
 	_, _, state, trained, err := registry.LoadOrTrain(context.Background(), config)
-	if err != nil {
-		t.Fatalf("LoadOrTrain() train error = %v", err)
-	}
-	if !trained || state.MetricCalls == 0 {
-		t.Fatalf("LoadOrTrain() trained=%v state=%#v", trained, state)
-	}
+	require.NoError(t, err)
+	require.True(t, trained)
+	require.NotZero(t, state.MetricCalls)
 	_, _, state, trained, err = registry.LoadOrTrain(context.Background(), config)
-	if err != nil {
-		t.Fatalf("LoadOrTrain() load error = %v", err)
-	}
-	if trained || state.MetricCalls != 0 {
-		t.Fatalf("LoadOrTrain() trained=%v state=%#v", trained, state)
-	}
+	require.NoError(t, err)
+	require.False(t, trained)
+	require.Zero(t, state.MetricCalls)
 }
 
 func TestProgramRegistryVersionMismatch(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "program.json")
 	artifact := NewProgramArtifact("echo", Candidate{InstructionComponent: "trained"})
 	artifact.ProgramVersion = "v1"
-	if err := SaveProgramArtifact(path, artifact); err != nil {
-		t.Fatalf("SaveProgramArtifact() error = %v", err)
-	}
+	require.NoError(t, SaveProgramArtifact(path, artifact))
 	registry := NewProgramRegistry()
-	if err := registry.Register("echo", func() (Program, error) { return artifactEchoProgram{}, nil }); err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
+	require.NoError(t, registry.Register("echo", func() (Program, error) { return artifactEchoProgram{}, nil }))
 	_, _, _, _, err := registry.LoadOrTrain(context.Background(), ProgramTrainConfig{
 		Name:           "echo",
 		ArtifactPath:   path,
@@ -153,32 +117,18 @@ func TestProgramRegistryVersionMismatch(t *testing.T) {
 		Metric:         ExactMatchMetric{Fields: []string{"instruction"}},
 		ReflectionLM:   LanguageModelFunc(func(context.Context, string) (string, error) { return "trained", nil }),
 	})
-	if err == nil || err.Error() != `program artifact "echo" has program version "v1", expected "v2"` {
-		t.Fatalf("LoadOrTrain() error = %v", err)
-	}
+	require.EqualError(t, err, `program artifact "echo" has program version "v1", expected "v2"`)
 }
 
 func TestProgramRegistryErrors(t *testing.T) {
 	registry := NewProgramRegistry()
-	if err := registry.Register("", func() (Program, error) { return artifactEchoProgram{}, nil }); err == nil {
-		t.Fatal("Register() with empty name succeeded")
-	}
-	if err := registry.Register("echo", nil); err == nil {
-		t.Fatal("Register() with nil factory succeeded")
-	}
-	if err := registry.Register("echo", func() (Program, error) { return artifactEchoProgram{}, nil }); err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
-	if err := registry.Register("echo", func() (Program, error) { return artifactEchoProgram{}, nil }); err == nil {
-		t.Fatal("Register() duplicate succeeded")
-	}
-	if _, err := registry.Build("missing"); err == nil {
-		t.Fatal("Build() missing succeeded")
-	}
-	if err := registry.Register("bad", func() (Program, error) { return nil, errors.New("boom") }); err != nil {
-		t.Fatalf("Register() bad error = %v", err)
-	}
-	if _, err := registry.Build("bad"); err == nil {
-		t.Fatal("Build() factory error succeeded")
-	}
+	require.Error(t, registry.Register("", func() (Program, error) { return artifactEchoProgram{}, nil }))
+	require.Error(t, registry.Register("echo", nil))
+	require.NoError(t, registry.Register("echo", func() (Program, error) { return artifactEchoProgram{}, nil }))
+	require.Error(t, registry.Register("echo", func() (Program, error) { return artifactEchoProgram{}, nil }))
+	_, err := registry.Build("missing")
+	require.Error(t, err)
+	require.NoError(t, registry.Register("bad", func() (Program, error) { return nil, errors.New("boom") }))
+	_, err = registry.Build("bad")
+	require.Error(t, err)
 }

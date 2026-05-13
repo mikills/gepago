@@ -4,6 +4,8 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestProgramArtifactRoundTrip(t *testing.T) {
@@ -12,57 +14,38 @@ func TestProgramArtifactRoundTrip(t *testing.T) {
 	artifact.Version = "v1"
 	artifact.Metadata = map[string]any{"score": 1.0}
 
-	if err := SaveProgramArtifact(path, artifact); err != nil {
-		t.Fatalf("SaveProgramArtifact() error = %v", err)
-	}
+	require.NoError(t, SaveProgramArtifact(path, artifact))
 	loaded, err := LoadProgramArtifact(path)
-	if err != nil {
-		t.Fatalf("LoadProgramArtifact() error = %v", err)
-	}
-	if loaded.Name != "financial-scout" || loaded.Version != "v1" {
-		t.Fatalf("loaded artifact = %#v", loaded)
-	}
-	if loaded.Candidate["report.instruction"] != "write report" {
-		t.Fatalf("loaded candidate = %#v", loaded.Candidate)
-	}
+	require.NoError(t, err)
+	require.Equal(t, "financial-scout", loaded.Name)
+	require.Equal(t, "v1", loaded.Version)
+	require.Equal(t, "write report", loaded.Candidate["report.instruction"])
 }
 
 func TestLoadCompiledProgramOverlay(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "scout.json")
-	if err := SaveProgramArtifact(path, NewProgramArtifact("echo", Candidate{InstructionComponent: "trained"})); err != nil {
-		t.Fatalf("SaveProgramArtifact() error = %v", err)
-	}
+	require.NoError(
+		t,
+		SaveProgramArtifact(path, NewProgramArtifact("echo", Candidate{InstructionComponent: "trained"})),
+	)
 	compiled, _, err := LoadCompiledProgram(path, seededTwoComponentProgram{})
-	if err != nil {
-		t.Fatalf("LoadCompiledProgram() error = %v", err)
-	}
-	if compiled.Candidate[InstructionComponent] != "trained" {
-		t.Fatalf("instruction = %q", compiled.Candidate[InstructionComponent])
-	}
-	if compiled.Candidate[DemosComponent] != "seed demo" {
-		t.Fatalf("demos = %q", compiled.Candidate[DemosComponent])
-	}
+	require.NoError(t, err)
+	require.Equal(t, "trained", compiled.Candidate[InstructionComponent])
+	require.Equal(t, "seed demo", compiled.Candidate[DemosComponent])
 }
 
 func TestLoadCompiledProgram(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "scout.json")
-	if err := SaveProgramArtifact(path, NewProgramArtifact("echo", Candidate{InstructionComponent: "trained"})); err != nil {
-		t.Fatalf("SaveProgramArtifact() error = %v", err)
-	}
+	require.NoError(
+		t,
+		SaveProgramArtifact(path, NewProgramArtifact("echo", Candidate{InstructionComponent: "trained"})),
+	)
 	compiled, artifact, err := LoadCompiledProgram(path, artifactEchoProgram{})
-	if err != nil {
-		t.Fatalf("LoadCompiledProgram() error = %v", err)
-	}
-	if artifact.Name != "echo" {
-		t.Fatalf("artifact.Name = %q", artifact.Name)
-	}
+	require.NoError(t, err)
+	require.Equal(t, "echo", artifact.Name)
 	prediction, err := compiled.Run(context.Background(), Prediction{})
-	if err != nil {
-		t.Fatalf("compiled.Run() error = %v", err)
-	}
-	if prediction["instruction"] != "trained" {
-		t.Fatalf("prediction = %#v", prediction)
-	}
+	require.NoError(t, err)
+	require.Equal(t, "trained", prediction["instruction"])
 }
 
 type seededTwoComponentProgram struct{}
