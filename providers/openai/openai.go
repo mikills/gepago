@@ -95,7 +95,11 @@ func (m *LanguageModel) Generate(ctx context.Context, prompt string) (string, er
 	if len(completion.Choices) == 0 {
 		return "", errors.New("openai reflection completion: no choices returned")
 	}
-	return completion.Choices[0].Message.Content, nil
+	content := completion.Choices[0].Message.Content
+	if strings.TrimSpace(content) == "" {
+		return "", errors.New("openai reflection completion: empty content")
+	}
+	return content, nil
 }
 
 func (m *LanguageModel) LastUsage() gepa.Usage {

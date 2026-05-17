@@ -10,14 +10,14 @@ import (
 
 func TestProgramArtifactRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "scout.json")
-	artifact := NewProgramArtifact("financial-scout", Candidate{"report.instruction": "write report"})
+	artifact := NewProgramArtifact("document-scout", Candidate{"report.instruction": "write report"})
 	artifact.Version = "v1"
 	artifact.Metadata = map[string]any{"score": 1.0}
 
 	require.NoError(t, SaveProgramArtifact(path, artifact))
 	loaded, err := LoadProgramArtifact(path)
 	require.NoError(t, err)
-	require.Equal(t, "financial-scout", loaded.Name)
+	require.Equal(t, "document-scout", loaded.Name)
 	require.Equal(t, "v1", loaded.Version)
 	require.Equal(t, "write report", loaded.Candidate["report.instruction"])
 }
