@@ -151,6 +151,7 @@ type OptimizationConfig struct {
 	MinibatchSize       int
 	Seed                int64
 	Persistence         OptimizationPersistence
+	Observers           []OptimizationObserver
 }
 
 // Validate checks that the optimiser configuration can run.
@@ -252,6 +253,16 @@ type OptimizationEvent struct {
 	FrontierIDs []string              `json:"frontier_ids,omitempty"`
 }
 
+type OptimizationObserver interface {
+	ObserveOptimization(context.Context, OptimizationEvent)
+}
+
+type OptimizationObserverFunc func(context.Context, OptimizationEvent)
+
+func (fn OptimizationObserverFunc) ObserveOptimization(ctx context.Context, evt OptimizationEvent) {
+	fn(ctx, evt)
+}
+
 // Optimizer executes the GEPA reflective evolution loop until the rollout budget is spent.
 type Optimizer struct {
 	config OptimizationConfig
@@ -304,7 +315,7 @@ func (o *Optimizer) Run(ctx context.Context) (OptimizationState, error) {
 			break
 		}
 	}
-	return o.finishState(state)
+	return o.finishState(ctx, state)
 }
 
 func (o *Optimizer) validationSet() []Example {
@@ -327,7 +338,7 @@ func (o *Optimizer) startState(ctx context.Context, valset []Example) (Optimizat
 
 func (o *Optimizer) initializeState(ctx context.Context, valset []Example) (OptimizationState, error) {
 	state := OptimizationState{RunID: NewID(), StartedAt: time.Now().UTC(), Ledger: UsageLedger{Runs: 1}}
-	if err := o.emit(OptimizationEvent{
+	if err := o.emit(ctx, OptimizationEvent{
 		Kind:      OptimizationStarted,
 		RunID:     state.RunID,
 		Timestamp: time.Now().UTC(),
@@ -396,7 +407,7 @@ func (o *Optimizer) proposeForIteration(
 	parent CandidateRecord,
 ) (proposalAttempt, bool, error) {
 	iteration := state.Iterations
-	if err := o.emit(OptimizationEvent{
+	if err := o.emit(ctx, OptimizationEvent{
 		Kind:      OptimizationIterationStart,
 		RunID:     state.RunID,
 		Iteration: iteration,
@@ -429,7 +440,7 @@ func (o *Optimizer) proposeForIteration(
 		state.Spans = append(state.Spans, NewUsageSpan(state.RunID, "", "llm.reflect", "proposer").Finish(usage, nil))
 	}
 	proposed = MergeCandidate(parent.Candidate, proposed)
-	if err := o.emit(OptimizationEvent{
+	if err := o.emit(ctx, OptimizationEvent{
 		Kind:      OptimizationCandidateProposed,
 		RunID:     state.RunID,
 		Iteration: iteration,
@@ -552,7 +563,7 @@ func (o *Optimizer) evaluateProposal(
 	beforeSum := scoreForExamples(attempt.before, afterBatch)
 	afterSum := after.SumScore()
 	if !o.config.AcceptanceCriterion.ShouldAccept(beforeSum, afterSum) {
-		return false, o.rejectCandidate(state, parent, attempt, beforeSum, afterSum)
+		return false, o.rejectCandidate(ctx, state, parent, attempt, beforeSum, afterSum)
 	}
 	return true, o.acceptCandidate(ctx, state, parent, attempt, valset, after, beforeSum, afterSum)
 }
@@ -579,6 +590,7 @@ func (o *Optimizer) evaluateAfterProposal(
 }
 
 func (o *Optimizer) rejectCandidate(
+	ctx context.Context,
 	state *OptimizationState,
 	parent CandidateRecord,
 	attempt proposalAttempt,
@@ -610,7 +622,7 @@ func (o *Optimizer) rejectCandidate(
 		ScoreAfter:  afterSum,
 		Message:     "candidate did not strictly improve minibatch score",
 	}
-	if err := o.emit(evt); err != nil {
+	if err := o.emit(ctx, evt); err != nil {
 		return err
 	}
 	return o.save(*state)
@@ -666,7 +678,7 @@ func (o *Optimizer) acceptCandidate(
 		state.BestCandidateID = record.ID
 	}
 	state.FrontierIDs = computeFrontier(state.Candidates)
-	return o.emitAcceptedCandidateEvents(*state, parent.ID, record.ID, beforeSum, afterSum)
+	return o.emitAcceptedCandidateEvents(ctx, *state, parent.ID, record.ID, beforeSum, afterSum)
 }
 
 func (o *Optimizer) evaluateValidation(
@@ -691,6 +703,7 @@ func (o *Optimizer) evaluateValidation(
 }
 
 func (o *Optimizer) emitAcceptedCandidateEvents(
+	ctx context.Context,
 	state OptimizationState,
 	parentID string,
 	candidateID string,
@@ -714,16 +727,16 @@ func (o *Optimizer) emitAcceptedCandidateEvents(
 		Timestamp:   time.Now().UTC(),
 		FrontierIDs: state.FrontierIDs,
 	}
-	if err := o.emit(accepted); err != nil {
+	if err := o.emit(ctx, accepted); err != nil {
 		return err
 	}
-	if err := o.emit(frontier); err != nil {
+	if err := o.emit(ctx, frontier); err != nil {
 		return err
 	}
 	return o.save(state)
 }
 
-func (o *Optimizer) finishState(state OptimizationState) (OptimizationState, error) {
+func (o *Optimizer) finishState(ctx context.Context, state OptimizationState) (OptimizationState, error) {
 	state.EndedAt = time.Now().UTC()
 	state.Ledger.TotalDuration = state.EndedAt.Sub(state.StartedAt)
 	evt := OptimizationEvent{
@@ -734,17 +747,35 @@ func (o *Optimizer) finishState(state OptimizationState) (OptimizationState, err
 		CandidateID: state.BestCandidateID,
 		FrontierIDs: state.FrontierIDs,
 	}
-	if err := o.emit(evt); err != nil {
+	if err := o.emit(ctx, evt); err != nil {
 		return state, err
 	}
 	return state, o.save(state)
 }
 
-func (o *Optimizer) emit(evt OptimizationEvent) error {
+func (o *Optimizer) emit(ctx context.Context, evt OptimizationEvent) error {
+	if evt.Timestamp.IsZero() {
+		evt.Timestamp = time.Now().UTC()
+	}
+	for _, observer := range o.config.Observers {
+		observeOptimizationSafely(ctx, observer, evt)
+	}
 	if o.config.Persistence != nil {
 		return o.config.Persistence.AppendOptimizationEvent(evt)
 	}
 	return nil
+}
+
+func observeOptimizationSafely(ctx context.Context, observer OptimizationObserver, evt OptimizationEvent) {
+	if observer == nil {
+		return
+	}
+	defer func() {
+		if recover() != nil {
+			return
+		}
+	}()
+	observer.ObserveOptimization(ctx, evt)
 }
 
 func (o *Optimizer) save(state OptimizationState) error {

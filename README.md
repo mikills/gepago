@@ -135,19 +135,19 @@ This mirrors the GEPA paper's compound-system formulation `Φ = (M, C, X, Y)`: `
 Optimisation can happen offline, then runtime applications can load the trained prompt bundle wherever the same programme can be initialised.
 
 ```go
-artifact := gepa.NewProgramArtifact("financial-scout", compiled.Candidate)
-err := gepa.SaveProgramArtifact("financial-scout.program.json", artifact)
+artifact := gepa.NewProgramArtifact("internal-program", compiled.Candidate)
+err := gepa.SaveProgramArtifact("internal-program.program.json", artifact)
 ```
 
 At runtime, register factories that inject app dependencies such as models, tools, stores, or retrievers:
 
 ```go
 registry := gepa.NewProgramRegistry()
-err := registry.Register("financial-scout", func() (gepa.Program, error) {
-    return buildFinancialScoutProgram(plannerLM, reporterLM, retriever), nil
+err := registry.Register("internal-program", func() (gepa.Program, error) {
+    return buildInternalProgram(plannerLM, reporterLM, retriever), nil
 })
 
-compiled, artifact, err := registry.LoadCompiled("financial-scout.program.json")
+compiled, artifact, err := registry.LoadCompiled("internal-program.program.json")
 result, err := compiled.Run(ctx, input)
 _ = artifact
 ```
@@ -156,8 +156,8 @@ Services may also train on demand, then reuse the saved artifact on later calls:
 
 ```go
 compiled, artifact, state, trained, err := registry.LoadOrTrain(ctx, gepa.ProgramTrainConfig{
-    Name:           "financial-scout",
-    ArtifactPath:   "financial-scout.program.json",
+    Name:           "internal-program",
+    ArtifactPath:   "internal-program.program.json",
     ProgramVersion: "v1",
     Trainset:       examples,
     Metric:         metric,

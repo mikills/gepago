@@ -29,6 +29,7 @@ type CompileConfig struct {
 	Seed                int64
 	Persistence         OptimizationPersistence
 	AcceptanceCriterion AcceptanceCriterion
+	Observers           []OptimizationObserver
 }
 
 // CompiledProgram runs a programme with the best candidate found by Compile.
@@ -77,6 +78,7 @@ func Compile(ctx context.Context, config CompileConfig) (CompiledProgram, Optimi
 		MinibatchSize:       config.MinibatchSize,
 		Seed:                config.Seed,
 		Persistence:         config.Persistence,
+		Observers:           config.Observers,
 	})
 	if err != nil {
 		return CompiledProgram{}, OptimizationState{}, err

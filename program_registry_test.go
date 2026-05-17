@@ -30,17 +30,17 @@ func TestProgramRegistryLifecycle(t *testing.T) {
 
 func TestProgramRegistryLoadCompiled(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "program.json")
-	artifact := NewProgramArtifact("financial-scout", Candidate{InstructionComponent: "trained scout"})
+	artifact := NewProgramArtifact("document-scout", Candidate{InstructionComponent: "trained scout"})
 	require.NoError(t, SaveProgramArtifact(path, artifact))
 	registry := NewProgramRegistry()
 	require.NoError(
 		t,
-		registry.Register("financial-scout", func() (Program, error) { return artifactEchoProgram{}, nil }),
+		registry.Register("document-scout", func() (Program, error) { return artifactEchoProgram{}, nil }),
 	)
 
 	compiled, loaded, err := registry.LoadCompiled(path)
 	require.NoError(t, err)
-	require.Equal(t, "financial-scout", loaded.Name)
+	require.Equal(t, "document-scout", loaded.Name)
 	prediction, err := compiled.Run(context.Background(), Prediction{})
 	require.NoError(t, err)
 	require.Equal(t, "trained scout", prediction["instruction"])

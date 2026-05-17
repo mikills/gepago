@@ -4,6 +4,8 @@
 
 # Private unless specified
 usecases/**
+programs/**
+artifacts/**
 
 .diago/
 .DS_Store
