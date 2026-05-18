@@ -41,7 +41,19 @@ type CompiledProgram struct {
 
 // Run executes the compiled programme with its optimised candidate.
 func (p CompiledProgram) Run(ctx context.Context, inputs Prediction) (Prediction, error) {
-	return p.Program.RunCandidate(ctx, p.Candidate, inputs)
+	prediction, _, err := p.RunWithUsage(ctx, inputs)
+	return prediction, err
+}
+
+// RunWithUsage executes the compiled programme and returns usage recorded during the run.
+func (p CompiledProgram) RunWithUsage(ctx context.Context, inputs Prediction) (Prediction, Usage, error) {
+	runCtx, collector := WithUsageCollector(ctx)
+	prediction, err := p.Program.RunCandidate(runCtx, p.Candidate, inputs)
+	usage := collector.Usage()
+	if isZeroUsage(usage) {
+		usage = ProgramLastUsage(p.Program)
+	}
+	return prediction, usage, err
 }
 
 // Compile runs GEPA over a prompt programme using structured examples and a metric.
@@ -145,11 +157,16 @@ func (e ProgramEvaluator) Evaluate(
 		if !ok {
 			return EvaluationResult{}, errors.New("program evaluator examples must contain IOExample input")
 		}
-		actual, err := e.Program.RunCandidate(ctx, candidate, ioExample.Inputs)
+		runCtx, collector := WithUsageCollector(ctx)
+		actual, err := e.Program.RunCandidate(runCtx, candidate, ioExample.Inputs)
 		if err != nil {
 			return EvaluationResult{}, fmt.Errorf("evaluate example %q: run candidate: %w", example.ID, err)
 		}
-		usage = usage.Add(ProgramLastUsage(e.Program))
+		exampleUsage := collector.Usage()
+		if isZeroUsage(exampleUsage) {
+			exampleUsage = ProgramLastUsage(e.Program)
+		}
+		usage = usage.Add(exampleUsage)
 		metricResult, err := e.Metric.Score(ctx, ioExample.Expected, actual)
 		if err != nil {
 			return EvaluationResult{}, fmt.Errorf("evaluate example %q: score prediction: %w", example.ID, err)
@@ -178,6 +195,10 @@ func ProgramLastUsage(program Program) Usage {
 		return Usage{}
 	}
 	return reporter.LastUsage()
+}
+
+func isZeroUsage(usage Usage) bool {
+	return usage.PromptTokens == 0 && usage.CompletionTokens == 0 && usage.TotalTokens == 0
 }
 
 func bestCandidateFromState(state OptimizationState) CandidateRecord {

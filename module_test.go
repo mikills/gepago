@@ -5,6 +5,8 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 type echoProgram struct {
@@ -90,6 +92,35 @@ func TestPipelineMissingInput(t *testing.T) {
 		t.Fatalf("RunCandidate() error = %v", err)
 	}
 }
+
+func TestPipelineUsage(t *testing.T) {
+	lm := &sequenceUsageModel{}
+	program := PipelineProgram{Steps: []PipelineStep{
+		{Name: "plan", Program: Predict{Signature: Signature{Name: "plan", Inputs: []Field{{Name: "document"}}, Outputs: []Field{{Name: "plan"}}}, LM: lm, Instruction: "plan"}},
+		{Name: "report", Program: Predict{Signature: Signature{Name: "report", Inputs: []Field{{Name: "plan"}}, Outputs: []Field{{Name: "report"}}}, LM: lm, Instruction: "report"}, InputKeys: []string{"plan"}},
+	}}
+	compiled := CompiledProgram{Program: program, Candidate: program.SeedCandidate()}
+
+	_, usage, err := compiled.RunWithUsage(context.Background(), Prediction{"document": "cash 10"})
+	require.NoError(t, err)
+	require.Equal(t, Usage{PromptTokens: 3, CompletionTokens: 30, TotalTokens: 33}, usage)
+}
+
+type sequenceUsageModel struct {
+	calls int
+	last  Usage
+}
+
+func (m *sequenceUsageModel) Generate(_ context.Context, _ string) (string, error) {
+	m.calls++
+	m.last = Usage{PromptTokens: m.calls, CompletionTokens: m.calls * 10, TotalTokens: m.calls * 11}
+	if m.calls == 1 {
+		return `{"plan":"find evidence"}`, nil
+	}
+	return `{"report":"found evidence"}`, nil
+}
+
+func (m *sequenceUsageModel) LastUsage() Usage { return m.last }
 
 func TestPipelineReturnAll(t *testing.T) {
 	program := PipelineProgram{

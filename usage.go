@@ -1,10 +1,49 @@
 package gepa
 
-import "time"
+import (
+	"context"
+	"sync"
+	"time"
+)
 
 // UsageReporter exposes token usage from the most recent provider call.
 type UsageReporter interface {
 	LastUsage() Usage
+}
+
+type usageCollectorKey struct{}
+
+type UsageCollector struct {
+	mu    sync.Mutex
+	usage Usage
+}
+
+func WithUsageCollector(ctx context.Context) (context.Context, *UsageCollector) {
+	collector := &UsageCollector{}
+	return context.WithValue(ctx, usageCollectorKey{}, collector), collector
+}
+
+func (c *UsageCollector) Add(usage Usage) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.usage = c.usage.Add(usage)
+}
+
+func (c *UsageCollector) Usage() Usage {
+	if c == nil {
+		return Usage{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.usage
+}
+
+func recordUsage(ctx context.Context, usage Usage) {
+	collector, _ := ctx.Value(usageCollectorKey{}).(*UsageCollector)
+	collector.Add(usage)
 }
 
 func errorString(err error) string {

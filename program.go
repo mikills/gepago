@@ -110,6 +110,7 @@ func (p Predict) RunCandidate(ctx context.Context, candidate Candidate, inputs P
 	if err != nil {
 		return nil, err
 	}
+	recordUsage(ctx, languageModelUsage(p.LM))
 	return p.parseOrRepair(ctx, raw)
 }
 
@@ -160,6 +161,7 @@ func (p Predict) parseOrRepair(ctx context.Context, raw string) (Prediction, err
 		if repairErr != nil {
 			return nil, repairErr
 		}
+		recordUsage(ctx, languageModelUsage(repairLM))
 		prediction, err = ParsePrediction(repaired)
 		if err == nil {
 			return prediction, nil
