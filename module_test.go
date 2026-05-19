@@ -96,8 +96,31 @@ func TestPipelineMissingInput(t *testing.T) {
 func TestPipelineUsage(t *testing.T) {
 	lm := &sequenceUsageModel{}
 	program := PipelineProgram{Steps: []PipelineStep{
-		{Name: "plan", Program: Predict{Signature: Signature{Name: "plan", Inputs: []Field{{Name: "document"}}, Outputs: []Field{{Name: "plan"}}}, LM: lm, Instruction: "plan"}},
-		{Name: "report", Program: Predict{Signature: Signature{Name: "report", Inputs: []Field{{Name: "plan"}}, Outputs: []Field{{Name: "report"}}}, LM: lm, Instruction: "report"}, InputKeys: []string{"plan"}},
+		{
+			Name: "plan",
+			Program: Predict{
+				Signature: Signature{
+					Name:    "plan",
+					Inputs:  []Field{{Name: "document"}},
+					Outputs: []Field{{Name: "plan"}},
+				},
+				LM:          lm,
+				Instruction: "plan",
+			},
+		},
+		{
+			Name: "report",
+			Program: Predict{
+				Signature: Signature{
+					Name:    "report",
+					Inputs:  []Field{{Name: "plan"}},
+					Outputs: []Field{{Name: "report"}},
+				},
+				LM:          lm,
+				Instruction: "report",
+			},
+			InputKeys: []string{"plan"},
+		},
 	}}
 	compiled := CompiledProgram{Program: program, Candidate: program.SeedCandidate()}
 

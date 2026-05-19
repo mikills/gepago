@@ -9,17 +9,19 @@ import (
 
 func TestOptimizationEvents(t *testing.T) {
 	examples := []Example{{ID: "a", Input: "a"}, {ID: "b", Input: "b"}}
-	evaluator := EvaluatorFunc(func(_ context.Context, candidate Candidate, examples []Example, _ bool) (EvaluationResult, error) {
-		items := make([]EvaluationItem, 0, len(examples))
-		for _, example := range examples {
-			score := 0.0
-			if candidate["prompt"] == "better" {
-				score = 1
+	evaluator := EvaluatorFunc(
+		func(_ context.Context, candidate Candidate, examples []Example, _ bool) (EvaluationResult, error) {
+			items := make([]EvaluationItem, 0, len(examples))
+			for _, example := range examples {
+				score := 0.0
+				if candidate["prompt"] == "better" {
+					score = 1
+				}
+				items = append(items, EvaluationItem{ExampleID: example.ID, Score: score})
 			}
-			items = append(items, EvaluationItem{ExampleID: example.ID, Score: score})
-		}
-		return EvaluationResult{Items: items}, nil
-	})
+			return EvaluationResult{Items: items}, nil
+		},
+	)
 	events := []OptimizationEvent{}
 	optimizer, err := NewOptimizer(OptimizationConfig{
 		SeedCandidate:  Candidate{"prompt": "start"},
