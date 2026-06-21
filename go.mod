@@ -1,12 +1,14 @@
 module github.com/mikills/gepago
 
-go 1.24.0
+go 1.25.0
 
 require (
+	github.com/a-h/templ v0.3.1020
 	github.com/anthropics/anthropic-sdk-go v1.41.0
 	github.com/google/uuid v1.6.0
 	github.com/openai/openai-go/v3 v3.34.0
 	github.com/stretchr/testify v1.11.1
+	golang.org/x/sync v0.16.0
 )
 
 require (
@@ -22,6 +24,5 @@ require (
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
 	github.com/wk8/go-ordered-map/v2 v2.1.8 // indirect
-	golang.org/x/sync v0.16.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
