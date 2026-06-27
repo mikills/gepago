@@ -142,6 +142,8 @@ func (p *ReflectiveProposer) buildPrompt(
 	return prompt, nil
 }
 
+const codeFence = "```"
+
 const defaultReflectionPromptTemplate = `You are improving one text component in a system.
 
 Objective:
@@ -154,19 +156,19 @@ Component name:
 {{component}}
 
 Current component text:
-` + "```" + `
+` + codeFence + `
 {{current}}
-` + "```" + `
+` + codeFence + `
 
 Prior lessons from earlier proposals:
-` + "```json" + `
+` + codeFence + `json
 {{lessons}}
-` + "```" + `
+` + codeFence + `
 
 Evaluation records and traces:
-` + "```json" + `
+` + codeFence + `json
 {{records}}
-` + "```" + `
+` + codeFence + `
 
 Return only the improved replacement text inside fenced code blocks.
 You may also return a JSON object keyed by component name.`
@@ -185,7 +187,7 @@ func ParseComponentReplacement(raw string, component string) string {
 
 // ExtractFencedText returns the first fenced block body, or trimmed raw text when none exists.
 func ExtractFencedText(raw string) string {
-	start := strings.Index(raw, "```")
+	start := strings.Index(raw, codeFence)
 	if start < 0 {
 		return strings.TrimSpace(raw)
 	}
@@ -196,7 +198,7 @@ func ExtractFencedText(raw string) string {
 			rest = rest[newline+1:]
 		}
 	}
-	end := strings.Index(rest, "```")
+	end := strings.Index(rest, codeFence)
 	if end < 0 {
 		return strings.TrimSpace(rest)
 	}

@@ -70,8 +70,10 @@ func main() {
 	fmt.Println("report: sentiment-report.html")
 }
 
+var rootContext = context.Background()
+
 func interruptContext() (context.Context, context.CancelFunc) {
-	return signal.NotifyContext(context.Background(), os.Interrupt)
+	return signal.NotifyContext(rootContext, os.Interrupt)
 }
 
 func languageModelFromEnv() (gepa.LanguageModel, error) {
