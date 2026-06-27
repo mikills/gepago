@@ -81,6 +81,8 @@ func main() {
 	fmt.Printf("prediction: %#v\n", prediction)
 }
 
+var rootContext = context.Background()
+
 func interruptContext() (context.Context, context.CancelFunc) {
-	return signal.NotifyContext(context.Background(), os.Interrupt)
+	return signal.NotifyContext(rootContext, os.Interrupt)
 }

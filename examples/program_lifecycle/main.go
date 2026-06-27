@@ -17,7 +17,7 @@ func main() {
 	artifactPath := flag.String("artifact", "program.lifecycle.example.json", "artifact output path")
 	flag.Parse()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(rootContext, os.Interrupt)
 	defer stop()
 
 	lm, err := languageModelFromEnv()
@@ -28,7 +28,7 @@ func main() {
 
 	program := sentimentProgram(lm)
 	examples := lifecycleExamples()
-	metric := gepa.ExactMatchMetric{Fields: []string{"label"}, CaseInsensitive: true, TrimSpace: true}
+	metric := gepa.ExactMatchMetric{Fields: []string{labelField}, CaseInsensitive: true, TrimSpace: true}
 
 	seedScore, err := evaluate(ctx, program, program.SeedCandidate(), examples, metric)
 	if err != nil {
@@ -75,13 +75,17 @@ func main() {
 	fmt.Printf("loaded prediction: %v\n", prediction)
 }
 
+var rootContext = context.Background()
+
+const labelField = "label"
+
 func sentimentProgram(lm gepa.LanguageModel) gepa.Predict {
 	return gepa.Predict{
 		Signature: gepa.Signature{
 			Name:        "sentiment_lifecycle_example",
 			Description: "Classify short customer text.",
 			Inputs:      []gepa.Field{{Name: "text", Description: "customer text"}},
-			Outputs:     []gepa.Field{{Name: "label", Description: "positive or negative"}},
+			Outputs:     []gepa.Field{{Name: labelField, Description: "positive or negative"}},
 		},
 		Instruction:     "Classify the sentiment as positive or negative.",
 		LM:              lm,
@@ -95,22 +99,22 @@ func lifecycleExamples() []gepa.Example {
 		gepa.NewIOExample(
 			"positive-fast",
 			gepa.Prediction{"text": "The team resolved my ticket fast."},
-			gepa.Prediction{"label": "positive"},
+			gepa.Prediction{labelField: "positive"},
 		),
 		gepa.NewIOExample(
 			"positive-helpful",
 			gepa.Prediction{"text": "Support was helpful and clear."},
-			gepa.Prediction{"label": "positive"},
+			gepa.Prediction{labelField: "positive"},
 		),
 		gepa.NewIOExample(
 			"negative-broken",
 			gepa.Prediction{"text": "The product broke on day one."},
-			gepa.Prediction{"label": "negative"},
+			gepa.Prediction{labelField: "negative"},
 		),
 		gepa.NewIOExample(
 			"negative-late",
 			gepa.Prediction{"text": "Delivery was late and nobody replied."},
-			gepa.Prediction{"label": "negative"},
+			gepa.Prediction{labelField: "negative"},
 		),
 	}
 }

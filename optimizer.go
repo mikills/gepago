@@ -562,10 +562,22 @@ func (o *Optimizer) evaluateProposal(
 	}
 	beforeSum := scoreForExamples(attempt.before, afterBatch)
 	afterSum := after.SumScore()
+	scores := proposalScores{before: beforeSum, after: afterSum}
 	if !o.config.AcceptanceCriterion.ShouldAccept(beforeSum, afterSum) {
-		return false, o.rejectCandidate(ctx, state, parent, attempt, beforeSum, afterSum)
+		return false, o.rejectCandidate(ctx, state, parent, attempt, scores)
 	}
-	return true, o.acceptCandidate(ctx, state, parent, attempt, valset, after, beforeSum, afterSum)
+	return true, o.acceptCandidate(ctx, state, parent, attempt, acceptedCandidateEvaluation{valset: valset, after: after, scores: scores})
+}
+
+type proposalScores struct {
+	before float64
+	after  float64
+}
+
+type acceptedCandidateEvaluation struct {
+	valset []Example
+	after  EvaluationResult
+	scores proposalScores
 }
 
 func (o *Optimizer) evaluateAfterProposal(
@@ -594,8 +606,7 @@ func (o *Optimizer) rejectCandidate(
 	state *OptimizationState,
 	parent CandidateRecord,
 	attempt proposalAttempt,
-	beforeSum float64,
-	afterSum float64,
+	scores proposalScores,
 ) error {
 	state.ProposalRecords = append(state.ProposalRecords, ProposalRecord{
 		ID:                 NewID(),
@@ -603,14 +614,14 @@ func (o *Optimizer) rejectCandidate(
 		ParentIDs:          []string{parent.ID},
 		Components:         append([]string(nil), attempt.components...),
 		Metadata:           attempt.metadata,
-		MinibatchBeforeSum: beforeSum,
-		MinibatchAfterSum:  afterSum,
+		MinibatchBeforeSum: scores.before,
+		MinibatchAfterSum:  scores.after,
 		Accepted:           false,
 		CreatedAt:          time.Now().UTC(),
 	})
 	state.Lessons = appendBoundedLesson(
 		state.Lessons,
-		lessonFromProposal(false, attempt.components, beforeSum, afterSum),
+		lessonFromProposal(false, attempt.components, scores.before, scores.after),
 	)
 	evt := OptimizationEvent{
 		Kind:        OptimizationCandidateRejected,
@@ -618,8 +629,8 @@ func (o *Optimizer) rejectCandidate(
 		Iteration:   state.Iterations,
 		Timestamp:   time.Now().UTC(),
 		ParentID:    parent.ID,
-		ScoreBefore: beforeSum,
-		ScoreAfter:  afterSum,
+		ScoreBefore: scores.before,
+		ScoreAfter:  scores.after,
 		Message:     "candidate did not strictly improve minibatch score",
 	}
 	if err := o.emit(ctx, evt); err != nil {
@@ -634,16 +645,13 @@ func (o *Optimizer) acceptCandidate(
 	state *OptimizationState,
 	parent CandidateRecord,
 	attempt proposalAttempt,
-	valset []Example,
-	after EvaluationResult,
-	beforeSum float64,
-	afterSum float64,
+	evaluation acceptedCandidateEvaluation,
 ) error {
 	proposed := attempt.candidate
 	if state.MetricCalls >= o.config.MaxMetricCalls {
 		return nil
 	}
-	valBatch := o.sampleExact(valset, o.config.MaxMetricCalls-state.MetricCalls)
+	valBatch := o.sampleExact(evaluation.valset, o.config.MaxMetricCalls-state.MetricCalls)
 	valEval, err := o.evaluateValidation(ctx, state, proposed, valBatch)
 	if err != nil {
 		return err
@@ -653,7 +661,7 @@ func (o *Optimizer) acceptCandidate(
 		Candidate:                CloneCandidate(proposed),
 		ParentIDs:                []string{parent.ID},
 		DiscoveredAt:             time.Now().UTC(),
-		TrainScore:               after.AverageScore(),
+		TrainScore:               evaluation.after.AverageScore(),
 		ValidationScore:          valEval.AverageScore(),
 		ScoresByExample:          scoresByExample(valEval),
 		ObjectiveScoresByExample: objectiveScoresByExample(valEval),
@@ -665,20 +673,20 @@ func (o *Optimizer) acceptCandidate(
 		ParentIDs:          []string{parent.ID},
 		Components:         append([]string(nil), attempt.components...),
 		Metadata:           attempt.metadata,
-		MinibatchBeforeSum: beforeSum,
-		MinibatchAfterSum:  afterSum,
+		MinibatchBeforeSum: evaluation.scores.before,
+		MinibatchAfterSum:  evaluation.scores.after,
 		Accepted:           true,
 		CreatedAt:          time.Now().UTC(),
 	})
 	state.Lessons = appendBoundedLesson(
 		state.Lessons,
-		lessonFromProposal(true, attempt.components, beforeSum, afterSum),
+		lessonFromProposal(true, attempt.components, evaluation.scores.before, evaluation.scores.after),
 	)
 	if record.ValidationScore > bestRecord(*state).ValidationScore {
 		state.BestCandidateID = record.ID
 	}
 	state.FrontierIDs = computeFrontier(state.Candidates)
-	return o.emitAcceptedCandidateEvents(ctx, *state, parent.ID, record.ID, beforeSum, afterSum)
+	return o.emitAcceptedCandidateEvents(ctx, *state, acceptedCandidateEventDetails{parentID: parent.ID, candidateID: record.ID, scores: evaluation.scores})
 }
 
 func (o *Optimizer) evaluateValidation(
@@ -702,23 +710,26 @@ func (o *Optimizer) evaluateValidation(
 	return valEval, nil
 }
 
+type acceptedCandidateEventDetails struct {
+	parentID    string
+	candidateID string
+	scores      proposalScores
+}
+
 func (o *Optimizer) emitAcceptedCandidateEvents(
 	ctx context.Context,
 	state OptimizationState,
-	parentID string,
-	candidateID string,
-	beforeSum float64,
-	afterSum float64,
+	details acceptedCandidateEventDetails,
 ) error {
 	accepted := OptimizationEvent{
 		Kind:        OptimizationCandidateAccepted,
 		RunID:       state.RunID,
 		Iteration:   state.Iterations,
 		Timestamp:   time.Now().UTC(),
-		CandidateID: candidateID,
-		ParentID:    parentID,
-		ScoreBefore: beforeSum,
-		ScoreAfter:  afterSum,
+		CandidateID: details.candidateID,
+		ParentID:    details.parentID,
+		ScoreBefore: details.scores.before,
+		ScoreAfter:  details.scores.after,
 	}
 	frontier := OptimizationEvent{
 		Kind:        OptimizationFrontierUpdated,
