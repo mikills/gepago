@@ -195,7 +195,11 @@ func (r *agentRun) execute() (RunResult, error) {
 }
 
 func (r *agentRun) executeTurn(turn int) (bool, error) {
-	r.agent.fireTurnEvent(r.ctx, r.logger, turnEvent{kind: EventTurnStart, runID: r.memory.RunID, turn: turn, usage: r.result.Usage})
+	r.agent.fireTurnEvent(
+		r.ctx,
+		r.logger,
+		turnEvent{kind: EventTurnStart, runID: r.memory.RunID, turn: turn, usage: r.result.Usage},
+	)
 	resp, err := r.chat(turn)
 	if err != nil {
 		return true, err
@@ -208,7 +212,11 @@ func (r *agentRun) executeTurn(turn int) (bool, error) {
 	if err := r.executeToolCalls(turn, resp.Message.ToolCalls, resp.Message); err != nil {
 		return true, err
 	}
-	r.agent.fireTurnEvent(r.ctx, r.logger, turnEvent{kind: EventTurnEnd, runID: r.memory.RunID, turn: turn, usage: r.result.Usage})
+	r.agent.fireTurnEvent(
+		r.ctx,
+		r.logger,
+		turnEvent{kind: EventTurnEnd, runID: r.memory.RunID, turn: turn, usage: r.result.Usage},
+	)
 	return false, nil
 }
 
@@ -216,7 +224,17 @@ func (r *agentRun) chat(turn int) (ChatResponse, error) {
 	chatReq := r.chatRequest(turn)
 	llmSpan := gepa.NewUsageSpan(r.memory.RunID, r.runSpan.ID, gepa.UsageSpanLLMCall, r.agent.Model)
 	llmSpan.Model = r.agent.Model
-	r.agent.fireLLMRequest(r.ctx, r.logger, llmRequestEvent{runID: r.memory.RunID, turn: turn, timestamp: llmSpan.StartedAt, req: chatReq, usage: r.result.Usage})
+	r.agent.fireLLMRequest(
+		r.ctx,
+		r.logger,
+		llmRequestEvent{
+			runID:     r.memory.RunID,
+			turn:      turn,
+			timestamp: llmSpan.StartedAt,
+			req:       chatReq,
+			usage:     r.result.Usage,
+		},
+	)
 	resp, err := r.agent.Client.Chat(r.ctx, chatReq)
 	r.result.Spans = append(r.result.Spans, llmSpan.Finish(resp.Usage, err))
 	r.result.Ledger.ModelCalls++
@@ -229,7 +247,13 @@ func (r *agentRun) chat(turn int) (ChatResponse, error) {
 }
 
 func (r *agentRun) chatRequest(turn int) ChatRequest {
-	req := ChatRequest{Model: r.agent.Model, Messages: r.result.Transcript, Temperature: r.agent.Temperature, MaxTokens: r.agent.MaxTokens, ResponseFormat: r.agent.ResponseFormat}
+	req := ChatRequest{
+		Model:          r.agent.Model,
+		Messages:       r.result.Transcript,
+		Temperature:    r.agent.Temperature,
+		MaxTokens:      r.agent.MaxTokens,
+		ResponseFormat: r.agent.ResponseFormat,
+	}
 	if turn < r.maxTurns {
 		req.Tools = r.tools
 	}
@@ -240,13 +264,21 @@ func (r *agentRun) recordChatResponse(turn int, resp ChatResponse) {
 	r.result.Turns = turn
 	r.result.Usage = r.result.Usage.Add(resp.Usage)
 	r.result.Transcript = append(r.result.Transcript, resp.Message)
-	r.agent.fireLLMResponse(r.ctx, r.logger, llmResponseEvent{runID: r.memory.RunID, turn: turn, resp: resp, usage: r.result.Usage})
+	r.agent.fireLLMResponse(
+		r.ctx,
+		r.logger,
+		llmResponseEvent{runID: r.memory.RunID, turn: turn, resp: resp, usage: r.result.Usage},
+	)
 }
 
 func (r *agentRun) finishComplete(turn int, resp ChatResponse) {
 	r.result.Final = resp.Message
 	r.result.StopReason = mapFinishReason(resp.FinishReason)
-	r.agent.fireTurnEvent(r.ctx, r.logger, turnEvent{kind: EventTurnEnd, runID: r.memory.RunID, turn: turn, usage: r.result.Usage})
+	r.agent.fireTurnEvent(
+		r.ctx,
+		r.logger,
+		turnEvent{kind: EventTurnEnd, runID: r.memory.RunID, turn: turn, usage: r.result.Usage},
+	)
 	r.finishRun(turn, nil)
 }
 
@@ -262,23 +294,61 @@ func (r *agentRun) executeToolCalls(turn int, calls []ToolCall, final Message) e
 func (r *agentRun) executeToolCall(turn int, call ToolCall, final Message) error {
 	record := ToolCallRecord{Turn: turn, CallID: call.ID, Name: call.Name, Arguments: call.Arguments}
 	toolSpan := gepa.NewUsageSpan(r.memory.RunID, r.runSpan.ID, gepa.UsageSpanToolCall, call.Name)
-	r.agent.fireToolCallEvent(r.ctx, r.logger, toolCallEvent{kind: EventToolCallStart, runID: r.memory.RunID, timestamp: toolSpan.StartedAt, record: record, usage: r.result.Usage})
+	r.agent.fireToolCallEvent(
+		r.ctx,
+		r.logger,
+		toolCallEvent{
+			kind:      EventToolCallStart,
+			runID:     r.memory.RunID,
+			timestamp: toolSpan.StartedAt,
+			record:    record,
+			usage:     r.result.Usage,
+		},
+	)
 	handler, ok := r.handlers[call.Name]
 	if !ok {
-		return r.finishToolError(toolErrorDetails{turn: turn, final: final, record: record, span: toolSpan, cause: ErrUnknownTool, returned: fmt.Errorf("%w: %q", ErrUnknownTool, call.Name)})
+		return r.finishToolError(
+			toolErrorDetails{
+				turn:     turn,
+				final:    final,
+				record:   record,
+				span:     toolSpan,
+				cause:    ErrUnknownTool,
+				returned: fmt.Errorf("%w: %q", ErrUnknownTool, call.Name),
+			},
+		)
 	}
 	started := time.Now()
 	output, handlerErr := handler(r.ctx, r.memory, call.Arguments)
 	record.Duration = time.Since(started)
 	record.Output = output
 	if handlerErr != nil {
-		return r.finishToolError(toolErrorDetails{turn: turn, final: final, record: record, span: toolSpan, cause: handlerErr, returned: fmt.Errorf("agent %q tool %q: %w", r.agent.Name, call.Name, handlerErr)})
+		return r.finishToolError(
+			toolErrorDetails{
+				turn:     turn,
+				final:    final,
+				record:   record,
+				span:     toolSpan,
+				cause:    handlerErr,
+				returned: fmt.Errorf("agent %q tool %q: %w", r.agent.Name, call.Name, handlerErr),
+			},
+		)
 	}
 	r.result.ToolCalls = append(r.result.ToolCalls, record)
 	r.result.Ledger.ToolCalls++
 	r.result.Spans = append(r.result.Spans, toolSpan.Finish(Usage{}, nil))
 	r.result.Transcript = append(r.result.Transcript, Message{Role: RoleTool, Content: output, ToolCallID: call.ID})
-	r.agent.fireToolCallEvent(r.ctx, r.logger, toolCallEvent{kind: EventToolCallEnd, runID: r.memory.RunID, timestamp: time.Now().UTC(), record: record, usage: r.result.Usage})
+	r.agent.fireToolCallEvent(
+		r.ctx,
+		r.logger,
+		toolCallEvent{
+			kind:      EventToolCallEnd,
+			runID:     r.memory.RunID,
+			timestamp: time.Now().UTC(),
+			record:    record,
+			usage:     r.result.Usage,
+		},
+	)
 	return nil
 }
 
@@ -299,7 +369,17 @@ func (r *agentRun) finishToolError(details toolErrorDetails) error {
 	r.result.Final = details.final
 	r.result.Spans = append(r.result.Spans, details.span.Finish(Usage{}, details.cause))
 	r.finishRun(details.turn, details.cause)
-	r.agent.fireToolCallEvent(r.ctx, r.logger, toolCallEvent{kind: EventToolCallEnd, runID: r.memory.RunID, timestamp: time.Now().UTC(), record: details.record, usage: r.result.Usage})
+	r.agent.fireToolCallEvent(
+		r.ctx,
+		r.logger,
+		toolCallEvent{
+			kind:      EventToolCallEnd,
+			runID:     r.memory.RunID,
+			timestamp: time.Now().UTC(),
+			record:    details.record,
+			usage:     r.result.Usage,
+		},
+	)
 	return details.returned
 }
 
@@ -340,7 +420,14 @@ func (a *Agent) fireTurnEvent(ctx context.Context, logger *slog.Logger, event tu
 		ctx,
 		a.Observers,
 		logger,
-		Event{Kind: event.kind, RunID: event.runID, AgentName: a.Name, Turn: event.turn, Timestamp: time.Now().UTC(), Usage: event.usage},
+		Event{
+			Kind:      event.kind,
+			RunID:     event.runID,
+			AgentName: a.Name,
+			Turn:      event.turn,
+			Timestamp: time.Now().UTC(),
+			Usage:     event.usage,
+		},
 	)
 }
 

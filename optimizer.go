@@ -566,7 +566,13 @@ func (o *Optimizer) evaluateProposal(
 	if !o.config.AcceptanceCriterion.ShouldAccept(beforeSum, afterSum) {
 		return false, o.rejectCandidate(ctx, state, parent, attempt, scores)
 	}
-	return true, o.acceptCandidate(ctx, state, parent, attempt, acceptedCandidateEvaluation{valset: valset, after: after, scores: scores})
+	return true, o.acceptCandidate(
+		ctx,
+		state,
+		parent,
+		attempt,
+		acceptedCandidateEvaluation{valset: valset, after: after, scores: scores},
+	)
 }
 
 type proposalScores struct {
@@ -686,7 +692,11 @@ func (o *Optimizer) acceptCandidate(
 		state.BestCandidateID = record.ID
 	}
 	state.FrontierIDs = computeFrontier(state.Candidates)
-	return o.emitAcceptedCandidateEvents(ctx, *state, acceptedCandidateEventDetails{parentID: parent.ID, candidateID: record.ID, scores: evaluation.scores})
+	return o.emitAcceptedCandidateEvents(
+		ctx,
+		*state,
+		acceptedCandidateEventDetails{parentID: parent.ID, candidateID: record.ID, scores: evaluation.scores},
+	)
 }
 
 func (o *Optimizer) evaluateValidation(
