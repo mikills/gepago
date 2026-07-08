@@ -1,0 +1,33 @@
+{
+  "providers": [
+    {"id": "openai", "name": "OpenAI"},
+    {"id": "anthropic", "name": "Anthropic"},
+    {"id": "google", "name": "Google Gemini"}
+  ],
+  "models": [
+    {
+      "id": "gpt-4o-mini",
+      "provider": "openai",
+      "display_name": "GPT-4o mini",
+      "family": "gpt-4o",
+      "input_price_per_m_tokens": 0.15,
+      "output_price_per_m_tokens": 0.60
+    },
+    {
+      "id": "claude-3-5-haiku-latest",
+      "provider": "anthropic",
+      "display_name": "Claude 3.5 Haiku",
+      "family": "claude",
+      "input_price_per_m_tokens": 0.80,
+      "output_price_per_m_tokens": 4.00
+    },
+    {
+      "id": "gemini-1.5-flash",
+      "provider": "google",
+      "display_name": "Gemini 1.5 Flash",
+      "family": "gemini",
+      "input_price_per_m_tokens": 0.075,
+      "output_price_per_m_tokens": 0.30
+    }
+  ]
+}

@@ -5,8 +5,11 @@
 # Private unless specified
 usecases/**
 programs/**
+!programs/crucible/
+!programs/crucible/**
 artifacts/**
 
 .diago/
+.crucible/
 .DS_Store
 .notes/
