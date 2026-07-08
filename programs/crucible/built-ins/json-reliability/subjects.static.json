@@ -1,0 +1,13 @@
+{
+  "subjects": [
+    {
+      "type": "static",
+      "name": "static-valid-json",
+      "value": {
+        "answer": "Paris",
+        "confidence": 0.95
+      },
+      "raw": "{\"answer\":\"Paris\",\"confidence\":0.95}"
+    }
+  ]
+}

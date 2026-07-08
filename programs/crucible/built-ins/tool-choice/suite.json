@@ -1,0 +1,26 @@
+{
+  "name": "file-context-tool-choice",
+  "description": "Evaluate whether an agent gathers the right file context before answering.",
+  "cases": [
+    {
+      "id": "single-file-context",
+      "input": {"prompt": "Explain how ChargeCustomer prevents duplicate captures."},
+      "expectations": [
+        {"select": "tool_calls.names", "should": "contains_sequence", "value": ["Analyze file"]},
+        {"select": "tool_calls.arguments.path", "should": "contains", "value": "payments.go"},
+        {"select": "final", "should": "contains", "value": "idempotency"}
+      ]
+    },
+    {
+      "id": "no-tool-needed",
+      "input": {"prompt": "Say hello in one sentence."},
+      "expectations": [
+        {"select": "tool_calls.count", "should": "count_equals", "value": 0},
+        {"select": "final", "should": "contains", "value": "hello"}
+      ]
+    }
+  ],
+  "evaluators": [
+    {"type": "expectations", "weight": 1}
+  ]
+}

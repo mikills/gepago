@@ -26,7 +26,7 @@ Original paper:
 - Select candidates from a Pareto frontier or current-best strategy.
 - Accept/reject candidates using configurable score criteria.
 - Resume optimisation from persisted state.
-- Use optional OpenAI or Claude providers for real reflective proposals.
+- Use optional OpenAI, Claude, or Google/Gemini providers for real reflective proposals.
 - Generate a self-contained HTML report for candidates, proposals, scores, and usage spans.
 
 ## Package layout
@@ -36,6 +36,7 @@ github.com/mikills/gepago                  core optimiser and programme layer
 github.com/mikills/gepago/agents           optional evented agent runtime
 github.com/mikills/gepago/providers/openai OpenAI and OpenAI-compatible provider
 github.com/mikills/gepago/providers/claude Anthropic Claude provider
+github.com/mikills/gepago/providers/google Google Gemini provider
 ```
 
 The root package is intentionally provider-neutral and does not depend on the agent runtime.
@@ -261,6 +262,7 @@ Provider packages live outside the core package:
 ```go
 import (
     gepaclaude "github.com/mikills/gepago/providers/claude"
+    gepagoogle "github.com/mikills/gepago/providers/google"
     gepaopenai "github.com/mikills/gepago/providers/openai"
 )
 ```
@@ -291,6 +293,15 @@ lm, err := gepaopenai.NewLanguageModel(gepaopenai.Config{
 lm, err := gepaclaude.NewLanguageModel(gepaclaude.Config{
     APIKey: os.Getenv("ANTHROPIC_API_KEY"),
     Model:  "claude-sonnet-4-20250514",
+})
+```
+
+Google/Gemini supports both `LanguageModel` and `agents.ChatClient` for tool-calling agents:
+
+```go
+chatClient, err := gepagoogle.NewChatClient(gepagoogle.Config{
+    APIKey: os.Getenv("GOOGLE_API_KEY"),
+    Model:  "gemini-1.5-flash",
 })
 ```
 

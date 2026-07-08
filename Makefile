@@ -6,25 +6,36 @@ MODERNIZE := go run golang.org/x/tools/go/analysis/passes/modernize/cmd/moderniz
 STATICCHECK := go run honnef.co/go/tools/cmd/staticcheck@v0.7.0
 MAX_LEN ?= 120
 DIAGO_OUTPUT ?= .diago/audit.txt
+WORK_MODULES := . ./programs/crucible
 
 modernize:
-	$(MODERNIZE) -mapsloop -fix ./...
+	@for module in $(WORK_MODULES); do \
+		(cd $$module && $(MODERNIZE) -mapsloop -fix ./...); \
+	done
 
 fmt: modernize
 	$(GOLINES) --max-len=$(MAX_LEN) -w .
 	gofmt -w $(GOFILES)
 
 test:
-	go test ./... -count=1
+	@for module in $(WORK_MODULES); do \
+		(cd $$module && go test ./... -count=1); \
+	done
 
 vet:
-	go vet ./...
+	@for module in $(WORK_MODULES); do \
+		(cd $$module && go vet ./...); \
+	done
 
 staticcheck:
-	$(STATICCHECK) ./...
+	@for module in $(WORK_MODULES); do \
+		(cd $$module && $(STATICCHECK) ./...); \
+	done
 
 diago:
-	diago -target ./... -race -coverage -deps -output $(DIAGO_OUTPUT)
+	@for module in $(WORK_MODULES); do \
+		(cd $$module && diago -target ./... -race -coverage -deps -output $(DIAGO_OUTPUT)); \
+	done
 
 verify: fmt test vet staticcheck diago
 

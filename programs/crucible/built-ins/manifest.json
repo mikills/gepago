@@ -1,0 +1,16 @@
+{
+  "built_ins": [
+    {
+      "name": "tool-choice",
+      "path": "built-ins/tool-choice",
+      "description": "Evaluates whether an agent calls the right tools with the right arguments, gathers required file context, avoids unnecessary tools, and returns grounded answers.",
+      "capabilities": ["tool-use", "agent-trajectory", "context-gathering", "grounding"]
+    },
+    {
+      "name": "json-reliability",
+      "path": "built-ins/json-reliability",
+      "description": "Evaluates whether subjects reliably return structured JSON with required fields across repeated prompts.",
+      "capabilities": ["structured-output", "json-validity", "schema-following"]
+    }
+  ]
+}

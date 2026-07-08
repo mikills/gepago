@@ -1,0 +1,25 @@
+{
+  "name": "json-reliability",
+  "description": "Evaluate whether a subject returns valid JSON with required fields.",
+  "cases": [
+    {
+      "id": "capital",
+      "input": {
+        "prompt": "What is the capital of France? Return JSON with answer and confidence."
+      }
+    },
+    {
+      "id": "sum",
+      "input": {
+        "prompt": "What is 2 + 2? Return JSON with answer and confidence."
+      }
+    }
+  ],
+  "evaluators": [
+    {
+      "type": "json_validity",
+      "required_fields": ["answer", "confidence"],
+      "weight": 1
+    }
+  ]
+}

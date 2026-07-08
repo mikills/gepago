@@ -1,0 +1,16 @@
+{
+  "subjects": [
+    {
+      "type": "openai",
+      "name": "gpt-json-candidate",
+      "model": "gpt-4o-mini",
+      "api_key_env": "OPENAI_API_KEY",
+      "parse_json": true,
+      "max_tokens": 256,
+      "prompt_template_lines": [
+        "{{.Input.prompt}}",
+        "Return only valid JSON with fields: answer (string), confidence (number)."
+      ]
+    }
+  ]
+}
