@@ -126,7 +126,12 @@ func buildSimpleEvaluator(
 		}
 		return CommandEvaluator{EvaluatorName: spec.Name, Command: spec.Command, Args: spec.Args, Env: spec.Env}, true
 	case "webhook", "webhook_evaluator":
-		evaluator := WebhookEvaluator{EvaluatorName: spec.Name, URL: spec.URL, Method: spec.Method, Headers: spec.Headers}
+		evaluator := WebhookEvaluator{
+			EvaluatorName: spec.Name,
+			URL:           spec.URL,
+			Method:        spec.Method,
+			Headers:       spec.Headers,
+		}
 		return evaluator, true
 	default:
 		return nil, false

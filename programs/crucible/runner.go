@@ -191,7 +191,13 @@ func runSubjectCase(
 	repeat int,
 ) SubjectCaseResult {
 	output, cached, err := subjectOutput(ctx, config.Cache, subject, evalCase, repeat)
-	item := SubjectCaseResult{Subject: subject.Name(), CaseID: evalCase.ID, Repeat: repeat, Output: output, Cached: cached}
+	item := SubjectCaseResult{
+		Subject: subject.Name(),
+		CaseID:  evalCase.ID,
+		Repeat:  repeat,
+		Output:  output,
+		Cached:  cached,
+	}
 	if err != nil {
 		item.Error = err.Error()
 		return item

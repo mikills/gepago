@@ -245,13 +245,19 @@ func testOpenAIAgentSubject(t *testing.T) {
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
 		call := calls.Add(1)
 		if call == 1 {
-			fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"Analyze file","arguments":"{\"path\":\"payments.go\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
+			fmt.Fprint(
+				w,
+				`{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"Analyze file","arguments":"{\"path\":\"payments.go\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`,
+			)
 			return
 		}
 		messages, ok := req["messages"].([]any)
 		require.True(t, ok)
 		assert.Contains(t, fmt.Sprint(messages), "tool")
-		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"ChargeCustomer uses idempotency."},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16}}`)
+		fmt.Fprint(
+			w,
+			`{"choices":[{"message":{"role":"assistant","content":"ChargeCustomer uses idempotency."},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16}}`,
+		)
 	}))
 	defer server.Close()
 	subject, err := BuildSubject(SubjectSpec{
@@ -287,13 +293,19 @@ func testOpenAIResponsesAgentSubject(t *testing.T) {
 			tools, ok := req["tools"].([]any)
 			require.True(t, ok)
 			assert.Contains(t, fmt.Sprint(tools), "Analyze file")
-			fmt.Fprint(w, `{"output":[{"type":"function_call","call_id":"call-1","name":"Analyze file","arguments":"{\"path\":\"payments.go\"}"}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}`)
+			fmt.Fprint(
+				w,
+				`{"output":[{"type":"function_call","call_id":"call-1","name":"Analyze file","arguments":"{\"path\":\"payments.go\"}"}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}`,
+			)
 			return
 		}
 		input, ok := req["input"].([]any)
 		require.True(t, ok)
 		assert.Contains(t, fmt.Sprint(input), "function_call_output")
-		fmt.Fprint(w, `{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ChargeCustomer uses idempotency."}]}],"usage":{"input_tokens":12,"output_tokens":4,"total_tokens":16}}`)
+		fmt.Fprint(
+			w,
+			`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ChargeCustomer uses idempotency."}]}],"usage":{"input_tokens":12,"output_tokens":4,"total_tokens":16}}`,
+		)
 	}))
 	defer server.Close()
 	subject, err := BuildSubject(SubjectSpec{
@@ -326,13 +338,19 @@ func testAnthropicAgentSubject(t *testing.T) {
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
 		call := calls.Add(1)
 		if call == 1 {
-			fmt.Fprint(w, `{"content":[{"type":"tool_use","id":"toolu_1","name":"Analyze file","input":{"path":"payments.go"}}],"stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":5}}`)
+			fmt.Fprint(
+				w,
+				`{"content":[{"type":"tool_use","id":"toolu_1","name":"Analyze file","input":{"path":"payments.go"}}],"stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":5}}`,
+			)
 			return
 		}
 		messages, ok := req["messages"].([]any)
 		require.True(t, ok)
 		assert.Contains(t, fmt.Sprint(messages), "tool_result")
-		fmt.Fprint(w, `{"content":[{"type":"text","text":"ChargeCustomer uses idempotency."}],"stop_reason":"end_turn","usage":{"input_tokens":12,"output_tokens":4}}`)
+		fmt.Fprint(
+			w,
+			`{"content":[{"type":"text","text":"ChargeCustomer uses idempotency."}],"stop_reason":"end_turn","usage":{"input_tokens":12,"output_tokens":4}}`,
+		)
 	}))
 	defer server.Close()
 	subject, err := BuildSubject(SubjectSpec{
@@ -366,11 +384,17 @@ func testGoogleAgentSubject(t *testing.T) {
 		call := calls.Add(1)
 		if call == 1 {
 			assert.Contains(t, fmt.Sprint(req["tools"]), "Analyze_file")
-			fmt.Fprint(w, `{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"Analyze_file","args":{"path":"payments.go"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}`)
+			fmt.Fprint(
+				w,
+				`{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"Analyze_file","args":{"path":"payments.go"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}`,
+			)
 			return
 		}
 		assert.Contains(t, fmt.Sprint(req["contents"]), "functionResponse")
-		fmt.Fprint(w, `{"candidates":[{"content":{"role":"model","parts":[{"text":"ChargeCustomer uses idempotency."}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":4,"totalTokenCount":16}}`)
+		fmt.Fprint(
+			w,
+			`{"candidates":[{"content":{"role":"model","parts":[{"text":"ChargeCustomer uses idempotency."}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":4,"totalTokenCount":16}}`,
+		)
 	}))
 	defer server.Close()
 	subject, err := BuildSubject(SubjectSpec{
@@ -404,14 +428,23 @@ func TestRegistryAndRunStore(t *testing.T) {
 		OutputPricePerMTokens: 2,
 	}}}
 	result := RunResult{
-		RunID:           "run-1",
-		SuiteName:       "suite",
-		StartedAt:       time.Now().UTC(),
-		EndedAt:         time.Now().UTC(),
-		Subjects:        []string{"subject"},
-		Cases:           []EvalCase{{ID: "case"}},
-		SubjectMetadata: map[string]SubjectMetadata{"subject": {Name: "subject", Provider: "openai", Model: "gpt-test"}},
-		Summary:         []SubjectSummary{{Subject: "subject", Cases: 1, AverageScore: 1, Usage: gepa.Usage{PromptTokens: 1000, CompletionTokens: 1000}}},
+		RunID:     "run-1",
+		SuiteName: "suite",
+		StartedAt: time.Now().UTC(),
+		EndedAt:   time.Now().UTC(),
+		Subjects:  []string{"subject"},
+		Cases:     []EvalCase{{ID: "case"}},
+		SubjectMetadata: map[string]SubjectMetadata{
+			"subject": {Name: "subject", Provider: "openai", Model: "gpt-test"},
+		},
+		Summary: []SubjectSummary{
+			{
+				Subject:      "subject",
+				Cases:        1,
+				AverageScore: 1,
+				Usage:        gepa.Usage{PromptTokens: 1000, CompletionTokens: 1000},
+			},
+		},
 	}
 	ApplyModelRegistry(&result, registry)
 	assert.Equal(t, 0.003, result.Summary[0].EstimatedCostUSD)

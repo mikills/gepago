@@ -60,8 +60,16 @@ func toolChoiceSuite() crucible.Suite {
 				ID:    "multi-file-context",
 				Input: gepa.Prediction{"prompt": "Explain how refunds update the ledger."},
 				Expectations: []crucible.Expectation{
-					{Select: "tool_calls.names", Should: "contains_sequence", Value: []string{analyzeFileTool, analyzeFileTool}},
-					{Select: "tool_calls.arguments.path", Should: "contains_all", Value: []string{"refunds.go", "ledger.go"}},
+					{
+						Select: "tool_calls.names",
+						Should: "contains_sequence",
+						Value:  []string{analyzeFileTool, analyzeFileTool},
+					},
+					{
+						Select: "tool_calls.arguments.path",
+						Should: "contains_all",
+						Value:  []string{"refunds.go", "ledger.go"},
+					},
 					{Select: "final", Should: "contains", Value: "ledger"},
 				},
 			},

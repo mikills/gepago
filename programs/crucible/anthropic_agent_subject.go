@@ -84,7 +84,11 @@ func (c anthropicChatClient) post(ctx context.Context, data []byte) ([]byte, err
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("anthropic agent chat status %d: %s", resp.StatusCode, strings.TrimSpace(response.String()))
+		return nil, fmt.Errorf(
+			"anthropic agent chat status %d: %s",
+			resp.StatusCode,
+			strings.TrimSpace(response.String()),
+		)
 	}
 	return response.Bytes(), nil
 }
@@ -209,7 +213,11 @@ func decodeAnthropicResponse(data []byte) (agents.ChatResponse, error) {
 		CompletionTokens: response.Usage.OutputTokens,
 		TotalTokens:      response.Usage.InputTokens + response.Usage.OutputTokens,
 	}
-	return agents.ChatResponse{Message: message, Usage: usage, FinishReason: anthropicFinishReason(response.StopReason)}, nil
+	return agents.ChatResponse{
+		Message:      message,
+		Usage:        usage,
+		FinishReason: anthropicFinishReason(response.StopReason),
+	}, nil
 }
 
 func applyAnthropicBlock(message *agents.Message, block anthropicContentBlock) {

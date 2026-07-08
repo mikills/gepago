@@ -67,7 +67,10 @@ func (m *LanguageModel) Generate(ctx context.Context, prompt string) (string, er
 		MaxTokens:   &m.maxTokens,
 		Temperature: m.temperature,
 		Messages: []agents.Message{
-			{Role: agents.RoleSystem, Content: "You are a precise optimisation assistant. Follow the requested output format exactly."},
+			{
+				Role:    agents.RoleSystem,
+				Content: "You are a precise optimisation assistant. Follow the requested output format exactly.",
+			},
 			{Role: agents.RoleUser, Content: prompt},
 		},
 	})
@@ -170,7 +173,11 @@ func (c *ChatClient) post(ctx context.Context, model string, data []byte) ([]byt
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("google generateContent status %d: %s", resp.StatusCode, strings.TrimSpace(response.String()))
+		return nil, fmt.Errorf(
+			"google generateContent status %d: %s",
+			resp.StatusCode,
+			strings.TrimSpace(response.String()),
+		)
 	}
 	return response.Bytes(), nil
 }
@@ -389,7 +396,8 @@ func isGoogleFunctionNameFirstByte(b byte) bool {
 }
 
 func isGoogleFunctionNameRune(r rune) bool {
-	return (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.'
+	return (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' ||
+		r == '.'
 }
 
 func googleGenerationSettings(req agents.ChatRequest) *googleGenerationConfig {
@@ -425,7 +433,11 @@ func decodeGoogleResponse(data []byte, toolNames map[string]string) (agents.Chat
 	if usage.TotalTokens == 0 {
 		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	}
-	return agents.ChatResponse{Message: message, Usage: usage, FinishReason: googleFinishReason(candidate.FinishReason, message)}, nil
+	return agents.ChatResponse{
+		Message:      message,
+		Usage:        usage,
+		FinishReason: googleFinishReason(candidate.FinishReason, message),
+	}, nil
 }
 
 func applyGooglePart(message *agents.Message, part googlePart, toolNames map[string]string) {

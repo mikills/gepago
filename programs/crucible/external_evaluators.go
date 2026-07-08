@@ -75,7 +75,11 @@ func (e WebhookEvaluator) Evaluate(ctx context.Context, input EvalInput) (Score,
 		return Score{}, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return Score{}, fmt.Errorf("webhook evaluator returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return Score{}, fmt.Errorf(
+			"webhook evaluator returned status %d: %s",
+			resp.StatusCode,
+			strings.TrimSpace(string(body)),
+		)
 	}
 	return parseExternalScore(body)
 }

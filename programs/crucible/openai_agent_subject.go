@@ -158,7 +158,12 @@ func (c openAIChatClient) post(ctx context.Context, path string, data []byte) ([
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("openai agent %s status %d: %s", path, resp.StatusCode, strings.TrimSpace(response.String()))
+		return nil, fmt.Errorf(
+			"openai agent %s status %d: %s",
+			path,
+			resp.StatusCode,
+			strings.TrimSpace(response.String()),
+		)
 	}
 	return response.Bytes(), nil
 }

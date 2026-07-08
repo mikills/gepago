@@ -151,7 +151,8 @@ func prettyJSON(value any) string {
 
 func nonZero(value any) bool {
 	data, err := json.Marshal(value)
-	return err == nil && string(data) != "null" && string(data) != "{}" && string(data) != "[]" && string(data) != "\"\""
+	return err == nil && string(data) != "null" && string(data) != "{}" && string(data) != "[]" &&
+		string(data) != "\"\""
 }
 
 var reportTemplate = template.Must(template.New("crucible-report").Funcs(template.FuncMap{

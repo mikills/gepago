@@ -140,7 +140,14 @@ func listModels(args []string) error {
 		return err
 	}
 	for _, model := range registry.Models {
-		fmt.Printf("%s/%s\t%s\t$%.4f in / $%.4f out per MTok\n", model.Provider, model.ID, model.DisplayName, model.InputPricePerMTokens, model.OutputPricePerMTokens)
+		fmt.Printf(
+			"%s/%s\t%s\t$%.4f in / $%.4f out per MTok\n",
+			model.Provider,
+			model.ID,
+			model.DisplayName,
+			model.InputPricePerMTokens,
+			model.OutputPricePerMTokens,
+		)
 	}
 	return nil
 }
