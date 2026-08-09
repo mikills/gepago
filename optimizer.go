@@ -2,10 +2,14 @@ package gepa
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
 	"math/rand"
+	"reflect"
 	"strings"
 	"time"
 )
@@ -197,22 +201,6 @@ type CandidateRecord struct {
 	ObjectiveScoresByExample map[string]map[string]float64 `json:"objective_scores_by_example,omitempty"`
 }
 
-// OptimizationState is the resumable run ledger for candidates, proposals, scores, and usage.
-type OptimizationState struct {
-	RunID           string            `json:"run_id"`
-	StartedAt       time.Time         `json:"started_at"`
-	EndedAt         time.Time         `json:"ended_at"`
-	Candidates      []CandidateRecord `json:"candidates"`
-	ProposalRecords []ProposalRecord  `json:"proposal_records"`
-	Lessons         []string          `json:"lessons,omitempty"`
-	BestCandidateID string            `json:"best_candidate_id"`
-	FrontierIDs     []string          `json:"frontier_ids"`
-	MetricCalls     int               `json:"metric_calls"`
-	Iterations      int               `json:"iterations"`
-	Ledger          UsageLedger       `json:"ledger"`
-	Spans           []UsageSpan       `json:"spans"`
-}
-
 // ProposalRecord stores one proposal attempt and its acceptance outcome.
 type ProposalRecord struct {
 	ID                 string             `json:"id"`
@@ -266,7 +254,7 @@ func (fn OptimizationObserverFunc) ObserveOptimization(ctx context.Context, evt 
 // Optimizer executes the GEPA reflective evolution loop until the rollout budget is spent.
 type Optimizer struct {
 	config OptimizationConfig
-	rng    *rand.Rand
+	seed   int64
 }
 
 // NewOptimizer validates config and constructs an Optimizer with default strategies.
@@ -295,7 +283,7 @@ func NewOptimizer(config OptimizationConfig) (*Optimizer, error) {
 	if seed == 0 {
 		seed = 1
 	}
-	return &Optimizer{config: config, rng: rand.New(rand.NewSource(seed))}, nil
+	return &Optimizer{config: config, seed: seed}, nil
 }
 
 // Run executes the optimisation loop until the metric-call budget is exhausted.
@@ -325,19 +313,116 @@ func (o *Optimizer) validationSet() []Example {
 	return o.config.Trainset
 }
 
+func (o *Optimizer) configFingerprint(valset []Example) string {
+	fingerprint := struct {
+		SeedCandidate       Candidate
+		Trainset            []Example
+		Valset              []Example
+		ConfiguredValset    []Example
+		Objective           string
+		Background          string
+		PromptTemplates     map[string]string
+		Components          []string
+		CandidateSelector   string
+		ComponentSelector   string
+		AcceptanceCriterion string
+		Evaluator           string
+		DatasetBuilder      string
+		Proposer            string
+		ReflectionLM        string
+		MergeProposer       string
+		EnableMerge         bool
+		MaxMetricCalls      int
+		MinibatchSize       int
+		Seed                int64
+	}{
+		SeedCandidate:       o.config.SeedCandidate,
+		Trainset:            o.config.Trainset,
+		Valset:              valset,
+		ConfiguredValset:    o.config.Valset,
+		Objective:           o.config.Objective,
+		Background:          o.config.Background,
+		PromptTemplates:     o.config.PromptTemplates,
+		Components:          o.config.Components,
+		CandidateSelector:   optimizationTypeName(o.config.CandidateSelector),
+		ComponentSelector:   optimizationTypeName(o.config.ComponentSelector),
+		AcceptanceCriterion: optimizationTypeName(o.config.AcceptanceCriterion),
+		Evaluator:           optimizationTypeName(o.config.Evaluator),
+		DatasetBuilder:      optimizationTypeName(o.config.DatasetBuilder),
+		Proposer:            optimizationTypeName(o.config.Proposer),
+		ReflectionLM:        optimizationTypeName(o.config.ReflectionLM),
+		MergeProposer:       optimizationTypeName(o.config.MergeProposer),
+		EnableMerge:         o.config.EnableMerge,
+		MaxMetricCalls:      o.config.MaxMetricCalls,
+		MinibatchSize:       o.config.MinibatchSize,
+		Seed:                o.seed,
+	}
+	encoded, err := json.Marshal(fingerprint)
+	if err != nil {
+		encoded = []byte(fmt.Sprintf("%#v", fingerprint))
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}
+
+func optimizationTypeName(value any) string {
+	if value == nil {
+		return ""
+	}
+	return reflect.TypeOf(value).String()
+}
+
+func (o *Optimizer) rngForIteration(iteration int) *rand.Rand {
+	// Deriving one stream per iteration makes resumed runs independent of how
+	// many random values were consumed before the last persisted checkpoint.
+	const mix = uint64(0x9e3779b97f4a7c15)
+	seed := uint64(o.seed) + uint64(iteration)*mix
+	seed ^= seed >> 30
+	seed *= 0xbf58476d1ce4e5b9
+	seed ^= seed >> 27
+	seed *= 0x94d049bb133111eb
+	seed ^= seed >> 31
+	return rand.New(rand.NewSource(int64(seed)))
+}
+
 func (o *Optimizer) startState(ctx context.Context, valset []Example) (OptimizationState, error) {
 	if o.config.Resume && o.config.Persistence != nil {
 		state, err := o.config.Persistence.LoadOptimizationState()
-		if err == nil && len(state.Candidates) > 0 {
+		if err == nil {
+			// Some callback persistence adapters represent an absent state as an
+			// empty object. Only the entirely empty state is treated as missing;
+			// partially populated state is validated and rejected below.
+			if state.isMissing() {
+				return o.initializeState(ctx, valset)
+			}
+			if err := state.Validate(); err != nil {
+				return state, fmt.Errorf("validate optimization state for resume: %w", err)
+			}
+			expectedFingerprint := o.configFingerprint(valset)
+			if state.ConfigFingerprint != expectedFingerprint {
+				return state, fmt.Errorf(
+					"optimization state config fingerprint mismatch: persisted=%s current=%s",
+					state.ConfigFingerprint,
+					expectedFingerprint,
+				)
+			}
 			state.EndedAt = time.Time{}
 			return state, nil
+		}
+		if !IsOptimizationStateNotFound(err) {
+			return state, fmt.Errorf("load optimization state for resume: %w", err)
 		}
 	}
 	return o.initializeState(ctx, valset)
 }
 
 func (o *Optimizer) initializeState(ctx context.Context, valset []Example) (OptimizationState, error) {
-	state := OptimizationState{RunID: NewID(), StartedAt: time.Now().UTC(), Ledger: UsageLedger{Runs: 1}}
+	state := OptimizationState{
+		RunID:             NewID(),
+		StartedAt:         time.Now().UTC(),
+		Ledger:            UsageLedger{Runs: 1},
+		ConfigFingerprint: o.configFingerprint(valset),
+	}
 	if err := o.emit(ctx, OptimizationEvent{
 		Kind:      OptimizationStarted,
 		RunID:     state.RunID,
@@ -375,8 +460,9 @@ func (o *Optimizer) initializeState(ctx context.Context, valset []Example) (Opti
 // validate the proposed patch, then optionally try merging frontier candidates.
 func (o *Optimizer) runIteration(ctx context.Context, state *OptimizationState, valset []Example) (bool, error) {
 	state.Iterations++
-	parent := o.config.CandidateSelector.SelectCandidate(*state, o.rng)
-	attempt, stop, err := o.proposeForIteration(ctx, state, parent)
+	rng := o.rngForIteration(state.Iterations)
+	parent := o.config.CandidateSelector.SelectCandidate(*state, rng)
+	attempt, stop, err := o.proposeForIteration(ctx, state, parent, rng)
 	if err != nil || stop {
 		return stop, err
 	}
@@ -405,6 +491,7 @@ func (o *Optimizer) proposeForIteration(
 	ctx context.Context,
 	state *OptimizationState,
 	parent CandidateRecord,
+	rng *rand.Rand,
 ) (proposalAttempt, bool, error) {
 	iteration := state.Iterations
 	if err := o.emit(ctx, OptimizationEvent{
@@ -416,7 +503,7 @@ func (o *Optimizer) proposeForIteration(
 	}); err != nil {
 		return proposalAttempt{}, false, err
 	}
-	batch := o.sampleBatch(o.config.Trainset, o.config.MinibatchSize, o.config.MaxMetricCalls-state.MetricCalls)
+	batch := o.sampleBatch(o.config.Trainset, o.config.MinibatchSize, o.config.MaxMetricCalls-state.MetricCalls, rng)
 	if len(batch) == 0 {
 		return proposalAttempt{}, true, nil
 	}
@@ -499,7 +586,7 @@ func (o *Optimizer) evaluateMerge(
 		return CandidateRecord{}, false, err
 	}
 	merged := MergeCandidate(left.Candidate, patch)
-	batch := o.sampleExact(valset, o.config.MaxMetricCalls-state.MetricCalls)
+	batch := sampleExact(valset, o.config.MaxMetricCalls-state.MetricCalls, o.rngForIteration(state.Iterations))
 	if len(batch) == 0 {
 		return CandidateRecord{}, false, nil
 	}
@@ -555,7 +642,11 @@ func (o *Optimizer) evaluateProposal(
 	if state.MetricCalls >= o.config.MaxMetricCalls {
 		return false, nil
 	}
-	afterBatch := o.sampleExact(attempt.batch, o.config.MaxMetricCalls-state.MetricCalls)
+	afterBatch := sampleExact(
+		attempt.batch,
+		o.config.MaxMetricCalls-state.MetricCalls,
+		o.rngForIteration(state.Iterations),
+	)
 	after, err := o.evaluateAfterProposal(ctx, state, attempt.candidate, afterBatch)
 	if err != nil {
 		return false, err
@@ -657,7 +748,11 @@ func (o *Optimizer) acceptCandidate(
 	if state.MetricCalls >= o.config.MaxMetricCalls {
 		return nil
 	}
-	valBatch := o.sampleExact(evaluation.valset, o.config.MaxMetricCalls-state.MetricCalls)
+	valBatch := sampleExact(
+		evaluation.valset,
+		o.config.MaxMetricCalls-state.MetricCalls,
+		o.rngForIteration(state.Iterations),
+	)
 	valEval, err := o.evaluateValidation(ctx, state, proposed, valBatch)
 	if err != nil {
 		return err
@@ -806,14 +901,14 @@ func (o *Optimizer) save(state OptimizationState) error {
 	return nil
 }
 
-func (o *Optimizer) sampleBatch(examples []Example, size int, remainingBudget int) []Example {
+func (o *Optimizer) sampleBatch(examples []Example, size int, remainingBudget int, rng *rand.Rand) []Example {
 	if size > remainingBudget {
 		size = remainingBudget
 	}
-	return o.sampleExact(examples, size)
+	return sampleExact(examples, size, rng)
 }
 
-func (o *Optimizer) sampleExact(examples []Example, size int) []Example {
+func sampleExact(examples []Example, size int, rng *rand.Rand) []Example {
 	if size <= 0 || len(examples) == 0 {
 		return nil
 	}
@@ -822,7 +917,7 @@ func (o *Optimizer) sampleExact(examples []Example, size int) []Example {
 		copy(batch, examples)
 		return batch
 	}
-	perm := o.rng.Perm(len(examples))
+	perm := rng.Perm(len(examples))
 	batch := make([]Example, 0, size)
 	for i := 0; i < size; i++ {
 		batch = append(batch, examples[perm[i]])

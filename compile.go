@@ -30,6 +30,7 @@ type CompileConfig struct {
 	Persistence         OptimizationPersistence
 	AcceptanceCriterion AcceptanceCriterion
 	Observers           []OptimizationObserver
+	Resume              bool
 }
 
 // CompiledProgram runs a programme with the best candidate found by Compile.
@@ -91,6 +92,7 @@ func Compile(ctx context.Context, config CompileConfig) (CompiledProgram, Optimi
 		Seed:                config.Seed,
 		Persistence:         config.Persistence,
 		Observers:           config.Observers,
+		Resume:              config.Resume,
 	})
 	if err != nil {
 		return CompiledProgram{}, OptimizationState{}, err
@@ -99,9 +101,13 @@ func Compile(ctx context.Context, config CompileConfig) (CompiledProgram, Optimi
 	if err != nil {
 		return CompiledProgram{}, state, err
 	}
+	best := bestCandidateFromState(state)
+	if len(best.Candidate) == 0 {
+		return CompiledProgram{}, state, errors.New("optimization completed without a best candidate")
+	}
 	compiled := CompiledProgram{
 		Program:   config.Program,
-		Candidate: bestCandidateFromState(state).Candidate,
+		Candidate: best.Candidate,
 		State:     state,
 	}
 	return compiled, state, nil
@@ -167,7 +173,9 @@ func (e ProgramEvaluator) Evaluate(
 			exampleUsage = ProgramLastUsage(e.Program)
 		}
 		usage = usage.Add(exampleUsage)
-		metricResult, err := e.Metric.Score(ctx, ioExample.Expected, actual)
+		metricCtx, metricCollector := WithUsageCollector(ctx)
+		metricResult, err := e.Metric.Score(metricCtx, ioExample.Expected, actual)
+		usage = usage.Add(metricCollector.Usage())
 		if err != nil {
 			return EvaluationResult{}, fmt.Errorf("evaluate example %q: score prediction: %w", example.ID, err)
 		}
