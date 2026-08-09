@@ -1,15 +1,19 @@
-.PHONY: fmt modernize test vet staticcheck diago verify check release release-major
+.PHONY: fmt modernize test vet staticcheck diago wasm-build wasm-test verify check release release-major
 
-GOFILES := $(shell find . -name '*.go' -not -path './testdata/*' -not -path './usecases/*')
+GOFILES := $(shell find . -name '*.go' \
+	-not -path './testdata/*' \
+	-not -path './usecases/*' \
+	-not -path './programs/kiln/train/repos/quote/v3/*')
 GOLINES := go run github.com/segmentio/golines@v0.13.0
 MODERNIZE := go run golang.org/x/tools/go/analysis/passes/modernize/cmd/modernize@v0.45.0
 STATICCHECK := go run honnef.co/go/tools/cmd/staticcheck@v0.7.0
 MAX_LEN ?= 120
 DIAGO_OUTPUT ?= .diago/audit.txt
 WORK_MODULES := . ./programs/crucible
+WASM_PACKAGE := packages/gepago/wasm
 
 modernize:
-	@for module in $(WORK_MODULES); do \
+	@set -e; for module in $(WORK_MODULES); do \
 		(cd $$module && $(MODERNIZE) -mapsloop -fix ./...); \
 	done
 
@@ -18,26 +22,32 @@ fmt: modernize
 	gofmt -w $(GOFILES)
 
 test:
-	@for module in $(WORK_MODULES); do \
+	@set -e; for module in $(WORK_MODULES); do \
 		(cd $$module && go test ./... -count=1); \
 	done
 
 vet:
-	@for module in $(WORK_MODULES); do \
+	@set -e; for module in $(WORK_MODULES); do \
 		(cd $$module && go vet ./...); \
 	done
 
 staticcheck:
-	@for module in $(WORK_MODULES); do \
+	@set -e; for module in $(WORK_MODULES); do \
 		(cd $$module && $(STATICCHECK) ./...); \
 	done
 
 diago:
-	@for module in $(WORK_MODULES); do \
+	@set -e; for module in $(WORK_MODULES); do \
 		(cd $$module && diago -target ./... -race -coverage -deps -output $(DIAGO_OUTPUT)); \
 	done
 
-verify: fmt test vet staticcheck diago
+wasm-build:
+	cd $(WASM_PACKAGE) && npm run build
+
+wasm-test:
+	cd $(WASM_PACKAGE) && npm test
+
+verify: fmt test vet staticcheck diago wasm-test
 
 check: fmt test vet staticcheck
 	git diff --exit-code
