@@ -40,12 +40,14 @@ func (m LLMJudgeMetric) Score(ctx context.Context, expected Prediction, actual P
 	if err != nil {
 		return MetricResult{}, err
 	}
+	recordUsage(ctx, languageModelUsage(m.LM))
 	judge, err := parseJudgeResponse(raw)
 	if err != nil && m.ParseRetry {
 		repaired, repairErr := m.LM.Generate(ctx, judgeRepairPrompt(raw, err))
 		if repairErr != nil {
 			return MetricResult{}, repairErr
 		}
+		recordUsage(ctx, languageModelUsage(m.LM))
 		judge, err = parseJudgeResponse(repaired)
 	}
 	if err != nil {

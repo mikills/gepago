@@ -2,10 +2,106 @@ package gepa
 
 import (
 	"context"
+	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
 )
+
+type resumePersistenceStub struct {
+	state    OptimizationState
+	loadErr  error
+	saveCall int
+}
+
+func (p *resumePersistenceStub) AppendOptimizationEvent(OptimizationEvent) error { return nil }
+
+func (p *resumePersistenceStub) SaveOptimizationState(state OptimizationState) error {
+	p.state = state
+	p.saveCall++
+	return nil
+}
+
+func (p *resumePersistenceStub) LoadOptimizationState() (OptimizationState, error) {
+	return p.state, p.loadErr
+}
+
+func newResumeTestOptimizer(p OptimizationPersistence) (*Optimizer, error) {
+	examples := []Example{{ID: "a", Input: "a"}}
+	return NewOptimizer(OptimizationConfig{
+		SeedCandidate: Candidate{"prompt": "start"},
+		Trainset:      examples,
+		Evaluator: EvaluatorFunc(
+			func(_ context.Context, _ Candidate, examples []Example, _ bool) (EvaluationResult, error) {
+				items := make([]EvaluationItem, 0, len(examples))
+				for _, example := range examples {
+					items = append(items, EvaluationItem{ExampleID: example.ID, Score: 0})
+				}
+				return EvaluationResult{Items: items}, nil
+			},
+		),
+		DatasetBuilder: ReflectiveDatasetBuilderFunc(DefaultReflectiveDatasetBuilder),
+		Proposer: ProposerFunc(func(context.Context, Candidate, ReflectiveDataset, []string) (Candidate, error) {
+			return Candidate{"prompt": "same"}, nil
+		}),
+		MaxMetricCalls: 1,
+		MinibatchSize:  1,
+		Persistence:    p,
+		Resume:         true,
+	})
+}
+
+func TestOptimizerResumeStateHandling(t *testing.T) {
+	t.Run("missing state starts a new run", func(t *testing.T) {
+		p := &resumePersistenceStub{loadErr: os.ErrNotExist}
+		optimizer, err := newResumeTestOptimizer(p)
+		if err != nil {
+			t.Fatalf("NewOptimizer() error = %v", err)
+		}
+		state, err := optimizer.Run(context.Background())
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if state.RunID == "" || len(state.Candidates) != 1 {
+			t.Fatalf("new state = %#v", state)
+		}
+	})
+
+	t.Run("load failures are fatal", func(t *testing.T) {
+		loadErr := errors.New("persistence transport unavailable")
+		optimizer, err := newResumeTestOptimizer(&resumePersistenceStub{loadErr: loadErr})
+		if err != nil {
+			t.Fatalf("NewOptimizer() error = %v", err)
+		}
+		_, err = optimizer.Run(context.Background())
+		if !errors.Is(err, loadErr) {
+			t.Fatalf("Run() error = %v, want %v", err, loadErr)
+		}
+	})
+
+	t.Run("invalid state is fatal", func(t *testing.T) {
+		p := &resumePersistenceStub{state: OptimizationState{
+			RunID:             "run",
+			ConfigFingerprint: "test",
+			StartedAt:         time.Now().UTC(),
+			Candidates:        []CandidateRecord{{ID: "candidate", Candidate: Candidate{"prompt": "saved"}}},
+			BestCandidateID:   "missing",
+			FrontierIDs:       []string{"candidate"},
+		}}
+		optimizer, err := newResumeTestOptimizer(p)
+		if err != nil {
+			t.Fatalf("NewOptimizer() error = %v", err)
+		}
+		_, err = optimizer.Run(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "best candidate") {
+			t.Fatalf("Run() error = %v, want invalid best candidate", err)
+		}
+		if p.saveCall != 0 {
+			t.Fatalf("SaveOptimizationState calls = %d, want 0", p.saveCall)
+		}
+	})
+}
 
 func TestOptimizer(t *testing.T) {
 	examples := []Example{{ID: "a", Input: "a"}, {ID: "b", Input: "b"}}
@@ -82,6 +178,10 @@ func TestOptimizer(t *testing.T) {
 		)
 		if err != nil {
 			t.Fatalf("NewOptimizer() error = %v", err)
+		}
+		persistedState.ConfigFingerprint = optimizer.configFingerprint(optimizer.validationSet())
+		if err := p.SaveOptimizationState(persistedState); err != nil {
+			t.Fatalf("SaveOptimizationState() error = %v", err)
 		}
 		state, err := optimizer.Run(context.Background())
 		if err != nil {

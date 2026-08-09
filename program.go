@@ -157,7 +157,7 @@ func (p Predict) parseOrRepair(ctx context.Context, raw string) (Prediction, err
 		repairLM = p.LM
 	}
 	for attempt := 0; attempt < p.MaxParseRetries; attempt++ {
-		repaired, repairErr := repairLM.Generate(ctx, p.repairPrompt(raw, err))
+		repaired, repairErr := repairLM.Generate(ctx, p.RepairPrompt(raw, err))
 		if repairErr != nil {
 			return nil, repairErr
 		}
@@ -171,7 +171,11 @@ func (p Predict) parseOrRepair(ctx context.Context, raw string) (Prediction, err
 	return nil, err
 }
 
-func (p Predict) repairPrompt(raw string, parseErr error) string {
+// RepairPrompt renders the prompt used to ask a language model to repair an
+// output that ParsePrediction could not decode. It is exported so resumable
+// integrations can preserve Predict's repair protocol without duplicating its
+// formatting.
+func (p Predict) RepairPrompt(raw string, parseErr error) string {
 	return strings.Join([]string{
 		"The model output could not be parsed as JSON for this signature.",
 		"Return only a valid JSON object with these output fields: " + strings.Join(

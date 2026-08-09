@@ -8,6 +8,17 @@ import (
 	"sync"
 )
 
+// ErrOptimizationStateNotFound marks an intentionally absent resumable state.
+// Persistence implementations should return this error (or os.ErrNotExist) when
+// no state has been created yet. Other load errors are fatal to a resumed run.
+var ErrOptimizationStateNotFound = errors.New("optimization state not found")
+
+// IsOptimizationStateNotFound reports whether err explicitly means that no
+// resumable state exists yet.
+func IsOptimizationStateNotFound(err error) bool {
+	return errors.Is(err, ErrOptimizationStateNotFound) || errors.Is(err, os.ErrNotExist)
+}
+
 // OptimizationPersistence stores optimiser events and resumable state.
 type OptimizationPersistence interface {
 	AppendOptimizationEvent(evt OptimizationEvent) error

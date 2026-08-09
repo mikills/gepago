@@ -196,14 +196,26 @@ type ProgramHTTPHandler struct {
 }
 
 func (h ProgramHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.serveHTTPRequest(w, r)
+}
+
+func (h ProgramHTTPHandler) serveHTTPRequest(w http.ResponseWriter, r *http.Request) {
+	h.serveHTTP(r.Context(), w, r)
+}
+
+func (h ProgramHTTPHandler) serveHTTP(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	name := strings.TrimPrefix(r.URL.Path, "/programs/")
-	name = strings.TrimSuffix(name, "/run")
-	if name == "" || name == r.URL.Path {
-		http.Error(w, "program name is required", http.StatusBadRequest)
+	name, err := programNameFromPath(r.URL.Path)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	artifactPath, err := programArtifactPath(h.ArtifactDir, name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	var req struct {
@@ -213,12 +225,12 @@ func (h ProgramHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	compiled, _, err := h.Registry.LoadCompiled(filepath.Join(h.ArtifactDir, name+".program.json"))
+	compiled, _, err := h.Registry.LoadCompiled(artifactPath)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	prediction, err := compiled.Run(r.Context(), req.Input)
+	prediction, err := compiled.Run(ctx, req.Input)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -227,6 +239,67 @@ func (h ProgramHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(map[string]any{"output": prediction}); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+}
+
+func programNameFromPath(path string) (string, error) {
+	const prefix = "/programs/"
+	const suffix = "/run"
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return "", errors.New("program path must be /programs/{name}/run")
+	}
+	name := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
+	if name == "" || name == "." || strings.Contains(name, "..") || strings.ContainsAny(name, `/\\`) {
+		return "", errors.New("program name must be one safe path segment")
+	}
+	return name, nil
+}
+
+func programArtifactPath(artifactDir string, name string) (string, error) {
+	root, err := filepath.Abs(artifactDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve artifact directory: %w", err)
+	}
+	artifactPath, err := filepath.Abs(filepath.Join(root, name+".program.json"))
+	if err != nil {
+		return "", fmt.Errorf("resolve program artifact: %w", err)
+	}
+	if !pathWithinDirectory(root, artifactPath) {
+		return "", errors.New("program artifact is outside the artifact directory")
+	}
+
+	if err := validateArtifactSymlinks(root, artifactPath); err != nil {
+		return "", err
+	}
+	return artifactPath, nil
+}
+
+func validateArtifactSymlinks(root string, artifactPath string) error {
+	// Also check resolved paths when the artifact already exists so a symlink
+	// inside ArtifactDir cannot redirect the handler outside that directory.
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("resolve artifact directory symlinks: %w", err)
+	}
+	resolvedArtifact, err := filepath.EvalSymlinks(artifactPath)
+	if err == nil {
+		if !pathWithinDirectory(resolvedRoot, resolvedArtifact) {
+			return errors.New("program artifact is outside the artifact directory")
+		}
+		return nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return fmt.Errorf("resolve program artifact symlinks: %w", err)
+}
+
+func pathWithinDirectory(root string, target string) bool {
+	rel, err := filepath.Rel(root, target)
+	return err == nil && !filepath.IsAbs(rel) && rel != ".." &&
+		!strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // FileTrainLock provides a best-effort cross-process lock for runtime training.

@@ -19,3 +19,15 @@ func TestFilePersistence(t *testing.T) {
 		t.Fatalf("loaded BestCandidateID = %q", loaded.BestCandidateID)
 	}
 }
+
+func TestFilePersistenceMissingState(t *testing.T) {
+	p, err := NewFilePersistence(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFilePersistence() error = %v", err)
+	}
+
+	_, err = p.LoadOptimizationState()
+	if !IsOptimizationStateNotFound(err) {
+		t.Fatalf("LoadOptimizationState() error = %v, want missing state", err)
+	}
+}

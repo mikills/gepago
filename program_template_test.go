@@ -15,6 +15,23 @@ import (
 
 type echoTemplate struct{}
 
+type httpContextKey struct{}
+
+type contextCapturingProgram struct {
+	seen *context.Context
+}
+
+func (p contextCapturingProgram) Validate() error { return nil }
+
+func (p contextCapturingProgram) SeedCandidate() Candidate {
+	return Candidate{InstructionComponent: "seed"}
+}
+
+func (p contextCapturingProgram) RunCandidate(ctx context.Context, _ Candidate, _ Prediction) (Prediction, error) {
+	*p.seen = ctx
+	return Prediction{"context_value": ctx.Value(httpContextKey{})}, nil
+}
+
 func (echoTemplate) Name() string            { return "echo" }
 func (echoTemplate) ProgramVersion() string  { return "v1" }
 func (echoTemplate) Build() (Program, error) { return artifactEchoProgram{}, nil }
@@ -89,6 +106,61 @@ func TestProgramHTTPHandler(t *testing.T) {
 	ProgramHTTPHandler{Registry: registry, ArtifactDir: dir}.ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code)
 	require.Contains(t, w.Body.String(), "served")
+}
+
+func TestProgramHTTPHandlerRejectsUnsafePaths(t *testing.T) {
+	dir := t.TempDir()
+	body := bytes.NewBufferString(`{"input":{}}`)
+	for _, path := range []string{
+		"/programs/../run",
+		"/programs/..hidden/run",
+		"/programs/echo/other/run",
+		"/programs/echo\\other/run",
+		"/programs/echo/run/",
+	} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body.Bytes()))
+			w := httptest.NewRecorder()
+
+			ProgramHTTPHandler{ArtifactDir: dir}.ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusBadRequest, w.Code)
+		})
+	}
+	_, err := programArtifactPath(dir, "../outside")
+	require.Error(t, err)
+
+	outside := filepath.Join(t.TempDir(), "outside.program.json")
+	require.NoError(t, os.WriteFile(outside, []byte(`{}`), 0o644))
+	if err := os.Symlink(outside, filepath.Join(dir, "echo.program.json")); err == nil {
+		req := httptest.NewRequest(http.MethodPost, "/programs/echo/run", bytes.NewBufferString(`{"input":{}}`))
+		w := httptest.NewRecorder()
+		ProgramHTTPHandler{ArtifactDir: dir}.ServeHTTP(w, req)
+		require.Equal(t, http.StatusBadRequest, w.Code)
+	}
+}
+
+func TestHTTPHandlerRequestContext(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, SaveProgramArtifact(
+		filepath.Join(dir, "echo.program.json"),
+		NewProgramArtifact("echo", Candidate{InstructionComponent: "served"}),
+	))
+	var seen context.Context
+	registry := NewProgramRegistry()
+	require.NoError(t, registry.Register("echo", func() (Program, error) {
+		return contextCapturingProgram{seen: &seen}, nil
+	}))
+	body := bytes.NewBufferString(`{"input":{}}`)
+	requestContext := context.WithValue(context.Background(), httpContextKey{}, "request")
+	req := httptest.NewRequest(http.MethodPost, "/programs/echo/run", body).WithContext(requestContext)
+	w := httptest.NewRecorder()
+
+	ProgramHTTPHandler{Registry: registry, ArtifactDir: dir}.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.NotNil(t, seen)
+	require.Equal(t, "request", seen.Value(httpContextKey{}))
 }
 
 func TestFileTrainLock(t *testing.T) {
