@@ -6,7 +6,7 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/mikills/gepago.git",
-    "directory": "packages/wasm"
+    "directory": "packages/gepago/wasm"
   },
   "type": "module",
   "exports": {

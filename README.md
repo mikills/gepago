@@ -37,7 +37,7 @@ github.com/mikills/gepago/agents           optional evented agent runtime
 github.com/mikills/gepago/providers/openai OpenAI and OpenAI-compatible provider
 github.com/mikills/gepago/providers/claude Anthropic Claude provider
 github.com/mikills/gepago/providers/google Google Gemini provider
-packages/wasm                             Node.js ESM WASM packages
+packages/gepago/wasm                             Node.js ESM WASM packages
 ```
 
 The root package is intentionally provider-neutral and does not depend on the agent runtime.
@@ -330,12 +330,12 @@ It writes `sentiment-report.html` in the current directory.
 
 ## JavaScript / WASM
 
-The Node.js ESM WASM package is available at [`packages/wasm`](packages/wasm).
+The Node.js ESM WASM package is available at [`packages/gepago/wasm`](packages/gepago/wasm).
 It loads the Gepago Go engine as WebAssembly and exposes JSON-safe parsing, demo,
 metric, and prompt-building helpers:
 
 ```bash
-cd packages/wasm
+cd packages/gepago/wasm
 npm ci
 cd ../..
 make wasm-test

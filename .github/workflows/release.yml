@@ -30,10 +30,10 @@ jobs:
         with:
           node-version: "22.18.x"
           cache: npm
-          cache-dependency-path: packages/wasm/package-lock.json
+          cache-dependency-path: packages/gepago/wasm/package-lock.json
 
       - name: Install WASM package dependencies
-        working-directory: packages/wasm
+        working-directory: packages/gepago/wasm
         run: npm ci
 
       - name: Test

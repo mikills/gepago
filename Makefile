@@ -10,7 +10,7 @@ STATICCHECK := go run honnef.co/go/tools/cmd/staticcheck@v0.7.0
 MAX_LEN ?= 120
 DIAGO_OUTPUT ?= .diago/audit.txt
 WORK_MODULES := . ./programs/crucible
-WASM_PACKAGE := packages/wasm
+WASM_PACKAGE := packages/gepago/wasm
 
 modernize:
 	@set -e; for module in $(WORK_MODULES); do \

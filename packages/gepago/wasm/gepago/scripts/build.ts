@@ -7,7 +7,7 @@ const packageRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
 );
-const repositoryRoot = path.resolve(packageRoot, "../../..");
+const repositoryRoot = path.resolve(packageRoot, "../../../..");
 
 function option(name: string, fallback: string): string {
   const index = process.argv.indexOf(name);

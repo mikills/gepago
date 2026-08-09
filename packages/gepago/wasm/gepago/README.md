@@ -73,7 +73,7 @@ WASM's Go toolchain.
 From the repository root:
 
 ```bash
-cd packages/wasm
+cd packages/gepago/wasm
 npm ci
 npm run build
 npm test

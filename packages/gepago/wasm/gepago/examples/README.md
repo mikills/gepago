@@ -11,7 +11,7 @@ Build the package once before running the example so its compiled `dist/`
 entrypoint exists:
 
 ```bash
-(cd packages/wasm && npm ci && npm run build)
+(cd packages/gepago/wasm && npm ci && npm run build)
 ```
 
 This flow uses the Node SDK to:
@@ -24,15 +24,15 @@ This flow uses the Node SDK to:
 Run it with the configured Pi model:
 
 ```bash
-node packages/wasm/gepago/examples/document-knowledge-graph.ts \
-  --input packages/wasm/gepago/examples/fixtures/acme-robotics.md \
+node packages/gepago/wasm/gepago/examples/document-knowledge-graph.ts \
+  --input packages/gepago/wasm/gepago/examples/fixtures/acme-robotics.md \
   --out /tmp/acme-graph.json
 ```
 
 Or use an OpenAI-compatible model:
 
 ```bash
-OPENAI_API_KEY=... node packages/wasm/gepago/examples/document-knowledge-graph.ts \
+OPENAI_API_KEY=... node packages/gepago/wasm/gepago/examples/document-knowledge-graph.ts \
   --provider openai --model gpt-4.1-mini --out /tmp/acme-graph.json
 ```
 
@@ -43,7 +43,7 @@ example uses two labeled graph snippets, a host graph F1 metric, and then runs
 the best candidate over the full document:
 
 ```bash
-node packages/wasm/gepago/examples/document-knowledge-graph.ts \
+node packages/gepago/wasm/gepago/examples/document-knowledge-graph.ts \
   --compile --out /tmp/acme-graph-optimized.json
 ```
 
@@ -51,6 +51,6 @@ Compilation makes additional model calls. `--no-compile` (the default) runs the
 seed extraction instruction only. For an offline smoke test:
 
 ```bash
-node packages/wasm/gepago/examples/document-knowledge-graph.ts \
+node packages/gepago/wasm/gepago/examples/document-knowledge-graph.ts \
   --mock --no-compile --out /tmp/acme-graph.json
 ```
