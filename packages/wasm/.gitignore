@@ -1,0 +1,4 @@
+node_modules/
+gepago/dist/
+gepago/.test-dist/
+gepago/runtime/dist/wasm_exec.js

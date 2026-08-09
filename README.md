@@ -37,6 +37,7 @@ github.com/mikills/gepago/agents           optional evented agent runtime
 github.com/mikills/gepago/providers/openai OpenAI and OpenAI-compatible provider
 github.com/mikills/gepago/providers/claude Anthropic Claude provider
 github.com/mikills/gepago/providers/google Google Gemini provider
+packages/wasm                             Node.js ESM WASM packages
 ```
 
 The root package is intentionally provider-neutral and does not depend on the agent runtime.
@@ -326,6 +327,51 @@ GEPA_PROVIDER=claude ANTHROPIC_API_KEY=... go run ./examples/sentiment
 ```
 
 It writes `sentiment-report.html` in the current directory.
+
+## JavaScript / WASM
+
+The Node.js ESM WASM package is available at [`packages/wasm`](packages/wasm).
+It loads the Gepago Go engine as WebAssembly and exposes JSON-safe parsing, demo,
+metric, and prompt-building helpers:
+
+```bash
+cd packages/wasm
+npm ci
+cd ../..
+make wasm-test
+```
+
+Use it from a JavaScript project with:
+
+```bash
+npm install @mikills/wasm
+```
+
+```js
+import { createGepagoWasm } from "@mikills/wasm/gepago";
+
+const gepago = await createGepagoWasm();
+try {
+  const result = gepago.exactMatch(
+    { label: "positive" },
+    { label: " POSITIVE " },
+    { caseInsensitive: true, trimSpace: true },
+  );
+  console.log(result.score);
+} finally {
+  gepago.close();
+}
+```
+
+The WASM package exposes asynchronous `predict`, `compile`, `optimize`, and
+`runAgent` methods. Declarative `predict`, `chainOfThought`, and sequential
+`pipeline` programs are supported; pipeline candidates are step-scoped.
+`compile` routes task, reflector, judge, and repair calls to host callbacks and
+supports custom metrics, observers, and persistence callbacks. `optimize`
+provides JSON-safe evaluator, proposer, dataset-builder, merge, observer, and
+persistence hooks for lower-level workflows. Provider adapters keep credentials
+in the host runtime. The Node APIs require Node.js 22.18 or newer; worker and browser
+entries provide isolated runtimes.
 
 ## Development
 

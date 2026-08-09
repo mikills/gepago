@@ -1,0 +1,25 @@
+// Browser-safe provider exports. Do not add Node imports here: this file is
+// reachable from the package's browser entry point.
+export {
+  createOpenAIChat,
+  createOpenAIModel,
+  createOpenAIProvider,
+  createClaudeChat,
+  createClaudeModel,
+  createClaudeProvider,
+  createGoogleChat,
+  createGoogleModel,
+  createGoogleProvider,
+  openai,
+  claude,
+  google,
+  openaiModel,
+  claudeModel,
+  googleModel,
+  openaiChat,
+  claudeChat,
+  googleChat,
+  createOpenAI,
+  createClaude,
+  createGoogle,
+} from "./providers-http-browser.ts";

@@ -1,0 +1,75 @@
+{
+  "name": "@mikills/wasm",
+  "version": "0.1.0",
+  "description": "Reusable ESM WASM bindings for Gepago",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mikills/gepago.git",
+    "directory": "packages/wasm"
+  },
+  "type": "module",
+  "exports": {
+    "./gepago": {
+      "browser": {
+        "types": "./gepago/dist/browser.d.ts",
+        "import": "./gepago/dist/browser.js"
+      },
+      "types": "./gepago/dist/index.d.ts",
+      "import": "./gepago/dist/index.js"
+    },
+    "./gepago/browser": {
+      "types": "./gepago/dist/browser.d.ts",
+      "import": "./gepago/dist/browser.js"
+    },
+    "./gepago/providers": {
+      "browser": {
+        "types": "./gepago/dist/providers-browser.d.ts",
+        "import": "./gepago/dist/providers-browser.js"
+      },
+      "types": "./gepago/dist/providers.d.ts",
+      "import": "./gepago/dist/providers.js"
+    },
+    "./gepago/storage": {
+      "browser": {
+        "types": "./gepago/dist/storage-browser.d.ts",
+        "import": "./gepago/dist/storage-browser.js"
+      },
+      "types": "./gepago/dist/storage.d.ts",
+      "import": "./gepago/dist/storage.js"
+    },
+    "./gepago/artifacts": {
+      "browser": {
+        "types": "./gepago/dist/artifacts-core.d.ts",
+        "import": "./gepago/dist/artifacts-core.js"
+      },
+      "types": "./gepago/dist/artifacts.d.ts",
+      "import": "./gepago/dist/artifacts.js"
+    }
+  },
+  "files": [
+    "gepago/dist/",
+    "gepago/runtime/dist/wasm_exec.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "clean": "node gepago/scripts/clean.ts all",
+    "build": "node gepago/scripts/clean.ts build && node gepago/scripts/build.ts && tsc --project gepago/tsconfig.build.json",
+    "typecheck:example": "tsc --project gepago/tsconfig.examples.json --noEmit",
+    "typecheck:browser": "tsc --project gepago/tsconfig.browser.json --noEmit",
+    "test": "npm run build && npm run typecheck:example && npm run typecheck:browser && node gepago/scripts/clean.ts test && tsc --project gepago/tsconfig.test.json && node --test gepago/.test-dist/test/*.js",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "fake-indexeddb": "^6.2.4",
+    "typescript": "^5.9.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
