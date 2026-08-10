@@ -277,7 +277,10 @@ For OpenAI-compatible Responses API providers, add:
   "type": "agent",
   "provider": "openapi",
   "provider_api": "responses",
-  "name": "responses-agent"
+  "name": "responses-agent",
+  "model": "provider-model",
+  "base_url": "https://api.example.com/v1",
+  "api_key_env": "COMPATIBLE_API_KEY"
 }
 ```
 

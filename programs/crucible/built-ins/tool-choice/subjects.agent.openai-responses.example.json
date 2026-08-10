@@ -2,7 +2,7 @@
   "subjects": [
     {
       "type": "agent",
-      "provider": "openapi",
+      "provider": "openai",
       "provider_api": "responses",
       "name": "gpt-tool-agent-responses",
       "model": "gpt-4o-mini",

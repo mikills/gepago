@@ -361,7 +361,7 @@ func testOpenAIResponsesAgentSubject(t *testing.T) {
 	defer server.Close()
 	subject, err := BuildSubject(SubjectSpec{
 		Type:              "agent",
-		Provider:          "openapi",
+		Provider:          "openai",
 		ProviderAPI:       "responses",
 		Name:              "agent",
 		Model:             "gpt-test",
