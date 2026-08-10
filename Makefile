@@ -1,4 +1,4 @@
-.PHONY: fmt modernize test vet staticcheck diago wasm-build wasm-test verify check release release-major
+.PHONY: fmt modernize test vet staticcheck diago wasm-build wasm-test verify check release release-major release-crucible
 
 GOFILES := $(shell find . -name '*.go' \
 	-not -path './testdata/*' \
@@ -92,3 +92,30 @@ release: test
 
 release-major:
 	$(MAKE) release MAJOR=1
+
+# Release the nested Crucible module. Nested Go modules use a repository-path
+# tag, so Crucible v0.1.0 is tagged as programs/crucible/v0.1.0.
+# Examples:
+#   make release-crucible VERSION=v0.1.0
+#   make release-crucible VERSION=v0.1.0 DRY_RUN=1
+release-crucible: test
+	cd programs/crucible && GOWORK=off go test ./... -count=1
+	@set -euo pipefail; \
+	latest="$$(git tag --list 'programs/crucible/v[0-9]*' --sort=-version:refname | head -n 1)"; \
+	if [[ -z "$$latest" ]]; then latest="programs/crucible/v0.0.0"; fi; \
+	version="$(VERSION)"; \
+	if [[ ! "$$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$$ ]]; then \
+		echo "invalid Crucible version: $$version (expected vX.Y.Z)" >&2; exit 1; \
+	fi; \
+	tag="programs/crucible/$$version"; \
+	echo "latest Crucible tag: $$latest"; \
+	echo "release tag: $$tag"; \
+	if git rev-parse -q --verify "refs/tags/$$tag" >/dev/null; then \
+		echo "tag already exists: $$tag" >&2; exit 1; \
+	fi; \
+	if [[ -n "$(DRY_RUN)" ]]; then \
+		echo "dry run: git tag $$tag && git push origin $$tag"; \
+		exit 0; \
+	fi; \
+	git tag "$$tag"; \
+	git push origin "$$tag"

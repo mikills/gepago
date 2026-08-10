@@ -1,0 +1,78 @@
+name: release-crucible
+
+on:
+  push:
+    tags:
+      - "programs/crucible/v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: true
+
+      - name: Test standalone module
+        working-directory: programs/crucible
+        env:
+          GOWORK: "off"
+        run: go test ./... -count=1
+
+      - name: Build release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist build
+          version="${GITHUB_REF_NAME##*/}"
+          targets=(
+            "darwin amd64"
+            "darwin arm64"
+            "linux amd64"
+            "linux arm64"
+            "windows amd64"
+            "windows arm64"
+          )
+          for target in "${targets[@]}"; do
+            read -r goos goarch <<<"${target}"
+            binary="crucible"
+            if [[ "${goos}" == "windows" ]]; then
+              binary="crucible.exe"
+            fi
+            CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
+              go build -trimpath -ldflags="-s -w" \
+              -o "build/${binary}" ./programs/crucible/cmd/crucible
+            archive="crucible_${version}_${goos}_${goarch}"
+            if [[ "${goos}" == "windows" ]]; then
+              (cd build && zip -q "../dist/${archive}.zip" "${binary}")
+            else
+              tar -C build -czf "dist/${archive}.tar.gz" "${binary}"
+            fi
+            rm "build/${binary}"
+          done
+          (cd dist && sha256sum * > checksums.txt)
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME##*/}"
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --verify-tag \
+            --generate-notes \
+            --latest=false \
+            --title "Crucible ${version}"
