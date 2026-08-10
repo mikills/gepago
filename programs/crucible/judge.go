@@ -33,21 +33,22 @@ func (e RubricJudgeEvaluator) Evaluate(ctx context.Context, input EvalInput) (Sc
 	}
 	maxScore := positiveMaxScore(e.MaxScore)
 	raw, err := e.LM.Generate(ctx, rubricJudgePrompt(input, rubric, maxScore))
+	usage := languageModelUsage(e.LM)
 	if err != nil {
-		return Score{}, err
+		return Score{Usage: usage}, err
 	}
 	response, err := parseJudgeResponse(raw)
 	if err != nil {
-		return Score{}, err
+		return Score{Usage: usage}, err
 	}
 	if *response.Score > maxScore {
-		return Score{}, fmt.Errorf("rubric judge score %.4g exceeds maximum %.4g", *response.Score, maxScore)
+		return Score{Usage: usage}, fmt.Errorf("rubric judge score %.4g exceeds maximum %.4g", *response.Score, maxScore)
 	}
 	return Score{
 		Score:    clamp01(*response.Score / maxScore),
 		Feedback: response.Feedback,
 		Details:  response.Details,
-		Usage:    languageModelUsage(e.LM),
+		Usage:    usage,
 	}, nil
 }
 
@@ -72,12 +73,13 @@ func (e PairwiseJudgeEvaluator) Compare(ctx context.Context, input PairwiseInput
 	}
 	presented, swapped := pairwisePresentation(input)
 	raw, err := e.LM.Generate(ctx, pairwiseJudgePrompt(presented, rubric))
+	usage := languageModelUsage(e.LM)
 	if err != nil {
-		return PairwiseScore{}, err
+		return PairwiseScore{Usage: usage}, err
 	}
 	response, err := parsePairwiseJudgeResponse(raw, presented.SubjectA, presented.SubjectB)
 	if err != nil {
-		return PairwiseScore{}, err
+		return PairwiseScore{Usage: usage}, err
 	}
 	if swapped {
 		response.ScoreA, response.ScoreB = response.ScoreB, response.ScoreA
@@ -86,7 +88,7 @@ func (e PairwiseJudgeEvaluator) Compare(ctx context.Context, input PairwiseInput
 		response.Details = map[string]any{}
 	}
 	response.Details["presentation_swapped"] = swapped
-	response.Usage = languageModelUsage(e.LM)
+	response.Usage = usage
 	return response, nil
 }
 

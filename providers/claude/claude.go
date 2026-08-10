@@ -75,6 +75,8 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 
 // Generate sends a prompt and returns the model's text response.
 func (m *LanguageModel) Generate(ctx context.Context, prompt string) (string, error) {
+	m.lastUsage = gepa.Usage{}
+	m.lastModel = ""
 	message, err := m.client.Messages.New(ctx, anthropic.MessageNewParams{
 		Model:     anthropic.Model(m.model),
 		MaxTokens: int64(m.maxTokens),

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 )
 
@@ -78,4 +79,37 @@ func TestLanguageModel(t *testing.T) {
 			t.Fatalf("LastResolvedModel() = %q", lm.LastResolvedModel())
 		}
 	})
+}
+
+func TestLanguageModelClearsTelemetryBeforeFailedCall(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) > 1 {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"chatcmpl-test","object":"chat.completion","created":0,
+			"model":"resolved-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}
+		}`))
+	}))
+	defer server.Close()
+	lm, err := NewLanguageModel(Config{BaseURL: server.URL, Model: "requested-model"})
+	if err != nil {
+		t.Fatalf("NewLanguageModel() error = %v", err)
+	}
+	if _, err := lm.Generate(context.Background(), "first"); err != nil {
+		t.Fatalf("first Generate() error = %v", err)
+	}
+	if lm.LastUsage().TotalTokens != 3 || lm.LastResolvedModel() != "resolved-model" {
+		t.Fatalf("first telemetry = %#v, %q", lm.LastUsage(), lm.LastResolvedModel())
+	}
+	if _, err := lm.Generate(context.Background(), "second"); err == nil {
+		t.Fatal("second Generate() error = nil")
+	}
+	if lm.LastUsage().TotalTokens != 0 || lm.LastResolvedModel() != "" {
+		t.Fatalf("failed-call telemetry = %#v, %q", lm.LastUsage(), lm.LastResolvedModel())
+	}
 }

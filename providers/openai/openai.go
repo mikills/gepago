@@ -71,6 +71,8 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 
 // Generate sends a prompt and returns the model's text response.
 func (m *LanguageModel) Generate(ctx context.Context, prompt string) (string, error) {
+	m.lastUsage = gepa.Usage{}
+	m.lastModel = ""
 	params := openai.ChatCompletionNewParams{
 		Model: openai.ChatModel(m.model),
 		Messages: []openai.ChatCompletionMessageParamUnion{

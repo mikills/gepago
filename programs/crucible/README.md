@@ -384,8 +384,10 @@ or paired execution is missing, or the candidate introduces execution or require
 failures. Score regression thresholds are then applied only to compatible paired runs.
 The CLI includes judge model, endpoint, token limit, and command security mode in the
 evaluation identity. Library callers must provide `RunConfig.EvaluationIdentity` before their
-runs can be compared. Existing baselines created before evaluation identities were added must
-be regenerated.
+runs can be compared. Crucible also records `EvaluationRevision`; built-in scoring changes must
+bump that constant, while custom evaluators should implement `RevisionedEvaluator` and change
+their revision whenever scoring semantics change. Existing baselines without these identities
+and revisions must be regenerated.
 Both comparison drop thresholds default to zero, meaning any negative score or pairwise-rate
 movement fails unless an explicit allowance is supplied. Comparison HTML stores and displays
 the exact policy and gate outcome used by the CLI.

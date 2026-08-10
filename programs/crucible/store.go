@@ -3,13 +3,18 @@ package crucible
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"syscall"
 	"time"
 )
 
-const runStoreIndexName = "runs.json"
+const (
+	runStoreIndexName = "runs.json"
+	runStoreLockName  = "runs.lock"
+)
 
 // RunRecord is the compact index entry for a stored run artifact.
 type RunRecord struct {
@@ -35,24 +40,26 @@ func WriteRunToStore(storeDir string, result RunResult) error {
 	if err := ensureArtifactDir(storeDir); err != nil {
 		return err
 	}
-	index, err := LoadRunStore(storeDir)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	record := RunRecord{
-		RunID:       result.RunID,
-		SuiteName:   result.SuiteName,
-		StartedAt:   result.StartedAt,
-		EndedAt:     result.EndedAt,
-		Path:        result.RunID + ".json",
-		Subjects:    len(result.Subjects),
-		Cases:       len(result.Cases),
-		BestSubject: bestSubject(result.Summary),
-		BestScore:   bestScore(result.Summary),
-		GateFailed:  runGateFailed(result),
-	}
-	index.Upsert(record)
-	return WriteRunStore(storeDir, index)
+	return withRunStoreLock(storeDir, func() error {
+		index, err := LoadRunStore(storeDir)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		record := RunRecord{
+			RunID:       result.RunID,
+			SuiteName:   result.SuiteName,
+			StartedAt:   result.StartedAt,
+			EndedAt:     result.EndedAt,
+			Path:        result.RunID + ".json",
+			Subjects:    len(result.Subjects),
+			Cases:       len(result.Cases),
+			BestSubject: bestSubject(result.Summary),
+			BestScore:   bestScore(result.Summary),
+			GateFailed:  runGateFailed(result),
+		}
+		index.Upsert(record)
+		return writeRunStoreUnlocked(storeDir, index)
+	})
 }
 
 func runGateFailed(result RunResult) bool {
@@ -88,12 +95,41 @@ func LoadRunStore(storeDir string) (RunStoreIndex, error) {
 
 // WriteRunStore writes a run store index.
 func WriteRunStore(storeDir string, index RunStoreIndex) error {
+	if err := ensureArtifactDir(storeDir); err != nil {
+		return err
+	}
+	return withRunStoreLock(storeDir, func() error {
+		return writeRunStoreUnlocked(storeDir, index)
+	})
+}
+
+func writeRunStoreUnlocked(storeDir string, index RunStoreIndex) error {
 	index.Sort()
 	data, err := json.MarshalIndent(index, "", "  ")
 	if err != nil {
 		return err
 	}
 	return writeArtifactFile(filepath.Join(storeDir, runStoreIndexName), append(data, '\n'))
+}
+
+func withRunStoreLock(storeDir string, operation func() error) error {
+	lock, err := os.OpenFile(
+		filepath.Join(storeDir, runStoreLockName),
+		os.O_CREATE|os.O_RDWR,
+		artifactFileMode,
+	)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := lock.Chmod(artifactFileMode); err != nil {
+		return err
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("lock run store: %w", err)
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	return operation()
 }
 
 // Upsert inserts or replaces a run record by run id.

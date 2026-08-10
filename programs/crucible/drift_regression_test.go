@@ -210,6 +210,30 @@ type funcPairwiseEvaluator struct {
 	fn   func(context.Context, PairwiseInput) (PairwiseScore, error)
 }
 
+type revisionedEvaluator struct {
+	revision string
+}
+
+func (revisionedEvaluator) Name() string { return "revisioned" }
+
+func (revisionedEvaluator) Evaluate(context.Context, EvalInput) (Score, error) {
+	return Score{Score: 1}, nil
+}
+
+func (e revisionedEvaluator) CrucibleEvaluationRevision() string { return e.revision }
+
+type usageLanguageModel struct {
+	response string
+	err      error
+	usage    gepa.Usage
+}
+
+func (m usageLanguageModel) Generate(context.Context, string) (string, error) {
+	return m.response, m.err
+}
+
+func (m usageLanguageModel) LastUsage() gepa.Usage { return m.usage }
+
 func (e funcPairwiseEvaluator) Name() string { return e.name }
 
 func (e funcPairwiseEvaluator) Compare(ctx context.Context, input PairwiseInput) (PairwiseScore, error) {
@@ -397,6 +421,46 @@ func TestJudgeResponsesRequireCompleteValidFields(t *testing.T) {
 	}
 }
 
+func TestJudgeFailuresPreserveUsage(t *testing.T) {
+	usage := gepa.Usage{PromptTokens: 7, CompletionTokens: 3, TotalTokens: 10}
+	result, err := Run(context.Background(), RunConfig{
+		Suite:    Suite{Name: "judge-usage", Cases: []EvalCase{{ID: "case", Rubric: "Be correct"}}},
+		Subjects: []Subject{valueSubject("subject", gepa.Prediction{"answer": "ok"})},
+		Evaluators: []WeightedEvaluator{{Evaluator: RubricJudgeEvaluator{
+			LM: usageLanguageModel{response: `{"score":9}`, usage: usage}, MaxScore: 5,
+		}}},
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Results, 1)
+	require.Len(t, result.Results[0].Scores, 1)
+	assert.Contains(t, result.Results[0].Scores[0].Error, "exceeds maximum")
+	assert.Equal(t, usage, result.Results[0].Scores[0].Usage)
+	assert.Equal(t, usage, result.EvaluatorUsage)
+}
+
+func TestPairwiseJudgeFailuresPreserveUsage(t *testing.T) {
+	usage := gepa.Usage{PromptTokens: 11, CompletionTokens: 2, TotalTokens: 13}
+	result, err := Run(context.Background(), RunConfig{
+		Suite: Suite{Name: "pairwise-judge-usage", Cases: []EvalCase{{
+			ID: "case", Rubric: "Prefer the clearer answer",
+		}}},
+		Subjects: []Subject{
+			valueSubject("a", gepa.Prediction{"answer": "a"}),
+			valueSubject("b", gepa.Prediction{"answer": "b"}),
+		},
+		Evaluators: []WeightedEvaluator{{Evaluator: JSONValidityEvaluator{}}},
+		PairwiseEvaluators: []WeightedPairwiseEvaluator{{Evaluator: PairwiseJudgeEvaluator{
+			LM: usageLanguageModel{response: `{not-json`, usage: usage},
+		}}},
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Pairwise, 1)
+	require.Len(t, result.Pairwise[0].Scores, 1)
+	assert.Contains(t, result.Pairwise[0].Scores[0].Error, "parse pairwise judge response")
+	assert.Equal(t, usage, result.Pairwise[0].Scores[0].Usage)
+	assert.Equal(t, usage, result.EvaluatorUsage)
+}
+
 func TestCompareRunsRequiresIdenticalEvaluationContract(t *testing.T) {
 	baseline := comparisonFixtureRun(t, "baseline", "good")
 	candidate := comparisonFixtureRun(t, "candidate", "bad")
@@ -411,6 +475,12 @@ func TestCompareRunsRequiresIdenticalEvaluationContract(t *testing.T) {
 	incompatible := CompareRuns(baseline, candidate)
 	assert.False(t, incompatible.Compatible)
 	assert.Contains(t, strings.Join(incompatible.Incompatibilities, " "), "fingerprints do not match")
+
+	candidate = comparisonFixtureRun(t, "candidate", "bad")
+	candidate.EvaluationRevision = "different"
+	incompatible = CompareRuns(baseline, candidate)
+	assert.False(t, incompatible.Compatible)
+	assert.Contains(t, strings.Join(incompatible.Incompatibilities, " "), "revisions do not match")
 
 	candidate = comparisonFixtureRun(t, "candidate", "bad")
 	candidate.Results = nil
@@ -438,6 +508,21 @@ func TestEvaluationIdentityChangesFingerprintAndIsRequiredForComparison(t *testi
 	judgeB, err := Run(context.Background(), baseConfig)
 	require.NoError(t, err)
 	assert.NotEqual(t, judgeA.EvaluationFingerprint, judgeB.EvaluationFingerprint)
+}
+
+func TestCustomEvaluatorRevisionChangesFingerprint(t *testing.T) {
+	config := RunConfig{
+		Suite:      Suite{Name: "revision", Cases: []EvalCase{{ID: "case"}}},
+		Subjects:   []Subject{valueSubject("subject", gepa.Prediction{"answer": "ok"})},
+		Evaluators: []WeightedEvaluator{{Evaluator: revisionedEvaluator{revision: "v1"}}},
+	}
+	v1, err := Run(context.Background(), config)
+	require.NoError(t, err)
+	config.Evaluators[0].Evaluator = revisionedEvaluator{revision: "v2"}
+	v2, err := Run(context.Background(), config)
+	require.NoError(t, err)
+	assert.Equal(t, EvaluationRevision, v1.EvaluationRevision)
+	assert.NotEqual(t, v1.EvaluationFingerprint, v2.EvaluationFingerprint)
 }
 
 func TestCompareRejectsMissingPairwiseExecution(t *testing.T) {

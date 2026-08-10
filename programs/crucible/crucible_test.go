@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -497,6 +498,44 @@ func TestRegistryAndRunStore(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, index.Runs, 1)
 	require.NoError(t, WriteDashboardHTML(filepath.Join(dir, "dashboard.html"), index))
+}
+
+func TestRunStoreConcurrentWritersPreserveEveryRun(t *testing.T) {
+	dir := t.TempDir()
+	const writers = 24
+	var group sync.WaitGroup
+	errors := make(chan error, writers)
+	for index := 0; index < writers; index++ {
+		index := index
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			errors <- WriteRunToStore(dir, RunResult{
+				RunID:     fmt.Sprintf("run-%02d", index),
+				SuiteName: "suite",
+				StartedAt: time.Unix(int64(index), 0).UTC(),
+				EndedAt:   time.Unix(int64(index+1), 0).UTC(),
+			})
+		}()
+	}
+	group.Wait()
+	close(errors)
+	for err := range errors {
+		require.NoError(t, err)
+	}
+	store, err := LoadRunStore(dir)
+	require.NoError(t, err)
+	require.Len(t, store.Runs, writers)
+	seen := make(map[string]bool, writers)
+	for _, record := range store.Runs {
+		seen[record.RunID] = true
+	}
+	for index := 0; index < writers; index++ {
+		assert.True(t, seen[fmt.Sprintf("run-%02d", index)])
+	}
+	lockInfo, err := os.Stat(filepath.Join(dir, runStoreLockName))
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), lockInfo.Mode().Perm())
 }
 
 func TestArtifactsRender(t *testing.T) {

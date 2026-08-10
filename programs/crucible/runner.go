@@ -37,6 +37,7 @@ func Run(ctx context.Context, config RunConfig) (RunResult, error) {
 		SuiteName:                  config.Suite.Name,
 		Description:                config.Suite.Description,
 		StartedAt:                  started,
+		EvaluationRevision:         EvaluationRevision,
 		EvaluationFingerprint:      fingerprint,
 		EvaluationIdentityProvided: strings.TrimSpace(config.EvaluationIdentity) != "",
 		SubjectFingerprint:         config.SubjectFingerprint,
@@ -481,7 +482,10 @@ func evaluatePointwise(
 			err = validatePointwiseScore(score)
 		}
 		if err != nil {
-			score = Score{Error: err.Error(), Feedback: err.Error(), Details: map[string]any{"error": err.Error()}}
+			score = Score{
+				Usage: score.Usage, Error: err.Error(), Feedback: err.Error(),
+				Details: map[string]any{"error": err.Error()},
+			}
 		}
 		score.Name = defaultName(score.Name, weighted.Evaluator.Name())
 		score.Weight = normalizedWeight(weighted.Weight)
@@ -640,6 +644,7 @@ func compareSubjectPair(comparison pairComparison) PairwiseResult {
 		}
 		if err != nil {
 			score = PairwiseScore{
+				Usage:    score.Usage,
 				Error:    err.Error(),
 				Feedback: err.Error(),
 				Details:  map[string]any{"error": err.Error()},

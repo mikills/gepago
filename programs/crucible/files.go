@@ -1,6 +1,10 @@
 package crucible
 
-import "os"
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+)
 
 const (
 	artifactFileMode = 0o600
@@ -15,20 +19,38 @@ func ensureArtifactDir(path string) error {
 }
 
 func writeArtifactFile(path string, data []byte) error {
-	if err := os.WriteFile(path, data, artifactFileMode); err != nil {
+	dir := filepath.Dir(path)
+	temporary, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
 		return err
 	}
-	return os.Chmod(path, artifactFileMode)
-}
-
-func createArtifactFile(path string) (*os.File, error) {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, artifactFileMode)
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(artifactFileMode); err != nil {
+		temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return err
+	}
+	directory, err := os.Open(dir)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("open artifact directory: %w", err)
 	}
-	if err := file.Chmod(artifactFileMode); err != nil {
-		file.Close()
-		return nil, err
+	defer directory.Close()
+	if err := directory.Sync(); err != nil {
+		return fmt.Errorf("sync artifact directory: %w", err)
 	}
-	return file, nil
+	return nil
 }

@@ -114,6 +114,12 @@ func runCompatibilityIssues(baseline RunResult, candidate RunResult) []string {
 	if !baseline.EvaluationIdentityProvided || !candidate.EvaluationIdentityProvided {
 		issues = append(issues, "explicit evaluation identity missing from one or both runs")
 	}
+	if strings.TrimSpace(baseline.EvaluationRevision) == "" ||
+		strings.TrimSpace(candidate.EvaluationRevision) == "" {
+		issues = append(issues, "evaluation revision missing from one or both runs")
+	} else if baseline.EvaluationRevision != candidate.EvaluationRevision {
+		issues = append(issues, "evaluation revisions do not match")
+	}
 	if strings.TrimSpace(baseline.SubjectFingerprint) == "" ||
 		strings.TrimSpace(candidate.SubjectFingerprint) == "" {
 		issues = append(issues, "subject fingerprint missing from one or both runs")

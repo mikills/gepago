@@ -63,6 +63,8 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 
 // Generate sends a prompt and returns the model's text response.
 func (m *LanguageModel) Generate(ctx context.Context, prompt string) (string, error) {
+	m.lastUsage = gepa.Usage{}
+	m.lastModel = ""
 	resp, err := m.client.Chat(ctx, agents.ChatRequest{
 		Model:       m.client.model,
 		MaxTokens:   &m.maxTokens,

@@ -110,3 +110,29 @@ func TestLanguageModel(t *testing.T) {
 	assert.Equal(t, 10, lm.LastUsage().TotalTokens)
 	assert.Equal(t, "gemini-resolved", lm.LastResolvedModel())
 }
+
+func TestLanguageModelClearsTelemetryBeforeFailedCall(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) > 1 {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		fmt.Fprint(w, `{
+			"modelVersion":"gemini-resolved",
+			"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}],
+			"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":1,"totalTokenCount":3}
+		}`)
+	}))
+	defer server.Close()
+	lm, err := NewLanguageModel(Config{APIKey: "secret", BaseURL: server.URL, Model: "gemini-requested"})
+	require.NoError(t, err)
+	_, err = lm.Generate(context.Background(), "first")
+	require.NoError(t, err)
+	assert.Equal(t, 3, lm.LastUsage().TotalTokens)
+	assert.Equal(t, "gemini-resolved", lm.LastResolvedModel())
+	_, err = lm.Generate(context.Background(), "second")
+	require.Error(t, err)
+	assert.Equal(t, 0, lm.LastUsage().TotalTokens)
+	assert.Empty(t, lm.LastResolvedModel())
+}

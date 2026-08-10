@@ -146,6 +146,7 @@ type RunResult struct {
 	Description                  string                     `json:"description,omitempty"`
 	StartedAt                    time.Time                  `json:"started_at"`
 	EndedAt                      time.Time                  `json:"ended_at"`
+	EvaluationRevision           string                     `json:"evaluation_revision"`
 	EvaluationFingerprint        string                     `json:"evaluation_fingerprint"`
 	EvaluationIdentityProvided   bool                       `json:"evaluation_identity_provided"`
 	SubjectFingerprint           string                     `json:"subject_fingerprint,omitempty"`

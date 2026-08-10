@@ -22,13 +22,8 @@ func WriteRunJSON(path string, result RunResult) error {
 
 // WriteCSVSummary writes a compact subject leaderboard CSV.
 func WriteCSVSummary(path string, result RunResult) error {
-	file, err := createArtifactFile(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	writer := csv.NewWriter(file)
-	defer writer.Flush()
+	var data bytes.Buffer
+	writer := csv.NewWriter(&data)
 	if err := writer.Write(csvHeader()); err != nil {
 		return err
 	}
@@ -37,7 +32,11 @@ func WriteCSVSummary(path string, result RunResult) error {
 			return err
 		}
 	}
-	return writer.Error()
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return err
+	}
+	return writeArtifactFile(path, data.Bytes())
 }
 
 // WriteHTMLReport writes a static self-contained HTML evaluation report.
