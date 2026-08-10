@@ -45,7 +45,7 @@ func TestEnforceRunGate(t *testing.T) {
 	require.ErrorContains(t, enforceRunGate(result, 0, 0, true), "incomplete=0/1")
 }
 
-func TestAllowSubjectFailuresAllowsOnlyExplainedPairwiseGaps(t *testing.T) {
+func TestAllowFailuresGaps(t *testing.T) {
 	result := crucible.RunResult{
 		Repeats:                     1,
 		Subjects:                    []string{"a", "b"},
@@ -65,7 +65,7 @@ func TestAllowSubjectFailuresAllowsOnlyExplainedPairwiseGaps(t *testing.T) {
 	require.ErrorContains(t, enforceRunGate(result, 0, 0, true), "incomplete=0/1")
 }
 
-func TestEnforceDropThresholdRejectsUnsafeComparisons(t *testing.T) {
+func TestDropThresholdSafety(t *testing.T) {
 	require.Error(t, enforceDropThreshold(crucible.RunComparison{
 		Compatible:        false,
 		Incompatibilities: []string{"suite mismatch"},
@@ -91,7 +91,7 @@ func TestEnforceDropThresholdRejectsUnsafeComparisons(t *testing.T) {
 	require.ErrorContains(t, enforceDropThreshold(comparison, 0, 0), "-0.0100")
 }
 
-func TestCLIWiresPairwiseEvaluatorsAndCacheIdentity(t *testing.T) {
+func TestCLIEvaluatorWiring(t *testing.T) {
 	request := cliRunRequest{
 		ctx:          context.Background(),
 		judgeModel:   "judge-test",
@@ -111,14 +111,17 @@ func TestCLIWiresPairwiseEvaluatorsAndCacheIdentity(t *testing.T) {
 	require.Len(t, pointwise, 1)
 	require.Len(t, pairwise, 1)
 
-	config := request.runConfig(suite, nil, pointwise, pairwise, "cache-hash", "subjects-hash")
+	config := request.runConfig(runConfigInputs{
+		suite: suite, evaluators: pointwise, pairwiseEvaluators: pairwise,
+		cacheIdentity: "cache-hash", subjectFingerprint: "subjects-hash",
+	})
 	assert.Equal(t, "cache-hash", config.CacheIdentity)
 	assert.Equal(t, "subjects-hash", config.SubjectFingerprint)
 	assert.NotEmpty(t, config.EvaluationIdentity)
 	assert.Len(t, config.PairwiseEvaluators, 1)
 }
 
-func TestCLIRunValidationBoundsResourcesAndPaths(t *testing.T) {
+func TestCLIRunValidation(t *testing.T) {
 	valid := cliRunRequest{
 		suitePath:      "suite.json",
 		subjectsPath:   "subjects.json",
@@ -148,7 +151,7 @@ func TestCLIRunValidationBoundsResourcesAndPaths(t *testing.T) {
 	}
 }
 
-func TestJudgeConfigurationChangesEvaluationIdentity(t *testing.T) {
+func TestJudgeEvaluationIdentity(t *testing.T) {
 	baseline := cliRunRequest{judgeModel: "judge-a", judgeMaxTokens: 1024}
 	candidate := baseline
 	candidate.judgeModel = "judge-b"
@@ -158,7 +161,7 @@ func TestJudgeConfigurationChangesEvaluationIdentity(t *testing.T) {
 	assert.NotEqual(t, baseline.evaluationIdentity(), candidate.evaluationIdentity())
 }
 
-func TestFloatingPointGatesRejectNaNAndInfinity(t *testing.T) {
+func TestFloatingPointGateValidation(t *testing.T) {
 	for _, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
 		request := cliRunRequest{
 			suitePath: "suite.json", subjectsPath: "subjects.json",

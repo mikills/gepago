@@ -130,8 +130,17 @@ func AttachSubjectMetadata(result *RunResult, metadata map[string]SubjectMetadat
 	if len(metadata) == 0 {
 		return
 	}
+	missingResolution := collectResolvedMetadata(result.Results, metadata)
+	applyMetadataResolution(metadata, missingResolution)
+	result.SubjectMetadata = metadata
+}
+
+func collectResolvedMetadata(
+	results []SubjectCaseResult,
+	metadata map[string]SubjectMetadata,
+) map[string]bool {
 	missingResolution := map[string]bool{}
-	for _, execution := range result.Results {
+	for _, execution := range results {
 		item, configured := metadata[execution.Subject]
 		if !configured || strings.TrimSpace(item.Model) == "" {
 			continue
@@ -149,6 +158,10 @@ func AttachSubjectMetadata(result *RunResult, metadata map[string]SubjectMetadat
 		slices.Sort(item.ResolvedModels)
 		metadata[execution.Subject] = item
 	}
+	return missingResolution
+}
+
+func applyMetadataResolution(metadata map[string]SubjectMetadata, missingResolution map[string]bool) {
 	for subject, item := range metadata {
 		switch {
 		case len(item.ResolvedModels) == 0 && item.Model != "":
@@ -165,7 +178,6 @@ func AttachSubjectMetadata(result *RunResult, metadata map[string]SubjectMetadat
 		}
 		metadata[subject] = item
 	}
-	result.SubjectMetadata = metadata
 }
 
 func outputResolvedModels(output SubjectOutput) []string {

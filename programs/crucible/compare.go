@@ -111,6 +111,17 @@ func runCompatibilityIssues(baseline RunResult, candidate RunResult) []string {
 	if baseline.SuiteName != candidate.SuiteName {
 		issues = append(issues, fmt.Sprintf("suite mismatch: %q != %q", baseline.SuiteName, candidate.SuiteName))
 	}
+	issues = append(issues, evaluationCompatibilityIssues(baseline, candidate)...)
+	issues = append(issues, subjectCompatibilityIssues(baseline, candidate)...)
+	if baseline.Repeats != candidate.Repeats {
+		issues = append(issues, fmt.Sprintf("repeat count mismatch: %d != %d", baseline.Repeats, candidate.Repeats))
+	}
+	issues = append(issues, pairwiseRunCompatibilityIssues(baseline, candidate)...)
+	return issues
+}
+
+func evaluationCompatibilityIssues(baseline RunResult, candidate RunResult) []string {
+	var issues []string
 	if !baseline.EvaluationIdentityProvided || !candidate.EvaluationIdentityProvided {
 		issues = append(issues, "explicit evaluation identity missing from one or both runs")
 	}
@@ -120,19 +131,25 @@ func runCompatibilityIssues(baseline RunResult, candidate RunResult) []string {
 	} else if baseline.EvaluationRevision != candidate.EvaluationRevision {
 		issues = append(issues, "evaluation revisions do not match")
 	}
-	if strings.TrimSpace(baseline.SubjectFingerprint) == "" ||
-		strings.TrimSpace(candidate.SubjectFingerprint) == "" {
-		issues = append(issues, "subject fingerprint missing from one or both runs")
-	}
 	if strings.TrimSpace(baseline.EvaluationFingerprint) == "" ||
 		strings.TrimSpace(candidate.EvaluationFingerprint) == "" {
 		issues = append(issues, "evaluation fingerprint missing from one or both runs")
 	} else if baseline.EvaluationFingerprint != candidate.EvaluationFingerprint {
 		issues = append(issues, "evaluation fingerprints do not match")
 	}
-	if baseline.Repeats != candidate.Repeats {
-		issues = append(issues, fmt.Sprintf("repeat count mismatch: %d != %d", baseline.Repeats, candidate.Repeats))
+	return issues
+}
+
+func subjectCompatibilityIssues(baseline RunResult, candidate RunResult) []string {
+	if strings.TrimSpace(baseline.SubjectFingerprint) == "" ||
+		strings.TrimSpace(candidate.SubjectFingerprint) == "" {
+		return []string{"subject fingerprint missing from one or both runs"}
 	}
+	return nil
+}
+
+func pairwiseRunCompatibilityIssues(baseline RunResult, candidate RunResult) []string {
+	var issues []string
 	for label, run := range map[string]RunResult{"baseline": baseline, "candidate": candidate} {
 		if run.CompletedPairwiseEvaluations != run.ExpectedPairwiseEvaluations {
 			issues = append(issues, fmt.Sprintf(

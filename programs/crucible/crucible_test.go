@@ -245,7 +245,7 @@ func TestProviderAgentSubjects(t *testing.T) {
 	t.Run("google", testGoogleAgentSubject)
 }
 
-func TestOpenAPIModelSubjectUsesConfiguredEnvironmentKey(t *testing.T) {
+func TestOpenAPIEnvironmentKey(t *testing.T) {
 	t.Setenv("FIREWORKS_API_KEY", "fireworks-test-key")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/chat/completions", r.URL.Path)
@@ -500,23 +500,13 @@ func TestRegistryAndRunStore(t *testing.T) {
 	require.NoError(t, WriteDashboardHTML(filepath.Join(dir, "dashboard.html"), index))
 }
 
-func TestRunStoreConcurrentWritersPreserveEveryRun(t *testing.T) {
+func TestRunStoreConcurrency(t *testing.T) {
 	dir := t.TempDir()
 	const writers = 24
 	var group sync.WaitGroup
 	errors := make(chan error, writers)
 	for index := 0; index < writers; index++ {
-		index := index
-		group.Add(1)
-		go func() {
-			defer group.Done()
-			errors <- WriteRunToStore(dir, RunResult{
-				RunID:     fmt.Sprintf("run-%02d", index),
-				SuiteName: "suite",
-				StartedAt: time.Unix(int64(index), 0).UTC(),
-				EndedAt:   time.Unix(int64(index+1), 0).UTC(),
-			})
-		}()
+		startRunStoreWriter(&group, errors, dir, index)
 	}
 	group.Wait()
 	close(errors)
@@ -536,6 +526,19 @@ func TestRunStoreConcurrentWritersPreserveEveryRun(t *testing.T) {
 	lockInfo, err := os.Stat(filepath.Join(dir, runStoreLockName))
 	require.NoError(t, err)
 	assert.Equal(t, os.FileMode(0o600), lockInfo.Mode().Perm())
+}
+
+func startRunStoreWriter(group *sync.WaitGroup, errors chan<- error, dir string, index int) {
+	group.Add(1)
+	go func() {
+		defer group.Done()
+		errors <- WriteRunToStore(dir, RunResult{
+			RunID:     fmt.Sprintf("run-%02d", index),
+			SuiteName: "suite",
+			StartedAt: time.Unix(int64(index), 0).UTC(),
+			EndedAt:   time.Unix(int64(index+1), 0).UTC(),
+		})
+	}()
 }
 
 func TestArtifactsRender(t *testing.T) {

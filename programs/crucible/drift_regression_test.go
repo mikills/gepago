@@ -19,7 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestCacheIdentityPreventsStaleSubjectOutputs(t *testing.T) {
+func TestCacheIdentity(t *testing.T) {
 	var calls atomic.Int32
 	subject := FuncSubject{
 		SubjectName: "production",
@@ -57,7 +57,7 @@ func TestCacheIdentityPreventsStaleSubjectOutputs(t *testing.T) {
 	assert.Equal(t, int32(2), calls.Load())
 }
 
-func TestExecutionFailuresCountAsZeroScores(t *testing.T) {
+func TestExecutionFailureScoring(t *testing.T) {
 	subject := FuncSubject{
 		SubjectName: "sometimes-broken",
 		Func: func(_ context.Context, input gepa.Prediction) (SubjectOutput, error) {
@@ -85,7 +85,7 @@ func TestExecutionFailuresCountAsZeroScores(t *testing.T) {
 	assert.Positive(t, summary.ScoreStdError)
 }
 
-func TestRequiredEvaluatorCreatesHardGateFailure(t *testing.T) {
+func TestRequiredEvaluatorFailure(t *testing.T) {
 	result, err := Run(context.Background(), RunConfig{
 		Suite:    Suite{Name: "required", Cases: []EvalCase{{ID: "case"}}},
 		Subjects: []Subject{valueSubject("subject", gepa.Prediction{"answer": "plausible"})},
@@ -104,7 +104,7 @@ func TestRequiredEvaluatorCreatesHardGateFailure(t *testing.T) {
 	assert.Equal(t, 1, result.Summary[0].GateFailures)
 }
 
-func TestRequiredEvaluatorCannotSkipItsGate(t *testing.T) {
+func TestRequiredEvaluatorSkip(t *testing.T) {
 	result, err := Run(context.Background(), RunConfig{
 		Suite:    Suite{Name: "required-skip", Cases: []EvalCase{{ID: "case"}}},
 		Subjects: []Subject{valueSubject("subject", gepa.Prediction{"answer": "plausible"})},
@@ -122,7 +122,7 @@ func TestRequiredEvaluatorCannotSkipItsGate(t *testing.T) {
 	assert.Equal(t, []string{"must-run"}, result.Results[0].GateFailures)
 }
 
-func TestPointwiseEvaluatorErrorIsInfrastructureFailure(t *testing.T) {
+func TestPointwiseEvaluatorErrors(t *testing.T) {
 	result, err := Run(context.Background(), RunConfig{
 		Suite:    Suite{Name: "evaluator-error", Cases: []EvalCase{{ID: "case"}}},
 		Subjects: []Subject{valueSubject("subject", gepa.Prediction{"answer": "ok"})},
@@ -138,7 +138,7 @@ func TestPointwiseEvaluatorErrorIsInfrastructureFailure(t *testing.T) {
 	assert.Equal(t, 1, result.Summary[0].EvaluatorFailures)
 }
 
-func TestMalformedPointwiseScoresAreEvaluatorFailures(t *testing.T) {
+func TestMalformedPointwiseScores(t *testing.T) {
 	for _, invalid := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), -1, 2} {
 		result, err := Run(context.Background(), RunConfig{
 			Suite:    Suite{Name: "invalid-pointwise", Cases: []EvalCase{{ID: "case"}}},
@@ -156,7 +156,7 @@ func TestMalformedPointwiseScoresAreEvaluatorFailures(t *testing.T) {
 	}
 }
 
-func TestPointwiseCancellationSkipsRemainingEvaluators(t *testing.T) {
+func TestPointwiseCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var calls atomic.Int32
@@ -177,7 +177,7 @@ func TestPointwiseCancellationSkipsRemainingEvaluators(t *testing.T) {
 	assert.Equal(t, context.Canceled.Error(), scores[1].Error)
 }
 
-func TestOversizedEvaluatorEvidenceIsNotRetained(t *testing.T) {
+func TestOversizedEvaluatorEvidence(t *testing.T) {
 	usage := gepa.Usage{PromptTokens: 5, CompletionTokens: 2, TotalTokens: 7}
 	result, err := Run(context.Background(), RunConfig{
 		Suite:    Suite{Name: "score-budget", Cases: []EvalCase{{ID: "case"}}},
@@ -196,7 +196,7 @@ func TestOversizedEvaluatorEvidenceIsNotRetained(t *testing.T) {
 	assert.Equal(t, usage, result.EvaluatorUsage)
 }
 
-func TestOversizedPairwiseEvidencePreservesUsage(t *testing.T) {
+func TestOversizedPairwiseEvidence(t *testing.T) {
 	usage := gepa.Usage{PromptTokens: 8, CompletionTokens: 3, TotalTokens: 11}
 	result, err := Run(context.Background(), RunConfig{
 		Suite: Suite{Name: "pairwise-score-budget", Cases: []EvalCase{{ID: "case"}}},
@@ -280,7 +280,7 @@ func (e repeatRecordingPairwiseEvaluator) Compare(
 	return PairwiseScore{Winner: input.SubjectA, ScoreA: 1}, nil
 }
 
-func TestPairwiseComparisonPreservesEveryRepeat(t *testing.T) {
+func TestPairwiseRepeats(t *testing.T) {
 	var repeats []int
 	result, err := Run(context.Background(), RunConfig{
 		Suite: Suite{Name: "pairwise-repeat", Cases: []EvalCase{{ID: "case"}}},
@@ -300,7 +300,7 @@ func TestPairwiseComparisonPreservesEveryRepeat(t *testing.T) {
 	assert.Equal(t, 3, result.Summary[0].PairwiseWins)
 }
 
-func TestPairwiseEvaluatorErrorsAreRunFailures(t *testing.T) {
+func TestPairwiseEvaluatorErrors(t *testing.T) {
 	result, err := Run(context.Background(), RunConfig{
 		Suite: Suite{Name: "pairwise-error", Cases: []EvalCase{{ID: "case"}}},
 		Subjects: []Subject{
@@ -320,7 +320,7 @@ func TestPairwiseEvaluatorErrorsAreRunFailures(t *testing.T) {
 	assert.Zero(t, result.Summary[0].PairwiseTies)
 }
 
-func TestCancelledRunRecordsIncompletePairwiseWork(t *testing.T) {
+func TestCancelledPairwiseWork(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	result, err := Run(ctx, RunConfig{
@@ -339,7 +339,7 @@ func TestCancelledRunRecordsIncompletePairwiseWork(t *testing.T) {
 	assert.Zero(t, result.CompletedPairwiseEvaluations)
 }
 
-func TestPairwiseJudgeBlindsSubjectsAndBalancesPresentation(t *testing.T) {
+func TestPairwiseJudgeBlinding(t *testing.T) {
 	var mu sync.Mutex
 	var prompts []string
 	judge := gepa.LanguageModelFunc(func(_ context.Context, prompt string) (string, error) {
@@ -371,7 +371,7 @@ func TestPairwiseJudgeBlindsSubjectsAndBalancesPresentation(t *testing.T) {
 	assert.NotEqual(t, first.Winner, second.Winner)
 }
 
-func TestPairwiseJudgeRestoresOriginalScoreOrientation(t *testing.T) {
+func TestPairwiseScoreOrientation(t *testing.T) {
 	judge := gepa.LanguageModelFunc(func(context.Context, string) (string, error) {
 		return `{"winner":"a","score_a":0.9,"score_b":0.1,"feedback":"A"}`, nil
 	})
@@ -402,7 +402,7 @@ func TestPairwiseJudgeRequiresRubric(t *testing.T) {
 	require.EqualError(t, err, "pairwise judge requires a rubric")
 }
 
-func TestPairwiseEvaluatorsReceiveIsolatedEvidence(t *testing.T) {
+func TestPairwiseEvidenceIsolation(t *testing.T) {
 	mutator := funcPairwiseEvaluator{
 		name: "mutator",
 		fn: func(_ context.Context, input PairwiseInput) (PairwiseScore, error) {
@@ -437,7 +437,7 @@ func TestPairwiseEvaluatorsReceiveIsolatedEvidence(t *testing.T) {
 	assert.Equal(t, "a", result.Results[0].Output.Value["answer"])
 }
 
-func TestJudgeResponsesRequireCompleteValidFields(t *testing.T) {
+func TestJudgeResponseValidation(t *testing.T) {
 	_, err := parseJudgeResponse(`{"feedback":"missing score"}`)
 	require.ErrorContains(t, err, "finite score")
 	for _, raw := range []string{
@@ -468,7 +468,7 @@ func TestJudgeFailuresPreserveUsage(t *testing.T) {
 	assert.Equal(t, usage, result.EvaluatorUsage)
 }
 
-func TestPairwiseJudgeFailuresPreserveUsage(t *testing.T) {
+func TestPairwiseJudgeFailureUsage(t *testing.T) {
 	usage := gepa.Usage{PromptTokens: 11, CompletionTokens: 2, TotalTokens: 13}
 	result, err := Run(context.Background(), RunConfig{
 		Suite: Suite{Name: "pairwise-judge-usage", Cases: []EvalCase{{
@@ -491,7 +491,7 @@ func TestPairwiseJudgeFailuresPreserveUsage(t *testing.T) {
 	assert.Equal(t, usage, result.EvaluatorUsage)
 }
 
-func TestCompareRunsRequiresIdenticalEvaluationContract(t *testing.T) {
+func TestComparisonContract(t *testing.T) {
 	baseline := comparisonFixtureRun(t, "baseline", "good")
 	candidate := comparisonFixtureRun(t, "candidate", "bad")
 	comparison := CompareRuns(baseline, candidate)
@@ -519,7 +519,7 @@ func TestCompareRunsRequiresIdenticalEvaluationContract(t *testing.T) {
 	assert.Contains(t, strings.Join(incomplete.Incompatibilities, " "), "missing from one run")
 }
 
-func TestEvaluationIdentityChangesFingerprintAndIsRequiredForComparison(t *testing.T) {
+func TestEvaluationIdentityFingerprint(t *testing.T) {
 	baseConfig := RunConfig{
 		Suite:      Suite{Name: "identity", Cases: []EvalCase{{ID: "case"}}},
 		Subjects:   []Subject{valueSubject("production", gepa.Prediction{"answer": "ok"})},
@@ -540,7 +540,7 @@ func TestEvaluationIdentityChangesFingerprintAndIsRequiredForComparison(t *testi
 	assert.NotEqual(t, judgeA.EvaluationFingerprint, judgeB.EvaluationFingerprint)
 }
 
-func TestCustomEvaluatorRevisionChangesFingerprint(t *testing.T) {
+func TestEvaluatorRevisionFingerprint(t *testing.T) {
 	config := RunConfig{
 		Suite:      Suite{Name: "revision", Cases: []EvalCase{{ID: "case"}}},
 		Subjects:   []Subject{valueSubject("subject", gepa.Prediction{"answer": "ok"})},
@@ -555,7 +555,7 @@ func TestCustomEvaluatorRevisionChangesFingerprint(t *testing.T) {
 	assert.NotEqual(t, v1.EvaluationFingerprint, v2.EvaluationFingerprint)
 }
 
-func TestCompareRejectsMissingPairwiseExecution(t *testing.T) {
+func TestMissingPairwiseExecution(t *testing.T) {
 	baseline := comparisonFixtureRun(t, "baseline", "good")
 	candidate := comparisonFixtureRun(t, "candidate", "good")
 	baseline.Pairwise = []PairwiseResult{{CaseID: "case", SubjectA: "production", SubjectB: "other"}}
@@ -564,7 +564,7 @@ func TestCompareRejectsMissingPairwiseExecution(t *testing.T) {
 	assert.Contains(t, strings.Join(comparison.Incompatibilities, " "), "pairwise execution")
 }
 
-func TestScoreUncertaintyUsesCasesRatherThanRepeats(t *testing.T) {
+func TestScoreUncertainty(t *testing.T) {
 	result, err := Run(context.Background(), RunConfig{
 		Suite: Suite{Name: "clustered", Cases: []EvalCase{
 			{ID: "good", Expected: gepa.Prediction{"answer": "good"}},
@@ -621,7 +621,7 @@ func (m *concurrencyTrackingLM) Generate(context.Context, string) (string, error
 	return "ok", nil
 }
 
-func TestModelBackedSubjectsAreSerializedAcrossNames(t *testing.T) {
+func TestModelSubjectSerialization(t *testing.T) {
 	model := &concurrencyTrackingLM{}
 	result, err := Run(context.Background(), RunConfig{
 		Suite: Suite{Name: "shared-model", Cases: []EvalCase{{ID: "case"}}},
@@ -637,7 +637,7 @@ func TestModelBackedSubjectsAreSerializedAcrossNames(t *testing.T) {
 	assert.Equal(t, int32(1), model.max.Load())
 }
 
-func TestDefaultsBoundConcurrencyAndModelFitHardGates(t *testing.T) {
+func TestDefaultResourceBounds(t *testing.T) {
 	assert.Equal(t, 1, maxConcurrency(0, 100))
 	evaluators := DefaultModelFitEvaluators(ModelFitConfig{
 		RequiredFields: []string{"answer"},
@@ -648,7 +648,7 @@ func TestDefaultsBoundConcurrencyAndModelFitHardGates(t *testing.T) {
 	assert.True(t, evaluators[1].Required)
 }
 
-func TestRunConfigRejectsUnboundedResources(t *testing.T) {
+func TestRunResourceLimits(t *testing.T) {
 	base := RunConfig{
 		Suite:      Suite{Name: "bounded", Cases: []EvalCase{{ID: "case"}}},
 		Subjects:   []Subject{valueSubject("subject", gepa.Prediction{"answer": "ok"})},
@@ -667,7 +667,7 @@ func TestRunConfigRejectsUnboundedResources(t *testing.T) {
 	}
 }
 
-func TestRunConfigCapsQuadraticPairwiseWork(t *testing.T) {
+func TestPairwiseResourceLimit(t *testing.T) {
 	subjects := make([]Subject, 100)
 	for index := range subjects {
 		subjects[index] = valueSubject(fmt.Sprintf("subject-%d", index), gepa.Prediction{"answer": "ok"})
@@ -685,7 +685,7 @@ func TestRunConfigCapsQuadraticPairwiseWork(t *testing.T) {
 	require.ErrorContains(t, err, "10000 evaluator calls")
 }
 
-func TestOversizedSubjectOutputIsNotRetained(t *testing.T) {
+func TestOversizedSubjectOutput(t *testing.T) {
 	result, err := Run(context.Background(), RunConfig{
 		Suite: Suite{Name: "output-budget", Cases: []EvalCase{{ID: "case"}}},
 		Subjects: []Subject{FuncSubject{SubjectName: "oversized", Func: func(context.Context, gepa.Prediction) (SubjectOutput, error) {
@@ -708,7 +708,7 @@ func TestCommandOutputIsBounded(t *testing.T) {
 	assert.True(t, buffer.exceeded)
 }
 
-func TestArtifactsUseOwnerOnlyPermissions(t *testing.T) {
+func TestArtifactPermissions(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "run.json")
 	require.NoError(t, os.WriteFile(path, []byte("old"), 0o644))
@@ -740,7 +740,7 @@ func (resolvedModelLM) LastUsage() gepa.Usage {
 	return gepa.Usage{PromptTokens: 1_000_000, TotalTokens: 1_000_000}
 }
 
-func TestResolvedModelDrivesArtifactProvenanceAndCost(t *testing.T) {
+func TestResolvedModelProvenance(t *testing.T) {
 	result, err := Run(context.Background(), RunConfig{
 		Suite: Suite{Name: "resolved-model", Cases: []EvalCase{{ID: "case"}}},
 		Subjects: []Subject{RawModelSubject{
@@ -764,7 +764,7 @@ func TestResolvedModelDrivesArtifactProvenanceAndCost(t *testing.T) {
 	assert.Equal(t, 2.0, result.Summary[0].EstimatedCostUSD)
 }
 
-func TestResolvedModelProvenanceMarksMixedPartialAndFallback(t *testing.T) {
+func TestMixedModelProvenance(t *testing.T) {
 	baseMetadata := map[string]SubjectMetadata{"subject": {Name: "subject", Model: "alias"}}
 
 	mixed := RunResult{Results: []SubjectCaseResult{{Subject: "subject", Output: SubjectOutput{Metadata: map[string]any{

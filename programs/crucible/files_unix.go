@@ -3,12 +3,13 @@
 package crucible
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"syscall"
 )
 
-func acquireArtifactLock(path string) (func(), error) {
+func acquireArtifactLock(path string) (func() error, error) {
 	lock, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, artifactFileMode)
 	if err != nil {
 		return nil, err
@@ -21,9 +22,10 @@ func acquireArtifactLock(path string) (func(), error) {
 		lock.Close()
 		return nil, fmt.Errorf("lock artifact: %w", err)
 	}
-	return func() {
-		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
-		_ = lock.Close()
+	return func() error {
+		unlockErr := syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		closeErr := lock.Close()
+		return errors.Join(unlockErr, closeErr)
 	}, nil
 }
 

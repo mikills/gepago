@@ -192,13 +192,8 @@ func parsePairwiseJudgeResponse(raw string, subjectA string, subjectB string) (P
 	if err := json.Unmarshal([]byte(gepa.ExtractFencedText(raw)), &response); err != nil {
 		return PairwiseScore{}, fmt.Errorf("parse pairwise judge response: %w", err)
 	}
-	if response.ScoreA == nil || response.ScoreB == nil ||
-		math.IsNaN(*response.ScoreA) || math.IsNaN(*response.ScoreB) ||
-		math.IsInf(*response.ScoreA, 0) || math.IsInf(*response.ScoreB, 0) {
-		return PairwiseScore{}, errors.New("pairwise judge response requires finite score_a and score_b")
-	}
-	if *response.ScoreA < 0 || *response.ScoreA > 1 || *response.ScoreB < 0 || *response.ScoreB > 1 {
-		return PairwiseScore{}, errors.New("pairwise judge scores must be between 0 and 1")
+	if err := validatePairwiseJudgeScores(response); err != nil {
+		return PairwiseScore{}, err
 	}
 	winner, err := normalizePairwiseWinner(response.Winner, subjectA, subjectB)
 	if err != nil {
@@ -211,6 +206,24 @@ func parsePairwiseJudgeResponse(raw string, subjectA string, subjectB string) (P
 		Feedback: response.Feedback,
 		Details:  response.Details,
 	}, nil
+}
+
+func validatePairwiseJudgeScores(response pairwiseJudgeResponse) error {
+	if invalidJudgeScore(response.ScoreA) || invalidJudgeScore(response.ScoreB) {
+		return errors.New("pairwise judge response requires finite score_a and score_b")
+	}
+	if outsideUnitInterval(*response.ScoreA) || outsideUnitInterval(*response.ScoreB) {
+		return errors.New("pairwise judge scores must be between 0 and 1")
+	}
+	return nil
+}
+
+func invalidJudgeScore(score *float64) bool {
+	return score == nil || math.IsNaN(*score) || math.IsInf(*score, 0)
+}
+
+func outsideUnitInterval(score float64) bool {
+	return score < 0 || score > 1
 }
 
 func normalizePairwiseWinner(winner string, subjectA string, subjectB string) (string, error) {

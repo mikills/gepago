@@ -110,12 +110,14 @@ func writeRunStoreUnlocked(storeDir string, index RunStoreIndex) error {
 	return writeArtifactFile(filepath.Join(storeDir, runStoreIndexName), append(data, '\n'))
 }
 
-func withRunStoreLock(storeDir string, operation func() error) error {
+func withRunStoreLock(storeDir string, operation func() error) (err error) {
 	unlock, err := acquireArtifactLock(filepath.Join(storeDir, runStoreLockName))
 	if err != nil {
 		return err
 	}
-	defer unlock()
+	defer func() {
+		err = errors.Join(err, unlock())
+	}()
 	return operation()
 }
 

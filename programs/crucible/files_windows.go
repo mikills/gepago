@@ -3,6 +3,7 @@
 package crucible
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -23,7 +24,7 @@ var (
 	artifactMoveFileEx   = artifactKernel32.NewProc("MoveFileExW")
 )
 
-func acquireArtifactLock(path string) (func(), error) {
+func acquireArtifactLock(path string) (func() error, error) {
 	lock, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, artifactFileMode)
 	if err != nil {
 		return nil, err
@@ -45,8 +46,8 @@ func acquireArtifactLock(path string) (func(), error) {
 		lock.Close()
 		return nil, fmt.Errorf("lock artifact: %w", callErr)
 	}
-	return func() {
-		_, _, _ = artifactUnlockFileEx.Call(
+	return func() error {
+		result, _, callErr := artifactUnlockFileEx.Call(
 			lock.Fd(),
 			0,
 			1,
@@ -54,7 +55,11 @@ func acquireArtifactLock(path string) (func(), error) {
 			uintptr(unsafe.Pointer(overlapped)),
 		)
 		runtime.KeepAlive(overlapped)
-		_ = lock.Close()
+		closeErr := lock.Close()
+		if result == 0 {
+			return errors.Join(fmt.Errorf("unlock artifact: %w", callErr), closeErr)
+		}
+		return closeErr
 	}, nil
 }
 

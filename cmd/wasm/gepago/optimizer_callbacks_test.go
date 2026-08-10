@@ -147,7 +147,7 @@ func TestHostOptimizerCallbacks(t *testing.T) {
 	}
 }
 
-func TestHostOptimizationPersistenceMissingState(t *testing.T) {
+func TestHostPersistenceMissingState(t *testing.T) {
 	persistence := hostOptimizationPersistence{
 		loadState: func(request string) (string, error) {
 			if request != `{"kind":"optimizer.persistence.load_state"}` {

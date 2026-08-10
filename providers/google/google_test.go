@@ -111,7 +111,7 @@ func TestLanguageModel(t *testing.T) {
 	assert.Equal(t, "gemini-resolved", lm.LastResolvedModel())
 }
 
-func TestLanguageModelClearsTelemetryBeforeFailedCall(t *testing.T) {
+func TestFailedCallClearsTelemetry(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		if calls.Add(1) > 1 {

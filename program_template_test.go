@@ -108,7 +108,7 @@ func TestProgramHTTPHandler(t *testing.T) {
 	require.Contains(t, w.Body.String(), "served")
 }
 
-func TestProgramHTTPHandlerRejectsUnsafePaths(t *testing.T) {
+func TestProgramHTTPPathSafety(t *testing.T) {
 	dir := t.TempDir()
 	body := bytes.NewBufferString(`{"input":{}}`)
 	for _, path := range []string{

@@ -38,10 +38,11 @@ func (b *cappedBuffer) Write(data []byte) (int, error) {
 
 func runCommandOutput(command *exec.Cmd) ([]byte, []byte, error) {
 	var killOnce sync.Once
+	var killErr error
 	kill := func() {
 		killOnce.Do(func() {
 			if command.Process != nil {
-				_ = command.Process.Kill()
+				killErr = command.Process.Kill()
 			}
 		})
 	}
@@ -52,6 +53,9 @@ func runCommandOutput(command *exec.Cmd) ([]byte, []byte, error) {
 	err := command.Run()
 	if stdout.exceeded || stderr.exceeded {
 		return stdout.buffer.Bytes(), stderr.buffer.Bytes(), errCommandOutputTooLarge
+	}
+	if err == nil && killErr != nil {
+		err = killErr
 	}
 	return stdout.buffer.Bytes(), stderr.buffer.Bytes(), err
 }

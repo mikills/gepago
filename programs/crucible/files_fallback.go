@@ -8,7 +8,7 @@ import (
 	"runtime"
 )
 
-func acquireArtifactLock(string) (func(), error) {
+func acquireArtifactLock(string) (func() error, error) {
 	return nil, fmt.Errorf("artifact locking is not supported on %s", runtime.GOOS)
 }
 

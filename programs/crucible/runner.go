@@ -295,11 +295,11 @@ func (w subjectCaseWorkers) startOne(
 			results[indexed.index] = runSubjectCase(
 				w.ctx,
 				w.config,
-				job.subject,
-				job.evalCase,
-				job.repeat,
-				w.subjectLocks[subjectConcurrencyKey(job.subject)],
-				w.evaluatorLock,
+				job,
+				subjectCaseLocks{
+					subject:   w.subjectLocks[subjectConcurrencyKey(job.subject)],
+					evaluator: w.evaluatorLock,
+				},
 				w.retainedBytes,
 			)
 		}
@@ -325,6 +325,11 @@ type subjectCaseJob struct {
 	subject  Subject
 	evalCase EvalCase
 	repeat   int
+}
+
+type subjectCaseLocks struct {
+	subject   *sync.Mutex
+	evaluator *sync.Mutex
 }
 
 func subjectCaseJobs(config RunConfig) []subjectCaseJob {
@@ -360,20 +365,17 @@ func maxConcurrency(configured int, jobs int) int {
 func runSubjectCase(
 	ctx context.Context,
 	config RunConfig,
-	subject Subject,
-	evalCase EvalCase,
-	repeat int,
-	subjectLock *sync.Mutex,
-	evaluatorLock *sync.Mutex,
+	job subjectCaseJob,
+	locks subjectCaseLocks,
 	retainedBytes *atomic.Int64,
 ) SubjectCaseResult {
-	subjectLock.Lock()
-	output, cached, err := subjectOutput(ctx, config.Cache, config.CacheIdentity, subject, evalCase, repeat)
-	subjectLock.Unlock()
+	locks.subject.Lock()
+	output, cached, err := subjectOutput(ctx, config, job)
+	locks.subject.Unlock()
 	item := SubjectCaseResult{
-		Subject: subject.Name(),
-		CaseID:  evalCase.ID,
-		Repeat:  repeat,
+		Subject: job.subject.Name(),
+		CaseID:  job.evalCase.ID,
+		Repeat:  job.repeat,
 		Output:  output,
 		Cached:  cached,
 	}
@@ -386,10 +388,10 @@ func runSubjectCase(
 		item.Error = err.Error()
 		return item
 	}
-	input := EvalInput{Suite: config.Suite, Case: evalCase, Subject: subject.Name(), Output: output}
-	evaluatorLock.Lock()
+	input := EvalInput{Suite: config.Suite, Case: job.evalCase, Subject: job.subject.Name(), Output: output}
+	locks.evaluator.Lock()
 	item.Scores = evaluatePointwise(ctx, config.Evaluators, input, retainedBytes)
-	evaluatorLock.Unlock()
+	locks.evaluator.Unlock()
 	item.GateFailures = requiredScoreFailures(item.Scores)
 	item.AggregateScore = aggregateScores(item.Scores)
 	return item
@@ -416,29 +418,26 @@ func reserveRetainedValue(retainedBytes *atomic.Int64, value any, label string) 
 
 func subjectOutput(
 	ctx context.Context,
-	cache Cache,
-	cacheIdentity string,
-	subject Subject,
-	evalCase EvalCase,
-	repeat int,
+	config RunConfig,
+	job subjectCaseJob,
 ) (SubjectOutput, bool, error) {
-	key, err := cacheKey(cacheIdentity, subject.Name(), evalCase, repeat)
+	key, err := cacheKey(config.CacheIdentity, job.subject.Name(), job.evalCase, job.repeat)
 	if err != nil {
 		return SubjectOutput{}, false, err
 	}
-	if cache != nil {
-		if output, ok, err := cache.Get(ctx, key); ok || err != nil {
+	if config.Cache != nil {
+		if output, ok, err := config.Cache.Get(ctx, key); ok || err != nil {
 			return output, ok, err
 		}
 	}
-	output, err := timedRun(ctx, subject, evalCase.Input)
+	output, err := timedRun(ctx, job.subject, job.evalCase.Input)
 	if err == nil {
 		if sizeErr := validateSingleOutput(output); sizeErr != nil {
 			return output, false, sizeErr
 		}
 	}
-	if err == nil && cache != nil {
-		return output, false, cache.Set(ctx, key, output)
+	if err == nil && config.Cache != nil {
+		return output, false, config.Cache.Set(ctx, key, output)
 	}
 	return output, false, err
 }
@@ -547,38 +546,66 @@ func runPairwiseComparisons(
 		return nil
 	}
 	indexed := indexResults(results)
+	run := pairwiseRun{
+		ctx: ctx, config: config, indexed: indexed,
+		pairs: subjectPairs(len(config.Subjects)), retainedBytes: retainedBytes,
+	}
 	comparisons := []PairwiseResult{}
 	for _, evalCase := range config.Suite.Cases {
 		if ctx.Err() != nil {
 			return comparisons
 		}
-		for repeat := 0; repeat < repeatCount(config.Repeats); repeat++ {
-			if ctx.Err() != nil {
-				return comparisons
-			}
-			for i := 0; i < len(config.Subjects); i++ {
-				for j := i + 1; j < len(config.Subjects); j++ {
-					if ctx.Err() != nil {
-						return comparisons
-					}
-					comparison := compareSubjectPair(pairComparison{
-						ctx:           ctx,
-						config:        config,
-						indexed:       indexed,
-						evalCase:      evalCase,
-						repeat:        repeat,
-						left:          i,
-						right:         j,
-						retainedBytes: retainedBytes,
-					})
-					if len(comparison.Scores) > 0 {
-						comparisons = append(comparisons, comparison)
-					}
-				}
-			}
+		comparisons = append(comparisons, runPairwiseCase(run, evalCase)...)
+	}
+	return comparisons
+}
+
+type pairwiseRun struct {
+	ctx           context.Context
+	config        RunConfig
+	indexed       map[string]map[string]map[int]SubjectCaseResult
+	pairs         []subjectPair
+	retainedBytes *atomic.Int64
+}
+
+func runPairwiseCase(run pairwiseRun, evalCase EvalCase) []PairwiseResult {
+	var comparisons []PairwiseResult
+	for repeat := 0; repeat < repeatCount(run.config.Repeats) && run.ctx.Err() == nil; repeat++ {
+		comparisons = append(comparisons, runPairwiseRepeat(run, evalCase, repeat)...)
+	}
+	return comparisons
+}
+
+func runPairwiseRepeat(run pairwiseRun, evalCase EvalCase, repeat int) []PairwiseResult {
+	var comparisons []PairwiseResult
+	for _, pair := range run.pairs {
+		if run.ctx.Err() != nil {
+			return comparisons
+		}
+		comparison := compareSubjectPair(pairComparison{
+			ctx: run.ctx, config: run.config, indexed: run.indexed, evalCase: evalCase,
+			repeat: repeat, left: pair.left, right: pair.right, retainedBytes: run.retainedBytes,
+		})
+		if len(comparison.Scores) > 0 {
+			comparisons = append(comparisons, comparison)
 		}
 	}
 	return comparisons
+}
+
+type subjectPair struct {
+	left  int
+	right int
+}
+
+func subjectPairs(count int) []subjectPair {
+	pairs := make([]subjectPair, 0, count*(count-1)/2)
+	for left := 0; left < count; left++ {
+		for right := left + 1; right < count; right++ {
+			pairs = append(pairs, subjectPair{left: left, right: right})
+		}
+	}
+	return pairs
 }
 
 func indexResults(results []SubjectCaseResult) map[string]map[string]map[int]SubjectCaseResult {
