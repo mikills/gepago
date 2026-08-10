@@ -251,9 +251,17 @@ func runSuite(ctx context.Context, args []string) error {
 	cacheDir := flags.String("cache-dir", "", "optional disk cache directory for subject outputs")
 	cacheEpoch := flags.String("cache-epoch", "", "required cache generation or date when cache-dir is set")
 	allowCommand := flags.Bool("allow-command", false, "allow JSON-configured command subjects and evaluators")
-	allowFailures := flags.Bool("allow-subject-failures", false, "write a successful run exit even when subject executions fail")
+	allowFailures := flags.Bool(
+		"allow-subject-failures",
+		false,
+		"write a successful run exit even when subject executions fail",
+	)
 	failBelow := flags.Float64("fail-below", 0, "fail if any subject average score is below this threshold")
-	failPairwiseBelow := flags.Float64("fail-pairwise-below", 0, "fail if any compared subject pairwise win rate is below this threshold")
+	failPairwiseBelow := flags.Float64(
+		"fail-pairwise-below",
+		0,
+		"fail if any compared subject pairwise win rate is below this threshold",
+	)
 	judgeModel := flags.String("judge-model", "", "optional OpenAI/OpenAI-compatible judge model for rubric evaluators")
 	judgeMaxTokens := flags.Int("judge-max-tokens", 1024, "maximum output tokens for each judge call")
 	judgeAPIKeyEnv := flags.String("judge-api-key-env", "OPENAI_API_KEY", "judge API key environment variable")
@@ -873,13 +881,22 @@ func subjectFailureRegressions(diff crucible.SubjectScoreDiff) []string {
 		failures = append(failures, fmt.Sprintf("%s execution failures=%d", diff.Subject, diff.CandidateFailures))
 	}
 	if diff.CandidateGateFailures > 0 {
-		failures = append(failures, fmt.Sprintf("%s required evaluator failures=%d", diff.Subject, diff.CandidateGateFailures))
+		failures = append(
+			failures,
+			fmt.Sprintf("%s required evaluator failures=%d", diff.Subject, diff.CandidateGateFailures),
+		)
 	}
 	if diff.CandidateEvaluatorFailures > 0 {
-		failures = append(failures, fmt.Sprintf("%s evaluator errors=%d", diff.Subject, diff.CandidateEvaluatorFailures))
+		failures = append(
+			failures,
+			fmt.Sprintf("%s evaluator errors=%d", diff.Subject, diff.CandidateEvaluatorFailures),
+		)
 	}
 	if diff.CandidatePairwiseFailures > 0 {
-		failures = append(failures, fmt.Sprintf("%s pairwise evaluator failures=%d", diff.Subject, diff.CandidatePairwiseFailures))
+		failures = append(
+			failures,
+			fmt.Sprintf("%s pairwise evaluator failures=%d", diff.Subject, diff.CandidatePairwiseFailures),
+		)
 	}
 	return failures
 }

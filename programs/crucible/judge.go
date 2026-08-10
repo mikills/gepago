@@ -42,7 +42,13 @@ func (e RubricJudgeEvaluator) Evaluate(ctx context.Context, input EvalInput) (Sc
 		return Score{Usage: usage}, err
 	}
 	if *response.Score > maxScore {
-		return Score{Usage: usage}, fmt.Errorf("rubric judge score %.4g exceeds maximum %.4g", *response.Score, maxScore)
+		return Score{
+				Usage: usage,
+			}, fmt.Errorf(
+				"rubric judge score %.4g exceeds maximum %.4g",
+				*response.Score,
+				maxScore,
+			)
 	}
 	return Score{
 		Score:    clamp01(*response.Score / maxScore),

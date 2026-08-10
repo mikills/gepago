@@ -89,13 +89,24 @@ func evaluatorUsage(results []SubjectCaseResult, pairwise []PairwiseResult) gepa
 
 func validateRunConfig(config RunConfig) error {
 	repeats := repeatCount(config.Repeats)
-	jobs := cappedProduct(maxSubjectCaseExecutions+1, uint64(len(config.Subjects)), uint64(len(config.Suite.Cases)), uint64(repeats))
+	jobs := cappedProduct(
+		maxSubjectCaseExecutions+1,
+		uint64(len(config.Subjects)),
+		uint64(len(config.Suite.Cases)),
+		uint64(repeats),
+	)
 	subjectCount := uint64(len(config.Subjects))
 	var pairs uint64
 	if subjectCount >= 2 {
 		pairs = subjectCount * (subjectCount - 1) / 2
 	}
-	pairwiseCalls := cappedProduct(maxEvaluatorCalls+1, uint64(len(config.Suite.Cases)), uint64(repeats), pairs, uint64(len(config.PairwiseEvaluators)))
+	pairwiseCalls := cappedProduct(
+		maxEvaluatorCalls+1,
+		uint64(len(config.Suite.Cases)),
+		uint64(repeats),
+		pairs,
+		uint64(len(config.PairwiseEvaluators)),
+	)
 	pointwiseCalls := cappedProduct(maxEvaluatorCalls+1, jobs, uint64(len(config.Evaluators)))
 	for _, check := range []struct {
 		invalid bool

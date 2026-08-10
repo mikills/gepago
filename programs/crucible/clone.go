@@ -1,6 +1,7 @@
 package crucible
 
 import (
+	"maps"
 	"reflect"
 
 	gepa "github.com/mikills/gepago"
@@ -195,9 +196,7 @@ func cloneStringMap(input map[string]string) map[string]string {
 		return nil
 	}
 	cloned := make(map[string]string, len(input))
-	for key, value := range input {
-		cloned[key] = value
-	}
+	maps.Copy(cloned, input)
 	return cloned
 }
 

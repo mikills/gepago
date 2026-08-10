@@ -582,13 +582,19 @@ func TestScoreUncertainty(t *testing.T) {
 }
 
 func TestSubjectInputsAreIsolated(t *testing.T) {
-	mutator := FuncSubject{SubjectName: "mutator", Func: func(_ context.Context, input gepa.Prediction) (SubjectOutput, error) {
-		input["nested"].(map[string]any)["value"] = "mutated"
-		return SubjectOutput{Value: gepa.Prediction{"answer": "ok"}}, nil
-	}}
-	observer := FuncSubject{SubjectName: "observer", Func: func(_ context.Context, input gepa.Prediction) (SubjectOutput, error) {
-		return SubjectOutput{Value: gepa.Prediction{"answer": input["nested"].(map[string]any)["value"]}}, nil
-	}}
+	mutator := FuncSubject{
+		SubjectName: "mutator",
+		Func: func(_ context.Context, input gepa.Prediction) (SubjectOutput, error) {
+			input["nested"].(map[string]any)["value"] = "mutated"
+			return SubjectOutput{Value: gepa.Prediction{"answer": "ok"}}, nil
+		},
+	}
+	observer := FuncSubject{
+		SubjectName: "observer",
+		Func: func(_ context.Context, input gepa.Prediction) (SubjectOutput, error) {
+			return SubjectOutput{Value: gepa.Prediction{"answer": input["nested"].(map[string]any)["value"]}}, nil
+		},
+	}
 	result, err := Run(context.Background(), RunConfig{
 		Suite: Suite{Name: "isolation", Cases: []EvalCase{{
 			ID:       "case",
@@ -688,9 +694,11 @@ func TestPairwiseResourceLimit(t *testing.T) {
 func TestOversizedSubjectOutput(t *testing.T) {
 	result, err := Run(context.Background(), RunConfig{
 		Suite: Suite{Name: "output-budget", Cases: []EvalCase{{ID: "case"}}},
-		Subjects: []Subject{FuncSubject{SubjectName: "oversized", Func: func(context.Context, gepa.Prediction) (SubjectOutput, error) {
-			return SubjectOutput{Raw: strings.Repeat("x", maxSingleOutputBytes+1)}, nil
-		}}},
+		Subjects: []Subject{
+			FuncSubject{SubjectName: "oversized", Func: func(context.Context, gepa.Prediction) (SubjectOutput, error) {
+				return SubjectOutput{Raw: strings.Repeat("x", maxSingleOutputBytes+1)}, nil
+			}},
+		},
 		Evaluators: []WeightedEvaluator{{Evaluator: JSONValidityEvaluator{}}},
 	})
 	require.NoError(t, err)
