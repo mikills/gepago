@@ -102,8 +102,6 @@ var subjectRegistry = struct {
 func init() {
 	RegisterSubjectType("model", buildModelSubject)
 	RegisterSubjectType("openai", buildModelSubject)
-	RegisterSubjectType("openai-compatible", buildModelSubject)
-	RegisterSubjectType("openai_compatible", buildModelSubject)
 	RegisterSubjectType("openapi", buildModelSubject)
 	RegisterSubjectType("agent", buildAgentSubject)
 	RegisterSubjectType("tool-agent", buildAgentSubject)
@@ -167,7 +165,7 @@ func subjectPromptTemplate(spec SubjectSpec) string {
 
 func buildAgentSubject(spec SubjectSpec, _ SubjectBuildOptions) (Subject, error) {
 	provider := normalizeSubjectType(spec.Provider)
-	if provider == "" || provider == "openai" || provider == "openai-compatible" || provider == "openapi" {
+	if provider == "" || provider == "openai" || provider == "openapi" {
 		return newOpenAIAgentSubject(spec)
 	}
 	if provider == "anthropic" || provider == "claude" {

@@ -234,12 +234,20 @@ func TestConfiguredSubjects(t *testing.T) {
 func TestProviderAgentSubjects(t *testing.T) {
 	t.Run("openai chat completions", testOpenAIAgentSubject)
 	t.Run("openai responses", testOpenAIResponsesAgentSubject)
-	t.Run("openapi provider alias", func(t *testing.T) {
+	t.Run("openapi provider", func(t *testing.T) {
 		_, err := BuildSubject(SubjectSpec{
 			Type: "agent", Provider: "openapi", Name: "agent",
 			Model: "accounts/fireworks/models/test-model", BaseURL: "http://localhost.invalid",
 		})
 		require.NoError(t, err)
+	})
+	t.Run("rejects legacy openapi aliases", func(t *testing.T) {
+		for _, legacyName := range []string{"openai-compatible", "openai_compatible"} {
+			_, err := BuildSubject(SubjectSpec{Type: legacyName, Name: "legacy"})
+			require.ErrorContains(t, err, "unknown subject type")
+			_, err = BuildSubject(SubjectSpec{Type: "agent", Provider: legacyName, Name: "legacy"})
+			require.ErrorContains(t, err, "unsupported agent provider")
+		}
 	})
 	t.Run("anthropic", testAnthropicAgentSubject)
 	t.Run("google", testGoogleAgentSubject)
@@ -353,7 +361,7 @@ func testOpenAIResponsesAgentSubject(t *testing.T) {
 	defer server.Close()
 	subject, err := BuildSubject(SubjectSpec{
 		Type:              "agent",
-		Provider:          "openai-compatible",
+		Provider:          "openapi",
 		ProviderAPI:       "responses",
 		Name:              "agent",
 		Model:             "gpt-test",

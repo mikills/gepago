@@ -251,7 +251,7 @@ func subjectProvider(spec SubjectSpec) string {
 func normalizeProviderName(provider string) string {
 	provider = strings.TrimSpace(strings.ToLower(provider))
 	switch provider {
-	case "openai-compatible", "openai_compatible", "openai":
+	case "openai":
 		return "openai"
 	case "openapi":
 		return "openapi"

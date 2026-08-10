@@ -219,9 +219,9 @@ The runnable configuration is also available at
 environment explicit so other OpenAI-compatible services can use `openapi` without inheriting
 Fireworks-specific defaults.
 
-Provider-backed agent subject. The built-in agent provider supports `openai`,
-`openai-compatible`, `openapi`, `anthropic`, and `google`; users can register their own subject
-type names in Go for custom agents. OpenAI-compatible agents default to Chat Completions
+Provider-backed agent subject. The built-in agent provider supports `openai`, `openapi`,
+`anthropic`, and `google`. Users can register their own subject type names in Go for custom
+agents. OpenAI-compatible agents default to Chat Completions
 (`provider_api: "chat_completions"`) and can opt into the Responses API with
 `provider_api: "responses"`.
 
@@ -275,7 +275,7 @@ For OpenAI-compatible Responses API providers, add:
 ```json
 {
   "type": "agent",
-  "provider": "openai-compatible",
+  "provider": "openapi",
   "provider_api": "responses",
   "name": "responses-agent"
 }
