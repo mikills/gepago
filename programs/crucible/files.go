@@ -1,7 +1,6 @@
 package crucible
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 )
@@ -41,16 +40,8 @@ func writeArtifactFile(path string, data []byte) error {
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(temporaryPath, path); err != nil {
+	if err := replaceArtifactFile(temporaryPath, path); err != nil {
 		return err
 	}
-	directory, err := os.Open(dir)
-	if err != nil {
-		return fmt.Errorf("open artifact directory: %w", err)
-	}
-	defer directory.Close()
-	if err := directory.Sync(); err != nil {
-		return fmt.Errorf("sync artifact directory: %w", err)
-	}
-	return nil
+	return syncArtifactDirectory(dir)
 }

@@ -178,19 +178,49 @@ func TestPointwiseCancellationSkipsRemainingEvaluators(t *testing.T) {
 }
 
 func TestOversizedEvaluatorEvidenceIsNotRetained(t *testing.T) {
+	usage := gepa.Usage{PromptTokens: 5, CompletionTokens: 2, TotalTokens: 7}
 	result, err := Run(context.Background(), RunConfig{
 		Suite:    Suite{Name: "score-budget", Cases: []EvalCase{{ID: "case"}}},
 		Subjects: []Subject{valueSubject("subject", gepa.Prediction{"answer": "ok"})},
 		Evaluators: []WeightedEvaluator{{Evaluator: FuncEvaluator{
 			EvaluatorName: "oversized-score",
 			Func: func(context.Context, EvalInput) (Score, error) {
-				return Score{Score: 1, Feedback: strings.Repeat("x", maxSingleOutputBytes+1)}, nil
+				return Score{Score: 1, Feedback: strings.Repeat("x", maxSingleOutputBytes+1), Usage: usage}, nil
 			},
 		}}},
 	})
 	require.NoError(t, err)
 	assert.Contains(t, result.Results[0].Scores[0].Error, "retention limit")
 	assert.Less(t, len(result.Results[0].Scores[0].Feedback), 1_000)
+	assert.Equal(t, usage, result.Results[0].Scores[0].Usage)
+	assert.Equal(t, usage, result.EvaluatorUsage)
+}
+
+func TestOversizedPairwiseEvidencePreservesUsage(t *testing.T) {
+	usage := gepa.Usage{PromptTokens: 8, CompletionTokens: 3, TotalTokens: 11}
+	result, err := Run(context.Background(), RunConfig{
+		Suite: Suite{Name: "pairwise-score-budget", Cases: []EvalCase{{ID: "case"}}},
+		Subjects: []Subject{
+			valueSubject("a", gepa.Prediction{"answer": "a"}),
+			valueSubject("b", gepa.Prediction{"answer": "b"}),
+		},
+		Evaluators: []WeightedEvaluator{{Evaluator: JSONValidityEvaluator{}}},
+		PairwiseEvaluators: []WeightedPairwiseEvaluator{{Evaluator: funcPairwiseEvaluator{
+			name: "oversized-pairwise-score",
+			fn: func(_ context.Context, input PairwiseInput) (PairwiseScore, error) {
+				return PairwiseScore{
+					Winner: input.SubjectA, ScoreA: 1,
+					Feedback: strings.Repeat("x", maxSingleOutputBytes+1), Usage: usage,
+				}, nil
+			},
+		}}},
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Pairwise, 1)
+	require.Len(t, result.Pairwise[0].Scores, 1)
+	assert.Contains(t, result.Pairwise[0].Scores[0].Error, "retention limit")
+	assert.Equal(t, usage, result.Pairwise[0].Scores[0].Usage)
+	assert.Equal(t, usage, result.EvaluatorUsage)
 }
 
 type repeatRecordingPairwiseEvaluator struct {

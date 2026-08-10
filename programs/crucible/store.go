@@ -3,11 +3,9 @@ package crucible
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
-	"syscall"
 	"time"
 )
 
@@ -113,22 +111,11 @@ func writeRunStoreUnlocked(storeDir string, index RunStoreIndex) error {
 }
 
 func withRunStoreLock(storeDir string, operation func() error) error {
-	lock, err := os.OpenFile(
-		filepath.Join(storeDir, runStoreLockName),
-		os.O_CREATE|os.O_RDWR,
-		artifactFileMode,
-	)
+	unlock, err := acquireArtifactLock(filepath.Join(storeDir, runStoreLockName))
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
-	if err := lock.Chmod(artifactFileMode); err != nil {
-		return err
-	}
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("lock run store: %w", err)
-	}
-	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	defer unlock()
 	return operation()
 }
 

@@ -493,7 +493,7 @@ func evaluatePointwise(
 		score.Score = clamp01(score.Score)
 		if sizeErr := reserveRetainedValue(retainedBytes, score, "pointwise score"); sizeErr != nil {
 			score = Score{Name: score.Name, Weight: score.Weight, Required: score.Required,
-				Error: sizeErr.Error(), Feedback: sizeErr.Error()}
+				Error: sizeErr.Error(), Feedback: sizeErr.Error(), Usage: score.Usage}
 		}
 		scores = append(scores, score)
 	}
@@ -654,7 +654,7 @@ func compareSubjectPair(comparison pairComparison) PairwiseResult {
 		score.Weight = normalizedWeight(weighted.Weight)
 		if sizeErr := reserveRetainedValue(comparison.retainedBytes, score, "pairwise score"); sizeErr != nil {
 			score = PairwiseScore{Name: score.Name, Weight: score.Weight,
-				Error: sizeErr.Error(), Feedback: sizeErr.Error()}
+				Error: sizeErr.Error(), Feedback: sizeErr.Error(), Usage: score.Usage}
 		}
 		result.Scores = append(result.Scores, score)
 	}
