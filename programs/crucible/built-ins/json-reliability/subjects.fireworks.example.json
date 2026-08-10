@@ -1,0 +1,17 @@
+{
+  "subjects": [
+    {
+      "type": "openapi",
+      "name": "fireworks-json-candidate",
+      "model": "accounts/fireworks/models/deepseek-v4-flash-0731",
+      "base_url": "https://api.fireworks.ai/inference/v1",
+      "api_key_env": "FIREWORKS_API_KEY",
+      "parse_json": true,
+      "max_tokens": 512,
+      "prompt_template_lines": [
+        "{{.Input.prompt}}",
+        "Return only valid JSON with fields: answer (string), confidence (number)."
+      ]
+    }
+  ]
+}

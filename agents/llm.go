@@ -92,9 +92,10 @@ type ChatRequest struct {
 
 // ChatResponse is returned by an agent chat client.
 type ChatResponse struct {
-	Message      Message      `json:"message"`
-	Usage        Usage        `json:"usage"`
-	FinishReason FinishReason `json:"finish_reason"`
+	Message       Message      `json:"message"`
+	Usage         Usage        `json:"usage"`
+	FinishReason  FinishReason `json:"finish_reason"`
+	ResolvedModel string       `json:"resolved_model,omitempty"`
 }
 
 // ChatClient is the provider-neutral chat interface used by Agent.

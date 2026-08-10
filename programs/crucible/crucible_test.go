@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -159,7 +160,7 @@ func TestLoadSuiteJSONAndBuildEvaluators(t *testing.T) {
 		"cases":[{"id":"case-1","input":{"text":"hello"},"expected":{"text":"hello"}}],
 		"evaluators":[{"type":"exact_match","fields":["text"],"weight":2}]
 	}`
-	require.NoError(t, os.WriteFile(path, []byte(data), publicFileMode))
+	require.NoError(t, os.WriteFile(path, []byte(data), artifactFileMode))
 	suite, err := LoadSuiteJSON(path)
 	require.NoError(t, err)
 	evaluators, err := BuildEvaluators(suite.Evaluators, EvaluatorFactoryConfig{})
@@ -233,8 +234,58 @@ func TestConfiguredSubjects(t *testing.T) {
 func TestProviderAgentSubjects(t *testing.T) {
 	t.Run("openai chat completions", testOpenAIAgentSubject)
 	t.Run("openai responses", testOpenAIResponsesAgentSubject)
+	t.Run("openapi provider", func(t *testing.T) {
+		_, err := BuildSubject(SubjectSpec{
+			Type: "agent", Provider: "openapi", Name: "agent",
+			Model: "accounts/fireworks/models/test-model", BaseURL: "http://localhost.invalid",
+		})
+		require.NoError(t, err)
+	})
+	t.Run("rejects legacy openapi aliases", func(t *testing.T) {
+		for _, legacyName := range []string{"openai-compatible", "openai_compatible"} {
+			_, err := BuildSubject(SubjectSpec{Type: legacyName, Name: "legacy"})
+			require.ErrorContains(t, err, "unknown subject type")
+			_, err = BuildSubject(SubjectSpec{Type: "agent", Provider: legacyName, Name: "legacy"})
+			require.ErrorContains(t, err, "unsupported agent provider")
+		}
+	})
 	t.Run("anthropic", testAnthropicAgentSubject)
 	t.Run("google", testGoogleAgentSubject)
+}
+
+func TestOpenAPIEnvironmentKey(t *testing.T) {
+	t.Setenv("FIREWORKS_API_KEY", "fireworks-test-key")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/chat/completions", r.URL.Path)
+		assert.Equal(t, "Bearer fireworks-test-key", r.Header.Get("Authorization"))
+		var request map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		assert.Equal(t, "accounts/fireworks/models/test-model", request["model"])
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"model":"accounts/fireworks/models/resolved-test-model",
+			"choices":[{"message":{"role":"assistant","content":"{\"answer\":\"ok\"}"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}
+		}`)
+	}))
+	defer server.Close()
+
+	subject, err := BuildSubject(SubjectSpec{
+		Type: "openapi", Name: "fireworks-model",
+		Model: "accounts/fireworks/models/test-model", BaseURL: server.URL,
+		APIKeyEnv: "FIREWORKS_API_KEY", ParseJSON: true,
+	})
+	require.NoError(t, err)
+	output, err := subject.Run(context.Background(), gepa.Prediction{"prompt": "Return JSON"})
+	require.NoError(t, err)
+	assert.Equal(t, "ok", output.Value["answer"])
+	assert.Equal(t, 5, output.Usage.TotalTokens)
+	assert.Equal(t, "accounts/fireworks/models/resolved-test-model", output.Metadata["resolved_model"])
+
+	metadata := SubjectMetadataFromConfig(SubjectConfig{Subjects: []SubjectSpec{{
+		Type: "openapi", Name: "fireworks-model", Model: "accounts/fireworks/models/test-model",
+	}}})
+	assert.Equal(t, "openapi", metadata["fireworks-model"].Provider)
 }
 
 func testOpenAIAgentSubject(t *testing.T) {
@@ -310,7 +361,7 @@ func testOpenAIResponsesAgentSubject(t *testing.T) {
 	defer server.Close()
 	subject, err := BuildSubject(SubjectSpec{
 		Type:              "agent",
-		Provider:          "openai-compatible",
+		Provider:          "openai",
 		ProviderAPI:       "responses",
 		Name:              "agent",
 		Model:             "gpt-test",
@@ -455,6 +506,47 @@ func TestRegistryAndRunStore(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, index.Runs, 1)
 	require.NoError(t, WriteDashboardHTML(filepath.Join(dir, "dashboard.html"), index))
+}
+
+func TestRunStoreConcurrency(t *testing.T) {
+	dir := t.TempDir()
+	const writers = 24
+	var group sync.WaitGroup
+	errors := make(chan error, writers)
+	for index := 0; index < writers; index++ {
+		startRunStoreWriter(&group, errors, dir, index)
+	}
+	group.Wait()
+	close(errors)
+	for err := range errors {
+		require.NoError(t, err)
+	}
+	store, err := LoadRunStore(dir)
+	require.NoError(t, err)
+	require.Len(t, store.Runs, writers)
+	seen := make(map[string]bool, writers)
+	for _, record := range store.Runs {
+		seen[record.RunID] = true
+	}
+	for index := 0; index < writers; index++ {
+		assert.True(t, seen[fmt.Sprintf("run-%02d", index)])
+	}
+	lockInfo, err := os.Stat(filepath.Join(dir, runStoreLockName))
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), lockInfo.Mode().Perm())
+}
+
+func startRunStoreWriter(group *sync.WaitGroup, errors chan<- error, dir string, index int) {
+	group.Add(1)
+	go func() {
+		defer group.Done()
+		errors <- WriteRunToStore(dir, RunResult{
+			RunID:     fmt.Sprintf("run-%02d", index),
+			SuiteName: "suite",
+			StartedAt: time.Unix(int64(index), 0).UTC(),
+			EndedAt:   time.Unix(int64(index+1), 0).UTC(),
+		})
+	}()
 }
 
 func TestArtifactsRender(t *testing.T) {

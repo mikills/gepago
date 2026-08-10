@@ -27,11 +27,13 @@ func DefaultModelFitEvaluators(config ModelFitConfig) []WeightedEvaluator {
 	evaluators = append(evaluators, WeightedEvaluator{
 		Evaluator: JSONValidityEvaluator{RequiredFields: config.RequiredFields},
 		Weight:    0.2,
+		Required:  true,
 	})
 	if config.MaxLatency > 0 || config.MaxTokens > 0 {
 		evaluators = append(evaluators, WeightedEvaluator{
 			Evaluator: BudgetEvaluator{MaxLatency: config.MaxLatency, MaxTokens: config.MaxTokens},
 			Weight:    0.2,
+			Required:  true,
 		})
 	}
 	return evaluators

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	gepa "github.com/mikills/gepago"
@@ -28,21 +29,32 @@ func (e RubricJudgeEvaluator) Evaluate(ctx context.Context, input EvalInput) (Sc
 		rubric = strings.TrimSpace(e.Rubric)
 	}
 	if rubric == "" {
-		return Score{Skipped: true, Feedback: "rubric not provided"}, nil
+		return Score{}, errors.New("rubric judge requires a rubric")
 	}
 	maxScore := positiveMaxScore(e.MaxScore)
 	raw, err := e.LM.Generate(ctx, rubricJudgePrompt(input, rubric, maxScore))
+	usage := languageModelUsage(e.LM)
 	if err != nil {
-		return Score{}, err
+		return Score{Usage: usage}, err
 	}
 	response, err := parseJudgeResponse(raw)
 	if err != nil {
-		return Score{}, err
+		return Score{Usage: usage}, err
+	}
+	if *response.Score > maxScore {
+		return Score{
+				Usage: usage,
+			}, fmt.Errorf(
+				"rubric judge score %.4g exceeds maximum %.4g",
+				*response.Score,
+				maxScore,
+			)
 	}
 	return Score{
-		Score:    clamp01(response.Score / maxScore),
+		Score:    clamp01(*response.Score / maxScore),
 		Feedback: response.Feedback,
 		Details:  response.Details,
+		Usage:    usage,
 	}, nil
 }
 
@@ -63,29 +75,65 @@ func (e PairwiseJudgeEvaluator) Compare(ctx context.Context, input PairwiseInput
 		rubric = strings.TrimSpace(e.Rubric)
 	}
 	if rubric == "" {
-		return PairwiseScore{Winner: "tie", Feedback: "rubric not provided"}, nil
+		return PairwiseScore{}, errors.New("pairwise judge requires a rubric")
 	}
-	raw, err := e.LM.Generate(ctx, pairwiseJudgePrompt(input, rubric))
+	presented, swapped := pairwisePresentation(input)
+	raw, err := e.LM.Generate(ctx, pairwiseJudgePrompt(presented, rubric))
+	usage := languageModelUsage(e.LM)
 	if err != nil {
-		return PairwiseScore{}, err
+		return PairwiseScore{Usage: usage}, err
 	}
-	response, err := parsePairwiseJudgeResponse(raw, input.SubjectA, input.SubjectB)
+	response, err := parsePairwiseJudgeResponse(raw, presented.SubjectA, presented.SubjectB)
 	if err != nil {
-		return PairwiseScore{}, err
+		return PairwiseScore{Usage: usage}, err
 	}
+	if swapped {
+		response.ScoreA, response.ScoreB = response.ScoreB, response.ScoreA
+	}
+	if response.Details == nil {
+		response.Details = map[string]any{}
+	}
+	response.Details["presentation_swapped"] = swapped
+	response.Usage = usage
 	return response, nil
 }
 
+func languageModelUsage(model gepa.LanguageModel) gepa.Usage {
+	if reporter, ok := model.(gepa.UsageReporter); ok {
+		return reporter.LastUsage()
+	}
+	return gepa.Usage{}
+}
+
+func pairwisePresentation(input PairwiseInput) (PairwiseInput, bool) {
+	identity, _ := fingerprintValue(struct {
+		Suite    string `json:"suite"`
+		Case     string `json:"case"`
+		SubjectA string `json:"subject_a"`
+		SubjectB string `json:"subject_b"`
+	}{input.Suite.Name, input.Case.ID, input.SubjectA, input.SubjectB})
+	swap := len(identity) > 0 && identity[0]%2 == 0
+	if input.Repeat%2 == 1 {
+		swap = !swap
+	}
+	if !swap {
+		return input, false
+	}
+	input.SubjectA, input.SubjectB = input.SubjectB, input.SubjectA
+	input.OutputA, input.OutputB = input.OutputB, input.OutputA
+	return input, true
+}
+
 type judgeResponse struct {
-	Score    float64        `json:"score"`
+	Score    *float64       `json:"score"`
 	Feedback string         `json:"feedback"`
 	Details  map[string]any `json:"details,omitempty"`
 }
 
 type pairwiseJudgeResponse struct {
 	Winner   string         `json:"winner"`
-	ScoreA   float64        `json:"score_a"`
-	ScoreB   float64        `json:"score_b"`
+	ScoreA   *float64       `json:"score_a"`
+	ScoreB   *float64       `json:"score_b"`
 	Feedback string         `json:"feedback"`
 	Details  map[string]any `json:"details,omitempty"`
 }
@@ -117,10 +165,8 @@ func pairwiseJudgePrompt(input PairwiseInput, rubric string) string {
 		"Rubric:\n" + rubric,
 		"Case ID: " + input.Case.ID,
 		fencedJSON("Input JSON", input.Case.Input),
-		"Subject A: " + input.SubjectA,
-		fencedJSON("Output A JSON", input.OutputA.Value),
-		"Subject B: " + input.SubjectB,
-		fencedJSON("Output B JSON", input.OutputB.Value),
+		fencedJSON("Candidate A JSON", input.OutputA.Value),
+		fencedJSON("Candidate B JSON", input.OutputB.Value),
 		`Required output shape: {"winner": "a|b|tie", "score_a": number, "score_b": number, "feedback": string, "details": object}`,
 	}, "\n\n")
 }
@@ -138,6 +184,12 @@ func parseJudgeResponse(raw string) (judgeResponse, error) {
 	if err := json.Unmarshal([]byte(gepa.ExtractFencedText(raw)), &response); err != nil {
 		return judgeResponse{}, fmt.Errorf("parse rubric judge response: %w", err)
 	}
+	if response.Score == nil || math.IsNaN(*response.Score) || math.IsInf(*response.Score, 0) {
+		return judgeResponse{}, errors.New("rubric judge response requires a finite score")
+	}
+	if *response.Score < 0 {
+		return judgeResponse{}, errors.New("rubric judge score cannot be negative")
+	}
 	return response, nil
 }
 
@@ -146,24 +198,51 @@ func parsePairwiseJudgeResponse(raw string, subjectA string, subjectB string) (P
 	if err := json.Unmarshal([]byte(gepa.ExtractFencedText(raw)), &response); err != nil {
 		return PairwiseScore{}, fmt.Errorf("parse pairwise judge response: %w", err)
 	}
-	winner := normalizePairwiseWinner(response.Winner, subjectA, subjectB)
+	if err := validatePairwiseJudgeScores(response); err != nil {
+		return PairwiseScore{}, err
+	}
+	winner, err := normalizePairwiseWinner(response.Winner, subjectA, subjectB)
+	if err != nil {
+		return PairwiseScore{}, err
+	}
 	return PairwiseScore{
 		Winner:   winner,
-		ScoreA:   clamp01(response.ScoreA),
-		ScoreB:   clamp01(response.ScoreB),
+		ScoreA:   *response.ScoreA,
+		ScoreB:   *response.ScoreB,
 		Feedback: response.Feedback,
 		Details:  response.Details,
 	}, nil
 }
 
-func normalizePairwiseWinner(winner string, subjectA string, subjectB string) string {
-	switch strings.ToLower(strings.TrimSpace(winner)) {
-	case "a", subjectA:
-		return subjectA
-	case "b", subjectB:
-		return subjectB
+func validatePairwiseJudgeScores(response pairwiseJudgeResponse) error {
+	if invalidJudgeScore(response.ScoreA) || invalidJudgeScore(response.ScoreB) {
+		return errors.New("pairwise judge response requires finite score_a and score_b")
+	}
+	if outsideUnitInterval(*response.ScoreA) || outsideUnitInterval(*response.ScoreB) {
+		return errors.New("pairwise judge scores must be between 0 and 1")
+	}
+	return nil
+}
+
+func invalidJudgeScore(score *float64) bool {
+	return score == nil || math.IsNaN(*score) || math.IsInf(*score, 0)
+}
+
+func outsideUnitInterval(score float64) bool {
+	return score < 0 || score > 1
+}
+
+func normalizePairwiseWinner(winner string, subjectA string, subjectB string) (string, error) {
+	normalized := strings.TrimSpace(winner)
+	switch {
+	case strings.EqualFold(normalized, "a"), strings.EqualFold(normalized, subjectA):
+		return subjectA, nil
+	case strings.EqualFold(normalized, "b"), strings.EqualFold(normalized, subjectB):
+		return subjectB, nil
+	case strings.EqualFold(normalized, "tie"):
+		return "tie", nil
 	default:
-		return "tie"
+		return "", fmt.Errorf("invalid pairwise judge winner %q", winner)
 	}
 }
 

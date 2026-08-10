@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	gepa "github.com/mikills/gepago"
@@ -44,12 +45,15 @@ type ModelInfo struct {
 
 // SubjectMetadata records model/provider data for one run subject.
 type SubjectMetadata struct {
-	Name        string `json:"name"`
-	Type        string `json:"type,omitempty"`
-	Provider    string `json:"provider,omitempty"`
-	ProviderAPI string `json:"provider_api,omitempty"`
-	Model       string `json:"model,omitempty"`
-	BaseURL     string `json:"base_url,omitempty"`
+	Name            string   `json:"name"`
+	Type            string   `json:"type,omitempty"`
+	Provider        string   `json:"provider,omitempty"`
+	ProviderAPI     string   `json:"provider_api,omitempty"`
+	Model           string   `json:"model,omitempty"`
+	ResolvedModel   string   `json:"resolved_model,omitempty"`
+	ResolvedModels  []string `json:"resolved_models,omitempty"`
+	ModelResolution string   `json:"model_resolution,omitempty"`
+	BaseURL         string   `json:"base_url,omitempty"`
 }
 
 // LoadModelRegistryJSON reads model/provider metadata from JSON.
@@ -126,7 +130,79 @@ func AttachSubjectMetadata(result *RunResult, metadata map[string]SubjectMetadat
 	if len(metadata) == 0 {
 		return
 	}
+	missingResolution := collectResolvedMetadata(result.Results, metadata)
+	applyMetadataResolution(metadata, missingResolution)
 	result.SubjectMetadata = metadata
+}
+
+func collectResolvedMetadata(
+	results []SubjectCaseResult,
+	metadata map[string]SubjectMetadata,
+) map[string]bool {
+	missingResolution := map[string]bool{}
+	for _, execution := range results {
+		item, configured := metadata[execution.Subject]
+		if !configured || strings.TrimSpace(item.Model) == "" {
+			continue
+		}
+		resolvedModels := outputResolvedModels(execution.Output)
+		if len(resolvedModels) == 0 {
+			missingResolution[execution.Subject] = true
+			continue
+		}
+		for _, resolved := range resolvedModels {
+			if !slices.Contains(item.ResolvedModels, resolved) {
+				item.ResolvedModels = append(item.ResolvedModels, resolved)
+			}
+		}
+		slices.Sort(item.ResolvedModels)
+		metadata[execution.Subject] = item
+	}
+	return missingResolution
+}
+
+func applyMetadataResolution(metadata map[string]SubjectMetadata, missingResolution map[string]bool) {
+	for subject, item := range metadata {
+		switch {
+		case len(item.ResolvedModels) == 0 && item.Model != "":
+			item.ModelResolution = "requested_fallback"
+		case len(item.ResolvedModels) == 1 && !missingResolution[subject]:
+			item.ResolvedModel = item.ResolvedModels[0]
+			item.ModelResolution = "provider_response"
+		case len(item.ResolvedModels) == 1:
+			item.ResolvedModel = item.ResolvedModels[0]
+			item.ModelResolution = "partial_provider_responses"
+		case len(item.ResolvedModels) > 1:
+			item.ResolvedModel = ""
+			item.ModelResolution = "mixed_provider_responses"
+		}
+		metadata[subject] = item
+	}
+}
+
+func outputResolvedModels(output SubjectOutput) []string {
+	var models []string
+	if values, ok := output.Metadata["resolved_models"].([]string); ok {
+		models = append(models, values...)
+	} else if values, ok := output.Metadata["resolved_models"].([]any); ok {
+		for _, value := range values {
+			if model, ok := value.(string); ok {
+				models = append(models, model)
+			}
+		}
+	}
+	if model, ok := output.Metadata["resolved_model"].(string); ok {
+		models = append(models, model)
+	}
+	clean := make([]string, 0, len(models))
+	for _, model := range models {
+		model = strings.TrimSpace(model)
+		if model != "" && !slices.Contains(clean, model) {
+			clean = append(clean, model)
+		}
+	}
+	slices.Sort(clean)
+	return clean
 }
 
 // ApplyModelRegistry estimates per-subject cost and stores model details in summary metadata.
@@ -140,7 +216,15 @@ func ApplyModelRegistry(result *RunResult, registry ModelRegistry) {
 		if !ok {
 			continue
 		}
-		model, ok := registry.FindModel(metadata.Provider, metadata.Model)
+		if metadata.ModelResolution == "mixed_provider_responses" ||
+			metadata.ModelResolution == "partial_provider_responses" {
+			continue
+		}
+		modelID := metadata.ResolvedModel
+		if modelID == "" {
+			modelID = metadata.Model
+		}
+		model, ok := registry.FindModel(metadata.Provider, modelID)
 		if !ok {
 			continue
 		}
@@ -167,8 +251,10 @@ func subjectProvider(spec SubjectSpec) string {
 func normalizeProviderName(provider string) string {
 	provider = strings.TrimSpace(strings.ToLower(provider))
 	switch provider {
-	case "openai-compatible", "openai_compatible", "openai":
+	case "openai":
 		return "openai"
+	case "openapi":
+		return "openapi"
 	case "claude":
 		return "anthropic"
 	case "gemini":

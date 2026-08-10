@@ -64,6 +64,14 @@ func (s AgentSubject) message(input gepa.Prediction) string {
 
 func agentOutput(result agents.RunResult) SubjectOutput {
 	toolCalls := summarizeToolCalls(result.ToolCalls)
+	metadata := map[string]any{
+		toolCallsKey: toolCalls,
+		"spans":      result.Spans,
+	}
+	if len(result.ResolvedModels) > 0 {
+		metadata["resolved_models"] = append([]string(nil), result.ResolvedModels...)
+		metadata["resolved_model"] = result.ResolvedModels[len(result.ResolvedModels)-1]
+	}
 	return SubjectOutput{
 		Value: gepa.Prediction{
 			"final":       result.Final.Content,
@@ -74,10 +82,7 @@ func agentOutput(result agents.RunResult) SubjectOutput {
 		Usage:     result.Usage,
 		Trace:     result.Transcript,
 		Latency:   result.Ledger.TotalDuration,
-		Metadata: map[string]any{
-			toolCallsKey: toolCalls,
-			"spans":      result.Spans,
-		},
+		Metadata:  metadata,
 	}
 }
 

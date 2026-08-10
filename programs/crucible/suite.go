@@ -15,6 +15,7 @@ type EvaluatorSpec struct {
 	Type           string            `json:"type"`
 	Name           string            `json:"name,omitempty"`
 	Weight         float64           `json:"weight,omitempty"`
+	Required       bool              `json:"required,omitempty"`
 	Fields         []string          `json:"fields,omitempty"`
 	RequiredFields []string          `json:"required_fields,omitempty"`
 	Rubric         string            `json:"rubric,omitempty"`
@@ -56,7 +57,32 @@ func BuildEvaluators(specs []EvaluatorSpec, config EvaluatorFactoryConfig) ([]We
 		if err != nil {
 			return nil, err
 		}
-		evaluators = append(evaluators, WeightedEvaluator{Evaluator: evaluator, Weight: normalizedWeight(spec.Weight)})
+		evaluators = append(evaluators, WeightedEvaluator{
+			Evaluator: evaluator,
+			Weight:    normalizedWeight(spec.Weight),
+			Required:  spec.Required,
+		})
+	}
+	return evaluators, nil
+}
+
+// BuildPairwiseEvaluators constructs built-in pairwise evaluators from suite specs.
+func BuildPairwiseEvaluators(
+	specs []EvaluatorSpec,
+	config EvaluatorFactoryConfig,
+) ([]WeightedPairwiseEvaluator, error) {
+	evaluators := make([]WeightedPairwiseEvaluator, 0, len(specs))
+	for _, spec := range specs {
+		if strings.TrimSpace(spec.Type) != "pairwise_judge" {
+			return nil, fmt.Errorf("unknown pairwise evaluator type %q", spec.Type)
+		}
+		if config.JudgeLM == nil {
+			return nil, fmt.Errorf("pairwise judge language model is required")
+		}
+		evaluators = append(evaluators, WeightedPairwiseEvaluator{
+			Evaluator: PairwiseJudgeEvaluator{LM: config.JudgeLM, Rubric: spec.Rubric},
+			Weight:    normalizedWeight(spec.Weight),
+		})
 	}
 	return evaluators, nil
 }
@@ -68,10 +94,8 @@ func validateSuite(suite Suite) error {
 	if len(suite.Cases) == 0 {
 		return fmt.Errorf("suite requires at least one case")
 	}
-	for i, evalCase := range suite.Cases {
-		if strings.TrimSpace(evalCase.ID) == "" {
-			return fmt.Errorf("case %d id is required", i)
-		}
+	if err := validateCases(suite.Cases); err != nil {
+		return err
 	}
 	return nil
 }

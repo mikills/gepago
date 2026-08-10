@@ -153,8 +153,8 @@ func (c openAIChatClient) post(ctx context.Context, path string, data []byte) ([
 		return nil, err
 	}
 	defer resp.Body.Close()
-	var response bytes.Buffer
-	if _, err := response.ReadFrom(resp.Body); err != nil {
+	response, err := readHTTPResponse(resp.Body)
+	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -162,10 +162,10 @@ func (c openAIChatClient) post(ctx context.Context, path string, data []byte) ([
 			"openai agent %s status %d: %s",
 			path,
 			resp.StatusCode,
-			strings.TrimSpace(response.String()),
+			strings.TrimSpace(string(response)),
 		)
 	}
-	return response.Bytes(), nil
+	return response, nil
 }
 
 const (
@@ -241,6 +241,7 @@ type openAIFunctionCall struct {
 }
 
 type openAIChatResponse struct {
+	Model   string `json:"model"`
 	Choices []struct {
 		Message      openAIMessage `json:"message"`
 		FinishReason string        `json:"finish_reason"`
@@ -276,6 +277,7 @@ type openAIResponseTool struct {
 }
 
 type openAIResponsesResponse struct {
+	Model  string                      `json:"model"`
 	Output []openAIResponsesOutputItem `json:"output"`
 	Usage  struct {
 		InputTokens  int `json:"input_tokens"`
@@ -430,8 +432,9 @@ func decodeOpenAIChatResponse(data []byte) (agents.ChatResponse, error) {
 			Content:   choice.Message.Content,
 			ToolCalls: agentsToolCalls(choice.Message.ToolCalls),
 		},
-		Usage:        response.Usage,
-		FinishReason: finishReason(choice.FinishReason),
+		Usage:         response.Usage,
+		FinishReason:  finishReason(choice.FinishReason),
+		ResolvedModel: response.Model,
 	}, nil
 }
 
@@ -462,7 +465,7 @@ func decodeOpenAIResponsesResponse(data []byte) (agents.ChatResponse, error) {
 	if response.IncompleteDetails.Reason == "max_output_tokens" {
 		finish = agents.FinishLength
 	}
-	return agents.ChatResponse{Message: message, Usage: usage, FinishReason: finish}, nil
+	return agents.ChatResponse{Message: message, Usage: usage, FinishReason: finish, ResolvedModel: response.Model}, nil
 }
 
 func applyOpenAIResponsesOutput(message *agents.Message, item openAIResponsesOutputItem) {

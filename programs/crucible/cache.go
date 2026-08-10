@@ -2,13 +2,10 @@ package crucible
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // Cache stores subject outputs so repeated eval runs can avoid recomputing expensive calls.
@@ -37,28 +34,27 @@ func (c DiskCache) Get(_ context.Context, key string) (SubjectOutput, bool, erro
 }
 
 func (c DiskCache) Set(_ context.Context, key string, output SubjectOutput) error {
-	if err := os.MkdirAll(c.Dir, publicDirMode); err != nil {
+	if err := ensureArtifactDir(c.Dir); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(output, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(c.path(key), append(data, '\n'), publicFileMode)
+	return writeArtifactFile(c.path(key), append(data, '\n'))
 }
 
 func (c DiskCache) path(key string) string {
 	return filepath.Join(c.Dir, key+".json")
 }
 
-func cacheKey(subject string, evalCase EvalCase, repeat int) string {
+func cacheKey(identity string, subject string, evalCase EvalCase, repeat int) (string, error) {
 	payload := map[string]any{
-		"subject": subject,
-		"case_id": evalCase.ID,
-		"input":   evalCase.Input,
-		"repeat":  repeat,
+		"cache_identity": identity,
+		"subject":        subject,
+		"case_id":        evalCase.ID,
+		"input":          evalCase.Input,
+		"repeat":         repeat,
 	}
-	data, _ := json.Marshal(payload)
-	sum := sha256.Sum256(data)
-	return strings.ToLower(hex.EncodeToString(sum[:]))
+	return fingerprintValue(payload)
 }

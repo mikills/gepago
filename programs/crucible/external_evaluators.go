@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os/exec"
 	"strings"
@@ -40,9 +39,9 @@ func (e CommandEvaluator) Evaluate(ctx context.Context, input EvalInput) (Score,
 	cmd := exec.CommandContext(ctx, e.Command, e.Args...)
 	cmd.Stdin = bytes.NewReader(payload)
 	cmd.Env = append(cmd.Environ(), e.Env...)
-	stdout, err := cmd.Output()
+	stdout, stderr, err := runCommandOutput(cmd)
 	if err != nil {
-		return Score{}, commandError(err)
+		return Score{}, commandError(err, stderr)
 	}
 	return parseExternalScore(stdout)
 }
@@ -70,7 +69,7 @@ func (e WebhookEvaluator) Evaluate(ctx context.Context, input EvalInput) (Score,
 		return Score{}, err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := readHTTPResponse(resp.Body)
 	if err != nil {
 		return Score{}, err
 	}

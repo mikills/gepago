@@ -41,6 +41,7 @@ type LanguageModel struct {
 	headers   map[string]string
 	maxTokens int
 	lastUsage gepa.Usage
+	lastModel string
 }
 
 // NewLanguageModel constructs a Claude language model.
@@ -74,6 +75,8 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 
 // Generate sends a prompt and returns the model's text response.
 func (m *LanguageModel) Generate(ctx context.Context, prompt string) (string, error) {
+	m.lastUsage = gepa.Usage{}
+	m.lastModel = ""
 	message, err := m.client.Messages.New(ctx, anthropic.MessageNewParams{
 		Model:     anthropic.Model(m.model),
 		MaxTokens: int64(m.maxTokens),
@@ -97,6 +100,7 @@ func (m *LanguageModel) Generate(ctx context.Context, prompt string) (string, er
 				message.Usage.CacheReadInputTokens + message.Usage.OutputTokens,
 		),
 	}
+	m.lastModel = string(message.Model)
 	text := strings.TrimSpace(claudeText(message.Content))
 	if text == "" {
 		return "", errors.New("claude reflection completion: no text returned")
@@ -107,6 +111,8 @@ func (m *LanguageModel) Generate(ctx context.Context, prompt string) (string, er
 func (m *LanguageModel) LastUsage() gepa.Usage {
 	return m.lastUsage
 }
+
+func (m *LanguageModel) LastResolvedModel() string { return m.lastModel }
 
 func claudeText(content []anthropic.ContentBlockUnion) string {
 	parts := make([]string, 0, len(content))

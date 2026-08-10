@@ -5,7 +5,6 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"html/template"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,18 +17,13 @@ func WriteRunJSON(path string, result RunResult) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(data, '\n'), publicFileMode)
+	return writeArtifactFile(path, append(data, '\n'))
 }
 
 // WriteCSVSummary writes a compact subject leaderboard CSV.
 func WriteCSVSummary(path string, result RunResult) error {
-	file, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	writer := csv.NewWriter(file)
-	defer writer.Flush()
+	var data bytes.Buffer
+	writer := csv.NewWriter(&data)
 	if err := writer.Write(csvHeader()); err != nil {
 		return err
 	}
@@ -38,7 +32,11 @@ func WriteCSVSummary(path string, result RunResult) error {
 			return err
 		}
 	}
-	return writer.Error()
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return err
+	}
+	return writeArtifactFile(path, data.Bytes())
 }
 
 // WriteHTMLReport writes a static self-contained HTML evaluation report.
@@ -47,7 +45,7 @@ func WriteHTMLReport(path string, result RunResult) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(html), publicFileMode)
+	return writeArtifactFile(path, []byte(html))
 }
 
 // HTMLReport renders a static self-contained HTML evaluation report.
@@ -74,9 +72,19 @@ func csvHeader() []string {
 	return []string{
 		"subject",
 		"average_score",
+		"score_std_error",
+		"score_samples",
+		"score_ci95_available",
+		"score_ci95_low",
+		"score_ci95_high",
 		"cases",
+		"successes",
 		"failures",
+		"failure_rate",
+		"gate_failures",
+		"evaluator_failures",
 		"average_latency",
+		"p95_latency",
 		"total_tokens",
 		"prompt_tokens",
 		"completion_tokens",
@@ -84,6 +92,8 @@ func csvHeader() []string {
 		"pairwise_wins",
 		"pairwise_losses",
 		"pairwise_ties",
+		"pairwise_failures",
+		"pairwise_win_rate",
 	}
 }
 
@@ -91,9 +101,19 @@ func summaryRow(summary SubjectSummary) []string {
 	return []string{
 		summary.Subject,
 		formatFloat(summary.AverageScore),
+		formatFloat(summary.ScoreStdError),
+		strconv.Itoa(summary.ScoreSamples),
+		strconv.FormatBool(summary.ScoreCI95Available),
+		formatFloat(summary.ScoreCI95Low),
+		formatFloat(summary.ScoreCI95High),
 		strconv.Itoa(summary.Cases),
+		strconv.Itoa(summary.Successes),
 		strconv.Itoa(summary.Failures),
+		formatFloat(summary.FailureRate),
+		strconv.Itoa(summary.GateFailures),
+		strconv.Itoa(summary.EvaluatorFailures),
 		summary.AverageLatency.String(),
+		summary.P95Latency.String(),
 		strconv.Itoa(summary.Usage.TotalTokens),
 		strconv.Itoa(summary.Usage.PromptTokens),
 		strconv.Itoa(summary.Usage.CompletionTokens),
@@ -101,6 +121,8 @@ func summaryRow(summary SubjectSummary) []string {
 		strconv.Itoa(summary.PairwiseWins),
 		strconv.Itoa(summary.PairwiseLosses),
 		strconv.Itoa(summary.PairwiseTies),
+		strconv.Itoa(summary.PairwiseFailures),
+		formatFloat(summary.PairwiseWinRate),
 	}
 }
 
@@ -141,6 +163,26 @@ func scoreClass(value float64) string {
 	}
 }
 
+func summaryClass(summary SubjectSummary) string {
+	if summary.Failures > 0 || summary.GateFailures > 0 ||
+		summary.EvaluatorFailures > 0 || summary.PairwiseFailures > 0 {
+		return "fail"
+	}
+	return scoreClass(summary.AverageScore)
+}
+
+func resultClass(result SubjectCaseResult) string {
+	if result.Error != "" || len(result.GateFailures) > 0 {
+		return "fail"
+	}
+	for _, score := range result.Scores {
+		if score.Error != "" {
+			return "fail"
+		}
+	}
+	return scoreClass(result.AggregateScore)
+}
+
 func prettyJSON(value any) string {
 	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
@@ -156,13 +198,15 @@ func nonZero(value any) bool {
 }
 
 var reportTemplate = template.Must(template.New("crucible-report").Funcs(template.FuncMap{
-	"score":      formatFloat,
-	"percent":    formatPercent,
-	"scoreClass": scoreClass,
-	"cost":       formatCost,
-	"json":       prettyJSON,
-	"join":       strings.Join,
-	"nonZero":    nonZero,
+	"score":        formatFloat,
+	"percent":      formatPercent,
+	"scoreClass":   scoreClass,
+	"summaryClass": summaryClass,
+	"resultClass":  resultClass,
+	"cost":         formatCost,
+	"json":         prettyJSON,
+	"join":         strings.Join,
+	"nonZero":      nonZero,
 }).Parse(`<!doctype html>
 <html lang="en">
 <head>
@@ -205,12 +249,21 @@ details { border: 1px solid var(--line); border-radius: 6px; padding: 10px; back
 <div class="metric"><span class="muted">Cases</span><strong>{{len .Result.Cases}}</strong></div>
 <div class="metric"><span class="muted">Results</span><strong>{{len .Result.Results}}</strong></div>
 <div class="metric"><span class="muted">Pairwise</span><strong>{{len .Result.Pairwise}}</strong></div>
+<div class="metric"><span class="muted">Pairwise evaluations</span><strong>{{.Result.CompletedPairwiseEvaluations}} / {{.Result.ExpectedPairwiseEvaluations}}</strong></div>
+<div class="metric"><span class="muted">Evaluator tokens</span><strong>{{.Result.EvaluatorUsage.TotalTokens}}</strong></div>
+{{if .Result.GateOutcome.Evaluated}}<div class="metric"><span class="muted">Configured gate</span><strong><span class="badge {{if .Result.GateOutcome.Passed}}pass{{else}}fail{{end}}">{{if .Result.GateOutcome.Passed}}PASS{{else}}FAIL{{end}}</span></strong></div>{{end}}
 </div></section>
-<section><h2>Leaderboard</h2><table><thead><tr><th>Subject</th><th>Score</th><th>Cases</th><th>Failures</th><th>Avg latency</th><th>Tokens</th><th>Est. cost</th><th>Pairwise</th></tr></thead><tbody>
-{{range .Summary}}<tr><td><strong>{{.Subject}}</strong>{{if .Model.ID}}<div class="muted small">{{.Model.Provider}}/{{.Model.ID}}</div>{{end}}</td><td><span class="badge {{scoreClass .AverageScore}}">{{percent .AverageScore}}</span></td><td>{{.Cases}}</td><td>{{.Failures}}</td><td>{{.AverageLatency}}</td><td>{{.Usage.TotalTokens}}</td><td>{{cost .EstimatedCostUSD}}</td><td>{{.PairwiseWins}}W / {{.PairwiseLosses}}L / {{.PairwiseTies}}T</td></tr>{{end}}
+{{if .Result.GateOutcome.Evaluated}}<section><h2>Run policy</h2><div class="grid">
+<div class="metric"><span class="muted">Minimum score</span><strong>{{percent .Result.Policy.MinimumScore}}</strong></div>
+<div class="metric"><span class="muted">Minimum pairwise</span><strong>{{percent .Result.Policy.MinimumPairwiseWinRate}}</strong></div>
+<div class="metric"><span class="muted">Timeout</span><strong>{{.Result.Policy.Timeout}}</strong></div>
+<div class="metric"><span class="muted">Cache</span><strong>{{if .Result.Policy.CacheEnabled}}enabled{{else}}disabled{{end}}</strong></div>
+</div>{{if .Result.GateOutcome.Error}}<p><span class="badge fail">Gate failure</span> {{.Result.GateOutcome.Error}}</p>{{end}}</section>{{end}}
+<section><h2>Leaderboard</h2><table><thead><tr><th>Subject</th><th>Score</th><th>Cases</th><th>Failures</th><th>Evaluator errors</th><th>Avg latency</th><th>Tokens</th><th>Est. cost</th><th>Pairwise</th></tr></thead><tbody>
+{{range .Summary}}<tr><td><strong>{{.Subject}}</strong>{{if .Model.ID}}<div class="muted small">{{.Model.Provider}}/{{.Model.ID}}</div>{{end}}</td><td><span class="badge {{summaryClass .}}">{{percent .AverageScore}}</span></td><td>{{.Cases}}</td><td>{{.Failures}} execution / {{.GateFailures}} required</td><td>{{.EvaluatorFailures}} pointwise / {{.PairwiseFailures}} pairwise</td><td>{{.AverageLatency}}</td><td>{{.Usage.TotalTokens}}</td><td>{{cost .EstimatedCostUSD}}</td><td>{{.PairwiseWins}}W / {{.PairwiseLosses}}L / {{.PairwiseTies}}T · {{percent .PairwiseWinRate}}</td></tr>{{end}}
 </tbody></table></section>
 <section><h2>Case Results</h2><table><thead><tr><th>Case</th><th>Subject</th><th>Aggregate</th><th>Signals</th><th>Drilldown</th></tr></thead><tbody>
-{{range .Result.Results}}<tr class="row-{{scoreClass .AggregateScore}}"><td><strong>{{.CaseID}}</strong>{{if .Repeat}}<div class="muted small">repeat {{.Repeat}}</div>{{end}}{{if .Cached}}<div><span class="badge info">cached</span></div>{{end}}</td><td>{{.Subject}}</td><td class="nowrap"><span class="scorebar {{scoreClass .AggregateScore}}" style="--score:{{.AggregateScore}}"><span></span></span><span class="badge {{scoreClass .AggregateScore}}">{{percent .AggregateScore}}</span></td><td>{{if .Error}}<span class="badge fail">error</span> {{.Error}}{{else}}{{range .Scores}}<div style="margin-bottom:6px"><span class="badge {{scoreClass .Score}}">{{.Name}}</span> {{if .Skipped}}<span class="muted">skipped</span>{{else}}{{percent .Score}}{{end}} <span class="muted">{{.Feedback}}</span></div>{{end}}{{end}}</td><td><details><summary>Inspect result</summary>
+{{range .Result.Results}}<tr class="row-{{resultClass .}}"><td><strong>{{.CaseID}}</strong>{{if .Repeat}}<div class="muted small">repeat {{.Repeat}}</div>{{end}}{{if .Cached}}<div><span class="badge info">cached</span></div>{{end}}</td><td>{{.Subject}}</td><td class="nowrap"><span class="scorebar {{resultClass .}}" style="--score:{{.AggregateScore}}"><span></span></span><span class="badge {{resultClass .}}">{{percent .AggregateScore}}</span></td><td>{{if .Error}}<span class="badge fail">error</span> {{.Error}}{{else}}{{range .Scores}}<div style="margin-bottom:6px"><span class="badge {{if .Error}}fail{{else}}{{scoreClass .Score}}{{end}}">{{.Name}}</span> {{if .Error}}error{{else if .Skipped}}<span class="muted">skipped</span>{{else}}{{percent .Score}}{{end}} <span class="muted">{{.Feedback}}</span></div>{{end}}{{if .GateFailures}}<div><span class="badge fail">required</span> {{join .GateFailures ", "}}</div>{{end}}{{end}}</td><td><details><summary>Inspect result</summary>
 <div class="output-grid">
 <div><h3>Structured output</h3><pre>{{json .Output.Value}}</pre></div>
 {{if .Output.Raw}}<div><h3>Raw output</h3><pre>{{.Output.Raw}}</pre></div>{{end}}
@@ -220,6 +273,6 @@ details { border: 1px solid var(--line); border-radius: 6px; padding: 10px; back
 </div></details></td></tr>{{end}}
 </tbody></table></section>
 {{if .Result.Pairwise}}<section><h2>Pairwise Comparisons</h2><table><thead><tr><th>Case</th><th>A</th><th>B</th><th>Scores</th></tr></thead><tbody>
-{{range .Result.Pairwise}}<tr><td>{{.CaseID}}</td><td>{{.SubjectA}}</td><td>{{.SubjectB}}</td><td>{{range .Scores}}<div><span class="badge {{scoreClass .ScoreA}}">{{.Name}}</span> winner: <strong>{{.Winner}}</strong> · A {{percent .ScoreA}} · B {{percent .ScoreB}} <span class="muted">{{.Feedback}}</span></div>{{end}}</td></tr>{{end}}
+{{range .Result.Pairwise}}<tr><td>{{.CaseID}}</td><td>{{.SubjectA}}</td><td>{{.SubjectB}}</td><td>{{range .Scores}}<div><span class="badge {{if .Error}}fail{{else}}{{scoreClass .ScoreA}}{{end}}">{{.Name}}</span> {{if .Error}}error: {{.Error}}{{else}}winner: <strong>{{.Winner}}</strong> · A {{percent .ScoreA}} · B {{percent .ScoreB}}{{end}} <span class="muted">{{.Feedback}}</span></div>{{end}}</td></tr>{{end}}
 </tbody></table></section>{{end}}
 </main></body></html>`))

@@ -3,7 +3,6 @@ package crucible
 import (
 	"bytes"
 	"html/template"
-	"os"
 	"sort"
 	"time"
 )
@@ -14,7 +13,7 @@ func WriteComparisonHTMLReport(path string, comparison RunComparison) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(html), publicFileMode)
+	return writeArtifactFile(path, []byte(html))
 }
 
 // ComparisonHTMLReport renders a static HTML comparison report.
@@ -42,9 +41,9 @@ func sortedComparison(comparison RunComparison) RunComparison {
 }
 
 var comparisonTemplate = template.Must(template.New("crucible-comparison").Funcs(template.FuncMap{
-	"score":      formatFloat,
-	"percent":    formatPercent,
-	"scoreClass": scoreClass,
+	"score":           formatFloat,
+	"percent":         formatPercent,
+	"comparisonClass": comparisonSubjectClass,
 }).Parse(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Crucible Comparison</title>
 <style>
@@ -55,6 +54,18 @@ h1 { margin:0 0 6px; } .muted { color:#64748b; } table { width:100%; border-coll
 .delta-up { color:#166534; font-weight:700; } .delta-down { color:#991b1b; font-weight:700; } .delta-flat { color:#64748b; font-weight:700; }
 </style></head><body><main>
 <header style="margin-bottom:22px"><h1>Crucible Comparison</h1><div class="muted">Generated {{.Generated.Format "2006-01-02 15:04:05 MST"}}</div><div class="muted">Baseline {{.Comparison.BaselineRunID}} · Candidate {{.Comparison.CandidateRunID}}</div></header>
-<section><h2>Subject score deltas</h2><table><thead><tr><th>Subject</th><th>Baseline</th><th>Candidate</th><th>Delta</th><th>Status</th></tr></thead><tbody>
-{{range .Comparison.Subjects}}<tr><td><strong>{{.Subject}}</strong></td><td>{{percent .BaselineScore}}</td><td>{{percent .CandidateScore}}</td><td>{{if gt .Delta 0.0}}<span class="delta-up">+{{score .Delta}}</span>{{else if lt .Delta 0.0}}<span class="delta-down">{{score .Delta}}</span>{{else}}<span class="delta-flat">{{score .Delta}}</span>{{end}}</td><td>{{if .Missing}}<span class="badge warn">missing</span>{{else}}<span class="badge {{scoreClass .CandidateScore}}">{{scoreClass .CandidateScore}}</span>{{end}}</td></tr>{{end}}
+{{if .Comparison.GateOutcome.Evaluated}}<section><h2>Comparison gate: <span class="badge {{if .Comparison.GateOutcome.Passed}}pass{{else}}fail{{end}}">{{if .Comparison.GateOutcome.Passed}}PASS{{else}}FAIL{{end}}</span></h2><div class="muted">Maximum score drop {{percent .Comparison.Policy.MaximumScoreDrop}} · maximum pairwise-rate drop {{percent .Comparison.Policy.MaximumPairwiseRateDrop}}</div>{{if .Comparison.GateOutcome.Error}}<p>{{.Comparison.GateOutcome.Error}}</p>{{end}}</section>{{end}}
+{{if not .Comparison.Compatible}}<section><h2>Incompatible runs</h2><ul>{{range .Comparison.Incompatibilities}}<li>{{.}}</li>{{end}}</ul></section>{{end}}
+<section><h2>Subject score deltas</h2><table><thead><tr><th>Subject</th><th>Baseline</th><th>Candidate</th><th>Delta</th><th>95% CI</th><th>Failures</th><th>Pairwise delta</th><th>Status</th></tr></thead><tbody>
+{{range .Comparison.Subjects}}<tr><td><strong>{{.Subject}}</strong></td><td>{{percent .BaselineScore}}</td><td>{{percent .CandidateScore}}</td><td>{{if gt .Delta 0.0}}<span class="delta-up">+{{score .Delta}}</span>{{else if lt .Delta 0.0}}<span class="delta-down">{{score .Delta}}</span>{{else}}<span class="delta-flat">{{score .Delta}}</span>{{end}}</td><td>{{if .DeltaCI95Available}}{{score .DeltaCI95Low}} to {{score .DeltaCI95High}}{{else}}insufficient cases{{end}}</td><td>{{.CandidateFailures}} execution / {{.CandidateGateFailures}} required / {{.CandidateEvaluatorFailures}} evaluator</td><td>{{score .PairwiseWinRateDelta}}</td><td><span class="badge {{comparisonClass . $.Comparison.Policy}}">{{comparisonClass . $.Comparison.Policy}}</span></td></tr>{{end}}
 </tbody></table></section></main></body></html>`))
+
+func comparisonSubjectClass(diff SubjectScoreDiff, policy ComparisonPolicy) string {
+	if diff.Missing || diff.CandidateFailures > 0 || diff.CandidateGateFailures > 0 ||
+		diff.CandidateEvaluatorFailures > 0 || diff.CandidatePairwiseFailures > 0 ||
+		diff.Delta < -policy.MaximumScoreDrop ||
+		diff.PairwiseWinRateDelta < -policy.MaximumPairwiseRateDrop {
+		return "fail"
+	}
+	return "pass"
+}
