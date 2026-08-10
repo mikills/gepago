@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
 
 	gepa "github.com/mikills/gepago"
 	"github.com/mikills/gepago/programs/crucible"
@@ -18,8 +21,8 @@ const usage = `crucible is the Crucible evaluation toolkit.
 
 Usage:
   crucible validate-suite <suite.json>
-  crucible run -suite <suite.json> -subjects <subjects.json> [-out .crucible] [-registry models.json] [-allow-command] [-fail-below 0.9]
-  crucible compare -baseline <run.json> -candidate <run.json> [-html compare.html] [-fail-drop 0.05]
+  crucible run -suite <suite.json> -subjects <subjects.json> [-out .crucible] [-registry models.json] [-allow-command] [-allow-subject-failures] [-fail-below 0.9] [-fail-pairwise-below 0.5]
+  crucible compare -baseline <run.json> -candidate <run.json> [-html compare.html] [-fail-drop 0.05] [-fail-pairwise-drop 0.05]
   crucible render-report -run <run.json> [-html report.html] [-csv summary.csv]
   crucible dashboard -store .crucible [-html dashboard.html]
   crucible models list -registry <models.json>
@@ -28,7 +31,7 @@ Usage:
   crucible built-ins info <name>
 `
 
-const publicDirMode = 0o755
+const artifactDirMode = 0o700
 
 var commandContext = context.Background()
 
@@ -225,7 +228,13 @@ func validateSuite(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("suite %q is valid: %d cases, %d evaluator specs\n", suite.Name, len(suite.Cases), len(suite.Evaluators))
+	fmt.Printf(
+		"suite %q is valid: %d cases, %d pointwise evaluator specs, %d pairwise evaluator specs\n",
+		suite.Name,
+		len(suite.Cases),
+		len(suite.Evaluators),
+		len(suite.PairwiseEvaluators),
+	)
 	return nil
 }
 
@@ -238,10 +247,15 @@ func runSuite(ctx context.Context, args []string) error {
 	runID := flags.String("run-id", "", "optional run id")
 	repeats := flags.Int("repeat", 1, "number of times to run each subject/case")
 	concurrency := flags.Int("concurrency", 1, "maximum concurrent subject/case runs")
+	timeout := flags.Duration("timeout", 10*time.Minute, "maximum wall time for the complete evaluation run")
 	cacheDir := flags.String("cache-dir", "", "optional disk cache directory for subject outputs")
+	cacheEpoch := flags.String("cache-epoch", "", "required cache generation or date when cache-dir is set")
 	allowCommand := flags.Bool("allow-command", false, "allow JSON-configured command subjects and evaluators")
+	allowFailures := flags.Bool("allow-subject-failures", false, "write a successful run exit even when subject executions fail")
 	failBelow := flags.Float64("fail-below", 0, "fail if any subject average score is below this threshold")
+	failPairwiseBelow := flags.Float64("fail-pairwise-below", 0, "fail if any compared subject pairwise win rate is below this threshold")
 	judgeModel := flags.String("judge-model", "", "optional OpenAI/OpenAI-compatible judge model for rubric evaluators")
+	judgeMaxTokens := flags.Int("judge-max-tokens", 1024, "maximum output tokens for each judge call")
 	judgeAPIKeyEnv := flags.String("judge-api-key-env", "OPENAI_API_KEY", "judge API key environment variable")
 	judgeBaseURL := flags.String("judge-base-url", "", "judge OpenAI-compatible base URL")
 	registryPath := flags.String("registry", "", "optional model registry JSON for cost/model metadata")
@@ -249,58 +263,115 @@ func runSuite(ctx context.Context, args []string) error {
 		return err
 	}
 	request := cliRunRequest{
-		ctx:            ctx,
-		suitePath:      *suitePath,
-		subjectsPath:   *subjectsPath,
-		outDir:         *outDir,
-		runID:          *runID,
-		repeats:        *repeats,
-		concurrency:    *concurrency,
-		cacheDir:       *cacheDir,
-		allowCommand:   *allowCommand,
-		failBelow:      *failBelow,
-		judgeModel:     *judgeModel,
-		judgeAPIKeyEnv: *judgeAPIKeyEnv,
-		judgeBaseURL:   *judgeBaseURL,
-		registryPath:   *registryPath,
+		ctx:               ctx,
+		suitePath:         *suitePath,
+		subjectsPath:      *subjectsPath,
+		outDir:            *outDir,
+		runID:             *runID,
+		repeats:           *repeats,
+		concurrency:       *concurrency,
+		timeout:           *timeout,
+		cacheDir:          *cacheDir,
+		cacheEpoch:        *cacheEpoch,
+		allowCommand:      *allowCommand,
+		allowFailures:     *allowFailures,
+		failBelow:         *failBelow,
+		failPairwiseBelow: *failPairwiseBelow,
+		judgeModel:        *judgeModel,
+		judgeMaxTokens:    *judgeMaxTokens,
+		judgeAPIKeyEnv:    *judgeAPIKeyEnv,
+		judgeBaseURL:      *judgeBaseURL,
+		registryPath:      *registryPath,
 	}
 	return request.run()
 }
 
 type cliRunRequest struct {
-	ctx            context.Context
-	suitePath      string
-	subjectsPath   string
-	outDir         string
-	runID          string
-	repeats        int
-	concurrency    int
-	cacheDir       string
-	allowCommand   bool
-	failBelow      float64
-	judgeModel     string
-	judgeAPIKeyEnv string
-	judgeBaseURL   string
-	registryPath   string
+	ctx               context.Context
+	suitePath         string
+	subjectsPath      string
+	outDir            string
+	runID             string
+	repeats           int
+	concurrency       int
+	timeout           time.Duration
+	cacheDir          string
+	cacheEpoch        string
+	allowCommand      bool
+	allowFailures     bool
+	failBelow         float64
+	failPairwiseBelow float64
+	judgeModel        string
+	judgeMaxTokens    int
+	judgeAPIKeyEnv    string
+	judgeBaseURL      string
+	registryPath      string
 }
 
 func (r cliRunRequest) run() error {
-	if r.suitePath == "" || r.subjectsPath == "" {
-		return fmt.Errorf("run requires -suite and -subjects")
+	if err := r.validate(); err != nil {
+		return err
+	}
+	if r.timeout > 0 {
+		ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
+		defer cancel()
+		r.ctx = ctx
 	}
 	suite, subjectConfig, subjects, err := r.loadRunInputs()
 	if err != nil {
 		return err
 	}
-	evaluators, err := r.evaluators(suite)
+	evaluators, pairwiseEvaluators, err := r.evaluators(suite)
 	if err != nil {
 		return err
 	}
-	result, err := crucible.Run(r.ctx, r.runConfig(suite, subjects, evaluators))
+	cacheIdentity, err := crucible.SubjectConfigFingerprint(subjectConfig)
+	if err != nil {
+		return err
+	}
+	subjectFingerprint := cacheIdentity
+	if r.cache() != nil {
+		cacheIdentity += ":" + r.cacheEpoch
+	}
+	result, err := crucible.Run(
+		r.ctx,
+		r.runConfig(suite, subjects, evaluators, pairwiseEvaluators, cacheIdentity, subjectFingerprint),
+	)
 	if err != nil {
 		return err
 	}
 	return r.finishRun(result, subjectConfig)
+}
+
+var safeRunID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
+func (r cliRunRequest) validate() error {
+	switch {
+	case r.suitePath == "" || r.subjectsPath == "":
+		return fmt.Errorf("run requires -suite and -subjects")
+	case r.repeats < 1 || r.repeats > 100:
+		return fmt.Errorf("repeat must be between 1 and 100")
+	case r.concurrency < 1 || r.concurrency > 256:
+		return fmt.Errorf("concurrency must be between 1 and 256")
+	case r.timeout <= 0:
+		return fmt.Errorf("timeout must be positive")
+	case !finiteUnitInterval(r.failBelow):
+		return fmt.Errorf("fail-below must be between 0 and 1")
+	case !finiteUnitInterval(r.failPairwiseBelow):
+		return fmt.Errorf("fail-pairwise-below must be between 0 and 1")
+	case strings.TrimSpace(r.judgeModel) != "" && r.judgeMaxTokens < 1:
+		return fmt.Errorf("judge-max-tokens must be at least 1")
+	case strings.TrimSpace(r.cacheDir) != "" && strings.TrimSpace(r.cacheEpoch) == "":
+		return fmt.Errorf("cache-epoch is required when cache-dir is set")
+	case strings.TrimSpace(r.runID) != "" && !safeRunID.MatchString(r.runID):
+		return fmt.Errorf("run-id must be a safe basename of letters, numbers, dots, underscores, or hyphens")
+	default:
+		return nil
+	}
+}
+
+func finiteUnitInterval(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0) && value >= 0 && value <= 1
 }
 
 func (r cliRunRequest) loadRunInputs() (crucible.Suite, crucible.SubjectConfig, []crucible.Subject, error) {
@@ -319,37 +390,79 @@ func (r cliRunRequest) loadRunInputs() (crucible.Suite, crucible.SubjectConfig, 
 	return suite, subjectConfig, subjects, err
 }
 
-func (r cliRunRequest) evaluators(suite crucible.Suite) ([]crucible.WeightedEvaluator, error) {
+func (r cliRunRequest) evaluators(
+	suite crucible.Suite,
+) ([]crucible.WeightedEvaluator, []crucible.WeightedPairwiseEvaluator, error) {
 	judgeLM, err := r.judgeLM()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return crucible.BuildEvaluators(
+	config := crucible.EvaluatorFactoryConfig{JudgeLM: judgeLM, AllowCommand: r.allowCommand}
+	evaluators, err := crucible.BuildEvaluators(
 		suite.Evaluators,
-		crucible.EvaluatorFactoryConfig{JudgeLM: judgeLM, AllowCommand: r.allowCommand},
+		config,
 	)
+	if err != nil {
+		return nil, nil, err
+	}
+	pairwise, err := crucible.BuildPairwiseEvaluators(suite.PairwiseEvaluators, config)
+	return evaluators, pairwise, err
 }
 
 func (r cliRunRequest) runConfig(
 	suite crucible.Suite,
 	subjects []crucible.Subject,
 	evaluators []crucible.WeightedEvaluator,
+	pairwiseEvaluators []crucible.WeightedPairwiseEvaluator,
+	cacheIdentity string,
+	subjectFingerprint string,
 ) crucible.RunConfig {
 	return crucible.RunConfig{
-		Suite:          suite,
-		Subjects:       subjects,
-		Evaluators:     evaluators,
-		RunID:          r.runID,
-		Repeats:        r.repeats,
-		MaxConcurrency: r.concurrency,
-		Cache:          r.cache(),
+		Suite:              suite,
+		Subjects:           subjects,
+		Evaluators:         evaluators,
+		PairwiseEvaluators: pairwiseEvaluators,
+		RunID:              r.runID,
+		Repeats:            r.repeats,
+		MaxConcurrency:     r.concurrency,
+		Cache:              r.cache(),
+		CacheIdentity:      cacheIdentity,
+		EvaluationIdentity: r.evaluationIdentity(),
+		SubjectFingerprint: subjectFingerprint,
 	}
+}
+
+func (r cliRunRequest) evaluationIdentity() string {
+	return fmt.Sprintf(
+		"judge_model=%q judge_base_url=%q judge_max_tokens=%d judge_api_key_env=%q allow_command=%t",
+		r.judgeModel,
+		r.judgeBaseURL,
+		r.judgeMaxTokens,
+		r.judgeAPIKeyEnv,
+		r.allowCommand,
+	)
 }
 
 func (r cliRunRequest) finishRun(result crucible.RunResult, subjectConfig crucible.SubjectConfig) error {
 	crucible.AttachSubjectMetadata(&result, crucible.SubjectMetadataFromConfig(subjectConfig))
 	if err := r.applyRegistry(&result); err != nil {
 		return err
+	}
+	result.Policy = crucible.RunPolicy{
+		MinimumScore:           r.failBelow,
+		MinimumPairwiseWinRate: r.failPairwiseBelow,
+		AllowSubjectFailures:   r.allowFailures,
+		Timeout:                r.timeout.String(),
+		CacheEnabled:           r.cache() != nil,
+		CacheEpoch:             r.cacheEpoch,
+		JudgeModel:             r.judgeModel,
+		JudgeBaseURL:           r.judgeBaseURL,
+		JudgeMaxTokens:         r.judgeMaxTokens,
+	}
+	gateErr := enforceRunGate(result, r.failBelow, r.failPairwiseBelow, r.allowFailures)
+	result.GateOutcome = crucible.RunGateOutcome{Evaluated: true, Passed: gateErr == nil}
+	if gateErr != nil {
+		result.GateOutcome.Error = gateErr.Error()
 	}
 	if err := writeRunArtifacts(r.outDir, result); err != nil {
 		return err
@@ -358,7 +471,7 @@ func (r cliRunRequest) finishRun(result crucible.RunResult, subjectConfig crucib
 		return err
 	}
 	printRunSummary(r.outDir, result)
-	return enforceThreshold(result, r.failBelow)
+	return gateErr
 }
 
 func (r cliRunRequest) applyRegistry(result *crucible.RunResult) error {
@@ -389,27 +502,99 @@ func (r cliRunRequest) judgeLM() (gepa.LanguageModel, error) {
 		Model:     r.judgeModel,
 		APIKeyEnv: r.judgeAPIKeyEnv,
 		BaseURL:   r.judgeBaseURL,
+		MaxTokens: r.judgeMaxTokens,
 	})
 }
 
-func enforceThreshold(result crucible.RunResult, threshold float64) error {
-	if threshold <= 0 {
-		return nil
-	}
+func enforceRunGate(
+	result crucible.RunResult,
+	threshold float64,
+	pairwiseThreshold float64,
+	allowFailures bool,
+) error {
 	failed := []string{}
+	if result.ContextError != "" {
+		failed = append(failed, "run context="+result.ContextError)
+	}
+	if pairwiseThreshold > 0 && result.ExpectedPairwiseEvaluations == 0 {
+		failed = append(failed, "pairwise threshold configured but no pairwise evaluations were expected")
+	}
+	if result.CompletedPairwiseEvaluations != result.ExpectedPairwiseEvaluations &&
+		(!allowFailures || !pairwiseGapExplainedBySubjectFailures(result)) {
+		failed = append(failed, fmt.Sprintf(
+			"pairwise evaluations incomplete=%d/%d",
+			result.CompletedPairwiseEvaluations,
+			result.ExpectedPairwiseEvaluations,
+		))
+	}
 	for _, summary := range result.Summary {
-		if summary.AverageScore < threshold {
+		if !allowFailures && summary.Failures > 0 {
+			failed = append(failed, fmt.Sprintf("%s executions=%d", summary.Subject, summary.Failures))
+		}
+		if summary.GateFailures > 0 {
+			failed = append(failed, fmt.Sprintf("%s required_evaluators=%d", summary.Subject, summary.GateFailures))
+		}
+		if summary.EvaluatorFailures > 0 {
+			failed = append(failed, fmt.Sprintf("%s evaluator_errors=%d", summary.Subject, summary.EvaluatorFailures))
+		}
+		if summary.PairwiseFailures > 0 {
+			failed = append(failed, fmt.Sprintf("%s pairwise_evaluators=%d", summary.Subject, summary.PairwiseFailures))
+		}
+		if threshold > 0 && summary.AverageScore < threshold {
 			failed = append(failed, fmt.Sprintf("%s %.4f", summary.Subject, summary.AverageScore))
+		}
+		if pairwiseThreshold > 0 && summary.PairwiseWeight > 0 && summary.PairwiseWinRate < pairwiseThreshold {
+			failed = append(failed, fmt.Sprintf("%s pairwise %.4f", summary.Subject, summary.PairwiseWinRate))
 		}
 	}
 	if len(failed) > 0 {
-		return fmt.Errorf("eval score below %.4f: %s", threshold, strings.Join(failed, ", "))
+		return fmt.Errorf("eval run gate failed: %s", strings.Join(failed, ", "))
 	}
 	return nil
 }
 
+func pairwiseGapExplainedBySubjectFailures(result crucible.RunResult) bool {
+	if result.ContextError != "" || result.CompletedPairwiseEvaluations >= result.ExpectedPairwiseEvaluations || len(result.Subjects) < 2 {
+		return false
+	}
+	pairsPerCase := len(result.Subjects) * (len(result.Subjects) - 1) / 2
+	contractSlots := len(result.Cases) * result.Repeats * pairsPerCase
+	if contractSlots == 0 || result.ExpectedPairwiseEvaluations%contractSlots != 0 {
+		return false
+	}
+	evaluators := result.ExpectedPairwiseEvaluations / contractSlots
+	byExecution := make(map[string]crucible.SubjectCaseResult, len(result.Results))
+	for _, execution := range result.Results {
+		if execution.Error == context.Canceled.Error() || execution.Error == context.DeadlineExceeded.Error() {
+			return false
+		}
+		key := fmt.Sprintf("%s\x00%s\x00%d", execution.CaseID, execution.Subject, execution.Repeat)
+		byExecution[key] = execution
+	}
+	available := 0
+	for _, evalCase := range result.Cases {
+		for repeat := 0; repeat < result.Repeats; repeat++ {
+			for left := 0; left < len(result.Subjects); left++ {
+				for right := left + 1; right < len(result.Subjects); right++ {
+					leftKey := fmt.Sprintf("%s\x00%s\x00%d", evalCase.ID, result.Subjects[left], repeat)
+					rightKey := fmt.Sprintf("%s\x00%s\x00%d", evalCase.ID, result.Subjects[right], repeat)
+					leftExecution, leftOK := byExecution[leftKey]
+					rightExecution, rightOK := byExecution[rightKey]
+					if leftOK && rightOK && leftExecution.Error == "" && rightExecution.Error == "" {
+						available += evaluators
+					}
+				}
+			}
+		}
+	}
+	return result.CompletedPairwiseEvaluations == available
+}
+
 func writeRunArtifacts(outDir string, result crucible.RunResult) error {
-	if err := os.MkdirAll(outDir, publicDirMode); err != nil {
+	if err := os.MkdirAll(outDir, artifactDirMode); err != nil {
+		return err
+	}
+	if err := os.Chmod(outDir, artifactDirMode); err != nil {
 		return err
 	}
 	base := filepath.Join(outDir, result.RunID)
@@ -448,11 +633,19 @@ func compareRuns(args []string) error {
 	candidatePath := flags.String("candidate", "", "candidate Crucible run JSON artifact")
 	htmlPath := flags.String("html", "", "optional HTML comparison report output path")
 	failDrop := flags.Float64("fail-drop", 0, "fail if any subject score drops by more than this amount")
+	failPairwiseDrop := flags.Float64(
+		"fail-pairwise-drop",
+		0,
+		"fail if any subject pairwise win rate drops by more than this amount",
+	)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if *baselinePath == "" || *candidatePath == "" {
 		return fmt.Errorf("compare requires -baseline and -candidate")
+	}
+	if !finiteUnitInterval(*failDrop) || !finiteUnitInterval(*failPairwiseDrop) {
+		return fmt.Errorf("comparison drop thresholds must be between 0 and 1")
 	}
 	baseline, err := loadRunResult(*baselinePath)
 	if err != nil {
@@ -463,16 +656,28 @@ func compareRuns(args []string) error {
 		return err
 	}
 	comparison := crucible.CompareRuns(baseline, candidate)
+	comparison.Policy = crucible.ComparisonPolicy{
+		MaximumScoreDrop:        *failDrop,
+		MaximumPairwiseRateDrop: *failPairwiseDrop,
+	}
+	gateErr := enforceDropThreshold(comparison, *failDrop, *failPairwiseDrop)
+	comparison.GateOutcome = crucible.RunGateOutcome{Evaluated: true, Passed: gateErr == nil}
+	if gateErr != nil {
+		comparison.GateOutcome.Error = gateErr.Error()
+	}
 	printComparison(comparison)
 	if *htmlPath != "" {
 		if err := crucible.WriteComparisonHTMLReport(*htmlPath, comparison); err != nil {
 			return err
 		}
 	}
-	return enforceDropThreshold(comparison, *failDrop)
+	return gateErr
 }
 
 func printComparison(comparison crucible.RunComparison) {
+	if !comparison.Compatible {
+		fmt.Printf("incompatible,%s\n", strings.Join(comparison.Incompatibilities, " | "))
+	}
 	fmt.Println("subject,baseline,candidate,delta,missing")
 	for _, diff := range comparison.Subjects {
 		fmt.Printf(
@@ -486,14 +691,58 @@ func printComparison(comparison crucible.RunComparison) {
 	}
 }
 
-func enforceDropThreshold(comparison crucible.RunComparison, failDrop float64) error {
-	if failDrop <= 0 {
-		return nil
+func enforceDropThreshold(comparison crucible.RunComparison, failDrop float64, failPairwiseDrop float64) error {
+	if !comparison.Compatible {
+		return fmt.Errorf(
+			"eval runs are not comparable: %s",
+			strings.Join(comparison.Incompatibilities, " | "),
+		)
 	}
 	failures := []string{}
 	for _, diff := range comparison.Subjects {
-		if diff.Delta < -failDrop {
+		if diff.Missing {
+			failures = append(failures, fmt.Sprintf("%s missing", diff.Subject))
+		}
+		if diff.CandidateFailures > 0 {
+			failures = append(failures, fmt.Sprintf("%s execution failures=%d", diff.Subject, diff.CandidateFailures))
+		}
+		if diff.CandidateGateFailures > 0 {
+			failures = append(failures, fmt.Sprintf(
+				"%s required evaluator failures=%d",
+				diff.Subject,
+				diff.CandidateGateFailures,
+			))
+		}
+		if diff.CandidateEvaluatorFailures > 0 {
+			failures = append(failures, fmt.Sprintf(
+				"%s evaluator errors=%d",
+				diff.Subject,
+				diff.CandidateEvaluatorFailures,
+			))
+		}
+		if diff.CandidatePairwiseFailures > 0 {
+			failures = append(failures, fmt.Sprintf(
+				"%s pairwise evaluator failures=%d",
+				diff.Subject,
+				diff.CandidatePairwiseFailures,
+			))
+		}
+		if failPairwiseDrop >= 0 && diff.PairwiseWinRateDelta < -failPairwiseDrop {
+			failures = append(failures, fmt.Sprintf("%s pairwise %.4f", diff.Subject, diff.PairwiseWinRateDelta))
+		}
+		if failDrop >= 0 && diff.Delta < -failDrop {
 			failures = append(failures, fmt.Sprintf("%s %.4f", diff.Subject, diff.Delta))
+		}
+	}
+	for _, diff := range comparison.Cases {
+		if diff.CandidateError != "" {
+			failures = append(failures, fmt.Sprintf("%s/%s/%d execution", diff.Subject, diff.CaseID, diff.Repeat))
+		}
+		if len(diff.CandidateGateFailures) > 0 {
+			failures = append(failures, fmt.Sprintf("%s/%s/%d required evaluator", diff.Subject, diff.CaseID, diff.Repeat))
+		}
+		if len(diff.CandidateEvaluatorFailures) > 0 {
+			failures = append(failures, fmt.Sprintf("%s/%s/%d evaluator error", diff.Subject, diff.CaseID, diff.Repeat))
 		}
 	}
 	if len(failures) > 0 {

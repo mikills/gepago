@@ -79,18 +79,18 @@ func (c anthropicChatClient) post(ctx context.Context, data []byte) ([]byte, err
 		return nil, err
 	}
 	defer resp.Body.Close()
-	var response bytes.Buffer
-	if _, err := response.ReadFrom(resp.Body); err != nil {
+	response, err := readHTTPResponse(resp.Body)
+	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf(
 			"anthropic agent chat status %d: %s",
 			resp.StatusCode,
-			strings.TrimSpace(response.String()),
+			strings.TrimSpace(string(response)),
 		)
 	}
-	return response.Bytes(), nil
+	return response, nil
 }
 
 type anthropicRequest struct {
@@ -124,6 +124,7 @@ type anthropicTool struct {
 }
 
 type anthropicResponse struct {
+	Model      string                  `json:"model"`
 	Content    []anthropicContentBlock `json:"content"`
 	StopReason string                  `json:"stop_reason"`
 	Usage      struct {
@@ -214,9 +215,10 @@ func decodeAnthropicResponse(data []byte) (agents.ChatResponse, error) {
 		TotalTokens:      response.Usage.InputTokens + response.Usage.OutputTokens,
 	}
 	return agents.ChatResponse{
-		Message:      message,
-		Usage:        usage,
-		FinishReason: anthropicFinishReason(response.StopReason),
+		Message:       message,
+		Usage:         usage,
+		FinishReason:  anthropicFinishReason(response.StopReason),
+		ResolvedModel: response.Model,
 	}, nil
 }
 

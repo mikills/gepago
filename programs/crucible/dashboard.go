@@ -3,7 +3,6 @@ package crucible
 import (
 	"bytes"
 	"html/template"
-	"os"
 	"time"
 )
 
@@ -13,7 +12,7 @@ func WriteDashboardHTML(path string, index RunStoreIndex) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(html), publicFileMode)
+	return writeArtifactFile(path, []byte(html))
 }
 
 // DashboardHTML renders local run history and trend data.
@@ -42,11 +41,11 @@ main { max-width: 1100px; margin: 0 auto; padding: 32px; }
 section { background:white; border:1px solid #dbe4f0; border-radius:8px; padding:20px; margin-bottom:18px; box-shadow:0 1px 2px rgba(15,23,42,.04); }
 h1 { margin:0 0 6px; } h2 { margin:0 0 14px; font-size:18px; } .muted { color:#64748b; }
 table { width:100%; border-collapse:collapse; font-size:14px; } th,td { padding:10px; border-bottom:1px solid #dbe4f0; text-align:left; } th { background:#f1f5f9; color:#475569; }
-.badge { display:inline-flex; border-radius:999px; padding:3px 9px; font-size:12px; font-weight:700; background:#dcfce7; color:#166534; }
+.badge { display:inline-flex; border-radius:999px; padding:3px 9px; font-size:12px; font-weight:700; background:#dcfce7; color:#166534; } .badge.fail { background:#fee2e2; color:#991b1b; }
 .empty { color:#64748b; padding:24px; text-align:center; border:1px dashed #cbd5e1; border-radius:8px; }
 </style></head><body><main>
 <header style="margin-bottom:22px"><h1>Crucible Dashboard</h1><div class="muted">Generated {{.Generated.Format "2006-01-02 15:04:05 MST"}}</div></header>
 <section><h2>Run history</h2>{{if .Index.Runs}}<table><thead><tr><th>Run</th><th>Suite</th><th>Started</th><th>Subjects</th><th>Cases</th><th>Best subject</th><th>Best score</th><th>Artifact</th></tr></thead><tbody>
-{{range .Index.Runs}}<tr><td><strong>{{.RunID}}</strong></td><td>{{.SuiteName}}</td><td>{{.StartedAt.Format "2006-01-02 15:04"}}</td><td>{{.Subjects}}</td><td>{{.Cases}}</td><td>{{.BestSubject}}</td><td><span class="badge">{{percent .BestScore}}</span></td><td><a href="{{.Path}}">JSON</a></td></tr>{{end}}
+{{range .Index.Runs}}<tr><td><strong>{{.RunID}}</strong></td><td>{{.SuiteName}}</td><td>{{.StartedAt.Format "2006-01-02 15:04"}}</td><td>{{.Subjects}}</td><td>{{.Cases}}</td><td>{{.BestSubject}}</td><td><span class="badge {{if .GateFailed}}fail{{end}}">{{percent .BestScore}}</span></td><td><a href="{{.Path}}">JSON</a></td></tr>{{end}}
 </tbody></table>{{else}}<div class="empty">No runs recorded yet.</div>{{end}}</section>
 </main></body></html>`))

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os/exec"
 	"strings"
@@ -39,7 +38,7 @@ func (s HTTPSubject) Run(ctx context.Context, input gepa.Prediction) (SubjectOut
 		return SubjectOutput{}, err
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := readHTTPResponse(resp.Body)
 	if err != nil {
 		return SubjectOutput{}, err
 	}
@@ -94,10 +93,10 @@ func (s CommandSubject) Run(ctx context.Context, input gepa.Prediction) (Subject
 	cmd := exec.CommandContext(ctx, s.Command, s.Args...)
 	cmd.Stdin = bytes.NewReader(stdin)
 	cmd.Env = append(cmd.Environ(), s.Env...)
-	stdout, err := cmd.Output()
+	stdout, stderr, err := runCommandOutput(cmd)
 	output := SubjectOutput{Raw: string(stdout)}
 	if err != nil {
-		return output, commandError(err)
+		return output, commandError(err, stderr)
 	}
 	value, err := parseRawOutput(string(stdout), s.ParseJSON, s.OutputField)
 	if err != nil {
@@ -107,9 +106,9 @@ func (s CommandSubject) Run(ctx context.Context, input gepa.Prediction) (Subject
 	return output, nil
 }
 
-func commandError(err error) error {
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		return fmt.Errorf("command subject failed: %w: %s", err, strings.TrimSpace(string(exitErr.Stderr)))
+func commandError(err error, stderr []byte) error {
+	if _, ok := err.(*exec.ExitError); ok {
+		return fmt.Errorf("command subject failed: %w: %s", err, strings.TrimSpace(string(stderr)))
 	}
 	return err
 }

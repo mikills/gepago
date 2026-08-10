@@ -159,7 +159,7 @@ func TestLoadSuiteJSONAndBuildEvaluators(t *testing.T) {
 		"cases":[{"id":"case-1","input":{"text":"hello"},"expected":{"text":"hello"}}],
 		"evaluators":[{"type":"exact_match","fields":["text"],"weight":2}]
 	}`
-	require.NoError(t, os.WriteFile(path, []byte(data), publicFileMode))
+	require.NoError(t, os.WriteFile(path, []byte(data), artifactFileMode))
 	suite, err := LoadSuiteJSON(path)
 	require.NoError(t, err)
 	evaluators, err := BuildEvaluators(suite.Evaluators, EvaluatorFactoryConfig{})
@@ -233,8 +233,50 @@ func TestConfiguredSubjects(t *testing.T) {
 func TestProviderAgentSubjects(t *testing.T) {
 	t.Run("openai chat completions", testOpenAIAgentSubject)
 	t.Run("openai responses", testOpenAIResponsesAgentSubject)
+	t.Run("openapi provider alias", func(t *testing.T) {
+		_, err := BuildSubject(SubjectSpec{
+			Type: "agent", Provider: "openapi", Name: "agent",
+			Model: "accounts/fireworks/models/test-model", BaseURL: "http://localhost.invalid",
+		})
+		require.NoError(t, err)
+	})
 	t.Run("anthropic", testAnthropicAgentSubject)
 	t.Run("google", testGoogleAgentSubject)
+}
+
+func TestOpenAPIModelSubjectUsesConfiguredEnvironmentKey(t *testing.T) {
+	t.Setenv("FIREWORKS_API_KEY", "fireworks-test-key")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/chat/completions", r.URL.Path)
+		assert.Equal(t, "Bearer fireworks-test-key", r.Header.Get("Authorization"))
+		var request map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		assert.Equal(t, "accounts/fireworks/models/test-model", request["model"])
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"model":"accounts/fireworks/models/resolved-test-model",
+			"choices":[{"message":{"role":"assistant","content":"{\"answer\":\"ok\"}"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}
+		}`)
+	}))
+	defer server.Close()
+
+	subject, err := BuildSubject(SubjectSpec{
+		Type: "openapi", Name: "fireworks-model",
+		Model: "accounts/fireworks/models/test-model", BaseURL: server.URL,
+		APIKeyEnv: "FIREWORKS_API_KEY", ParseJSON: true,
+	})
+	require.NoError(t, err)
+	output, err := subject.Run(context.Background(), gepa.Prediction{"prompt": "Return JSON"})
+	require.NoError(t, err)
+	assert.Equal(t, "ok", output.Value["answer"])
+	assert.Equal(t, 5, output.Usage.TotalTokens)
+	assert.Equal(t, "accounts/fireworks/models/resolved-test-model", output.Metadata["resolved_model"])
+
+	metadata := SubjectMetadataFromConfig(SubjectConfig{Subjects: []SubjectSpec{{
+		Type: "openapi", Name: "fireworks-model", Model: "accounts/fireworks/models/test-model",
+	}}})
+	assert.Equal(t, "openapi", metadata["fireworks-model"].Provider)
 }
 
 func testOpenAIAgentSubject(t *testing.T) {

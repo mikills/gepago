@@ -45,6 +45,7 @@ type LanguageModel struct {
 	maxTokens   int
 	temperature *float64
 	lastUsage   gepa.Usage
+	lastModel   string
 }
 
 // NewLanguageModel constructs a Google Gemini language model.
@@ -78,6 +79,7 @@ func (m *LanguageModel) Generate(ctx context.Context, prompt string) (string, er
 		return "", fmt.Errorf("google reflection completion: %w", err)
 	}
 	m.lastUsage = resp.Usage
+	m.lastModel = resp.ResolvedModel
 	content := strings.TrimSpace(resp.Message.Content)
 	if content == "" {
 		return "", errors.New("google reflection completion: empty content")
@@ -88,6 +90,8 @@ func (m *LanguageModel) Generate(ctx context.Context, prompt string) (string, er
 func (m *LanguageModel) LastUsage() gepa.Usage {
 	return m.lastUsage
 }
+
+func (m *LanguageModel) LastResolvedModel() string { return m.lastModel }
 
 // ChatClient adapts Google Gemini generateContent to agents.ChatClient.
 type ChatClient struct {
@@ -240,7 +244,8 @@ type googleFunctionDeclaration struct {
 }
 
 type googleGenerateResponse struct {
-	Candidates []struct {
+	ModelVersion string `json:"modelVersion"`
+	Candidates   []struct {
 		Content      googleContent `json:"content"`
 		FinishReason string        `json:"finishReason"`
 	} `json:"candidates"`
@@ -434,9 +439,10 @@ func decodeGoogleResponse(data []byte, toolNames map[string]string) (agents.Chat
 		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	}
 	return agents.ChatResponse{
-		Message:      message,
-		Usage:        usage,
-		FinishReason: googleFinishReason(candidate.FinishReason, message),
+		Message:       message,
+		Usage:         usage,
+		FinishReason:  googleFinishReason(candidate.FinishReason, message),
+		ResolvedModel: response.ModelVersion,
 	}, nil
 }
 

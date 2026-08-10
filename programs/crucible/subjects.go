@@ -89,14 +89,23 @@ func (s RawModelSubject) Run(ctx context.Context, input gepa.Prediction) (Subjec
 	if reporter, ok := s.LM.(gepa.UsageReporter); ok {
 		usage = reporter.LastUsage()
 	}
+	metadata := map[string]any{}
+	if reporter, ok := s.LM.(gepa.ResolvedModelReporter); ok {
+		if model := strings.TrimSpace(reporter.LastResolvedModel()); model != "" {
+			metadata["resolved_model"] = model
+		}
+	}
+	if len(metadata) == 0 {
+		metadata = nil
+	}
 	if err != nil {
-		return SubjectOutput{Raw: raw, Usage: usage}, err
+		return SubjectOutput{Raw: raw, Usage: usage, Metadata: metadata}, err
 	}
 	value, parseErr := s.parseRaw(raw)
 	if parseErr != nil {
-		return SubjectOutput{Raw: raw, Usage: usage}, parseErr
+		return SubjectOutput{Raw: raw, Usage: usage, Metadata: metadata}, parseErr
 	}
-	return SubjectOutput{Value: value, Raw: raw, Usage: usage}, nil
+	return SubjectOutput{Value: value, Raw: raw, Usage: usage, Metadata: metadata}, nil
 }
 
 func renderPromptTemplate(promptTemplate string, input gepa.Prediction) (string, error) {

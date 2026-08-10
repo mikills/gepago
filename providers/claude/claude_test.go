@@ -37,7 +37,7 @@ func TestClaudeLanguageModel(t *testing.T) {
 				t.Fatalf("request = %#v", request)
 			}
 			w.Header().Set("content-type", "application/json")
-			_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"improved prompt"}]}`))
+			_, _ = w.Write([]byte(`{"model":"claude-resolved","content":[{"type":"text","text":"improved prompt"}]}`))
 		}))
 		defer server.Close()
 
@@ -56,6 +56,9 @@ func TestClaudeLanguageModel(t *testing.T) {
 		}
 		if text != "improved prompt" {
 			t.Fatalf("Generate() = %q", text)
+		}
+		if lm.LastResolvedModel() != "claude-resolved" {
+			t.Fatalf("LastResolvedModel() = %q", lm.LastResolvedModel())
 		}
 	})
 }

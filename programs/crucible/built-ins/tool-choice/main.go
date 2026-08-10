@@ -16,7 +16,7 @@ import (
 
 const (
 	analyzeFileTool = "Analyze file"
-	publicDirMode   = 0o755
+	artifactDirMode = 0o700
 )
 
 var commandContext = context.Background()
@@ -147,7 +147,10 @@ func searchFiles(_ context.Context, _ *agents.Memory, arguments string) (string,
 }
 
 func writeArtifacts(result crucible.RunResult) error {
-	if err := os.MkdirAll(".crucible", publicDirMode); err != nil {
+	if err := os.MkdirAll(".crucible", artifactDirMode); err != nil {
+		return err
+	}
+	if err := os.Chmod(".crucible", artifactDirMode); err != nil {
 		return err
 	}
 	if err := crucible.WriteRunJSON(".crucible/tool-choice.json", result); err != nil {

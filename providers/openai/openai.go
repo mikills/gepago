@@ -39,6 +39,7 @@ type LanguageModel struct {
 	maxTokens   int
 	temperature *float64
 	lastUsage   gepa.Usage
+	lastModel   string
 }
 
 // NewLanguageModel constructs an OpenAI or OpenAI-compatible language model.
@@ -92,6 +93,7 @@ func (m *LanguageModel) Generate(ctx context.Context, prompt string) (string, er
 		CompletionTokens: int(completion.Usage.CompletionTokens),
 		TotalTokens:      int(completion.Usage.TotalTokens),
 	}
+	m.lastModel = completion.Model
 	if len(completion.Choices) == 0 {
 		return "", errors.New("openai reflection completion: no choices returned")
 	}
@@ -105,3 +107,5 @@ func (m *LanguageModel) Generate(ctx context.Context, prompt string) (string, er
 func (m *LanguageModel) LastUsage() gepa.Usage {
 	return m.lastUsage
 }
+
+func (m *LanguageModel) LastResolvedModel() string { return m.lastModel }

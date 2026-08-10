@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -88,14 +89,15 @@ func (r RunRequest) Validate() error {
 
 // RunResult is the transcript, stop reason, usage, and tool calls from an agent run.
 type RunResult struct {
-	Final      Message          `json:"final"`
-	Transcript []Message        `json:"transcript"`
-	Usage      Usage            `json:"usage"`
-	Ledger     gepa.UsageLedger `json:"ledger"`
-	Spans      []gepa.UsageSpan `json:"spans"`
-	StopReason StopReason       `json:"stop_reason"`
-	Turns      int              `json:"turns"`
-	ToolCalls  []ToolCallRecord `json:"tool_calls"`
+	Final          Message          `json:"final"`
+	Transcript     []Message        `json:"transcript"`
+	Usage          Usage            `json:"usage"`
+	Ledger         gepa.UsageLedger `json:"ledger"`
+	Spans          []gepa.UsageSpan `json:"spans"`
+	StopReason     StopReason       `json:"stop_reason"`
+	Turns          int              `json:"turns"`
+	ToolCalls      []ToolCallRecord `json:"tool_calls"`
+	ResolvedModels []string         `json:"resolved_models,omitempty"`
 }
 
 // StopReason explains why an agent run stopped.
@@ -236,6 +238,9 @@ func (r *agentRun) chat(turn int) (ChatResponse, error) {
 		},
 	)
 	resp, err := r.agent.Client.Chat(r.ctx, chatReq)
+	if resolved := strings.TrimSpace(resp.ResolvedModel); resolved != "" {
+		llmSpan.Model = resolved
+	}
 	r.result.Spans = append(r.result.Spans, llmSpan.Finish(resp.Usage, err))
 	r.result.Ledger.ModelCalls++
 	r.result.Ledger = r.result.Ledger.AddUsage(resp.Usage)
@@ -264,6 +269,9 @@ func (r *agentRun) recordChatResponse(turn int, resp ChatResponse) {
 	r.result.Turns = turn
 	r.result.Usage = r.result.Usage.Add(resp.Usage)
 	r.result.Transcript = append(r.result.Transcript, resp.Message)
+	if model := strings.TrimSpace(resp.ResolvedModel); model != "" && !slices.Contains(r.result.ResolvedModels, model) {
+		r.result.ResolvedModels = append(r.result.ResolvedModels, model)
+	}
 	r.agent.fireLLMResponse(
 		r.ctx,
 		r.logger,

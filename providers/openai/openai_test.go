@@ -74,5 +74,8 @@ func TestLanguageModel(t *testing.T) {
 		if text != "improved prompt" {
 			t.Fatalf("Generate() = %q", text)
 		}
+		if lm.LastResolvedModel() != "compatible-model" {
+			t.Fatalf("LastResolvedModel() = %q", lm.LastResolvedModel())
+		}
 	})
 }

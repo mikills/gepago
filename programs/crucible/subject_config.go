@@ -64,6 +64,12 @@ type SubjectBuildOptions struct {
 	AllowCommand bool
 }
 
+// SubjectConfigFingerprint returns a stable identity for all configured subject behaviour.
+// Secret values are never written to artifacts, only incorporated into this one-way digest.
+func SubjectConfigFingerprint(config SubjectConfig) (string, error) {
+	return fingerprintValue(config)
+}
+
 // BuildSubjects constructs evaluation subjects from serialized specs.
 func BuildSubjects(config SubjectConfig) ([]Subject, error) {
 	return BuildSubjectsWithOptions(config, SubjectBuildOptions{})
@@ -98,6 +104,7 @@ func init() {
 	RegisterSubjectType("openai", buildModelSubject)
 	RegisterSubjectType("openai-compatible", buildModelSubject)
 	RegisterSubjectType("openai_compatible", buildModelSubject)
+	RegisterSubjectType("openapi", buildModelSubject)
 	RegisterSubjectType("agent", buildAgentSubject)
 	RegisterSubjectType("tool-agent", buildAgentSubject)
 	RegisterSubjectType("http", buildHTTPSubjectFactory)
@@ -160,7 +167,7 @@ func subjectPromptTemplate(spec SubjectSpec) string {
 
 func buildAgentSubject(spec SubjectSpec, _ SubjectBuildOptions) (Subject, error) {
 	provider := normalizeSubjectType(spec.Provider)
-	if provider == "" || provider == "openai" || provider == "openai-compatible" {
+	if provider == "" || provider == "openai" || provider == "openai-compatible" || provider == "openapi" {
 		return newOpenAIAgentSubject(spec)
 	}
 	if provider == "anthropic" || provider == "claude" {

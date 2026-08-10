@@ -13,6 +13,12 @@ type LanguageModel interface {
 	Generate(ctx context.Context, prompt string) (string, error)
 }
 
+// ResolvedModelReporter reports the provider-resolved model from the most recent call.
+// Providers may omit it when their response protocol does not expose that identity.
+type ResolvedModelReporter interface {
+	LastResolvedModel() string
+}
+
 // LanguageModelFunc adapts a function to the LanguageModel interface.
 type LanguageModelFunc func(ctx context.Context, prompt string) (string, error)
 

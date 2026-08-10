@@ -96,6 +96,7 @@ func TestChatClient(t *testing.T) {
 func TestLanguageModel(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{
+			"modelVersion":"gemini-resolved",
 			"candidates":[{"content":{"role":"model","parts":[{"text":"reflection"}]},"finishReason":"STOP"}],
 			"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"totalTokenCount":10}
 		}`)
@@ -107,4 +108,5 @@ func TestLanguageModel(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "reflection", out)
 	assert.Equal(t, 10, lm.LastUsage().TotalTokens)
+	assert.Equal(t, "gemini-resolved", lm.LastResolvedModel())
 }

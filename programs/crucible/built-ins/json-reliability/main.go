@@ -11,7 +11,7 @@ import (
 	"github.com/mikills/gepago/programs/crucible"
 )
 
-const publicDirMode = 0o755
+const artifactDirMode = 0o700
 
 var commandContext = context.Background()
 
@@ -80,7 +80,10 @@ func answerFor(prompt string) string {
 }
 
 func writeArtifacts(result crucible.RunResult) error {
-	if err := os.MkdirAll(".crucible", publicDirMode); err != nil {
+	if err := os.MkdirAll(".crucible", artifactDirMode); err != nil {
+		return err
+	}
+	if err := os.Chmod(".crucible", artifactDirMode); err != nil {
 		return err
 	}
 	if err := crucible.WriteRunJSON(".crucible/json-reliability.json", result); err != nil {
