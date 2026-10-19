@@ -107,10 +107,10 @@ func (p Predict) RunCandidate(ctx context.Context, candidate Candidate, inputs P
 		return nil, err
 	}
 	raw, err := p.LM.Generate(ctx, prompt)
+	recordUsage(ctx, languageModelUsage(p.LM))
 	if err != nil {
 		return nil, err
 	}
-	recordUsage(ctx, languageModelUsage(p.LM))
 	return p.parseOrRepair(ctx, raw)
 }
 
@@ -158,10 +158,10 @@ func (p Predict) parseOrRepair(ctx context.Context, raw string) (Prediction, err
 	}
 	for attempt := 0; attempt < p.MaxParseRetries; attempt++ {
 		repaired, repairErr := repairLM.Generate(ctx, p.RepairPrompt(raw, err))
+		recordUsage(ctx, languageModelUsage(repairLM))
 		if repairErr != nil {
 			return nil, repairErr
 		}
-		recordUsage(ctx, languageModelUsage(repairLM))
 		prediction, err = ParsePrediction(repaired)
 		if err == nil {
 			return prediction, nil

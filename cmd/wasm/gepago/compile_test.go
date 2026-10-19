@@ -297,3 +297,26 @@ func TestCompileJudgeUsage(t *testing.T) {
 		t.Fatalf("judge usage was not included in optimizer accounting: %+v", value.State.Ledger)
 	}
 }
+
+func TestCompileLanguageModelResetsUsageWhenCallIsCancelled(t *testing.T) {
+	model := newCompileLanguageModel(compileModelInvokerFunc(
+		func(context.Context, compileModelRequest) (compileModelResult, error) {
+			return compileModelResult{Text: "ok", Usage: gepa.Usage{TotalTokens: 5}}, nil
+		},
+	), "program")
+	if _, err := model.Generate(context.Background(), "prompt"); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if got := model.LastUsage().TotalTokens; got != 5 {
+		t.Fatalf("LastUsage().TotalTokens = %d, want 5", got)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := model.Generate(ctx, "prompt"); err != context.Canceled {
+		t.Fatalf("Generate() error = %v, want context.Canceled", err)
+	}
+	if got := model.LastUsage(); got != (gepa.Usage{}) {
+		t.Fatalf("LastUsage() after cancelled call = %+v, want zero", got)
+	}
+}

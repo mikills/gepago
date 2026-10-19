@@ -22,7 +22,11 @@ type PipelineStep struct {
 	OutputPrefix string
 }
 
-// PipelineProgram composes multiple programmes into one optimisable programme.
+// PipelineProgram composes multiple programmes into one optimisable programme, passing one
+// untyped Prediction between steps.
+//
+// New code should use Pipeline, built with PipelineSpec, which checks the state contract
+// between steps before a run. PipelineProgram remains for the WASM compile bridge.
 type PipelineProgram struct {
 	Steps     []PipelineStep
 	ReturnAll bool
@@ -84,7 +88,7 @@ func (p PipelineProgram) RunCandidate(ctx context.Context, candidate Candidate, 
 		if err != nil {
 			return nil, fmt.Errorf("pipeline step %q: %w", step.Name, err)
 		}
-		outputs, err := step.Program.RunCandidate(ctx, stepCandidate(candidate, step), stepInputs)
+		outputs, err := step.Program.RunCandidate(ctx, stepCandidate(candidate, step.Name), stepInputs)
 		if err != nil {
 			return nil, fmt.Errorf("pipeline step %q: %w", step.Name, err)
 		}
@@ -105,9 +109,9 @@ func (p PipelineProgram) LastUsage() Usage {
 	return usage
 }
 
-func stepCandidate(candidate Candidate, step PipelineStep) Candidate {
+func stepCandidate(candidate Candidate, stepName string) Candidate {
 	out := Candidate{}
-	prefix := strings.TrimSpace(step.Name) + "."
+	prefix := strings.TrimSpace(stepName) + "."
 	for key, value := range candidate {
 		component, ok := strings.CutPrefix(key, prefix)
 		if ok {

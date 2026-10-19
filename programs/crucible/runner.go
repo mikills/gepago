@@ -390,13 +390,16 @@ func runSubjectCase(
 		Output:  output,
 		Cached:  cached,
 	}
+	if err != nil {
+		item.Error = err.Error()
+		if reserveRetainedOutput(retainedBytes, output) != nil {
+			item.Output = SubjectOutput{Usage: output.Usage, Latency: output.Latency}
+		}
+		return item
+	}
 	if sizeErr := reserveRetainedOutput(retainedBytes, output); sizeErr != nil {
 		item.Output = SubjectOutput{Usage: output.Usage, Latency: output.Latency}
 		item.Error = sizeErr.Error()
-		return item
-	}
-	if err != nil {
-		item.Error = err.Error()
 		return item
 	}
 	input := EvalInput{Suite: config.Suite, Case: job.evalCase, Subject: job.subject.Name(), Output: output}

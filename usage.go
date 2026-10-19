@@ -6,7 +6,9 @@ import (
 	"time"
 )
 
-// UsageReporter exposes token usage from the most recent provider call.
+// UsageReporter exposes token usage from the most recent provider call. Implementations must
+// reset it when each call starts, so a call that fails before the provider reports usage
+// returns zero rather than the previous call's usage: callers record it for failed calls too.
 type UsageReporter interface {
 	LastUsage() Usage
 }

@@ -165,19 +165,25 @@ func (e ProgramEvaluator) Evaluate(
 		}
 		runCtx, collector := WithUsageCollector(ctx)
 		actual, err := e.Program.RunCandidate(runCtx, candidate, ioExample.Inputs)
-		if err != nil {
-			return EvaluationResult{}, fmt.Errorf("evaluate example %q: run candidate: %w", example.ID, err)
-		}
 		exampleUsage := collector.Usage()
 		if isZeroUsage(exampleUsage) {
 			exampleUsage = ProgramLastUsage(e.Program)
 		}
 		usage = usage.Add(exampleUsage)
+		if errors.Is(err, ErrInvalidOutput) {
+			items = append(items, invalidOutputItem(example.ID, ioExample, actual, err))
+			continue
+		}
+		if err != nil {
+			err = fmt.Errorf("evaluate example %q: run candidate: %w", example.ID, err)
+			return EvaluationResult{Usage: usage}, err
+		}
 		metricCtx, metricCollector := WithUsageCollector(ctx)
 		metricResult, err := e.Metric.Score(metricCtx, ioExample.Expected, actual)
 		usage = usage.Add(metricCollector.Usage())
 		if err != nil {
-			return EvaluationResult{}, fmt.Errorf("evaluate example %q: score prediction: %w", example.ID, err)
+			err = fmt.Errorf("evaluate example %q: score prediction: %w", example.ID, err)
+			return EvaluationResult{Usage: usage}, err
 		}
 		items = append(items, EvaluationItem{
 			ExampleID:       example.ID,
@@ -194,6 +200,27 @@ func (e ProgramEvaluator) Evaluate(
 		})
 	}
 	return EvaluationResult{Items: items, Usage: usage}, nil
+}
+
+// invalidOutputItem scores an example whose programme output broke its contract as zero, with
+// the error as feedback, so reflection can learn from it instead of optimisation stopping.
+func invalidOutputItem(exampleID string, example IOExample, actual Prediction, err error) EvaluationItem {
+	var details map[string]any
+	var stepErr *StepError
+	if errors.As(err, &stepErr) {
+		details = stepErr.Details
+	}
+	return EvaluationItem{
+		ExampleID: exampleID,
+		Output:    actual,
+		SideInfo: map[string]any{
+			"inputs":   example.Inputs,
+			"expected": example.Expected,
+			"actual":   actual,
+			"feedback": err.Error(),
+			"details":  details,
+		},
+	}
 }
 
 // ProgramLastUsage returns the most recent model usage reported by a programme's language models.

@@ -65,6 +65,9 @@ func (m *compileLanguageModel) Generate(ctx context.Context, prompt string) (str
 	if m == nil || m.invoker == nil {
 		return "", errors.New("compile host model is required")
 	}
+	m.mu.Lock()
+	m.lastUsage = gepa.Usage{}
+	m.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -72,7 +75,6 @@ func (m *compileLanguageModel) Generate(ctx context.Context, prompt string) (str
 	m.mu.Lock()
 	m.nextAttempt++
 	attempt := m.nextAttempt
-	m.lastUsage = gepa.Usage{}
 	m.mu.Unlock()
 
 	result, err := m.invoker.GenerateModel(ctx, compileModelRequest{
@@ -84,13 +86,12 @@ func (m *compileLanguageModel) Generate(ctx context.Context, prompt string) (str
 	if err != nil {
 		return "", err
 	}
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-
 	m.mu.Lock()
 	m.lastUsage = result.Usage
 	m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	return result.Text, nil
 }
 

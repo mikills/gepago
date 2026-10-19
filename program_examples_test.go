@@ -126,6 +126,67 @@ func ExamplePipelineProgram() {
 	// Amount exceeds the automatic approval threshold.
 }
 
+func ExamplePipelineSpec_Build() {
+	ctx := context.Background()
+	document := gepa.Key[string]{Name: "document"}
+	amount := gepa.Key[int]{Name: "amount"}
+	decision := gepa.Key[string]{Name: "decision"}
+
+	extract := gepa.NewProgramStep("extract", gepa.Predict{
+		Signature: gepa.Signature{
+			Name:    "extract_amount",
+			Inputs:  []gepa.Field{{Name: "document"}},
+			Outputs: []gepa.Field{{Name: "amount"}},
+		},
+		Instruction: "Extract the obligation amount.",
+		LM: gepa.LanguageModelFunc(func(context.Context, string) (string, error) {
+			return `{"amount":125000}`, nil
+		}),
+	}, []gepa.KeyRef{document.Ref()}, []gepa.KeyRef{amount.Ref()})
+
+	decide := gepa.NewStep(
+		"decide",
+		[]gepa.KeyRef{amount.Ref()},
+		[]gepa.KeyRef{decision.Ref()},
+		func(_ context.Context, s gepa.State) error {
+			value, err := amount.Get(s)
+			if err != nil {
+				return err
+			}
+			if value > 100000 {
+				decision.Set(s, "needs_review")
+			} else {
+				decision.Set(s, "approve")
+			}
+			return nil
+		},
+	)
+
+	pipeline, err := gepa.PipelineSpec{
+		Inputs: []gepa.KeyRef{document.Ref()},
+		Steps:  []gepa.Step{extract, decide},
+	}.Build()
+	if err != nil {
+		panic(err)
+	}
+
+	inputs := gepa.NewState(nil)
+	document.Set(inputs, "Bond obligation for 125,000 due 30 June 2026.")
+	out, err := pipeline.Run(ctx, inputs)
+	if err != nil {
+		panic(err)
+	}
+	result, err := decision.Get(out)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(result)
+	fmt.Println(pipeline.SeedCandidate())
+	// Output:
+	// needs_review
+	// map[extract.instruction:Extract the obligation amount.]
+}
+
 func ExampleLLMJudgeMetric() {
 	metric := gepa.LLMJudgeMetric{
 		LM: gepa.LanguageModelFunc(func(context.Context, string) (string, error) {
