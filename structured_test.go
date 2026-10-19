@@ -1,4 +1,4 @@
-package gepa
+package gepa_test
 
 import (
 	"context"
@@ -7,202 +7,181 @@ import (
 	"strings"
 	"testing"
 
+	gepa "github.com/mikills/gepago"
+	"github.com/mikills/gepago/gepatest"
 	"github.com/stretchr/testify/require"
 )
 
-// structuredModel is a StructuredGenerator that records what each call received and replies
-// with its scripted texts in order, repeating the last one.
-type structuredModel struct {
-	replies []string
-	errs    []error
-	calls   []structuredCall
+// threeTokens is the usage of every scripted reply in these tests.
+var threeTokens = gepa.Usage{PromptTokens: 1, CompletionTokens: 2, TotalTokens: 3}
+
+// reply is a scripted reply with text that spent threeTokens.
+func reply(text string) gepatest.Reply {
+	return gepatest.Text(text).WithUsage(threeTokens)
 }
 
-type structuredCall struct {
-	prompt string
-	format *ResponseFormat
-}
-
-func (m *structuredModel) next() (Generation, error) {
-	i := len(m.calls) - 1
-	var err error
-	if i < len(m.errs) {
-		err = m.errs[i]
-	}
-	reply := m.replies[min(i, len(m.replies)-1)]
-	usage := Usage{PromptTokens: 1, CompletionTokens: 2, TotalTokens: 3}
-	return Generation{Text: reply, Usage: usage, FinishReason: FinishStop}, err
-}
-
-func (m *structuredModel) Generate(_ context.Context, prompt string) (Generation, error) {
-	m.calls = append(m.calls, structuredCall{prompt: prompt})
-	return m.next()
-}
-
-func (m *structuredModel) GenerateStructured(
-	_ context.Context,
-	prompt string,
-	format ResponseFormat,
-) (Generation, error) {
-	m.calls = append(m.calls, structuredCall{prompt: prompt, format: &format})
-	return m.next()
-}
-
-func typedQASignature() Signature {
-	return Signature{
+func typedQASignature() gepa.Signature {
+	return gepa.Signature{
 		Name:    "qa",
-		Inputs:  []Field{{Name: "question"}},
-		Outputs: []Field{{Name: "answer", Type: "string"}, {Name: "confidence", Type: "float64"}},
+		Inputs:  []gepa.Field{{Name: "question"}},
+		Outputs: []gepa.Field{{Name: "answer", Type: "string"}, {Name: "confidence", Type: "float64"}},
 	}
 }
 
 func TestPredictPassesTheSchemaToAStructuredModel(t *testing.T) {
-	lm := &structuredModel{replies: []string{`{"answer": "4", "confidence": 0.9}`}}
-	program := Predict{Signature: typedQASignature(), Instruction: "Answer.", LM: lm}
+	lm := gepatest.NewFakeGenerator().Default(reply(`{"answer": "4", "confidence": 0.9}`))
+	program := gepa.Predict{Signature: typedQASignature(), Instruction: "Answer.", LM: lm}
 
-	got, err := program.Run(context.Background(), Prediction{"question": "2+2?"})
+	got, err := program.Run(context.Background(), gepa.Prediction{"question": "2+2?"})
 
 	require.NoError(t, err)
 	require.Equal(t, "4", got["answer"])
-	require.Len(t, lm.calls, 1)
+	calls := lm.Calls()
+	require.Len(t, calls, 1)
+	require.Equal(t, gepatest.MethodGenerateStructured, calls[0].Method)
 	wantFormat, err := program.Signature.ResponseFormat()
 	require.NoError(t, err)
-	require.NotNil(t, lm.calls[0].format, "a structured model must receive the response format")
-	require.Equal(t, wantFormat, *lm.calls[0].format)
-	require.True(t, lm.calls[0].format.Strict)
-	wantPrompt, err := program.BuildPrompt(program.SeedCandidate(), Prediction{"question": "2+2?"})
+	require.NotNil(t, calls[0].Format, "a structured model must receive the response format")
+	require.Equal(t, wantFormat, *calls[0].Format)
+	require.True(t, calls[0].Format.Strict)
+	wantPrompt, err := program.BuildPrompt(program.SeedCandidate(), gepa.Prediction{"question": "2+2?"})
 	require.NoError(t, err)
-	require.Equal(t, wantPrompt, lm.calls[0].prompt, "the prompt is the same on both paths")
+	require.Equal(t, wantPrompt, calls[0].Prompt, "the prompt is the same on both paths")
 }
 
 func TestPredictSendsThePromptAloneToAPlainModel(t *testing.T) {
-	var prompts []string
-	lm := GeneratorFunc(func(_ context.Context, prompt string) (Generation, error) {
-		prompts = append(prompts, prompt)
-		return Generation{Text: `{"answer": "4", "confidence": 0.9}`}, nil
-	})
-	program := Predict{Signature: typedQASignature(), Instruction: "Answer.", LM: lm}
+	lm := gepatest.NewFakeGenerator().Default(gepatest.Text(`{"answer": "4", "confidence": 0.9}`))
+	program := gepa.Predict{Signature: typedQASignature(), Instruction: "Answer.", LM: lm.Plain()}
 
-	_, err := program.Run(context.Background(), Prediction{"question": "2+2?"})
+	_, err := program.Run(context.Background(), gepa.Prediction{"question": "2+2?"})
 
 	require.NoError(t, err)
-	require.Len(t, prompts, 1)
-	require.Contains(t, prompts[0], "Return only a JSON object with these output fields: answer, confidence.")
-	require.Contains(t, prompts[0], "The JSON object must match this JSON schema:\n```json\n{\n  \"type\": \"object\"")
-	require.Contains(t, prompts[0], `"confidence": {`+"\n"+`      "type": "number"`)
+	calls := lm.Calls()
+	require.Len(t, calls, 1)
+	require.Equal(t, gepatest.MethodGenerate, calls[0].Method)
+	require.Nil(t, calls[0].Format)
+	require.Contains(t, calls[0].Prompt, "Return only a JSON object with these output fields: answer, confidence.")
+	require.Contains(t, calls[0].Prompt, "The JSON object must match this JSON schema:\n```json\n{\n  \"type\": \"object\"")
+	require.Contains(t, calls[0].Prompt, `"confidence": {`+"\n"+`      "type": "number"`)
 }
 
 func TestBuildPromptAddsTheSchemaOnlyForTypedOutputs(t *testing.T) {
-	untyped := Predict{Signature: Signature{Inputs: []Field{{Name: "q"}}, Outputs: []Field{{Name: "a"}}}}
-	prompt, err := untyped.BuildPrompt(Candidate{}, Prediction{"q": "?"})
+	untyped := gepa.Predict{Signature: gepa.Signature{Inputs: []gepa.Field{{Name: "q"}}, Outputs: []gepa.Field{{Name: "a"}}}}
+	prompt, err := untyped.BuildPrompt(gepa.Candidate{}, gepa.Prediction{"q": "?"})
 	require.NoError(t, err)
 	require.True(t, strings.HasSuffix(prompt, "Return only a JSON object with these output fields: a."))
 
-	optional := Predict{
-		Signature: Signature{Inputs: []Field{{Name: "q"}}, Outputs: []Field{{Name: "a", Optional: true}}},
+	optional := gepa.Predict{
+		Signature: gepa.Signature{Inputs: []gepa.Field{{Name: "q"}}, Outputs: []gepa.Field{{Name: "a", Optional: true}}},
 	}
-	prompt, err = optional.BuildPrompt(Candidate{}, Prediction{"q": "?"})
+	prompt, err = optional.BuildPrompt(gepa.Candidate{}, gepa.Prediction{"q": "?"})
 	require.NoError(t, err)
 	require.Contains(t, prompt, "JSON schema")
 
-	invalid := Predict{Signature: Signature{Inputs: []Field{{Name: "q"}}, Outputs: []Field{{Name: "a", Type: "text"}}}}
-	_, err = invalid.BuildPrompt(Candidate{}, Prediction{"q": "?"})
+	invalid := gepa.Predict{Signature: gepa.Signature{Inputs: []gepa.Field{{Name: "q"}}, Outputs: []gepa.Field{{Name: "a", Type: "text"}}}}
+	_, err = invalid.BuildPrompt(gepa.Candidate{}, gepa.Prediction{"q": "?"})
 	require.ErrorContains(t, err, `output field "a": type "text" is not supported`)
 }
 
 func TestGenerateWithFormat(t *testing.T) {
-	format := ResponseFormat{Name: "qa", Schema: []byte(`{"type":"object"}`), Strict: true}
-	structured := &structuredModel{replies: []string{"structured"}}
-	got, err := GenerateWithFormat(context.Background(), structured, "prompt", format)
+	format := gepa.ResponseFormat{Name: "qa", Schema: []byte(`{"type":"object"}`), Strict: true}
+	structured := gepatest.NewFakeGenerator().Default(reply("structured"))
+	got, err := gepa.GenerateWithFormat(context.Background(), structured, "prompt", format)
 	require.NoError(t, err)
 	require.Equal(t, "structured", got.Text)
-	require.Equal(t, &format, structured.calls[0].format)
+	require.Equal(t, &format, structured.Calls()[0].Format)
 
-	plain := GeneratorFunc(func(_ context.Context, prompt string) (Generation, error) {
-		return Generation{Text: "plain: " + prompt}, nil
-	})
-	got, err = GenerateWithFormat(context.Background(), plain, "prompt", format)
+	plain := gepatest.NewFakeGenerator().OnPrompt("prompt", gepatest.Text("plain: prompt"))
+	got, err = gepa.GenerateWithFormat(context.Background(), plain.Plain(), "prompt", format)
 	require.NoError(t, err)
 	require.Equal(t, "plain: prompt", got.Text)
+	require.Equal(t, []gepatest.Call{{Method: gepatest.MethodGenerate, Prompt: "prompt", Script: `prompt "prompt"`}},
+		plain.Calls(), "a plain model gets the prompt alone")
 }
 
 func TestRetryingLanguageModelPassesStructuredCallsThrough(t *testing.T) {
-	inner := &structuredModel{
-		replies: []string{`{"answer": "4", "confidence": 1}`},
-		errs:    []error{TransientError(errors.New("overloaded"))},
-	}
-	retrying := &RetryingLanguageModel{LM: inner, MaxAttempts: 2}
-	var _ StructuredGenerator = retrying
-	program := Predict{Signature: typedQASignature(), LM: retrying}
-	ctx, collector := WithUsageCollector(context.Background())
+	inner := gepatest.NewFakeGenerator().Default(
+		reply(`{"answer": "4", "confidence": 1}`).WithErr(gepa.TransientError(errors.New("overloaded"))),
+		reply(`{"answer": "4", "confidence": 1}`),
+	)
+	retrying := &gepa.RetryingLanguageModel{LM: inner, MaxAttempts: 2}
+	var _ gepa.StructuredGenerator = retrying
+	program := gepa.Predict{Signature: typedQASignature(), LM: retrying}
+	ctx, collector := gepa.WithUsageCollector(context.Background())
 
-	got, err := program.Run(ctx, Prediction{"question": "2+2?"})
+	got, err := program.Run(ctx, gepa.Prediction{"question": "2+2?"})
 
 	require.NoError(t, err)
 	require.Equal(t, "4", got["answer"])
-	require.Len(t, inner.calls, 2, "the transient failure is retried")
-	for _, call := range inner.calls {
-		require.NotNil(t, call.format, "every attempt goes through GenerateStructured")
-		require.True(t, call.format.Strict)
+	calls := inner.Calls()
+	require.Len(t, calls, 2, "the transient failure is retried")
+	for _, call := range calls {
+		require.Equal(t, gepatest.MethodGenerateStructured, call.Method, "every attempt goes through GenerateStructured")
+		require.NotNil(t, call.Format)
+		require.True(t, call.Format.Strict)
 	}
-	require.Equal(t, Usage{PromptTokens: 2, CompletionTokens: 4, TotalTokens: 6}, collector.Usage())
+	require.Equal(t, gepa.Usage{PromptTokens: 2, CompletionTokens: 4, TotalTokens: 6}, collector.Usage())
 }
 
 func TestRetryingLanguageModelSendsThePromptAloneToAPlainModel(t *testing.T) {
-	calls := 0
-	inner := GeneratorFunc(func(_ context.Context, prompt string) (Generation, error) {
-		calls++
-		if calls == 1 {
-			return Generation{}, TransientError(errors.New("rate limited"))
-		}
-		return Generation{Text: "plain: " + prompt}, nil
-	})
-	retrying := &RetryingLanguageModel{LM: inner, MaxAttempts: 2}
+	inner := gepatest.NewFakeGenerator().Default(
+		gepatest.Fail(gepa.TransientError(errors.New("rate limited"))),
+		gepatest.Text("plain: prompt"),
+	)
+	retrying := &gepa.RetryingLanguageModel{LM: inner.Plain(), MaxAttempts: 2}
 
-	got, err := retrying.GenerateStructured(context.Background(), "prompt", ResponseFormat{Strict: true})
+	got, err := retrying.GenerateStructured(context.Background(), "prompt", gepa.ResponseFormat{Strict: true})
 
 	require.NoError(t, err)
 	require.Equal(t, "plain: prompt", got.Text)
-	require.Equal(t, 2, calls)
+	calls := inner.Calls()
+	require.Len(t, calls, 2)
+	for _, call := range calls {
+		require.Equal(t, gepatest.MethodGenerate, call.Method)
+		require.Equal(t, "prompt", call.Prompt)
+	}
 }
 
 func TestRetryingLanguageModelGenerateStructuredRequiresAModel(t *testing.T) {
-	_, err := (&RetryingLanguageModel{}).GenerateStructured(context.Background(), "prompt", ResponseFormat{})
+	_, err := (&gepa.RetryingLanguageModel{}).GenerateStructured(context.Background(), "prompt", gepa.ResponseFormat{})
 	require.EqualError(t, err, "retrying language model: wrapped model is required")
 }
 
 func TestPredictRepairsThroughTheStructuredRepairModel(t *testing.T) {
-	lm := &structuredModel{replies: []string{`{"answer": "4"}`}}
-	repair := &structuredModel{replies: []string{`{"answer": "4", "confidence": 0.5}`}}
-	program := Predict{Signature: typedQASignature(), LM: lm, RepairLM: repair, MaxParseRetries: 1}
+	lm := gepatest.NewFakeGenerator().Default(reply(`{"answer": "4"}`))
+	repair := gepatest.NewFakeGenerator().Default(reply(`{"answer": "4", "confidence": 0.5}`))
+	program := gepa.Predict{Signature: typedQASignature(), LM: lm, RepairLM: repair, MaxParseRetries: 1}
 
-	got, err := program.Run(context.Background(), Prediction{"question": "2+2?"})
+	got, err := program.Run(context.Background(), gepa.Prediction{"question": "2+2?"})
 
 	require.NoError(t, err)
-	require.Equal(t, Prediction{"answer": "4", "confidence": json.Number("0.5")}, got)
-	require.Len(t, repair.calls, 1)
-	require.NotNil(t, repair.calls[0].format)
-	require.Equal(t, lm.calls[0].format, repair.calls[0].format)
+	require.Equal(t, gepa.Prediction{"answer": "4", "confidence": json.Number("0.5")}, got)
+	repairs := repair.Calls()
+	require.Len(t, repairs, 1)
+	require.NotNil(t, repairs[0].Format)
+	require.Equal(t, lm.Calls()[0].Format, repairs[0].Format)
 }
 
 func TestPredictCountsUsageAcrossRetriesAndRepairs(t *testing.T) {
-	lm := &structuredModel{
-		replies: []string{`{"answer": "4"}`, `{"answer": "4"}`, `{"answer": "4", "confidence": 1}`},
-		errs:    []error{TransientError(errors.New("overloaded"))},
-	}
-	program := Predict{
+	lm := gepatest.NewFakeGenerator().Default(
+		reply(`{"answer": "4"}`).WithErr(gepa.TransientError(errors.New("overloaded"))),
+		reply(`{"answer": "4"}`),
+		reply(`{"answer": "4", "confidence": 1}`),
+	)
+	program := gepa.Predict{
 		Signature:       typedQASignature(),
-		LM:              &RetryingLanguageModel{LM: lm, MaxAttempts: 2},
+		LM:              &gepa.RetryingLanguageModel{LM: lm, MaxAttempts: 2},
 		MaxParseRetries: 1,
 	}
-	ctx, collector := WithUsageCollector(context.Background())
+	ctx, collector := gepa.WithUsageCollector(context.Background())
 
-	_, err := program.Run(ctx, Prediction{"question": "q"})
+	_, err := program.Run(ctx, gepa.Prediction{"question": "q"})
 
 	require.NoError(t, err)
-	require.Len(t, lm.calls, 3, "one retried call and one repair")
+	calls := lm.Calls()
+	require.Len(t, calls, 3, "one retried call and one repair")
 	require.Equal(t, 9, collector.Usage().TotalTokens)
-	for _, call := range lm.calls {
-		require.NotNil(t, call.format, "retries and repairs keep the response format")
+	for _, call := range calls {
+		require.NotNil(t, call.Format, "retries and repairs keep the response format")
 	}
 }

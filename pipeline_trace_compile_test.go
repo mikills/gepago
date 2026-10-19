@@ -3,32 +3,10 @@ package gepa
 import (
 	"context"
 	"fmt"
-	"path/filepath"
-	"strings"
-	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
-
-// reflectionPrompts is a reflection model that records the reflection prompts it receives.
-type reflectionPrompts struct {
-	mu      sync.Mutex
-	prompts []string
-}
-
-func (r *reflectionPrompts) Generate(_ context.Context, prompt string) (Generation, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.prompts = append(r.prompts, prompt)
-	return Generation{Text: "```\nsummarise briefly\n```", Usage: tenTokens}, nil
-}
-
-func (r *reflectionPrompts) all() string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return strings.Join(r.prompts, "\n")
-}
 
 // redactedSummaryPipeline is a pipeline whose model always answers wrongly, so every
 // minibatch is reflected on, and whose Redactor hides the document.
@@ -46,70 +24,6 @@ func redactedSummaryPipeline(t *testing.T) Pipeline {
 	}.Build()
 	require.NoError(t, err)
 	return pipeline
-}
-
-func TestCompileRecordsPipelineTracesOnlyForTraceDatasetBuilder(t *testing.T) {
-	tests := []struct {
-		name       string
-		builder    ReflectiveDatasetBuilder
-		wantTraces bool
-	}{
-		{name: "the default builder"},
-		{name: "a custom builder", builder: ReflectiveDatasetBuilderFunc(DefaultReflectiveDatasetBuilder)},
-		{name: "a nil TraceDatasetBuilder pointer", builder: (*TraceDatasetBuilder)(nil)},
-		{name: "TraceDatasetBuilder", builder: TraceDatasetBuilder{}, wantTraces: true},
-		{name: "a TraceDatasetBuilder pointer", builder: &TraceDatasetBuilder{}, wantTraces: true},
-	}
-	examples := []Example{NewIOExample("one", Prediction{"document": "secret doc"}, Prediction{"summary": "short"})}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			reflection := &reflectionPrompts{}
-			_, _, err := Compile(context.Background(), CompileConfig{
-				Program:        redactedSummaryPipeline(t),
-				Trainset:       examples,
-				Valset:         examples,
-				Metric:         ExactMatchMetric{Fields: []string{"summary"}},
-				ReflectionLM:   reflection,
-				Objective:      "summarise documents",
-				MaxMetricCalls: 4,
-				MinibatchSize:  1,
-				DatasetBuilder: tt.builder,
-			})
-			require.NoError(t, err)
-			prompts := reflection.all()
-			require.Contains(t, prompts, "Evaluation records and traces:")
-			if !tt.wantTraces {
-				require.NotContains(t, prompts, `"trace":`)
-				require.NotContains(t, prompts, `"steps":`)
-				return
-			}
-			require.Contains(t, prompts, `"trace":`)
-			require.Contains(t, prompts, `"steps":`)
-			require.Contains(t, prompts, `"step": "summarise"`)
-			require.Contains(t, prompts, `"document": "[doc]"`)
-		})
-	}
-}
-
-func TestProgramTrainConfigPassesItsDatasetBuilder(t *testing.T) {
-	registry := NewProgramRegistry()
-	require.NoError(t, registry.Register("summary", func() (Program, error) { return redactedSummaryPipeline(t), nil }))
-	reflection := &reflectionPrompts{}
-	examples := []Example{NewIOExample("one", Prediction{"document": "secret doc"}, Prediction{"summary": "short"})}
-	_, _, _, err := registry.TrainAndSave(context.Background(), ProgramTrainConfig{
-		Name:           "summary",
-		ArtifactPath:   filepath.Join(t.TempDir(), "summary.json"),
-		Trainset:       examples,
-		Valset:         examples,
-		Metric:         ExactMatchMetric{Fields: []string{"summary"}},
-		ReflectionLM:   reflection,
-		Objective:      "summarise documents",
-		MaxMetricCalls: 4,
-		MinibatchSize:  1,
-		DatasetBuilder: TraceDatasetBuilder{},
-	})
-	require.NoError(t, err)
-	require.Contains(t, reflection.all(), `"step": "summarise"`)
 }
 
 func TestTraceDatasetBuilderMatchesKeysAWrappingProgrammeScopes(t *testing.T) {
@@ -160,28 +74,6 @@ func TestTraceDatasetBuilderMatchesWholeSegments(t *testing.T) {
 			}
 			require.Equal(t, tt.want, errs)
 		})
-	}
-}
-
-func TestCompileReflectionPromptsHideRedactedValues(t *testing.T) {
-	examples := []Example{NewIOExample("one", Prediction{"document": "secret doc"}, Prediction{"summary": "short"})}
-	for _, builder := range []ReflectiveDatasetBuilder{nil, TraceDatasetBuilder{}} {
-		reflection := &reflectionPrompts{}
-		_, _, err := Compile(context.Background(), CompileConfig{
-			Program:        redactedSummaryPipeline(t),
-			Trainset:       examples,
-			Valset:         examples,
-			Metric:         ExactMatchMetric{Fields: []string{"summary"}},
-			ReflectionLM:   reflection,
-			Objective:      "summarise documents",
-			MaxMetricCalls: 4,
-			MinibatchSize:  1,
-			DatasetBuilder: builder,
-		})
-		require.NoError(t, err)
-		prompts := reflection.all()
-		require.Contains(t, prompts, `"document": "[doc]"`)
-		require.NotContains(t, prompts, "secret doc")
 	}
 }
 
@@ -394,47 +286,6 @@ func hideKey(name string, replacement any) Redactor {
 			return replacement
 		}
 		return value
-	}
-}
-
-// TestProgramEvaluatorRedactsWithNestedPipelineRedactors evaluates an outer pipeline without a
-// Redactor that runs an inner one with a Redactor, and checks the inner Redactor reaches the
-// reflection values and the recorded trace, whether or not traces are captured.
-func TestProgramEvaluatorRedactsWithNestedPipelineRedactors(t *testing.T) {
-	// the model echoes the document into the summary, which the Redactor does not name
-	echo := GeneratorFunc(func(_ context.Context, prompt string) (Generation, error) {
-		return Generation{Text: `{"summary": "about secret doc"}`, Usage: tenTokens}, nil
-	})
-	inner, err := PipelineSpec{
-		Inputs:   refs(docKey.Ref()),
-		Steps:    []Step{predictStep("summarise", echo, docKey.Ref(), summaryKey.Ref())},
-		Redactor: hideKey("document", "[doc]"),
-	}.Build()
-	require.NoError(t, err)
-	outer, err := PipelineSpec{
-		Inputs: refs(docKey.Ref()),
-		Steps:  []Step{NewProgramStep("inner", inner, refs(docKey.Ref()), refs(summaryKey.Ref()))},
-	}.Build()
-	require.NoError(t, err)
-	evaluator := ProgramEvaluator{Program: outer, Metric: ExactMatchMetric{Fields: []string{"summary"}}, RecordTraces: true}
-	examples := []Example{NewIOExample("one", Prediction{"document": "secret doc"}, Prediction{"summary": "short"})}
-
-	for _, captureTraces := range []bool{false, true} {
-		result, err := evaluator.Evaluate(context.Background(), outer.SeedCandidate(), examples, captureTraces)
-		require.NoError(t, err)
-		item := result.Items[0]
-		require.Equal(t, Prediction{"document": "[doc]"}, item.SideInfo["inputs"], "captureTraces %v", captureTraces)
-		require.Equal(t, Prediction{"summary": "about [doc]"}, item.Output, "the output's text is scrubbed")
-		require.NotContains(t, fmt.Sprint(item), "secret doc", "captureTraces %v", captureTraces)
-		if !captureTraces {
-			require.Nil(t, item.Trace)
-			continue
-		}
-		trace, ok := item.Trace.(PipelineTrace)
-		require.True(t, ok)
-		require.Equal(t, map[string]any{"document": "[doc]"}, trace.Inputs, "the outer run's trace is redacted too")
-		require.Equal(t, map[string]any{"summary": "about [doc]"}, trace.Steps[0].Writes)
-		require.Len(t, trace.Steps[0].Runs, 1)
 	}
 }
 

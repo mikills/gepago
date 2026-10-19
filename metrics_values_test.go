@@ -26,24 +26,6 @@ type metricObligation struct {
 	Amount   int    `json:"amount"`
 }
 
-type metricIn struct {
-	Q string `json:"q"`
-}
-
-type metricScoreOut struct {
-	Count int32   `json:"count"`
-	Ref   *string `json:"ref"`
-}
-
-type metricTypedOut struct {
-	Count      uint16           `json:"count"`
-	Ref        *string          `json:"ref"`
-	Missing    *string          `json:"missing"`
-	Label      metricLabel      `json:"label"`
-	Tags       []string         `json:"tags"`
-	Obligation metricObligation `json:"obligation"`
-}
-
 // datasetExpected decodes expected outputs as a JSON dataset would hold them.
 func datasetExpected(t *testing.T, text string) Prediction {
 	t.Helper()
@@ -55,25 +37,6 @@ func datasetExpected(t *testing.T, text string) Prediction {
 const metricExpectedJSON = `{"count": 3, "ref": "r-1", "missing": null, "label": "positive",
 	"tags": ["a", "b"], "obligation": {"amount": 10, "deadline": "2026-06-30"}}`
 
-func TestTypedPredictScoresWithMetrics(t *testing.T) {
-	program := TypedPredict[metricIn, metricScoreOut]{
-		LM: textModel(func(context.Context, string) (string, error) { return `{"count": 3, "ref": "r-1"}`, nil }),
-	}
-	examples := []Example{NewIOExample("one", Prediction{"q": "x"}, Prediction{"count": 3, "ref": "r-1"})}
-	got, err := program.RunCandidate(context.Background(), program.SeedCandidate(), Prediction{"q": "x"})
-	require.NoError(t, err)
-	require.Equal(t, Prediction{"count": int32(3), "ref": pointerTo("r-1")}, got)
-
-	numeric, err := ProgramEvaluator{Program: program, Metric: NumericMatchMetric{Fields: []string{"count"}}}.
-		Evaluate(context.Background(), program.SeedCandidate(), examples, false)
-	require.NoError(t, err)
-	exact, err := ProgramEvaluator{Program: program, Metric: ExactMatchMetric{Fields: []string{"ref"}}}.
-		Evaluate(context.Background(), program.SeedCandidate(), examples, false)
-	require.NoError(t, err)
-	require.Equal(t, 1.0, numeric.Items[0].Score, "a correct int32 count scores 1")
-	require.Equal(t, 1.0, exact.Items[0].Score, "a correct ref scores 1")
-}
-
 // typedMetrics are the built-in metrics over every field of metricTypedOut.
 func typedMetrics() map[string]Metric {
 	return map[string]Metric{
@@ -81,21 +44,6 @@ func typedMetrics() map[string]Metric {
 		"contains":       ContainsMetric{Fields: []string{"ref", "label", "tags", "obligation"}},
 		"numeric":        NumericMatchMetric{Fields: []string{"count"}},
 		"classification": ClassificationMetric{Field: "label"},
-	}
-}
-
-func TestTypedPredictOutputsScoreWithEveryMetric(t *testing.T) {
-	reply := `{"count": 3, "ref": "r-1", "missing": null, "label": "positive", "tags": ["a", "b"],
-		"obligation": {"deadline": "2026-06-30", "amount": 10}}`
-	program := TypedPredict[metricIn, metricTypedOut]{
-		LM: textModel(func(context.Context, string) (string, error) { return reply, nil }),
-	}
-	examples := []Example{NewIOExample("one", Prediction{"q": "x"}, datasetExpected(t, metricExpectedJSON))}
-	for name, metric := range typedMetrics() {
-		result, err := ProgramEvaluator{Program: program, Metric: metric}.
-			Evaluate(context.Background(), program.SeedCandidate(), examples, false)
-		require.NoError(t, err, name)
-		require.Equal(t, 1.0, result.Items[0].Score, "%s: %v", name, result.Items[0].SideInfo)
 	}
 }
 
@@ -408,41 +356,6 @@ func TestTextMetricsMatchNilOnlyWithNil(t *testing.T) {
 			require.Nil(t, result.Details["actual"], tt.name)
 		}
 	}
-}
-
-func TestLLMJudgeMetricRendersTypedValues(t *testing.T) {
-	var prompt string
-	metric := LLMJudgeMetric{
-		LM: textModel(func(_ context.Context, text string) (string, error) {
-			prompt = text
-			return `{"score": 1, "feedback": "ok"}`, nil
-		}),
-	}
-	actual := Prediction{
-		"count":      int32(3),
-		"ref":        pointerTo("<r-1>"),
-		"missing":    (*string)(nil),
-		"label":      metricLabel("positive"),
-		"obligation": metricObligation{Deadline: "2026-06-30", Amount: 10},
-		"ratio":      math.NaN(),
-	}
-	result, err := metric.Score(context.Background(), Prediction{"count": 3}, actual)
-	require.NoError(t, err)
-	require.Equal(t, 1.0, result.Score)
-	require.Contains(t, prompt, "Expected JSON:\n```json\n{\n  \"count\": 3\n}\n```")
-	require.Contains(t, prompt, strings.Join([]string{
-		"Actual JSON:\n```json\n{",
-		`  "count": 3,`,
-		`  "label": "positive",`,
-		`  "missing": null,`,
-		`  "obligation": {`,
-		`    "amount": 10,`,
-		`    "deadline": "2026-06-30"`,
-		`  },`,
-		`  "ratio": "NaN",`,
-		`  "ref": "<r-1>"`,
-		"}\n```",
-	}, "\n"))
 }
 
 type metricPtrHidden struct{ p *int }

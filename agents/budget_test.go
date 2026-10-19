@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	gepa "github.com/mikills/gepago"
+	"github.com/mikills/gepago/gepatest"
 	"github.com/stretchr/testify/require"
 )
 
@@ -99,7 +100,7 @@ func TestAgentInAPipelineMeetsTheRunsToolPolicy(t *testing.T) {
 
 			_, err := pipeline.Run(context.Background(), gepa.NewState(gepa.Prediction{"question": "hi"}))
 
-			require.Len(t, client.requests, tt.wantChats)
+			require.Len(t, client.Calls(), tt.wantChats)
 			if tt.wantErr == "" {
 				require.NoError(t, err)
 				return
@@ -151,7 +152,7 @@ func TestAgentInAPipelineWithAPolicyButNoTools(t *testing.T) {
 
 			_, err := pipeline.Run(context.Background(), gepa.NewState(gepa.Prediction{"question": "hi"}))
 
-			require.Len(t, client.requests, tt.wantChats)
+			require.Len(t, client.Calls(), tt.wantChats)
 			if tt.wantErr == "" {
 				require.NoError(t, err)
 				return
@@ -162,28 +163,10 @@ func TestAgentInAPipelineWithAPolicyButNoTools(t *testing.T) {
 	}
 }
 
-// flakyChat fails its first chat call transiently after spending three tokens, then answers.
-type flakyChat struct{ calls atomic.Int32 }
-
-func (c *flakyChat) Generate(context.Context, string) (gepa.Generation, error) {
-	return gepa.Generation{}, errors.New("flaky chat: Generate is not expected")
-}
-
-func (c *flakyChat) Chat(context.Context, ChatRequest) (ChatResponse, error) {
-	if c.calls.Add(1) == 1 {
-		return ChatResponse{Usage: Usage{TotalTokens: 3}}, gepa.TransientError(errors.New("busy"))
-	}
-	return ChatResponse{
-		Message:      Message{Role: RoleAssistant, Content: "done"},
-		Usage:        Usage{TotalTokens: 5},
-		FinishReason: FinishStop,
-	}, nil
-}
-
 func TestAgentWithARetryingClientInABudgetedPipeline(t *testing.T) {
 	tests := []struct {
 		maxCalls     int
-		wantAttempts int32
+		wantAttempts int
 		wantTokens   int
 		wantErr      string
 	}{
@@ -199,14 +182,18 @@ func TestAgentWithARetryingClientInABudgetedPipeline(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("MaxModelCalls %d", tt.maxCalls), func(t *testing.T) {
-			inner := &flakyChat{}
+			// the model fails its first chat call transiently after spending three tokens, then answers.
+			inner := gepatest.NewFakeGenerator().Default(
+				gepatest.Fail(gepa.TransientError(errors.New("busy"))).WithUsage(Usage{TotalTokens: 3}),
+				gepatest.Text("done").WithUsage(Usage{TotalTokens: 5}),
+			)
 			agent := &Agent{Name: "a", Client: &gepa.RetryingLanguageModel{LM: inner, MaxAttempts: 2}, Model: "m"}
 			pipeline := agentPipeline(t, agent, gepa.RunBudget{MaxModelCalls: tt.maxCalls})
 			ctx, collector := gepa.WithUsageCollector(context.Background())
 
 			_, err := pipeline.Run(ctx, gepa.NewState(gepa.Prediction{"question": "hi"}))
 
-			require.Equal(t, tt.wantAttempts, inner.calls.Load(), "each attempt is a model call")
+			require.Len(t, inner.Calls(), tt.wantAttempts, "each attempt is a model call")
 			require.Equal(t, tt.wantTokens, collector.Usage().TotalTokens, "each attempt's usage is recorded once")
 			if tt.wantErr == "" {
 				require.NoError(t, err)
@@ -219,10 +206,10 @@ func TestAgentWithARetryingClientInABudgetedPipeline(t *testing.T) {
 }
 
 func TestAgentInAPipelineAppliesItsMemoryWritesAtOnce(t *testing.T) {
-	client := &fakeChatClient{responses: []ChatResponse{
-		callReply("call-1", "lookup_order", `{"order_id":"A-1"}`),
-		{Message: Message{Role: RoleAssistant, Content: "shipped"}, FinishReason: FinishStop},
-	}}
+	client := gepatest.NewFakeGenerator().Default(
+		gepatest.ToolCall("call-1", "lookup_order", `{"order_id":"A-1"}`),
+		gepatest.Text("shipped"),
+	)
 	agent := Agent{
 		Name:         "orders",
 		Client:       client,
@@ -249,15 +236,13 @@ func TestAgentInAPipelineAppliesItsMemoryWritesAtOnce(t *testing.T) {
 }
 
 // threeTurnAgent calls a tool twice and then answers: three chat calls of ten tokens each.
-func threeTurnAgent() (*Agent, *fakeChatClient) {
+func threeTurnAgent() (*Agent, *gepatest.FakeGenerator) {
 	usage := Usage{PromptTokens: 4, CompletionTokens: 6, TotalTokens: 10}
-	first, second := callReply("c1", "echo", `{}`), callReply("c2", "echo", `{}`)
-	first.Usage, second.Usage = usage, usage
-	client := &fakeChatClient{responses: []ChatResponse{
-		first,
-		second,
-		{Message: Message{Role: RoleAssistant, Content: "done"}, Usage: usage, FinishReason: FinishStop},
-	}}
+	client := gepatest.NewFakeGenerator().Default(
+		gepatest.ToolCall("c1", "echo", `{}`).WithUsage(usage),
+		gepatest.ToolCall("c2", "echo", `{}`).WithUsage(usage),
+		gepatest.Text("done").WithUsage(usage),
+	)
 	return &Agent{
 		Name:   "budgeted",
 		Client: client,
@@ -307,7 +292,7 @@ func TestAgentInABudgetedPipeline(t *testing.T) {
 
 			got, err := pipeline.Run(ctx, gepa.NewState(gepa.Prediction{"question": "hi"}))
 
-			require.Len(t, client.requests, tt.wantChats)
+			require.Len(t, client.Calls(), tt.wantChats)
 			require.Equal(t, 10*tt.wantChats, collector.Usage().TotalTokens, "each chat call's usage is recorded once")
 			if tt.wantErr == "" {
 				require.NoError(t, err)
@@ -322,22 +307,17 @@ func TestAgentInABudgetedPipeline(t *testing.T) {
 
 func TestAgentRecordsTheUsageOfAFailedChatCallOnce(t *testing.T) {
 	spent := Usage{PromptTokens: 5, CompletionTokens: 2, TotalTokens: 7}
-	calls := 0
-	agent := Agent{
-		Name:  "failing",
-		Model: "fake",
-		Client: gepa.ChatClientFunc(func(context.Context, ChatRequest) (ChatResponse, error) {
-			calls++
-			return ChatResponse{Usage: spent}, gepa.TransientError(errors.New("connection reset mid-reply"))
-		}),
-	}
+	client := gepatest.NewFakeGenerator().Default(
+		gepatest.Fail(gepa.TransientError(errors.New("connection reset mid-reply"))).WithUsage(spent),
+	)
+	agent := Agent{Name: "failing", Model: "fake", Client: client}
 	ctx, collector := gepa.WithUsageCollector(context.Background())
 
 	result, err := agent.Run(ctx, RunRequest{Memory: NewMemory("run"), Messages: []Message{{Role: RoleUser, Content: "hi"}}})
 
 	require.EqualError(t, err, `agent "failing" chat turn 1: connection reset mid-reply`)
 	require.True(t, gepa.IsTransient(err))
-	require.Equal(t, 1, calls)
+	require.Len(t, client.Calls(), 1)
 	require.Equal(t, spent, collector.Usage())
 	require.Equal(t, 7, result.Ledger.TotalTokens)
 	require.Equal(t, 1, result.Ledger.ModelCalls)
@@ -350,5 +330,5 @@ func TestAgentRefusedChatCallMakesNoCall(t *testing.T) {
 	_, err := pipeline.Run(context.Background(), gepa.NewState(gepa.Prediction{"question": "hi"}))
 
 	require.ErrorContains(t, err, "model call 2 refused")
-	require.Len(t, client.requests, 1)
+	require.Len(t, client.Calls(), 1)
 }

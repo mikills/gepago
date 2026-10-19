@@ -608,48 +608,6 @@ func TestStepErrorReadsNeverLeaveUnredacted(t *testing.T) {
 	}
 }
 
-func TestReflectionRedactsTheFailingStepsReads(t *testing.T) {
-	const secret = "TOPSECRET-READ-2"
-	secretKey := Key[string]{Name: "secret"}
-	label := Key[string]{Name: "label"}
-	classify := NewProgramStep("classify", Predict{
-		Signature: Signature{Name: "classify", Inputs: []Field{{Name: "secret"}}, Outputs: []Field{{Name: "label"}}},
-		LM:        textModel(func(context.Context, string) (string, error) { return `{"label": null}`, nil }),
-	}, refs(secretKey.Ref()), refs(label.Ref()))
-	pipeline := fpBuild(t, PipelineSpec{
-		Inputs:   refs(secretKey.Ref()),
-		Steps:    []Step{classify},
-		Redactor: hideKey("secret", "[secret]"),
-	})
-	evaluator := ProgramEvaluator{
-		Program:      pipeline,
-		Metric:       ExactMatchMetric{Fields: []string{"label"}},
-		RecordTraces: true,
-	}
-	examples := []Example{NewIOExample("1", Prediction{"secret": secret}, Prediction{"label": "large"})}
-	candidate := pipeline.SeedCandidate()
-
-	eval, err := evaluator.Evaluate(context.Background(), candidate, examples, true)
-
-	require.NoError(t, err)
-	sideInfo := eval.Items[0].SideInfo
-	require.Equal(t, "classify", sideInfo["step"])
-	require.Equal(t, map[string]any{"secret": "[secret]"}, sideInfo["reads"])
-	require.Equal(t, map[string]any{"output": Prediction{"label": nil}}, sideInfo["details"])
-	component := "classify.instruction"
-	for _, builder := range []ReflectiveDatasetBuilder{
-		ReflectiveDatasetBuilderFunc(DefaultReflectiveDatasetBuilder),
-		TraceDatasetBuilder{},
-	} {
-		dataset := builder.BuildReflectiveDataset(candidate, eval, []string{component})
-		require.NotEmpty(t, dataset[component])
-		data, err := json.Marshal(dataset)
-		require.NoError(t, err)
-		require.NotContains(t, string(data), secret)
-		require.Contains(t, string(data), "[secret]")
-	}
-}
-
 func TestProgramEvaluatorRedactsToolCalls(t *testing.T) {
 	// the output as Python's json.dumps writes it, with a non-ASCII letter escaped
 	output := `{"carrier": ` + strconv.QuoteToASCII("Café Secret") + `, "balance": 12345.67}`

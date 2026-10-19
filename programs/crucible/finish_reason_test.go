@@ -8,6 +8,7 @@ import (
 
 	gepa "github.com/mikills/gepago"
 	"github.com/mikills/gepago/agents"
+	"github.com/mikills/gepago/gepatest"
 	openailm "github.com/mikills/gepago/providers/openai"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -40,9 +41,9 @@ func TestRawModelSubjectTruncationFailsCase(t *testing.T) {
 	subject := RawModelSubject{
 		SubjectName: "raw",
 		ParseJSON:   true,
-		LM: gepa.GeneratorFunc(func(context.Context, string) (gepa.Generation, error) {
-			return gepa.Generation{Text: `{"answer": "par`, Usage: usage, FinishReason: gepa.FinishLength}, nil
-		}),
+		LM: gepatest.NewFakeGenerator().Default(gepatest.Text(`{"answer": "par`).
+			WithUsage(usage).
+			WithFinishReason(gepa.FinishLength)),
 	}
 
 	out, err := subject.Run(context.Background(), gepa.Prediction{"q": "?"})
@@ -52,15 +53,6 @@ func TestRawModelSubjectTruncationFailsCase(t *testing.T) {
 	assert.Nil(t, out.Value)
 	assert.Equal(t, `{"answer": "par`, out.Raw)
 	assert.Equal(t, usage, out.Usage)
-}
-
-// stopChatClient answers every chat with the same response.
-type stopChatClient struct {
-	response agents.ChatResponse
-}
-
-func (c stopChatClient) Chat(context.Context, agents.ChatRequest) (agents.ChatResponse, error) {
-	return c.response, nil
 }
 
 func TestAgentSubjectFailsTruncatedOrRefusedRun(t *testing.T) {
@@ -90,11 +82,9 @@ func TestAgentSubjectFailsTruncatedOrRefusedRun(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client := stopChatClient{response: agents.ChatResponse{
-				Message:      agents.Message{Role: agents.RoleAssistant, Content: "final text"},
-				Usage:        usage,
-				FinishReason: tt.finish,
-			}}
+			client := gepatest.NewFakeGenerator().Default(gepatest.Text("final text").
+				WithUsage(usage).
+				WithFinishReason(tt.finish))
 			subject := AgentSubject{
 				SubjectName: "agent",
 				Agent:       &agents.Agent{Name: "agent", Model: "m", Client: client},

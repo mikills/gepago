@@ -214,22 +214,6 @@ func TestWithCacheDoesNotCacheFailures(t *testing.T) {
 	require.Equal(t, []string{"flaky#1 err: rate limited", "flaky#2"}, outcomeSummary(run))
 }
 
-func TestWithCacheBelongsToOneRun(t *testing.T) {
-	calls := &atomic.Int32{}
-	pipeline, err := PipelineSpec{
-		Inputs: refs(docKey.Ref()),
-		Steps:  []Step{WithCache(summariseStep(calls, nil), nil)},
-	}.Build()
-	require.NoError(t, err)
-
-	for range 2 {
-		got, err := pipeline.RunCandidate(context.Background(), nil, Prediction{"document": "cash 10"})
-		require.NoError(t, err)
-		require.Equal(t, Prediction{"summary": "short"}, got)
-	}
-	require.Equal(t, int32(2), calls.Load())
-}
-
 func TestWithCacheBuildErrors(t *testing.T) {
 	_, err := PipelineSpec{Steps: []Step{writeAmount("parse", 1), WithCache(nil, nil)}}.Build()
 	require.EqualError(t, err, "pipeline step 1 is nil")

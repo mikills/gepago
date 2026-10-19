@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	gepa "github.com/mikills/gepago"
+	"github.com/mikills/gepago/gepatest"
 	"github.com/stretchr/testify/require"
 )
 
@@ -12,28 +13,17 @@ import (
 // model calls and tool handlers see the RunContext of the step's run.
 func TestAgentInAPipelineStepSeesTheStepsRunContext(t *testing.T) {
 	var seen []gepa.RunContext
-	record := func(ctx context.Context) {
-		rc, ok := gepa.RunContextFrom(ctx)
-		require.True(t, ok)
-		seen = append(seen, rc)
-	}
-	replies := []ChatResponse{
-		callReply("call-1", "lookup", `{}`),
-		{Message: Message{Role: RoleAssistant, Content: "done"}, FinishReason: FinishStop},
-	}
+	client := gepatest.NewFakeGenerator().Default(gepatest.ToolCall("call-1", "lookup", `{}`), gepatest.Text("done"))
 	agent := Agent{
-		Name:  "agent",
-		Model: "fake",
-		Client: gepa.ChatClientFunc(func(ctx context.Context, _ ChatRequest) (ChatResponse, error) {
-			record(ctx)
-			reply := replies[0]
-			replies = replies[1:]
-			return reply, nil
-		}),
+		Name:   "agent",
+		Model:  "fake",
+		Client: client,
 		Tools: []ToolBinding{{
 			Definition: Tool{Name: "lookup", Description: "looks the answer up"},
 			Handler: func(ctx context.Context, _ *Memory, _ string) (string, error) {
-				record(ctx)
+				rc, ok := gepa.RunContextFrom(ctx)
+				require.True(t, ok)
+				seen = append(seen, rc)
 				return "found", nil
 			},
 		}},
@@ -58,5 +48,11 @@ func TestAgentInAPipelineStepSeesTheStepsRunContext(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, "trace-1", step.TraceID)
-	require.Equal(t, []gepa.RunContext{step, step, step}, seen, "two model calls and one tool call")
+	calls := client.Calls()
+	require.Len(t, calls, 2)
+	for _, call := range calls {
+		require.Equal(t, step, call.RunContext, "each model call sees the step's RunContext")
+		require.Equal(t, "ask", call.Step)
+	}
+	require.Equal(t, []gepa.RunContext{step}, seen, "the tool call sees the step's RunContext")
 }

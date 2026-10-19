@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,6 +15,7 @@ import (
 
 	gepa "github.com/mikills/gepago"
 	"github.com/mikills/gepago/agents"
+	"github.com/mikills/gepago/gepatest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -61,12 +61,12 @@ func TestRun(t *testing.T) {
 
 func TestJudges(t *testing.T) {
 	t.Run("rubric and pairwise", func(t *testing.T) {
-		judge := textJudge(func(_ context.Context, prompt string) (string, error) {
-			if strings.Contains(prompt, "Compare two subject outputs") {
-				return `{"winner":"a","score_a":0.9,"score_b":0.2,"feedback":"A is clearer"}`, nil
-			}
-			return `{"score":0.8,"feedback":"good"}`, nil
-		})
+		judge := gepatest.NewFakeGenerator().
+			OnPrompt(
+				"Compare two subject outputs",
+				gepatest.Text(`{"winner":"a","score_a":0.9,"score_b":0.2,"feedback":"A is clearer"}`),
+			).
+			Default(gepatest.Text(`{"score":0.8,"feedback":"good"}`))
 		suite := Suite{
 			Name: "open-ended",
 			Cases: []EvalCase{{
@@ -714,13 +714,9 @@ func TestAgentSubjectUsageBreakdown(t *testing.T) {
 
 func TestJudgesRejectTruncatedReplies(t *testing.T) {
 	usage := gepa.Usage{PromptTokens: 5, CompletionTokens: 64, TotalTokens: 69}
-	judge := gepa.GeneratorFunc(func(context.Context, string) (gepa.Generation, error) {
-		return gepa.Generation{
-			Text:         `{"winner":"a","score_a":1,"score_b":0,"score":1}`,
-			Usage:        usage,
-			FinishReason: gepa.FinishLength,
-		}, nil
-	})
+	judge := gepatest.NewFakeGenerator().Default(gepatest.Text(`{"winner":"a","score_a":1,"score_b":0,"score":1}`).
+		WithUsage(usage).
+		WithFinishReason(gepa.FinishLength))
 	evalCase := EvalCase{ID: "case", Rubric: "Be correct"}
 
 	score, err := RubricJudgeEvaluator{LM: judge}.Evaluate(context.Background(), EvalInput{Case: evalCase})
@@ -735,9 +731,9 @@ func TestJudgesRejectTruncatedReplies(t *testing.T) {
 }
 
 func TestJudgesRejectRefusedReplies(t *testing.T) {
-	judge := gepa.GeneratorFunc(func(context.Context, string) (gepa.Generation, error) {
-		return gepa.Generation{Text: "I can't grade that.", FinishReason: gepa.FinishContentFilter}, nil
-	})
+	judge := gepatest.NewFakeGenerator().Default(
+		gepatest.Text("I can't grade that.").WithFinishReason(gepa.FinishContentFilter),
+	)
 	evalCase := EvalCase{ID: "case", Rubric: "Be correct"}
 
 	score, err := RubricJudgeEvaluator{LM: judge}.Evaluate(context.Background(), EvalInput{Case: evalCase})
@@ -754,9 +750,7 @@ func TestRawModelSubjectReportsUsageOfFailedCall(t *testing.T) {
 	usage := gepa.Usage{PromptTokens: 4, CompletionTokens: 2, TotalTokens: 6}
 	subject := RawModelSubject{
 		SubjectName: "raw",
-		LM: gepa.GeneratorFunc(func(context.Context, string) (gepa.Generation, error) {
-			return gepa.Generation{Usage: usage, Model: "resolved"}, cause
-		}),
+		LM:          gepatest.NewFakeGenerator().Default(gepatest.Fail(cause).WithUsage(usage).WithModel("resolved")),
 	}
 
 	got, err := subject.Run(context.Background(), gepa.Prediction{"q": "?"})

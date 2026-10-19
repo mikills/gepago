@@ -3,22 +3,20 @@ package gepa_test
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	gepa "github.com/mikills/gepago"
+	"github.com/mikills/gepago/gepatest"
 )
 
 func ExampleCompile() {
 	ctx := context.Background()
-	lm := gepa.GeneratorFunc(func(_ context.Context, prompt string) (gepa.Generation, error) {
-		if strings.Contains(prompt, "Evaluation records and traces") {
-			return gepa.Generation{Text: "```\nClassify customer text as exactly positive or negative.\n```"}, nil
-		}
-		if strings.Contains(strings.ToLower(prompt), "broken") {
-			return gepa.Generation{Text: `{"label":"negative"}`}, nil
-		}
-		return gepa.Generation{Text: `{"label":"positive"}`}, nil
-	})
+	lm := gepatest.NewFakeGenerator().
+		OnPrompt(
+			"Evaluation records and traces",
+			gepatest.Text("```\nClassify customer text as exactly positive or negative.\n```"),
+		).
+		OnPrompt("broken", gepatest.Text(`{"label":"negative"}`)).
+		Default(gepatest.Text(`{"label":"positive"}`))
 
 	program := gepa.Predict{
 		Signature: gepa.Signature{
@@ -63,9 +61,7 @@ func ExampleChainOfThought() {
 			Inputs:  []gepa.Field{{Name: "question"}},
 			Outputs: []gepa.Field{{Name: "answer"}},
 		},
-		LM: gepa.GeneratorFunc(func(context.Context, string) (gepa.Generation, error) {
-			return gepa.Generation{Text: `{"answer":"42","reasoning":"6 times 7 is 42"}`}, nil
-		}),
+		LM: gepatest.NewFakeGenerator().Default(gepatest.Text(`{"answer":"42","reasoning":"6 times 7 is 42"}`)),
 	}
 	prediction, err := program.Run(context.Background(), gepa.Prediction{"question": "6*7?"})
 	if err != nil {
@@ -77,17 +73,13 @@ func ExampleChainOfThought() {
 
 func ExamplePipelineProgram() {
 	ctx := context.Background()
-	extractLM := gepa.GeneratorFunc(func(context.Context, string) (gepa.Generation, error) {
-		return gepa.Generation{Text: `{"amount":125000,"deadline":"2026-06-30"}`}, nil
-	})
-	decideLM := gepa.GeneratorFunc(func(_ context.Context, prompt string) (gepa.Generation, error) {
-		if strings.Contains(prompt, `"amount": 125000`) {
-			return gepa.Generation{
-				Text: `{"decision":"needs_review","reason":"Amount exceeds the automatic approval threshold."}`,
-			}, nil
-		}
-		return gepa.Generation{Text: `{"decision":"approve","reason":"Amount is within policy."}`}, nil
-	})
+	extractLM := gepatest.NewFakeGenerator().Default(gepatest.Text(`{"amount":125000,"deadline":"2026-06-30"}`))
+	decideLM := gepatest.NewFakeGenerator().
+		OnPrompt(
+			`"amount": 125000`,
+			gepatest.Text(`{"decision":"needs_review","reason":"Amount exceeds the automatic approval threshold."}`),
+		).
+		Default(gepatest.Text(`{"decision":"approve","reason":"Amount is within policy."}`))
 
 	program := gepa.PipelineProgram{Steps: []gepa.PipelineStep{
 		{
@@ -141,9 +133,7 @@ func ExamplePipelineSpec_Build() {
 			Outputs: []gepa.Field{{Name: "amount"}},
 		},
 		Instruction: "Extract the obligation amount.",
-		LM: gepa.GeneratorFunc(func(context.Context, string) (gepa.Generation, error) {
-			return gepa.Generation{Text: `{"amount":125000}`}, nil
-		}),
+		LM:          gepatest.NewFakeGenerator().OnStep("extract", gepatest.Text(`{"amount":125000}`)),
 	}, []gepa.KeyRef{document.Ref()}, []gepa.KeyRef{amount.Ref()})
 
 	decide := gepa.NewStep(
@@ -191,9 +181,7 @@ func ExamplePipelineSpec_Build() {
 
 func ExampleLLMJudgeMetric() {
 	metric := gepa.LLMJudgeMetric{
-		LM: gepa.GeneratorFunc(func(context.Context, string) (gepa.Generation, error) {
-			return gepa.Generation{Text: `{"score": 1, "feedback": "equivalent", "details": {}}`}, nil
-		}),
+		LM:     gepatest.NewFakeGenerator().Default(gepatest.Text(`{"score": 1, "feedback": "equivalent", "details": {}}`)),
 		Rubric: "Score semantic equivalence.",
 	}
 	result, err := metric.Score(
