@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"syscall"
 
@@ -20,11 +21,13 @@ import (
 // with: 429 and 5xx are transient, other 4xx permanent. With no status (zero), it classifies
 // the transport failure:
 //
-//   - a refused, reset or dropped connection, a response body cut short, or a network timeout
-//     is transient;
+//   - a refused, reset or dropped connection, a response body cut short, a network timeout, an
+//     HTTP/2 stream the server reset with INTERNAL_ERROR, REFUSED_STREAM or ENHANCE_YOUR_CALM,
+//     or a GOAWAY is transient;
 //   - a configuration failure that a retry cannot fix, such as a TLS certificate or handshake
-//     failure, an unknown host or an unsupported or malformed URL, is permanent;
-//   - any other transport failure, such as an HTTP/2 stream reset, stays unclassified.
+//     failure, an unknown host, an invalid address or port, or an unsupported or malformed
+//     URL, is permanent;
+//   - any other transport failure, such as an HTTP/2 PROTOCOL_ERROR, stays unclassified.
 //
 // When ctx has ended, Classify returns ctx.Err() itself; any other cancellation, or a
 // deadline that is not a network timeout, comes back as the bare context sentinel. Neither is
@@ -69,8 +72,7 @@ var requestURLFailures = []string{
 	"http: server gave HTTP response to HTTPS client",
 }
 
-// isRequestURLError reports a malformed or unusable request URL. Other transport failures,
-// such as an HTTP/2 stream reset, stay unclassified.
+// isRequestURLError reports a malformed or unusable request URL.
 func isRequestURLError(err error) bool {
 	var urlErr *url.Error
 	if !errors.As(err, &urlErr) {
@@ -88,7 +90,8 @@ func isRequestURLError(err error) bool {
 	return false
 }
 
-// isConfigurationError reports a TLS or name-resolution failure that a retry cannot fix.
+// isConfigurationError reports a TLS, address or name-resolution failure that a retry cannot
+// fix.
 func isConfigurationError(err error) bool {
 	var certErr *tls.CertificateVerificationError
 	var unknownAuthority x509.UnknownAuthorityError
@@ -105,14 +108,46 @@ func isConfigurationError(err error) bool {
 		// crypto/tls reports handshake alerts as net.OpError with these operations.
 		return true
 	}
+	if errors.As(err, &opErr) && opErr.Op == "dial" && dialsPortZero(opErr.Addr) {
+		// port 0 is never a reachable destination, so the base URL is wrong.
+		return true
+	}
+	var addrErr *net.AddrError
+	var parseErr *net.ParseError
+	var invalidAddr net.InvalidAddrError
+	var unknownNetwork net.UnknownNetworkError
+	if errors.As(err, &addrErr) || errors.As(err, &parseErr) || errors.As(err, &invalidAddr) ||
+		errors.As(err, &unknownNetwork) {
+		return true
+	}
 	var dnsErr *net.DNSError
 	return errors.As(err, &dnsErr) && dnsErr.IsNotFound
 }
+
+func dialsPortZero(addr net.Addr) bool {
+	tcpAddr, ok := addr.(*net.TCPAddr)
+	return ok && tcpAddr.Port == 0
+}
+
+// http2TransientFailures match the net/http HTTP/2 errors a later attempt may not repeat: a
+// stream the server reset with INTERNAL_ERROR, REFUSED_STREAM or ENHANCE_YOUR_CALM, and a
+// connection closed by GOAWAY. net/http bundles its HTTP/2 implementation with unexported
+// error types, and importing golang.org/x/net/http2 would add a dependency without matching
+// them, so the stable error text is matched instead.
+var http2TransientFailures = regexp.MustCompile(
+	`stream error: stream ID \d+; (INTERNAL_ERROR|REFUSED_STREAM|ENHANCE_YOUR_CALM)\b|` +
+		`http2: server sent GOAWAY and closed the connection|` +
+		`http2: Transport received Server's graceful shutdown GOAWAY|` +
+		`http2: client connection lost`,
+)
 
 // isConnectionError reports a dropped or refused connection, a body cut short or a network
 // timeout: failures a later attempt may not repeat.
 func isConnectionError(err error) bool {
 	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return true
+	}
+	if http2TransientFailures.MatchString(err.Error()) {
 		return true
 	}
 	for _, errno := range []syscall.Errno{

@@ -3,7 +3,6 @@ package google
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -281,15 +280,10 @@ func TestErrorsRedactTheAPIKey(t *testing.T) {
 	const key = "SECRET-KEY-123"
 	tlsServer := httptest.NewTLSServer(http.NotFoundHandler())
 	defer tlsServer.Close()
-	echoServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "API key "+r.URL.Query().Get("key")+" not valid", http.StatusBadRequest)
-	}))
-	defer echoServer.Close()
 
 	for name, base := range map[string]string{
 		"tls failure":        tlsServer.URL,
 		"unsupported scheme": "ftp://example.invalid",
-		"body echoes key":    echoServer.URL,
 	} {
 		t.Run(name, func(t *testing.T) {
 			lm, err := NewLanguageModel(Config{APIKey: key, BaseURL: base, Model: "m"})
@@ -299,18 +293,29 @@ func TestErrorsRedactTheAPIKey(t *testing.T) {
 
 			require.Error(t, err)
 			assert.NotContains(t, err.Error(), key)
-			assert.Contains(t, err.Error(), "REDACTED")
+			assert.Contains(t, err.Error(), "?key=REDACTED")
 			assert.True(t, gepa.IsPermanent(err), "redaction keeps the kind: %v", err)
 			var urlErr *url.Error
-			if errors.As(err, &urlErr) {
-				assert.NotContains(t, urlErr.URL, key)
-				assert.NotContains(t, urlErr.Error(), key)
-			}
+			require.ErrorAs(t, err, &urlErr)
+			assert.NotContains(t, urlErr.URL, key)
+			assert.NotContains(t, urlErr.Error(), key)
 		})
 	}
 
+	t.Run("a short key redacts only the parameter", func(t *testing.T) {
+		lm, err := NewLanguageModel(Config{APIKey: "k", BaseURL: tlsServer.URL, Model: "m"})
+		require.NoError(t, err)
+
+		_, err = lm.Generate(context.Background(), "p")
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "m:generateContent?key=REDACTED")
+		assert.Contains(t, err.Error(), "signed by unknown authority")
+		assert.NotContains(t, err.Error(), "key=k")
+	})
+
 	t.Run("context errors stay bare", func(t *testing.T) {
-		lm, err := NewLanguageModel(Config{APIKey: key, BaseURL: echoServer.URL, Model: "m"})
+		lm, err := NewLanguageModel(Config{APIKey: key, BaseURL: tlsServer.URL, Model: "m"})
 		require.NoError(t, err)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
@@ -319,6 +324,17 @@ func TestErrorsRedactTheAPIKey(t *testing.T) {
 
 		assert.Same(t, context.Canceled, err)
 	})
+}
+
+func TestRedactKeyParam(t *testing.T) {
+	for _, tt := range []struct{ in, want string }{
+		{`Post "https://h/m:generateContent?key=abc": EOF`, `Post "https://h/m:generateContent?key=REDACTED": EOF`},
+		{`https://h/p?alt=sse&key=a%2Bb&x=1`, `https://h/p?alt=sse&key=REDACTED&x=1`},
+		{`look up key k in the monkey`, `look up key k in the monkey`},
+		{`https://h/p?apikey=keep`, `https://h/p?apikey=keep`},
+	} {
+		assert.Equal(t, tt.want, redactKeyParam(tt.in))
+	}
 }
 
 func TestLanguageModelIsSafeForConcurrentUse(t *testing.T) {

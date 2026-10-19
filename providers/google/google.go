@@ -9,6 +9,7 @@ import (
 	"maps"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 
 	gepa "github.com/mikills/gepago"
@@ -199,22 +200,31 @@ func (c *ChatClient) post(ctx context.Context, model string, data []byte) ([]byt
 	return response.Bytes(), nil
 }
 
-// redact removes the API key from err's text and from the URL of any url.Error in its chain,
-// keeping the chain intact for errors.Is and errors.As.
+// redact replaces the value of the key query parameter, which carries the API key, in err's
+// text and in the URL of any url.Error in its chain, keeping the chain intact for errors.Is
+// and errors.As. Only the parameter value is replaced, so text that merely contains the key's
+// characters is left alone.
 func (c *ChatClient) redact(err error) error {
-	if err == nil || strings.TrimSpace(c.apiKey) == "" {
+	if err == nil {
 		return err
 	}
-	replacer := strings.NewReplacer(c.apiKey, redactedAPIKey, url.QueryEscape(c.apiKey), redactedAPIKey)
 	var urlErr *url.Error
 	if errors.As(err, &urlErr) {
-		urlErr.URL = replacer.Replace(urlErr.URL)
+		urlErr.URL = redactKeyParam(urlErr.URL)
 	}
-	text := replacer.Replace(err.Error())
+	text := redactKeyParam(err.Error())
 	if text == err.Error() {
 		return err
 	}
 	return &redactedError{err: err, text: text}
+}
+
+// apiKeyParam matches the value of a key query parameter up to the next parameter, quote or
+// space.
+var apiKeyParam = regexp.MustCompile(`([?&]key=)[^&#\s"']*`)
+
+func redactKeyParam(text string) string {
+	return apiKeyParam.ReplaceAllString(text, "${1}"+redactedAPIKey)
 }
 
 const redactedAPIKey = "REDACTED"

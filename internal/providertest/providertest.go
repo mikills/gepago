@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -105,6 +106,29 @@ func RunTransportCases(t *testing.T, generate GenerateFunc) {
 		requireKind(t, generate(context.Background(), server.URL, nil), gepa.Transient)
 	})
 
+	t.Run("connection closed without a response is transient", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+				_ = conn.Close()
+			}
+		}))
+		defer server.Close()
+
+		requireKind(t, generate(context.Background(), server.URL, nil), gepa.Transient)
+	})
+
+	for _, http2 := range []bool{false, true} {
+		for _, afterHeaders := range []bool{false, true} {
+			name := fmt.Sprintf("server abort (http2=%v, after headers=%v) is transient", http2, afterHeaders)
+			t.Run(name, func(t *testing.T) {
+				server := abortingServer(t, http2, afterHeaders)
+
+				requireKind(t, generate(context.Background(), server.URL, server.Client()), gepa.Transient)
+			})
+		}
+	}
+
 	t.Run("network timeout is transient", func(t *testing.T) {
 		release := make(chan struct{})
 		server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
@@ -133,6 +157,12 @@ func RunTransportCases(t *testing.T, generate GenerateFunc) {
 		requireKind(t, generate(context.Background(), "ftp://example.invalid", nil), gepa.Permanent)
 	})
 
+	for _, base := range []string{"http://127.0.0.1:99999", "http://127.0.0.1:0", "http://[::1]:0"} {
+		t.Run("unusable address "+base+" is permanent", func(t *testing.T) {
+			requireKind(t, generate(context.Background(), base, nil), gepa.Permanent)
+		})
+	}
+
 	t.Run("cancelled context comes back bare", func(t *testing.T) {
 		server := httptest.NewServer(http.NotFoundHandler())
 		defer server.Close()
@@ -145,6 +175,27 @@ func RunTransportCases(t *testing.T, generate GenerateFunc) {
 			t.Fatalf("err = %v, want context.Canceled itself", err)
 		}
 	})
+}
+
+// abortingServer aborts every handler, before or after writing part of the body. Over HTTP/1
+// net/http closes the connection; over HTTP/2 it resets the stream with INTERNAL_ERROR.
+func abortingServer(t *testing.T, http2, afterHeaders bool) *httptest.Server {
+	t.Helper()
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if afterHeaders {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Length", "1000")
+			_, _ = w.Write([]byte(`{"id":"x",`))
+			w.(http.Flusher).Flush()
+		}
+		panic(http.ErrAbortHandler)
+	}))
+	server.EnableHTTP2 = http2
+	server.Config.ErrorLog = log.New(io.Discard, "", 0)
+	server.StartTLS()
+	t.Cleanup(server.Close)
+	return server
 }
 
 func requireKind(t *testing.T, err error, want gepa.ErrorKind) {

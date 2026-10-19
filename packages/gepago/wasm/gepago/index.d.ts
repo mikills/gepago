@@ -53,7 +53,8 @@ export interface ChatRequest {
 export interface ChatResponse {
   message: Message;
   usage: Usage;
-  finish_reason: FinishReason;
+  /** Why the model stopped; omitted when the provider does not report it. */
+  finish_reason?: FinishReason;
 }
 
 export interface AgentConfigBase {
@@ -484,8 +485,11 @@ export interface CompileModelRequest {
 export interface CompileModelResult {
   text: string;
   usage?: Usage;
-  /** Why the model stopped; "length" marks a truncated reply that is not repaired. */
-  finishReason?: FinishReason;
+  /**
+   * Why the model stopped; "length" marks a truncated reply that is not repaired. Omit it,
+   * or pass null or "", when the provider does not report one.
+   */
+  finishReason?: FinishReason | "" | null;
   /** The model the provider resolved the request to. */
   model?: string;
 }
@@ -520,8 +524,11 @@ export type PredictModelUsage = Usage;
 export interface PredictModelResult {
   text: string;
   usage?: PredictModelUsage;
-  /** Why the model stopped; "length" fails the prediction without a repair request. */
-  finishReason?: FinishReason;
+  /**
+   * Why the model stopped; "length" fails the prediction without a repair request. Omit it,
+   * or pass null or "", when the provider does not report one.
+   */
+  finishReason?: FinishReason | "" | null;
   /** The model the provider resolved the request to. */
   model?: string;
 }

@@ -1,6 +1,7 @@
 package providererr
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -8,8 +9,10 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -136,7 +139,87 @@ func TestClassify(t *testing.T) {
 		{
 			name: "other transport failure",
 			ctx:  context.Background(),
-			err:  post(errors.New("http2: server sent GOAWAY and closed the connection")),
+			err:  post(errors.New("net/http: HTTP/1.x transport connection broken: malformed HTTP response")),
+		},
+		{
+			name:     "invalid port",
+			ctx:      context.Background(),
+			err:      dial(&net.AddrError{Err: "invalid port", Addr: "99999"}),
+			wantKind: gepa.Permanent,
+		},
+		{
+			name: "dial to port zero",
+			ctx:  context.Background(),
+			err: post(&net.OpError{
+				Op:   "dial",
+				Net:  "tcp",
+				Addr: &net.TCPAddr{IP: net.IPv6loopback},
+				Err:  os.NewSyscallError("connect", syscall.EADDRNOTAVAIL),
+			}),
+			wantKind: gepa.Permanent,
+		},
+		{
+			name:     "unparsable address",
+			ctx:      context.Background(),
+			err:      dial(&net.ParseError{Type: "IP address", Text: "256.1.1.1"}),
+			wantKind: gepa.Permanent,
+		},
+		{
+			name: "address not available on a real port",
+			ctx:  context.Background(),
+			err: post(&net.OpError{
+				Op:   "dial",
+				Net:  "tcp",
+				Addr: &net.TCPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 443},
+				Err:  os.NewSyscallError("connect", syscall.EADDRNOTAVAIL),
+			}),
+			wantKind: gepa.Transient,
+		},
+		{
+			name:     "HTTP/2 stream reset with INTERNAL_ERROR",
+			ctx:      context.Background(),
+			err:      post(errors.New("stream error: stream ID 1; INTERNAL_ERROR; received from peer")),
+			wantKind: gepa.Transient,
+		},
+		{
+			name:     "HTTP/2 stream refused",
+			ctx:      context.Background(),
+			err:      post(errors.New("stream error: stream ID 3; REFUSED_STREAM")),
+			wantKind: gepa.Transient,
+		},
+		{
+			name:     "HTTP/2 stream reset with ENHANCE_YOUR_CALM",
+			ctx:      context.Background(),
+			err:      post(errors.New("stream error: stream ID 5; ENHANCE_YOUR_CALM; received from peer")),
+			wantKind: gepa.Transient,
+		},
+		{
+			name: "HTTP/2 body cut by a stream reset",
+			ctx:  context.Background(),
+			err: fmt.Errorf(
+				"error reading response body: %w",
+				errors.New("stream error: stream ID 1; INTERNAL_ERROR; received from peer"),
+			),
+			wantKind: gepa.Transient,
+		},
+		{
+			name: "HTTP/2 GOAWAY",
+			ctx:  context.Background(),
+			err: post(errors.New(
+				`http2: server sent GOAWAY and closed the connection; LastStreamID=1, ErrCode=NO_ERROR, debug=""`,
+			)),
+			wantKind: gepa.Transient,
+		},
+		{
+			name:     "HTTP/2 graceful shutdown",
+			ctx:      context.Background(),
+			err:      post(errors.New("http2: Transport received Server's graceful shutdown GOAWAY")),
+			wantKind: gepa.Transient,
+		},
+		{
+			name: "HTTP/2 protocol error",
+			ctx:  context.Background(),
+			err:  post(errors.New("stream error: stream ID 1; PROTOCOL_ERROR")),
 		},
 		{name: "plain error", ctx: context.Background(), err: cause},
 		{
@@ -174,4 +257,32 @@ func TestClassify(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestClassifyServerResetConnection(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			// read the request, then reset the connection without answering, as a load
+			// balancer dropping an idle keep-alive connection does.
+			_, _ = http.ReadRequest(bufio.NewReader(conn))
+			if tcp, ok := conn.(*net.TCPConn); ok {
+				_ = tcp.SetLinger(0)
+			}
+			_ = conn.Close()
+		}
+	}()
+	request, err := http.NewRequest(http.MethodPost, "http://"+listener.Addr().String()+"/", strings.NewReader("{}"))
+	require.NoError(t, err)
+
+	_, err = (&http.Client{Transport: &http.Transport{}}).Do(request)
+
+	require.Error(t, err)
+	require.True(t, gepa.IsTransient(Classify(context.Background(), 0, err)), "err = %v", err)
 }

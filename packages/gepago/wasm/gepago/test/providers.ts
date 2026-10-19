@@ -181,6 +181,54 @@ test("model callbacks report normalised finish reasons", async () => {
   }
 });
 
+test("unknown or missing finish reasons are not reported", async () => {
+  const chats: Array<{
+    chat: (fetch: ProviderFetch) => ReturnType<typeof createOpenAIChat>;
+    body: JSONObject;
+  }> = [
+    {
+      chat: (fetch) => createClaudeChat({ apiKey: "k", model: "m", fetch }),
+      body: {
+        content: [{ type: "text", text: "paused" }],
+        stop_reason: "pause_turn",
+      },
+    },
+    {
+      chat: (fetch) => createGoogleChat({ apiKey: "k", model: "m", fetch }),
+      body: {
+        candidates: [
+          { content: { parts: [{ text: "x" }] }, finishReason: "OTHER" },
+        ],
+      },
+    },
+    {
+      chat: (fetch) => createOpenAIChat({ apiKey: "k", model: "m", fetch }),
+      body: { choices: [{ message: { content: "x" } }] },
+    },
+  ];
+  for (const { chat, body } of chats) {
+    const fetch = fakeFetch(() => jsonResponse(body));
+    const response = await chat(fetch)({
+      model: "m",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    assert.equal("finish_reason" in response, false, JSON.stringify(body));
+  }
+  const model = createGoogleModel({
+    apiKey: "k",
+    model: "m",
+    fetch: fakeFetch(() =>
+      jsonResponse({
+        candidates: [
+          { content: { parts: [{ text: "x" }] }, finishReason: "OTHER" },
+        ],
+      }),
+    ),
+  }) as PredictModel;
+  const result = (await model(modelRequest("p"))) as PredictModelResult;
+  assert.equal("finishReason" in result, false);
+});
+
 test("OpenAI chat maps tool calls and response format", async () => {
   let body: OpenAIRequestFixture | undefined;
   const chat = createOpenAIChat({

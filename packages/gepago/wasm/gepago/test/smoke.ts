@@ -20,6 +20,7 @@ import type {
   PredictHostRequest,
   PredictModelResult,
   PipelineProgram,
+  RunResult,
   Signature,
 } from "@mikills/wasm/gepago";
 
@@ -265,6 +266,13 @@ test("loads generated Go WASM and exposes deterministic APIs", async () => {
       })),
       /finishReason must be one of/,
     );
+    for (const finishReason of [null, ""] as const) {
+      const unreported = await gepago.predict(predictConfig, async () => ({
+        text: '{"label":"positive"}',
+        finishReason,
+      }));
+      assert.deepEqual(unreported.prediction, { label: "positive" });
+    }
 
     const compileConfig = {
       program: { signature, instruction: "Classify the text." },
@@ -315,6 +323,13 @@ test("loads generated Go WASM and exposes deterministic APIs", async () => {
       },
     );
     assert.deepEqual(truncatedCompileRoles, ["task"]);
+    for (const finishReason of [null, ""] as const) {
+      const unreportedCompiled = await gepago.compile(compileConfig, async () => ({
+        text: '{"label":"positive"}',
+        finishReason,
+      }));
+      assert.equal(unreportedCompiled.state.candidates[0].validation_score, 1);
+    }
     assert.equal(truncatedCompiled.state.candidates[0].validation_score, 0);
     assert.equal(truncatedCompiled.state.ledger.total_tokens, 5);
     const compiledPrediction = await gepago.runCompiled(
@@ -638,6 +653,26 @@ test("loads generated Go WASM and exposes deterministic APIs", async () => {
       async () => "never",
     );
     assert.deepEqual(noToolAgent.tool_calls, []);
+
+    for (const reason of [undefined, null, ""]) {
+      const response: Record<string, unknown> = {
+        message: { role: "assistant", content: "Hello." },
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      };
+      if (reason !== undefined) response.finish_reason = reason;
+      const unreportedAgent: RunResult = await gepago.runAgent(
+        {
+          name: "assistant",
+          model: "host-model",
+          messages: [{ role: "user", content: "Say hello." }],
+          run_id: "agent-unreported-finish",
+        },
+        async (): Promise<ChatResponse> =>
+          response as unknown as ChatResponse,
+        async () => "never",
+      );
+      assert.equal(unreportedAgent.stop_reason, "complete");
+    }
 
     await assert.rejects(
       gepago.runAgent(

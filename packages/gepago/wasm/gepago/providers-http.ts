@@ -4,6 +4,7 @@ import type {
   ChatRequest,
   ChatResponse,
   CompileModel,
+  FinishReason,
   Message,
   PredictModel,
   PredictHostRequest,
@@ -183,23 +184,35 @@ const contentFilterReasons = [
   "SPII",
   "IMAGE_SAFETY",
 ];
+const stopReasons = ["stop", "end_turn", "stop_sequence", "STOP"];
+const lengthReasons = [
+  "length",
+  "max_tokens",
+  "MAX_TOKENS",
+  "max_output_tokens",
+  "model_context_window_exceeded",
+];
+// finishReason normalises a provider stop reason. A missing or unknown one, such as Claude's
+// pause_turn or Gemini's OTHER, is not reported, as in the Go providers.
 export function finishReason(
   value: unknown,
   hasTools = false,
-): ChatResponse["finish_reason"] {
-  if (hasTools || value === "tool_use" || value === "function_call")
+): FinishReason | undefined {
+  const reason = String(value);
+  if (hasTools || ["tool_calls", "tool_use", "function_call"].includes(reason))
     return "tool_calls";
-  if (
-    [
-      "length",
-      "max_tokens",
-      "MAX_TOKENS",
-      "model_context_window_exceeded",
-    ].includes(String(value))
-  )
-    return "length";
-  if (contentFilterReasons.includes(String(value))) return "content_filter";
-  return "stop";
+  if (lengthReasons.includes(reason)) return "length";
+  if (contentFilterReasons.includes(reason)) return "content_filter";
+  if (stopReasons.includes(reason)) return "stop";
+  return undefined;
+}
+// finishReasonField is the finish_reason entry of a chat response, empty when not reported.
+export function finishReasonField(
+  value: unknown,
+  hasTools = false,
+): Pick<ChatResponse, "finish_reason"> {
+  const reason = finishReason(value, hasTools);
+  return reason === undefined ? {} : { finish_reason: reason };
 }
 export function modelCallbackFromChat(
   chat: AgentChat,
@@ -222,11 +235,12 @@ export function modelCallbackFromChat(
         { role: "user", content: prompt },
       ],
     });
-    return {
+    const result: PredictModelResult = {
       text: response.message.content ?? "",
       usage: response.usage,
-      finishReason: response.finish_reason,
     };
+    if (response.finish_reason) result.finishReason = response.finish_reason;
+    return result;
   };
 }
 export function providerCallbacks(

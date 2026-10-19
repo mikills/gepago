@@ -501,15 +501,14 @@ function normalizeAgentChatResponse(value: unknown): ChatResponse {
     throw new TypeError("agent chat response.message.role must be assistant");
   }
   const responseUsage = assertUsage(object.usage, "agent chat response.usage");
-  if (!agentFinishReasons.has(object.finish_reason as string)) {
+  const reported = isReportedFinishReason(object.finish_reason);
+  if (reported && !agentFinishReasons.has(object.finish_reason as string)) {
     throw new TypeError("agent chat response.finish_reason is invalid");
   }
   assertJSONValue(object, "agent chat response");
-  return {
-    message,
-    usage: responseUsage,
-    finish_reason: object.finish_reason as FinishReason,
-  };
+  const normalized: ChatResponse = { message, usage: responseUsage };
+  if (reported) normalized.finish_reason = object.finish_reason as FinishReason;
+  return normalized;
 }
 
 function assertAgentToolRequest(value: unknown): AgentToolRequest {
@@ -1167,6 +1166,12 @@ function normalizeCompileModelResult(
   return normalizeHostModelResult(value, "compile model result");
 }
 
+// isReportedFinishReason treats undefined, null and "" as a finish reason the provider did not
+// report, as the Go bridge does.
+function isReportedFinishReason(value: unknown): boolean {
+  return value !== undefined && value !== null && value !== "";
+}
+
 // normalizeHostModelResult validates a host model's reply and keeps only the fields the WASM
 // module reads: text, plus optional usage, finishReason and model.
 function normalizeHostModelResult(
@@ -1179,10 +1184,8 @@ function normalizeHostModelResult(
     throw new TypeError(`${name}.text is required`);
   assertString(result.text, `${name}.text`);
   if (result.usage !== undefined) assertUsage(result.usage, `${name}.usage`);
-  if (
-    result.finishReason !== undefined &&
-    !agentFinishReasons.has(result.finishReason as string)
-  )
+  const reported = isReportedFinishReason(result.finishReason);
+  if (reported && !agentFinishReasons.has(result.finishReason as string))
     throw new TypeError(
       `${name}.finishReason must be one of stop, length, tool_calls or content_filter`,
     );
@@ -1190,8 +1193,7 @@ function normalizeHostModelResult(
   assertJSONValue(result, name);
   const normalized: PredictModelResult = { text: result.text as string };
   if (result.usage !== undefined) normalized.usage = result.usage as Usage;
-  if (result.finishReason !== undefined)
-    normalized.finishReason = result.finishReason as FinishReason;
+  if (reported) normalized.finishReason = result.finishReason as FinishReason;
   if (result.model !== undefined) normalized.model = result.model as string;
   return normalized;
 }

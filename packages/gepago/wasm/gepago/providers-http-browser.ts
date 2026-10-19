@@ -15,7 +15,7 @@ import type {
 } from "./provider-types.ts";
 import type { WireObject } from "./internal-types.ts";
 import {
-  finishReason,
+  finishReasonField,
   headersWithDefaults,
   jsonObject,
   modelCallbackFromChat,
@@ -119,7 +119,7 @@ function openAIResponse(response: WireObject): ChatResponse {
       calls,
     ),
     usage: usageFrom(response.usage),
-    finish_reason: finishReason(choice.finish_reason, calls.length > 0),
+    ...finishReasonField(choice.finish_reason, calls.length > 0),
   };
 }
 function openAIRequest(
@@ -268,7 +268,7 @@ function anthropicResponse(response: WireObject): ChatResponse {
         Number(usage.cache_read_input_tokens ?? 0),
       output_tokens: usage.output_tokens,
     }),
-    finish_reason: finishReason(response.stop_reason, calls.length > 0),
+    ...finishReasonField(response.stop_reason, calls.length > 0),
   };
 }
 export interface ClaudeOptions extends HTTPProviderOptions {
@@ -454,7 +454,7 @@ function googleResponse(
   return {
     message: responseMessage(text, calls),
     usage: usageFrom(response.usageMetadata),
-    finish_reason: finishReason(candidate.finishReason, calls.length > 0),
+    ...finishReasonField(candidate.finishReason, calls.length > 0),
   };
 }
 export function createGoogleChat(input: HTTPProviderOptions): AgentChat {

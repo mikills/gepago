@@ -379,13 +379,15 @@ func TestPredictResumeStopsOnTruncatedReply(t *testing.T) {
 		t.Fatalf("truncated job was kept: %s", stale)
 	}
 
-	jobID, requestID = begin()
-	complete := invokeJSON("predict.resume", mustJSON(t, map[string]any{
-		"job_id": jobID, "request_id": requestID,
-		"result": map[string]any{"text": `{"label":"positive"}`, "finishReason": "stop", "model": "m"},
-	}))
-	if !strings.Contains(complete, `"status":"complete"`) {
-		t.Fatalf("stopped reply was not accepted: %s", complete)
+	for _, reason := range []any{"stop", nil, ""} {
+		jobID, requestID = begin()
+		complete := invokeJSON("predict.resume", mustJSON(t, map[string]any{
+			"job_id": jobID, "request_id": requestID,
+			"result": map[string]any{"text": `{"label":"positive"}`, "finishReason": reason, "model": "m"},
+		}))
+		if !strings.Contains(complete, `"status":"complete"`) {
+			t.Fatalf("reply with finishReason %#v was not accepted: %s", reason, complete)
+		}
 	}
 
 	jobID, requestID = begin()

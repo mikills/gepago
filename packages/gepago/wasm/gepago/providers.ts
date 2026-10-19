@@ -318,16 +318,12 @@ export function createPiChat(input: PiOptions = {}): AgentChat {
       request_id: "pi-chat",
       attempt: 1,
     });
+    // the pi CLI reports no finish reason, so none is set, as in the Go provider.
     if (typeof result === "string")
-      return {
-        message: responseMessage(result),
-        usage: usageFrom(),
-        finish_reason: "stop",
-      };
+      return { message: responseMessage(result), usage: usageFrom() };
     return {
       message: responseMessage(result.text),
       usage: result.usage ?? usageFrom(),
-      finish_reason: "stop",
     };
   };
 }
