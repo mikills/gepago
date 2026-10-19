@@ -46,6 +46,13 @@ import (
 // error and provenance, and from the text of every json.RawMessage in details, such as the
 // "output" a ToolStep attaches when its tool's output does not fit its writes.
 //
+// The Attributes of the RunContext that every event carries pass through the Redactor once per
+// run, before RunStarted, each under the key "attribute:<name>", where <name> is the
+// attribute's, with its value as a string. A result that is not a string becomes its JSON
+// encoding, or RedactedText when it has none. An attribute the Redactor changes is removed from
+// error messages like any other redacted value. RunContext's RunID, ParentRunID and TraceID are
+// not redacted.
+//
 // A Redactor that panics is recovered: the value is replaced by RedactionFailed and removed
 // from error messages like any other redacted value, so a failing Redactor never lets a value
 // through, and the run continues.
@@ -110,6 +117,28 @@ func applyRedactors(redactors []Redactor, key string, value any) (out any) {
 	return value
 }
 
+// redactRunContext returns a copy of rc as the run's events carry it, each attribute passed
+// through the redactors under its attributeKey. The caller holds the trace lock.
+func (r *runObservation) redactRunContext(rc RunContext) RunContext {
+	rc = rc.clone()
+	for name, value := range rc.Attributes {
+		rc.Attributes[name] = toolText(r.redact(attributeKey(name), value))
+	}
+	return rc
+}
+
+// attributeValues returns rc's attributes under their attributeKeys, or nil when it has none.
+func attributeValues(rc RunContext) map[string]any {
+	if len(rc.Attributes) == 0 {
+		return nil
+	}
+	values := make(map[string]any, len(rc.Attributes))
+	for name, value := range rc.Attributes {
+		values[attributeKey(name)] = value
+	}
+	return values
+}
+
 // redactEntry returns a copy of the detail named name as events carry it: a Prediction or
 // map[string]any entry by entry under each entry's key, and any other value under name. The
 // caller holds the trace lock.
@@ -172,11 +201,11 @@ type evaluationRedaction struct {
 // and each SideInfo entry are redacted as an event's details are (see redactEntry), with the
 // "inputs" and "expected" entries first converted to their keys' types where they convert, so a
 // Redactor sees them as it sees a run's values, SideInfo's "details" one level further, as an
-// event's details, and the inputs, reads, writes and details of any PipelineTrace in its Trace
-// as an event's, with the tool calls of its steps redacted as an event's are. Then the text of
-// every value the redactors change, among those and the values, details and tool calls of the
-// runs, is removed from every string in them, errors included. Without redactors it returns
-// item unchanged.
+// event's details, and the inputs, reads, writes, details and run context attributes of any
+// PipelineTrace in its Trace as an event's, with the tool calls of its steps redacted as an
+// event's are. Then the text of every value the redactors change, among those and the values,
+// details and tool calls of the runs, is removed from every string in them, errors and
+// attributes included. Without redactors it returns item unchanged.
 func (e evaluationRedaction) apply(item EvaluationItem) EvaluationItem {
 	if len(e.redactors) == 0 {
 		return item
@@ -209,13 +238,13 @@ func (e evaluationRedaction) apply(item EvaluationItem) EvaluationItem {
 		item.SideInfo = sideInfo
 	}
 	item.Trace = mapTraces(item.Trace, func(trace PipelineTrace) PipelineTrace {
-		return mapTrace(
-			trace,
-			run.redactValues,
-			run.redactEntries,
-			run.redactToolCalls,
-			func(text string) string { return text },
-		)
+		return mapTrace(trace, traceMapping{
+			values:     run.redactValues,
+			details:    run.redactEntries,
+			tools:      run.redactToolCalls,
+			text:       func(text string) string { return text },
+			runContext: run.redactRunContext,
+		})
 	})
 
 	if item.Output != nil {
@@ -225,7 +254,13 @@ func (e evaluationRedaction) apply(item EvaluationItem) EvaluationItem {
 		item.SideInfo = run.scrubValues(item.SideInfo)
 	}
 	item.Trace = mapTraces(item.Trace, func(trace PipelineTrace) PipelineTrace {
-		return mapTrace(trace, run.scrubValues, run.scrubValues, run.scrubToolCalls, run.trace.scrub)
+		return mapTrace(trace, traceMapping{
+			values:     run.scrubValues,
+			details:    run.scrubValues,
+			tools:      run.scrubToolCalls,
+			text:       run.trace.scrub,
+			runContext: run.scrubRunContext,
+		})
 	})
 	return item
 }
@@ -271,33 +306,37 @@ func mapTraces(value any, fn func(PipelineTrace) PipelineTrace) any {
 	return value
 }
 
-// mapTrace returns a copy of trace, its nested runs included, with values applied to its
-// inputs and to each step's reads and writes, details to each step's details, tools to each
-// step's tool calls, and text to its errors.
-func mapTrace(
-	trace PipelineTrace,
-	values, details func(map[string]any) map[string]any,
-	tools func([]ToolCallRecord) []ToolCallRecord,
-	text func(string) string,
-) PipelineTrace {
-	trace.Inputs = values(trace.Inputs)
-	trace.Err = text(trace.Err)
+// traceMapping holds what mapTrace applies to a trace: values to its inputs and to each step's
+// reads and writes, details to each step's details, tools to each step's tool calls, text to its
+// errors and runContext to its RunContext.
+type traceMapping struct {
+	values, details func(map[string]any) map[string]any
+	tools           func([]ToolCallRecord) []ToolCallRecord
+	text            func(string) string
+	runContext      func(RunContext) RunContext
+}
+
+// mapTrace returns a copy of trace, its nested runs included, with mapping applied.
+func mapTrace(trace PipelineTrace, mapping traceMapping) PipelineTrace {
+	trace.RunContext = mapping.runContext(trace.RunContext)
+	trace.Inputs = mapping.values(trace.Inputs)
+	trace.Err = mapping.text(trace.Err)
 	if trace.Steps == nil {
 		return trace
 	}
 	steps := make([]StepTrace, len(trace.Steps))
 	for i, step := range trace.Steps {
-		step.Reads = values(step.Reads)
-		step.Writes = values(step.Writes)
-		step.Details = details(step.Details)
-		step.ToolCalls = tools(step.ToolCalls)
-		step.Err = text(step.Err)
-		nested := mapTrace(PipelineTrace{Steps: step.Steps}, values, details, tools, text)
+		step.Reads = mapping.values(step.Reads)
+		step.Writes = mapping.values(step.Writes)
+		step.Details = mapping.details(step.Details)
+		step.ToolCalls = mapping.tools(step.ToolCalls)
+		step.Err = mapping.text(step.Err)
+		nested := mapTrace(PipelineTrace{Steps: step.Steps}, mapping)
 		step.Steps = nested.Steps
 		if step.Runs != nil {
 			runs := make([]PipelineTrace, len(step.Runs))
 			for j, run := range step.Runs {
-				runs[j] = mapTrace(run, values, details, tools, text)
+				runs[j] = mapTrace(run, mapping)
 			}
 			step.Runs = runs
 		}
@@ -305,6 +344,15 @@ func mapTrace(
 	}
 	trace.Steps = steps
 	return trace
+}
+
+// scrubRunContext returns a copy of rc with the redacted text removed from its attributes.
+func (r *runObservation) scrubRunContext(rc RunContext) RunContext {
+	rc = rc.clone()
+	for name, value := range rc.Attributes {
+		rc.Attributes[name] = r.trace.scrub(value)
+	}
+	return rc
 }
 
 // redactToolCalls returns copies of records as the run's events carry them, each call's

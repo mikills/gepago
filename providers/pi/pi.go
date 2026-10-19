@@ -5,10 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os/exec"
 	"strings"
+	"time"
 
 	gepa "github.com/mikills/gepago"
+	"github.com/mikills/gepago/internal/providerlog"
 )
 
 // Config controls how the pi CLI is run.
@@ -19,6 +22,13 @@ type Config struct {
 	Model string
 	// ExtraArgs are appended before the prompt.
 	ExtraArgs []string
+	// Logger, when set, receives one record for each Generate call: at Info on success and Warn
+	// on failure, with the gepa.RunContext of the call's context (see gepa.RunContext.LogAttrs),
+	// the operation, the model, the duration and the error, but never the prompt or the reply.
+	// The error of a failed run is logged without the text pi printed, which may hold part of a
+	// reply. Print mode reports no usage or finish reason, so the usage is zero. Nil logs
+	// nothing.
+	Logger *slog.Logger
 }
 
 // LanguageModel runs the pi CLI in print mode as a gepa.Generator, one subprocess per call.
@@ -59,14 +69,26 @@ func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Gener
 	}
 	args = append(args, m.config.ExtraArgs...)
 	args = append(args, "-p", prompt)
+	started := time.Now()
 	cmd := exec.CommandContext(ctx, m.config.Command, args...)
 	out, err := cmd.CombinedOutput()
+	call := providerlog.Call{
+		Provider:  "pi",
+		Operation: "generate",
+		Model:     strings.TrimSpace(m.config.Model),
+		Started:   started,
+	}
 	if err != nil {
+		call.Err = classifyError(ctx, "", err)
+		providerlog.Log(ctx, m.config.Logger, call)
 		return gepa.Generation{}, classifyError(ctx, strings.TrimSpace(string(out)), err)
 	}
+	providerlog.Log(ctx, m.config.Logger, call)
 	return gepa.Generation{Text: strings.TrimSpace(string(out))}, nil
 }
 
+// classifyError classifies err, the failure of a pi run that printed output, and names the
+// output in its message unless it is empty.
 func classifyError(ctx context.Context, output string, err error) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr

@@ -186,10 +186,15 @@ func TestProgramEvaluatorKeepsNestedObserverEvents(t *testing.T) {
 		}
 		trace, ok := result.Items[0].Trace.(PipelineTrace)
 		require.True(t, ok)
-		require.NotEqual(t, trace.TraceID, log.traceIDs()[0], "the recorded trace is the recorder's own")
 		require.Len(t, trace.Steps, 1)
 		require.Len(t, trace.Steps[0].Runs, 1)
 		nested := trace.Steps[0].Runs[0]
+		// the recorder observes the runs apart from the nested pipeline's observers, but both see
+		// the same run contexts
+		require.Equal(t, trace.TraceID, log.traceIDs()[0])
+		require.Equal(t, nested.RunContext, log.runsStarted[0].RunContext)
+		require.Equal(t, nested.SpanID, log.runsStarted[0].Span.ID)
+		require.Equal(t, trace.RunContext.RunID, nested.RunContext.ParentRunID)
 		require.Equal(t, map[string]any{"document": "[doc]"}, nested.Inputs)
 		require.Len(t, nested.Steps, 1)
 		require.Equal(t, "parse", nested.Steps[0].Step)

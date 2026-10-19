@@ -12,14 +12,16 @@ import (
 // PipelineObserver receives the events of the runs of a Pipeline built with it in
 // PipelineSpec.Observers.
 //
-// Every run is one trace: each run has a span, each execution of a step has a span whose parent
-// is the span of the run or of the execution around it, and every span of the run, those of
-// pipelines nested in it included, shares its TraceID. An execution is one run of a step: each
-// retry attempt, each fallback step, each cache hit and each skip on error is an execution of
-// its own, numbered by Attempt. WithPolicy and WithCache are not executions of their own; their
-// attempts, fallbacks, cache hits and skips are. A top-level step's writes are merged into the
-// state as part of its execution, so a MergeRule that fails fails that execution; for a
-// top-level WithPolicy or WithCache step it adds a failed execution after the one that wrote.
+// Each run has a span whose ID is the RunID of the run's RunContext, and each execution of a
+// step has a span whose parent is the span of the run or of the execution around it. Every span
+// of a run has the TraceID of the run's RunContext, which the runs nested in it share (see
+// RunContext), and every event carries the run's RunContext, with its attributes redacted (see
+// Redactor). An execution is one run of a step: each retry attempt, each fallback step, each
+// cache hit and each skip on error is an execution of its own, numbered by Attempt. WithPolicy
+// and WithCache are not executions of their own; their attempts, fallbacks, cache hits and skips
+// are. A top-level step's writes are merged into the state as part of its execution, so a
+// MergeRule that fails fails that execution; for a top-level WithPolicy or WithCache step it
+// adds a failed execution after the one that wrote.
 //
 // The events of a run are ordered:
 //   - RunStarted comes before every other event of the run and RunFinished after them. A run
@@ -32,16 +34,17 @@ import (
 //   - The attempts of a step follow each other in order. A skip, or the fallback step of an
 //     OnErrorFallback policy, follows the step's last failed attempt.
 //   - A pipeline run by a step, through NewProgramStep or a step that runs it with its
-//     context, joins the run's trace: its RunStarted and RunFinished come between that step's
-//     StepStarted and StepFinished, and its run span's parent is the step's span. Its events
-//     go to its own observers and then to those of every run around it.
+//     context, joins the observation of the run: its RunStarted and RunFinished come between
+//     that step's StepStarted and StepFinished, and its run span's parent is the step's span.
+//     Its events go to its own observers and then to those of every run around it.
 //
 // Under Parallel the events of steps that run side by side interleave, but the observer and
-// redactor calls of one trace are serialised: no two of them run at once, and every observer
-// of the trace sees its events in the same order. Calls are synchronous, so an observer that
-// blocks stalls the run, and it must not wait for another step of the same run. Runs of
-// different traces call a shared observer concurrently, so an observer of a pipeline that runs
-// concurrently must be safe for concurrent use.
+// redactor calls of one observed run, the runs nested in it included, are serialised: no two of
+// them run at once, and every observer of the run sees its events in the same order. Calls are
+// synchronous, so an observer that blocks stalls the run, and it must not wait for another step
+// of the same run. Separate top-level runs call a shared observer concurrently, even when they
+// share a TraceID because their callers gave them the same RunContext, so an observer of a
+// pipeline that runs concurrently must be safe for concurrent use.
 //
 // Observers are called in the order of PipelineSpec.Observers. An observer of a comparable
 // type, such as a pointer, is called once for each event even when it is listed more than
@@ -54,14 +57,16 @@ import (
 // the context the caller passed to the trace's top-level run ends, when the MaxDuration of the
 // event's run or of a run around it expires, or once the event's run has finished, but not when
 // a step's timeout, a token or model call limit or a failed Parallel sibling ends the step's
-// own context. It carries neither the run's trace, budget, usage collection, tool session nor
-// tool memory, so an observer's model calls, tool calls and pipeline runs are independent of
-// the observed run: they spend none of its budget or tool call limits, do not count in its
-// usage or tool records, and a pipeline run with ctx starts a trace of its own.
+// own context. It carries neither the run's observation, RunContext, budget, usage collection,
+// tool session nor tool memory, so an observer's model calls, tool calls and pipeline runs are
+// independent of the observed run: they spend none of its budget or tool call limits, do not
+// count in its usage or tool records, are not logged under its RunContext, and a pipeline run
+// with ctx starts a trace of its own. An observer that wants its work correlated with the run
+// can pass the event's RunContext to WithRunContext.
 //
 // The values an event carries pass through PipelineSpec.Redactor; see Redactor. Each observer
-// receives its own copy of them, so changing them changes neither the run nor what other
-// observers receive.
+// receives its own copy of them, its RunContext's Attributes included, so changing them changes
+// neither the run nor what other observers receive.
 type PipelineObserver interface {
 	RunStarted(ctx context.Context, event RunStartedEvent)
 	StepStarted(ctx context.Context, event StepStartedEvent)
@@ -71,9 +76,12 @@ type PipelineObserver interface {
 
 // RunStartedEvent reports the start of a pipeline run.
 type RunStartedEvent struct {
-	// Span is the run's span, of kind UsageSpanPipelineRun. ParentID is the span of the step
-	// that started a nested run, empty for a top-level run.
+	// Span is the run's span, of kind UsageSpanPipelineRun, whose ID is RunContext.RunID and
+	// TraceID RunContext.TraceID. ParentID is the span of the step that started a nested run in
+	// the same observation, and empty otherwise.
 	Span UsageSpan
+	// RunContext is the run's, with its Attributes redacted.
+	RunContext RunContext
 	// Inputs holds the run's inputs after redaction.
 	Inputs map[string]any
 }
@@ -82,8 +90,10 @@ type RunStartedEvent struct {
 type RunFinishedEvent struct {
 	// Span is the run's finished span; its Duration and Usage are the event's, and its Err is
 	// the message of the event's Err.
-	Span     UsageSpan
-	Duration time.Duration
+	Span UsageSpan
+	// RunContext is the run's, as RunStarted reported it.
+	RunContext RunContext
+	Duration   time.Duration
 	// Usage is what the model calls of the run recorded, nested steps and pipelines included.
 	Usage Usage
 	// Err is the run's error, a *StepError without a Redactor; see Redactor.
@@ -95,7 +105,9 @@ type StepStartedEvent struct {
 	// Span is the execution's span, of kind UsageSpanPipelineStep and named after the step.
 	// ParentID is the span of the enclosing execution, or of the run for a top-level step.
 	Span UsageSpan
-	Step string
+	// RunContext is the RunContext of the run the step belongs to, as RunStarted reported it.
+	RunContext RunContext
+	Step       string
 	// Attempt counts the step's executions in the run from one, cache hits and skips included.
 	Attempt int
 	// Reads holds the values of the step's declared reads after redaction.
@@ -106,10 +118,12 @@ type StepStartedEvent struct {
 type StepFinishedEvent struct {
 	// Span is the execution's finished span; its Duration and Usage are the event's, and its
 	// Err is the message of the event's Err.
-	Span     UsageSpan
-	Step     string
-	Attempt  int
-	Duration time.Duration
+	Span UsageSpan
+	// RunContext is the RunContext of the run the step belongs to, as RunStarted reported it.
+	RunContext RunContext
+	Step       string
+	Attempt    int
+	Duration   time.Duration
 	// Usage is what the execution's model calls recorded, nested steps included.
 	Usage Usage
 	// Err is the step's own error, before any enclosing step wraps it; see Redactor.
@@ -162,9 +176,9 @@ func (r *runObservation) observerContext(ctx context.Context) context.Context {
 }
 
 // observerCtx takes its deadline and cancellation from a run's life and its values from a
-// run's context, hiding those that tie it to a pipeline run: its trace, step frame, budget,
-// usage collection, step cache, evaluation capture, tool session, tool memory and staged tool
-// results.
+// run's context, hiding those that tie it to a pipeline run: its trace, step frame, run
+// context, budget, usage collection, step cache, evaluation capture, tool session, tool memory
+// and staged tool results.
 type observerCtx struct {
 	context.Context
 	values context.Context
@@ -172,8 +186,8 @@ type observerCtx struct {
 
 func (c observerCtx) Value(key any) any {
 	switch key.(type) {
-	case observeKey, evaluationKey, pipelineRunKey, usageFrameKey, usageCollectorKey, retryAdmissionKey, budgetClockKey,
-		toolEnvKey, toolMemoryKey, stepStageKey:
+	case observeKey, evaluationKey, pipelineRunKey, runContextKey, usageFrameKey, usageCollectorKey, retryAdmissionKey,
+		budgetClockKey, toolEnvKey, toolMemoryKey, stepStageKey:
 		return nil
 	}
 	return c.values.Value(key)
@@ -200,42 +214,45 @@ func sameObserver(a, b PipelineObserver) (same bool) {
 	return reflect.TypeOf(a) == reflect.TypeOf(b) && reflect.TypeOf(a).Comparable() && a == b
 }
 
-// traceObservation is shared by the runs of one trace. Its lock serialises their observer and
-// redactor calls and guards the text it removes from errors; see Redactor. A trace started
-// inside a recorded trace shares that trace's lock.
+// traceObservation is shared by the runs of one observation: a top-level observed run and the
+// runs nested in it. Its lock serialises their observer and redactor calls and guards the text
+// it removes from errors; see Redactor. An observation started inside a recorded one shares
+// that observation's lock.
 type traceObservation struct {
-	id string
 	mu *sync.Mutex
 	redactedText
 }
 
 // runObservation reports one run to its observers: its own and those of the runs around it,
-// with its own redactor followed by theirs. life ends when the context the caller passed to the
-// trace's top-level run ends, when the MaxDuration of the run or a run around it expires, or
-// when endLife ends it once the run has finished. recording, when set, reports the same run to
-// the RecordingObserver of an evaluation that records traces, in a trace of its own; see
-// observeScope.
+// with its own redactor followed by theirs. runContext is the run's RunContext as its events
+// carry it, with the attributes redacted; it is set when RunStarted is emitted. life ends when
+// the context the caller passed to the observation's top-level run ends, when the MaxDuration of
+// the run or a run around it expires, or when endLife ends it once the run has finished.
+// recording, when set, reports the same run to the RecordingObserver of an evaluation that
+// records traces, in an observation of its own; see observeScope.
 type runObservation struct {
-	trace     *traceObservation
-	observers []PipelineObserver
-	redactors []Redactor
-	span      UsageSpan
-	start     time.Time
-	life      context.Context
-	endLife   context.CancelFunc
-	recording *runObservation
+	trace      *traceObservation
+	observers  []PipelineObserver
+	redactors  []Redactor
+	span       UsageSpan
+	runContext RunContext
+	start      time.Time
+	life       context.Context
+	endLife    context.CancelFunc
+	recording  *runObservation
 }
 
-// observeRun starts observing a run of p over its converted inputs, as part of the trace in ctx
-// if there is one, and emits RunStarted. caller is the context the caller passed to the run.
-// It returns ctx carrying the run, and nil when nothing observes the run.
+// observeRun starts observing a run of p over its converted inputs, with rc as its RunContext,
+// as part of the observation in ctx if there is one, and emits RunStarted. caller is the context
+// the caller passed to the run. It returns ctx carrying the run, and nil when nothing observes
+// the run.
 //
 // A top-level run of an example that ProgramEvaluator records traces for reports to the
 // evaluation's RecordingObserver as well as to its own observers. When it has no observers of
 // its own, the recorder alone observes it, apart from its observers' trace: the runs inside it
 // report to the recorder as part of the recorded trace and, separately, to their own observers
 // as they would outside an evaluation.
-func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any) (
+func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any, rc RunContext) (
 	context.Context,
 	*runObservation,
 ) {
@@ -243,22 +260,23 @@ func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any)
 	capture := evaluationCaptureFrom(ctx)
 	recorder := capture.join(p, parent == nil)
 	capture.offer(inputs)
+	capture.offer(attributeValues(rc))
 	if parent == nil {
 		parent = &observeScope{}
 	}
 	var run, recording *runObservation
 	switch {
 	case recorder != nil && len(p.observers) == 0:
-		recording = p.startRun(nil, "", caller, []PipelineObserver{recorder}, nil)
+		recording = p.startRun(nil, "", caller, []PipelineObserver{recorder}, nil, rc)
 	case recorder != nil:
-		run = p.startRun(nil, "", caller, append(slices.Clone(p.observers), recorder), nil)
+		run = p.startRun(nil, "", caller, append(slices.Clone(p.observers), recorder), nil, rc)
 	default:
 		var lock *sync.Mutex
 		if parent.recording != nil {
-			recording = p.startRun(parent.recording, parent.recordingSpan, caller, nil, nil)
+			recording = p.startRun(parent.recording, parent.recordingSpan, caller, nil, nil, rc)
 			lock = recording.trace.mu
 		}
-		run = p.startRun(parent.run, parent.span, caller, p.observers, lock)
+		run = p.startRun(parent.run, parent.span, caller, p.observers, lock, rc)
 	}
 	scope := &observeScope{}
 	if recording != nil {
@@ -278,10 +296,12 @@ func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any)
 	run.trace.mu.Lock()
 	defer run.trace.mu.Unlock()
 	for lane := run; lane != nil; lane = lane.recording {
-		event := RunStartedEvent{Span: lane.span, Inputs: lane.redactValues(inputs)}
+		lane.runContext = lane.redactRunContext(rc)
+		event := RunStartedEvent{Span: lane.span, RunContext: lane.runContext, Inputs: lane.redactValues(inputs)}
 		observerCtx := lane.observerContext(ctx)
 		lane.deliver(func(observer PipelineObserver) {
 			event := event
+			event.RunContext = event.RunContext.clone()
 			event.Inputs = copyValues(event.Inputs)
 			observer.RunStarted(observerCtx, event)
 		})
@@ -289,9 +309,10 @@ func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any)
 	return ctx, run
 }
 
-// startRun returns the observation of a run of p, with observers added to those of parent: in
-// parent's trace, under the span parentSpan, when parent is set, and otherwise in a new trace
-// serialised by lock, or by a lock of its own when lock is nil. It returns nil when there is
+// startRun returns the observation of a run of p with the RunContext rc, with observers added
+// to those of parent: in parent's observation, under the span parentSpan, when parent is set,
+// and otherwise in a new observation serialised by lock, or by a lock of its own when lock is
+// nil. The run's span has rc's RunID as its ID and rc's TraceID. It returns nil when there is
 // neither a parent nor an observer. caller is the context the caller passed to the run.
 func (p Pipeline) startRun(
 	parent *runObservation,
@@ -299,6 +320,7 @@ func (p Pipeline) startRun(
 	caller context.Context,
 	observers []PipelineObserver,
 	lock *sync.Mutex,
+	rc RunContext,
 ) *runObservation {
 	if parent == nil && len(observers) == 0 {
 		return nil
@@ -316,14 +338,15 @@ func (p Pipeline) startRun(
 		if lock == nil {
 			lock = &sync.Mutex{}
 		}
-		run.trace = &traceObservation{id: NewID(), mu: lock}
+		run.trace = &traceObservation{mu: lock}
 	}
 	if limit := p.budget.MaxDuration; limit > 0 {
 		run.life, run.endLife = context.WithDeadline(run.life, run.start.Add(limit))
 	} else {
 		run.life, run.endLife = context.WithCancel(run.life)
 	}
-	run.span = NewUsageSpan(run.trace.id, parentSpan, UsageSpanPipelineRun, "pipeline")
+	run.span = NewUsageSpan(rc.TraceID, parentSpan, UsageSpanPipelineRun, "pipeline")
+	run.span.ID = rc.RunID
 	return run
 }
 
@@ -339,13 +362,16 @@ func (r *runObservation) finish(ctx context.Context, err error) {
 	for lane := r; lane != nil; lane = lane.recording {
 		laneErr := lane.redactError(err)
 		event := RunFinishedEvent{
-			Span:     finishSpan(lane.span, duration, usage, laneErr),
-			Duration: duration,
-			Usage:    usage,
-			Err:      laneErr,
+			Span:       finishSpan(lane.span, duration, usage, laneErr),
+			RunContext: lane.runContext,
+			Duration:   duration,
+			Usage:      usage,
+			Err:        laneErr,
 		}
 		observerCtx := lane.observerContext(ctx)
 		lane.deliver(func(observer PipelineObserver) {
+			event := event
+			event.RunContext = event.RunContext.clone()
 			observer.RunFinished(observerCtx, event)
 		})
 		lane.endLife()
@@ -377,12 +403,12 @@ func observeStep(ctx context.Context, node *stepNode, attempt int, values map[st
 	next := &observeScope{}
 	var lanes []*stepObservation
 	if scope.run != nil {
-		span := NewUsageSpan(scope.run.trace.id, scope.span, UsageSpanPipelineStep, node.name)
+		span := NewUsageSpan(scope.run.span.TraceID, scope.span, UsageSpanPipelineStep, node.name)
 		next.run, next.span = scope.run, span.ID
 		lanes = append(lanes, &stepObservation{run: scope.run, span: span, step: node.name})
 	}
 	if scope.recording != nil {
-		span := NewUsageSpan(scope.recording.trace.id, scope.recordingSpan, UsageSpanPipelineStep, node.name)
+		span := NewUsageSpan(scope.recording.span.TraceID, scope.recordingSpan, UsageSpanPipelineStep, node.name)
 		next.recording, next.recordingSpan = scope.recording, span.ID
 		lanes = append(lanes, &stepObservation{run: scope.recording, span: span, step: node.name})
 	}
@@ -406,10 +432,17 @@ func observeStep(ctx context.Context, node *stepNode, attempt int, values map[st
 		}
 		lane.ctx = ctx
 		lane.reads = lane.run.redactValues(reads)
-		event := StepStartedEvent{Span: lane.span, Step: node.name, Attempt: attempt, Reads: lane.reads}
+		event := StepStartedEvent{
+			Span:       lane.span,
+			RunContext: lane.run.runContext,
+			Step:       node.name,
+			Attempt:    attempt,
+			Reads:      lane.reads,
+		}
 		observerCtx := lane.run.observerContext(ctx)
 		lane.run.deliver(func(observer PipelineObserver) {
 			event := event
+			event.RunContext = event.RunContext.clone()
 			event.Reads = copyValues(event.Reads)
 			observer.StepStarted(observerCtx, event)
 		})
@@ -447,15 +480,16 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 		}
 		toolCalls := run.redactToolCalls(outcome.ToolCalls)
 		event := StepFinishedEvent{
-			Step:     lane.step,
-			Attempt:  outcome.Attempt,
-			Duration: outcome.Duration,
-			Usage:    outcome.Usage,
-			Writes:   run.redactValues(writes),
-			Details:  run.redactDetails(details),
-			Reads:    lane.reads,
-			Cached:   outcome.Cached,
-			Skipped:  outcome.Skipped,
+			RunContext: run.runContext,
+			Step:       lane.step,
+			Attempt:    outcome.Attempt,
+			Duration:   outcome.Duration,
+			Usage:      outcome.Usage,
+			Writes:     run.redactValues(writes),
+			Details:    run.redactDetails(details),
+			Reads:      lane.reads,
+			Cached:     outcome.Cached,
+			Skipped:    outcome.Skipped,
 		}
 		event.ToolCalls = run.scrubToolCalls(toolCalls)
 		event.Err = run.redactError(outcome.Err)
@@ -463,6 +497,7 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 		observerCtx := run.observerContext(lane.ctx)
 		run.deliver(func(observer PipelineObserver) {
 			event := event
+			event.RunContext = event.RunContext.clone()
 			event.Reads = copyValues(event.Reads)
 			event.Writes = copyValues(event.Writes)
 			event.Details = copyValues(event.Details)

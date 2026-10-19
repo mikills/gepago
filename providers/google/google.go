@@ -6,14 +6,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 
 	gepa "github.com/mikills/gepago"
 	"github.com/mikills/gepago/internal/providererr"
+	"github.com/mikills/gepago/internal/providerlog"
 )
 
 const defaultBaseURL = "https://generativelanguage.googleapis.com"
@@ -27,6 +30,12 @@ type Config struct {
 	MaxTokens   int
 	Temperature *float64
 	Client      *http.Client
+	// Logger, when set, receives one record for each Generate or Chat call: at Info on success
+	// and Warn on failure, with the gepa.RunContext of the call's context (see
+	// gepa.RunContext.LogAttrs), the operation, the requested and resolved model, finish reason,
+	// usage, duration and error, with the API key redacted as in returned errors, but never the
+	// prompt or the reply. Nil logs nothing.
+	Logger *slog.Logger
 }
 
 // Validate checks the provider configuration.
@@ -66,8 +75,8 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 // a cancelled or expired ctx returns its error unwrapped. A reply that fails after the API
 // reported usage returns that usage with the error. An empty reply is an error unless it
 // stopped at the token limit or under a content policy.
-func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Generation, error) {
-	resp, err := m.client.Chat(ctx, gepa.ChatRequest{
+func (m *LanguageModel) Generate(ctx context.Context, prompt string) (generation gepa.Generation, err error) {
+	req := gepa.ChatRequest{
 		Model:       m.client.model,
 		MaxTokens:   &m.maxTokens,
 		Temperature: m.temperature,
@@ -78,8 +87,13 @@ func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Gener
 			},
 			{Role: gepa.RoleUser, Content: prompt},
 		},
-	})
-	generation := gepa.Generation{
+	}
+	started := time.Now()
+	defer func() {
+		m.client.log(ctx, "generate", req, started, generation.Model, generation.FinishReason, generation.Usage, err)
+	}()
+	resp, err := m.client.send(ctx, req)
+	generation = gepa.Generation{
 		Text:         strings.TrimSpace(resp.Message.Content),
 		Usage:        resp.Usage,
 		Model:        resp.ResolvedModel,
@@ -126,6 +140,7 @@ type ChatClient struct {
 	model   string
 	headers map[string]string
 	client  *http.Client
+	logger  *slog.Logger
 }
 
 // NewChatClient constructs a Google Gemini agent chat client.
@@ -149,6 +164,7 @@ func NewChatClient(config Config) (*ChatClient, error) {
 		model:   config.Model,
 		headers: headers,
 		client:  httpClient,
+		logger:  config.Logger,
 	}, nil
 }
 
@@ -158,8 +174,39 @@ func NewChatClient(config Config) (*ChatClient, error) {
 // returns ctx.Err() unwrapped. The API key, which travels in the request URL, is redacted
 // from every error. A response without candidates still returns its usage with the error.
 func (c *ChatClient) Chat(ctx context.Context, req gepa.ChatRequest) (gepa.ChatResponse, error) {
+	started := time.Now()
+	resp, err := c.send(ctx, req)
+	c.log(ctx, "chat", req, started, resp.ResolvedModel, resp.FinishReason, resp.Usage, err)
+	return resp, err
+}
+
+// send is Chat without the log record.
+func (c *ChatClient) send(ctx context.Context, req gepa.ChatRequest) (gepa.ChatResponse, error) {
 	resp, err := c.chat(ctx, req)
 	return resp, c.redact(err)
+}
+
+// log records one call of the named operation made with req to the client's logger.
+func (c *ChatClient) log(
+	ctx context.Context,
+	operation string,
+	req gepa.ChatRequest,
+	started time.Time,
+	resolvedModel string,
+	finish gepa.FinishReason,
+	usage gepa.Usage,
+	err error,
+) {
+	providerlog.Log(ctx, c.logger, providerlog.Call{
+		Provider:      "google",
+		Operation:     operation,
+		Model:         googleRequestModel(c.model, req.Model),
+		ResolvedModel: resolvedModel,
+		FinishReason:  finish,
+		Usage:         usage,
+		Started:       started,
+		Err:           err,
+	})
 }
 
 func (c *ChatClient) chat(ctx context.Context, req gepa.ChatRequest) (gepa.ChatResponse, error) {

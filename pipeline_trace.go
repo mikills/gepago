@@ -15,18 +15,21 @@ import (
 // Values are stored as encoding/json decodes them into an any, and a value that JSON cannot
 // encode, such as NaN, as its %v text, so a trace is equal to itself after a JSON round trip.
 type PipelineTrace struct {
+	// TraceID is RunContext.TraceID and SpanID is RunContext.RunID; see PipelineObserver.
 	TraceID string `json:"trace_id"`
 	SpanID  string `json:"span_id"`
 	// ParentID is the span of the step that ran this run as a nested pipeline, empty for a
 	// top-level run.
-	ParentID  string         `json:"parent_id,omitempty"`
-	StartedAt time.Time      `json:"started_at"`
-	EndedAt   time.Time      `json:"ended_at,omitzero"`
-	Duration  time.Duration  `json:"duration"`
-	Inputs    map[string]any `json:"inputs,omitempty"`
-	Usage     Usage          `json:"usage"`
-	Err       string         `json:"err,omitempty"`
-	ErrKind   ErrorKind      `json:"err_kind,omitempty"`
+	ParentID string `json:"parent_id,omitempty"`
+	// RunContext is the run's, as its events carried it, with its Attributes redacted.
+	RunContext RunContext     `json:"run_context"`
+	StartedAt  time.Time      `json:"started_at"`
+	EndedAt    time.Time      `json:"ended_at,omitzero"`
+	Duration   time.Duration  `json:"duration"`
+	Inputs     map[string]any `json:"inputs,omitempty"`
+	Usage      Usage          `json:"usage"`
+	Err        string         `json:"err,omitempty"`
+	ErrKind    ErrorKind      `json:"err_kind,omitempty"`
 	// Steps holds the executions of the run's top-level steps in the order they started.
 	Steps []StepTrace `json:"steps,omitempty"`
 }
@@ -92,11 +95,12 @@ func (r *RecordingObserver) RunStarted(_ context.Context, event RunStartedEvent)
 		r.steps = map[string]*recordedStep{}
 	}
 	run := &recordedRun{trace: PipelineTrace{
-		TraceID:   event.Span.TraceID,
-		SpanID:    event.Span.ID,
-		ParentID:  event.Span.ParentID,
-		StartedAt: event.Span.StartedAt,
-		Inputs:    traceValues(event.Inputs),
+		TraceID:    event.Span.TraceID,
+		SpanID:     event.Span.ID,
+		ParentID:   event.Span.ParentID,
+		RunContext: event.RunContext.clone(),
+		StartedAt:  event.Span.StartedAt,
+		Inputs:     traceValues(event.Inputs),
 	}}
 	r.runs[event.Span.ID] = run
 	if parent, ok := r.steps[event.Span.ParentID]; ok {
@@ -198,6 +202,7 @@ func (r *RecordingObserver) Traces() []PipelineTrace {
 
 func (r *recordedRun) snapshot() PipelineTrace {
 	trace := r.trace
+	trace.RunContext = trace.RunContext.clone()
 	trace.Inputs = copyValues(trace.Inputs)
 	for _, step := range r.steps {
 		trace.Steps = append(trace.Steps, step.snapshot())

@@ -331,9 +331,9 @@ type PipelineSpec struct {
 // Pipeline is a validated, immutable sequence of steps created by PipelineSpec.Build. It
 // implements Program, so Compile can optimise the components of its ComponentSteps.
 //
-// A Pipeline is safe for concurrent runs: each run has its own State, budget and step cache.
-// Steps shared between concurrent runs, or run side by side by Parallel, must themselves be
-// safe for concurrent use.
+// A Pipeline is safe for concurrent runs: each run has its own State, budget, step cache and
+// RunContext, which its steps find with RunContextFrom. Steps shared between concurrent runs, or
+// run side by side by Parallel, must themselves be safe for concurrent use.
 type Pipeline struct {
 	inputs           []KeyRef
 	inputTypes       map[string]reflect.Type
@@ -625,6 +625,8 @@ func (p Pipeline) execute(ctx context.Context, candidate Candidate, inputs Predi
 		values[key.Name] = converted
 	}
 	caller := ctx
+	rc := childRunContext(ctx)
+	ctx = context.WithValue(ctx, runContextKey{}, rc)
 	run := newPipelineRun(p.defaults, p.optional)
 	ctx, release := startRunBudget(context.WithValue(ctx, pipelineRunKey{}, run), p.budget)
 	defer release()
@@ -638,7 +640,7 @@ func (p Pipeline) execute(ctx context.Context, candidate Candidate, inputs Predi
 		env := &toolEnv{registry: p.tools, session: session, parent: toolEnvFrom(ctx)}
 		ctx = withToolEnv(WithToolMemory(ctx, session.Memory()), env)
 	}
-	ctx, observed := p.observeRun(ctx, caller, values)
+	ctx, observed := p.observeRun(ctx, caller, values, rc)
 	state := State{values: values}
 	for _, node := range p.steps {
 		if err := p.runStep(ctx, candidate, node, state); err != nil {

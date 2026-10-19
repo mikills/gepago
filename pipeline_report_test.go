@@ -25,7 +25,7 @@ func TestHTMLRunReportShowsEveryStepAndTheFailure(t *testing.T) {
 	require.Contains(t, report, "pipeline step &#34;check&#34;: amount too small")
 	require.Contains(t, report, "primary down")
 	require.Contains(t, report, ">failed</strong>")
-	require.Contains(t, report, "Nested run "+trace.Steps[2].Runs[0].SpanID[:8])
+	require.Contains(t, report, "Nested run "+trace.Steps[2].Runs[0].RunContext.RunID+" ·")
 	// a nested step is rendered inside the step that ran it
 	fan := strings.Index(report, "<strong>fan</strong>")
 	summarise := strings.Index(report, "<strong>summarise</strong>")
@@ -85,6 +85,43 @@ func TestHTMLRunReportStatus(t *testing.T) {
 	}
 }
 
+func TestHTMLRunReportShowsTheRunContext(t *testing.T) {
+	trace := PipelineTrace{
+		TraceID: "trace-1",
+		SpanID:  "run-2",
+		RunContext: RunContext{
+			RunID:       "run-2",
+			ParentRunID: "run-1",
+			TraceID:     "trace-1",
+			Attributes:  map[string]string{"request": "req-7", "job": "nightly"},
+		},
+		Steps: []StepTrace{{Step: "outer", Runs: []PipelineTrace{{
+			SpanID:     "run-3",
+			RunContext: RunContext{RunID: "run-3", ParentRunID: "run-2", TraceID: "trace-1"},
+		}}}},
+	}
+	report, err := HTMLRunReport(trace, HTMLReportOptions{})
+	require.NoError(t, err)
+	require.Contains(t, report, "Trace trace-1 · Run run-2")
+	require.Contains(t, report, "<tr><th>Run ID</th><td><code>run-2</code></td></tr>")
+	require.Contains(t, report, "<tr><th>Parent run ID</th><td><code>run-1</code></td></tr>")
+	require.Contains(t, report, "<tr><th>Trace ID</th><td><code>trace-1</code></td></tr>")
+	job := strings.Index(report, "<tr><th>job</th><td><code>nightly</code></td></tr>")
+	request := strings.Index(report, "<tr><th>request</th><td><code>req-7</code></td></tr>")
+	require.Positive(t, job)
+	require.Less(t, job, request, "attributes are sorted by name")
+	require.Contains(t, report, "Nested run run-3 ·")
+
+	t.Run("a trace without a run context", func(t *testing.T) {
+		report, err := HTMLRunReport(PipelineTrace{TraceID: "trace-9", SpanID: "span-9"}, HTMLReportOptions{})
+		require.NoError(t, err)
+		require.Contains(t, report, "<tr><th>Run ID</th><td><code>span-9</code></td></tr>")
+		require.Contains(t, report, `<tr><th>Parent run ID</th><td><span class="muted">none</span></td></tr>`)
+		require.Contains(t, report, "<tr><th>Trace ID</th><td><code>trace-9</code></td></tr>")
+		require.Contains(t, report, "No attributes.")
+	})
+}
+
 func TestReportValuesFallsBackToText(t *testing.T) {
 	require.Equal(t, "{\n  \"a\": \"<b>\"\n}", reportValues(map[string]any{"a": "<b>"}))
 	require.True(t, strings.HasPrefix(reportValues(map[string]any{"a": make(chan int)}), "map[a:0x"))
@@ -107,8 +144,14 @@ func TestHTMLRunReportEscapesEveryField(t *testing.T) {
 	trace := PipelineTrace{
 		TraceID: "<script>t</script>",
 		SpanID:  "<script>s</script>",
-		Err:     "<script>e</script>",
-		Inputs:  map[string]any{"<script>k</script>": "<script>v</script>"},
+		RunContext: RunContext{
+			RunID:       "<script>r</script>",
+			ParentRunID: "<script>p</script>",
+			TraceID:     "<script>t</script>",
+			Attributes:  map[string]string{"<script>a</script>": "<script>v</script>"},
+		},
+		Err:    "<script>e</script>",
+		Inputs: map[string]any{"<script>k</script>": "<script>v</script>"},
 		Steps: []StepTrace{{
 			Step:    "<script>n</script>",
 			Err:     "<script>x</script>",

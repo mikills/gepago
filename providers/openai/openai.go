@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	gepa "github.com/mikills/gepago"
 	"github.com/mikills/gepago/internal/providererr"
+	"github.com/mikills/gepago/internal/providerlog"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/shared"
@@ -25,6 +28,12 @@ type Config struct {
 	Temperature *float64
 	// Client is the HTTP client requests go through; nil uses the SDK default.
 	Client *http.Client
+	// Logger, when set, receives one record for each Generate, GenerateStructured or Chat call
+	// that sends a request: at Info on success and Warn on failure, with the gepa.RunContext of
+	// the call's context (see gepa.RunContext.LogAttrs), the operation, the requested and
+	// resolved model, finish reason, usage, duration and error, but never the prompt or the
+	// reply. Nil logs nothing.
+	Logger *slog.Logger
 }
 
 // Validate checks the provider configuration.
@@ -45,6 +54,7 @@ type LanguageModel struct {
 	model       string
 	maxTokens   int
 	temperature *float64
+	logger      *slog.Logger
 }
 
 // NewLanguageModel constructs an OpenAI or OpenAI-compatible language model. The SDK's own
@@ -77,6 +87,7 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 		model:       config.Model,
 		maxTokens:   maxTokens,
 		temperature: config.Temperature,
+		logger:      config.Logger,
 	}, nil
 }
 
@@ -88,7 +99,7 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 // refusal as the text with FinishContentFilter. An empty reply is an error unless it stopped at
 // the token limit or under a content policy.
 func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Generation, error) {
-	return m.complete(ctx, m.params(prompt))
+	return m.complete(ctx, "generate", m.params(prompt))
 }
 
 // GenerateStructured is Generate with a response format, making LanguageModel a
@@ -104,7 +115,7 @@ func (m *LanguageModel) GenerateStructured(
 	format gepa.ResponseFormat,
 ) (gepa.Generation, error) {
 	if !format.Strict {
-		return m.Generate(ctx, prompt)
+		return m.complete(ctx, "generate_structured", m.params(prompt))
 	}
 	if !json.Valid(format.Schema) {
 		return gepa.Generation{}, gepa.PermanentError(
@@ -125,7 +136,7 @@ func (m *LanguageModel) GenerateStructured(
 			},
 		},
 	}
-	return m.complete(ctx, params)
+	return m.complete(ctx, "generate_structured", params)
 }
 
 func (m *LanguageModel) params(prompt string) openai.ChatCompletionNewParams {
@@ -145,12 +156,30 @@ func (m *LanguageModel) params(prompt string) openai.ChatCompletionNewParams {
 	return params
 }
 
-func (m *LanguageModel) complete(ctx context.Context, params openai.ChatCompletionNewParams) (gepa.Generation, error) {
+// complete sends params for the named operation and logs the call.
+func (m *LanguageModel) complete(
+	ctx context.Context,
+	operation string,
+	params openai.ChatCompletionNewParams,
+) (generation gepa.Generation, err error) {
+	started := time.Now()
+	defer func() {
+		providerlog.Log(ctx, m.logger, providerlog.Call{
+			Provider:      "openai",
+			Operation:     operation,
+			Model:         string(params.Model),
+			ResolvedModel: generation.Model,
+			FinishReason:  generation.FinishReason,
+			Usage:         generation.Usage,
+			Started:       started,
+			Err:           err,
+		})
+	}()
 	completion, err := m.client.Chat.Completions.New(ctx, params)
 	if err != nil {
 		return gepa.Generation{}, classifyError(ctx, err)
 	}
-	generation := gepa.Generation{Usage: openAIUsage(completion.Usage), Model: completion.Model}
+	generation = gepa.Generation{Usage: openAIUsage(completion.Usage), Model: completion.Model}
 	if len(completion.Choices) == 0 {
 		return generation, errors.New("openai reflection completion: no choices returned")
 	}
@@ -207,6 +236,23 @@ func (m *LanguageModel) Chat(ctx context.Context, req gepa.ChatRequest) (gepa.Ch
 	if err != nil {
 		return gepa.ChatResponse{}, gepa.PermanentError(fmt.Errorf("openai chat completion: %w", err))
 	}
+	started := time.Now()
+	resp, err := m.chat(ctx, params)
+	providerlog.Log(ctx, m.logger, providerlog.Call{
+		Provider:      "openai",
+		Operation:     "chat",
+		Model:         string(params.Model),
+		ResolvedModel: resp.ResolvedModel,
+		FinishReason:  resp.FinishReason,
+		Usage:         resp.Usage,
+		Started:       started,
+		Err:           err,
+	})
+	return resp, err
+}
+
+// chat sends one chat completion with params and converts the reply.
+func (m *LanguageModel) chat(ctx context.Context, params openai.ChatCompletionNewParams) (gepa.ChatResponse, error) {
 	completion, err := m.client.Chat.Completions.New(ctx, params)
 	if err != nil {
 		return gepa.ChatResponse{}, classifyErrorAs(ctx, "openai chat completion", err)
