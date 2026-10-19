@@ -29,19 +29,46 @@ type State struct {
 }
 
 // stepScope restricts a State to one step's declared keys and buffers its writes until the
-// step succeeds. skipped holds the declared writes a skipped step may leave unwritten.
+// step succeeds. skipped holds the declared writes a skipped step may leave unwritten, and
+// rejected copies of the values the step tried to write but was refused, which the observer
+// events of a failed step redact.
 type stepScope struct {
-	reads   map[string]reflect.Type
-	writes  map[string]reflect.Type
-	pending map[string]any
-	skipped map[string]bool
-	err     error
+	reads    map[string]reflect.Type
+	writes   map[string]reflect.Type
+	pending  map[string]any
+	skipped  map[string]bool
+	rejected []stateWrite
+	err      error
+}
+
+// stateWrite is a value written under a state key.
+type stateWrite struct {
+	key   string
+	value any
 }
 
 func (s *stepScope) fail(err error) {
 	if s.err == nil {
 		s.err = err
 	}
+}
+
+// reject fails the step with err and keeps a copy of the value it refused.
+func (s *stepScope) reject(key string, value any, err error) {
+	s.rejected = append(s.rejected, stateWrite{key: key, value: deepCopy(value)})
+	s.fail(err)
+}
+
+// attempted returns every value the step wrote or tried to write.
+func (s *stepScope) attempted() []stateWrite {
+	if s == nil {
+		return nil
+	}
+	writes := slices.Clone(s.rejected)
+	for key, value := range s.pending {
+		writes = append(writes, stateWrite{key: key, value: value})
+	}
+	return writes
 }
 
 // readOnlyView returns a State over values that exposes only reads and refuses every write.
@@ -124,14 +151,14 @@ func (s State) store(key string, typ reflect.Type, value any, fresh bool) {
 	declared, ok := scope.writes[key]
 	switch {
 	case !ok:
-		scope.fail(fmt.Errorf("state key %q is not a declared write", key))
+		scope.reject(key, value, fmt.Errorf("state key %q is not a declared write", key))
 	case typ != declared:
-		scope.fail(fmt.Errorf("state key %q is declared as %s but set as %s", key, declared, typ))
+		scope.reject(key, value, fmt.Errorf("state key %q is declared as %s but set as %s", key, declared, typ))
 	default:
 		if !fresh {
 			value = deepCopy(value)
 			if err := validateStateValue(value); err != nil {
-				scope.fail(fmt.Errorf("state key %q: %w", key, err))
+				scope.reject(key, value, fmt.Errorf("state key %q: %w", key, err))
 				return
 			}
 		}

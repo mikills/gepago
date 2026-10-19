@@ -139,7 +139,7 @@ func runChild(ctx context.Context, candidate Candidate, parent string, child *st
 	stepResult,
 	error,
 ) {
-	result, err := runNode(ctx, childCandidate(candidate, child), child, values)
+	result, err := runNode(ctx, childCandidate(candidate, child), child, values, nil)
 	if err != nil && child.name != parent {
 		return stepResult{}, newStepError(child.name, err)
 	}
@@ -147,23 +147,31 @@ func runChild(ctx context.Context, candidate Candidate, parent string, child *st
 }
 
 // runNode runs one step on a fresh view of values limited to its declared keys and returns its
-// writes when it succeeds. The candidate is the step's, as childCandidate selects it. Each execution of a
-// step other than a WithPolicy or WithCache wrapper gets its own usage frame, observer events and outcome
-// record. A panic becomes an error with the stack in its details. When the step's context
-// ended because a budget ran out or an attempt timed out, that cause replaces the step's
-// result, unless the step's error already carries it, so a step that finishes late still
-// fails and its writes are dropped.
-func runNode(ctx context.Context, candidate Candidate, node *stepNode, values map[string]any) (
-	result stepResult,
-	err error,
-) {
+// writes when it succeeds. The candidate is the step's, as childCandidate selects it. Each
+// execution of a step other than a WithPolicy or WithCache wrapper gets its own usage frame,
+// observer events and outcome record. A panic becomes an error with the stack in its details.
+// When the step's context ended because a budget ran out or an attempt timed out, that cause
+// replaces the step's result, unless the step's error already carries it, so a step that
+// finishes late still fails and its writes are dropped.
+//
+// commit, when set, checks the result before the execution ends, so an error it returns fails
+// the execution; a wrapper, which has no execution of its own, records the failure as an
+// execution that commits nothing.
+func runNode(
+	ctx context.Context,
+	candidate Candidate,
+	node *stepNode,
+	values map[string]any,
+	commit func(stepResult) error,
+) (result stepResult, err error) {
 	if node.step == nil {
 		return stepResult{}, errors.New("step is nil")
 	}
-	if composite, ok := node.step.(compositeStep); !ok || !composite.wrapper() {
-		var finish func(stepResult, error)
+	var scope *stepScope
+	if !isWrapper(node.step) {
+		var finish func(stepResult, error, []stateWrite)
 		ctx, finish = beginExecution(ctx, node, values)
-		defer func() { finish(result, err) }()
+		defer func() { finish(result, err, scope.attempted()) }()
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -177,7 +185,7 @@ func runNode(ctx context.Context, candidate Candidate, node *stepNode, values ma
 	if err := stepCanStart(ctx); err != nil {
 		return stepResult{}, err
 	}
-	scope := &stepScope{reads: node.readTypes, writes: node.writeTypes, pending: map[string]any{}}
+	scope = &stepScope{reads: node.readTypes, writes: node.writeTypes, pending: map[string]any{}}
 	view := State{values: values, scope: scope}
 	var runErr error
 	if componentStep, ok := node.step.(ComponentStep); ok {
@@ -201,22 +209,33 @@ func runNode(ctx context.Context, candidate Candidate, node *stepNode, values ma
 			return stepResult{}, fmt.Errorf("step did not write declared state key %q", key)
 		}
 	}
-	return stepResult{writes: scope.pending, skipped: scope.skipped}, nil
+	result = stepResult{writes: scope.pending, skipped: scope.skipped}
+	if commit == nil {
+		return result, nil
+	}
+	if err := commit(result); err != nil {
+		if isWrapper(node.step) {
+			beginStandIn(ctx, commitFailed, node, values)(stepResult{}, err)
+		}
+		return stepResult{}, err
+	}
+	return result, nil
 }
 
 // beginExecution starts one execution of node over values, the state its view reads: it
 // numbers the attempt, reports the start to the run's observers, opens a usage frame and
-// returns a function that records the outcome when the execution ends.
+// returns a function that records the outcome when the execution ends, given the values the
+// step wrote or tried to write.
 func beginExecution(ctx context.Context, node *stepNode, values map[string]any) (
 	context.Context,
-	func(stepResult, error),
+	func(stepResult, error, []stateWrite),
 ) {
 	run := pipelineRunFrom(ctx)
 	attempt := run.nextAttempt(node.name)
 	ctx, observed := observeStep(ctx, node, attempt, values)
 	ctx, frame, release := usageFrameFrom(ctx).enterStep(ctx, node.name)
 	start := time.Now()
-	return ctx, func(result stepResult, err error) {
+	return ctx, func(result stepResult, err error, attempted []stateWrite) {
 		release()
 		outcome := stepOutcome{
 			Step:     node.name,
@@ -226,11 +245,11 @@ func beginExecution(ctx context.Context, node *stepNode, values map[string]any) 
 			Err:      err,
 		}
 		run.record(outcome)
-		observed.finish(outcome, result)
+		observed.finish(outcome, result, attempted)
 	}
 }
 
-// standIn is an execution that commits writes without running its step.
+// standIn is an execution that does not run its step.
 type standIn int
 
 const (
@@ -238,25 +257,29 @@ const (
 	cacheHit standIn = iota
 	// skippedOnError commits the defaults of a step that skips on error.
 	skippedOnError
+	// commitFailed fails a top-level WithPolicy or WithCache step whose writes cannot be merged
+	// into the state.
+	commitFailed
 )
 
-// beginStandIn starts an execution of node over values that commits writes without running
-// the step, and returns a function that records it with the writes it committed.
-func beginStandIn(ctx context.Context, kind standIn, node *stepNode, values map[string]any) func(stepResult) {
+// beginStandIn starts an execution of node over values that does not run the step, and
+// returns a function that records it with the writes it committed or its error.
+func beginStandIn(ctx context.Context, kind standIn, node *stepNode, values map[string]any) func(stepResult, error) {
 	run := pipelineRunFrom(ctx)
 	attempt := run.nextAttempt(node.name)
 	_, observed := observeStep(ctx, node, attempt, values)
 	start := time.Now()
-	return func(result stepResult) {
+	return func(result stepResult, err error) {
 		outcome := stepOutcome{
 			Step:     node.name,
 			Attempt:  attempt,
 			Duration: time.Since(start),
 			Cached:   kind == cacheHit,
 			Skipped:  kind == skippedOnError,
+			Err:      err,
 		}
 		run.record(outcome)
-		observed.finish(outcome, result)
+		observed.finish(outcome, result, nil)
 	}
 }
 

@@ -222,7 +222,7 @@ func (p *policyStep) onError(ctx context.Context, candidate Candidate, s State, 
 				s.skip(key.Name)
 			}
 		}
-		finish(defaults)
+		finish(defaults, nil)
 		return nil
 	case errorActionFallback:
 		result, fallbackErr := runChild(ctx, candidate, p.child.name, p.fallback, s.values)

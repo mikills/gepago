@@ -605,40 +605,57 @@ func (p Pipeline) checkUndeclaredInputs(inputs Prediction) error {
 }
 
 // runStep runs a top-level step on a view limited to its declared keys and commits its writes
-// only when it succeeds, so a failed step leaves the state as the previous step left it.
-// Pending writes are already copies of the declared type; only merge results are converted
-// here. A key left unwritten by a skipped step keeps any value it already had. A panic in the
-// step or its merges becomes an error.
-func (p Pipeline) runStep(ctx context.Context, candidate Candidate, node *stepNode, state State) (err error) {
-	result, err := runNode(ctx, childCandidate(candidate, node), node, state.values)
+// only when it succeeds, so a failed step leaves the state as the previous step left it. The
+// step's writes are merged with the values already in state as part of its execution, so a
+// merge that fails fails the step's execution. A key left unwritten by a skipped step keeps
+// any value it already had.
+func (p Pipeline) runStep(ctx context.Context, candidate Candidate, node *stepNode, state State) error {
+	var committed map[string]any
+	_, err := runNode(ctx, childCandidate(candidate, node), node, state.values, func(result stepResult) error {
+		var err error
+		committed, err = p.mergeWrites(node, result, state.values)
+		return err
+	})
 	if err != nil {
 		return err
 	}
+	maps.Copy(state.values, committed)
+	return nil
+}
+
+// mergeWrites returns the values a top-level step's result commits: its pending writes,
+// already copies of their declared types, with each key that already has a value in values
+// combined with it by the key's MergeRule and converted back to its type. A panic in a merge
+// becomes an error.
+func (p Pipeline) mergeWrites(node *stepNode, result stepResult, values map[string]any) (
+	committed map[string]any,
+	err error,
+) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			committed = nil
 			err = WithStepDetails(
 				fmt.Errorf("step panicked: %v", recovered),
 				map[string]any{"stack": string(debug.Stack())},
 			)
 		}
 	}()
-	committed := make(map[string]any, len(result.writes))
+	committed = make(map[string]any, len(result.writes))
 	for _, key := range node.writeNames {
 		next, ok := result.writes[key]
 		if !ok {
 			continue
 		}
-		if prev, exists := state.values[key]; exists {
+		if prev, exists := values[key]; exists {
 			merged, err := p.merges[key](deepCopy(prev), next)
 			if err != nil {
-				return fmt.Errorf("merge state key %q: %w", key, err)
+				return nil, fmt.Errorf("merge state key %q: %w", key, err)
 			}
 			if next, err = convertStateValue(key, node.writeTypes[key], merged); err != nil {
-				return err
+				return nil, err
 			}
 		}
 		committed[key] = next
 	}
-	maps.Copy(state.values, committed)
-	return nil
+	return committed, nil
 }

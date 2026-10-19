@@ -31,6 +31,10 @@ type CompileConfig struct {
 	AcceptanceCriterion AcceptanceCriterion
 	Observers           []OptimizationObserver
 	Resume              bool
+	// DatasetBuilder turns evaluations into reflection records; nil uses
+	// DefaultReflectiveDatasetBuilder. With a TraceDatasetBuilder, the evaluator records the
+	// pipeline traces it reads (see ProgramEvaluator.RecordTraces).
+	DatasetBuilder ReflectiveDatasetBuilder
 }
 
 // CompiledProgram runs a programme with the best candidate found by Compile.
@@ -68,7 +72,15 @@ func Compile(ctx context.Context, config CompileConfig) (CompiledProgram, Optimi
 	if strings.TrimSpace(objective) == "" {
 		objective = seedCandidate[InstructionComponent]
 	}
-	evaluator := ProgramEvaluator{Program: config.Program, Metric: config.Metric}
+	datasetBuilder := config.DatasetBuilder
+	if isNil(datasetBuilder) {
+		datasetBuilder = ReflectiveDatasetBuilderFunc(DefaultReflectiveDatasetBuilder)
+	}
+	evaluator := ProgramEvaluator{
+		Program:      config.Program,
+		Metric:       config.Metric,
+		RecordTraces: isTraceDatasetBuilder(datasetBuilder),
+	}
 	acceptance := config.AcceptanceCriterion
 	if acceptance == nil {
 		acceptance = StrictImprovementAcceptance{}
@@ -78,7 +90,7 @@ func Compile(ctx context.Context, config CompileConfig) (CompiledProgram, Optimi
 		Trainset:            config.Trainset,
 		Valset:              config.Valset,
 		Evaluator:           evaluator,
-		DatasetBuilder:      ReflectiveDatasetBuilderFunc(DefaultReflectiveDatasetBuilder),
+		DatasetBuilder:      datasetBuilder,
 		ReflectionLM:        config.ReflectionLM,
 		Objective:           objective,
 		Components:          components,
@@ -145,15 +157,25 @@ func (c CompileConfig) Validate() error {
 type ProgramEvaluator struct {
 	Program Program
 	Metric  Metric
+	// RecordTraces makes Evaluate record pipeline traces for TraceDatasetBuilder when it is
+	// asked to capture traces. Compile sets it when its DatasetBuilder is a TraceDatasetBuilder;
+	// set it when you pair a ProgramEvaluator with a TraceDatasetBuilder in an
+	// OptimizationConfig.
+	RecordTraces bool
 }
 
+// Evaluate runs the programme on each example and scores its output. When RecordTraces and
+// captureTraces are both set and the programme runs a Pipeline, each item's Trace holds the
+// PipelineTrace of the run, as the pipeline's Redactor redacts it, or a []PipelineTrace when
+// the programme ran several; see TraceDatasetBuilder.
 func (e ProgramEvaluator) Evaluate(
 	ctx context.Context,
 	candidate Candidate,
 	examples []Example,
-	_ bool,
+	captureTraces bool,
 ) (EvaluationResult, error) {
 	items := make([]EvaluationItem, 0, len(examples))
+	traces := make([]any, 0, len(examples))
 	usage := Usage{}
 	for _, example := range examples {
 		ioExample, ok := example.Input.(IOExample)
@@ -161,8 +183,14 @@ func (e ProgramEvaluator) Evaluate(
 			return EvaluationResult{}, errors.New("program evaluator examples must contain IOExample input")
 		}
 		runCtx, collector := WithUsageCollector(ctx)
+		var recorder *RecordingObserver
+		if captureTraces && e.RecordTraces {
+			recorder = &RecordingObserver{}
+			runCtx = withTraceSink(runCtx, recorder)
+		}
 		actual, err := e.Program.RunCandidate(runCtx, candidate, ioExample.Inputs)
 		usage = usage.Add(collector.Usage())
+		traces = append(traces, evaluationTrace(recorder))
 		if errors.Is(err, ErrInvalidOutput) {
 			items = append(items, invalidOutputItem(example.ID, ioExample, actual, err))
 			continue
@@ -191,6 +219,12 @@ func (e ProgramEvaluator) Evaluate(
 				"details":  metricResult.Details,
 			},
 		})
+	}
+	// every example that did not end the evaluation added one item
+	for i := range min(len(items), len(traces)) {
+		if traces[i] != nil {
+			items[i].Trace = traces[i]
+		}
 	}
 	return EvaluationResult{Items: items, Usage: usage}, nil
 }

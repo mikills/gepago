@@ -2,6 +2,7 @@ package gepa
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -340,4 +341,88 @@ func TestTextFormsSurviveValuesThatPanic(t *testing.T) {
 	require.Contains(t, forms, "panicked")
 	require.Empty(t, textForms(nil))
 	require.Equal(t, []string{"a\"b", `a\"b`, `a\"b`}, textForms(`a"b`))
+	require.Equal(t, []string{"ab", "ab", "ab"}, textForms(ssnValue("ab")), "a named string has only string forms")
+}
+
+// ssnValue is a string type whose Validate method quotes the value it rejects.
+type ssnValue string
+
+func (s ssnValue) Validate() error {
+	if !strings.Contains(string(s), "-") {
+		return fmt.Errorf("ssn %q is malformed", string(s))
+	}
+	return nil
+}
+
+func TestRedactorRemovesAFailedStepsWritesFromItsError(t *testing.T) {
+	const secret = "123456789"
+	ssnKey := Key[string]{Name: "ssn"}
+	typedKey := Key[ssnValue]{Name: "ssn"}
+	tests := []struct {
+		name    string
+		writes  []KeyRef
+		run     func(State) error
+		wantErr string
+	}{
+		{
+			name:   "a declared write the step then fails on",
+			writes: refs(ssnKey.Ref()),
+			run: func(s State) error {
+				ssnKey.Set(s, secret)
+				return fmt.Errorf("checksum failed for %s", secret)
+			},
+			wantErr: "checksum failed for [ssn]",
+		},
+		{
+			name:   "a value its type's Validate method rejects",
+			writes: refs(typedKey.Ref()),
+			run: func(s State) error {
+				typedKey.Set(s, ssnValue(secret))
+				return nil
+			},
+			wantErr: `state key "ssn": ssn "[ssn]" is malformed`,
+		},
+		{
+			name:   "a write to an undeclared key",
+			writes: refs(amountKey.Ref()),
+			run: func(s State) error {
+				ssnKey.Set(s, secret)
+				return fmt.Errorf("lookup %s failed", secret)
+			},
+			wantErr: "lookup [ssn] failed\n" + `state key "ssn" is not a declared write`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := &RecordingObserver{}
+			log := &eventLog{}
+			step := NewStep("extract", refs(docKey.Ref()), tt.writes, func(_ context.Context, s State) error {
+				return tt.run(s)
+			})
+			pipeline, err := PipelineSpec{
+				Inputs:    refs(docKey.Ref()),
+				Steps:     []Step{step},
+				Observers: []PipelineObserver{recorder, log},
+				Redactor: func(key string, value any) any {
+					if key == "ssn" {
+						return "[ssn]"
+					}
+					return value
+				},
+			}.Build()
+			require.NoError(t, err)
+
+			_, err = pipeline.Run(context.Background(), NewState(Prediction{"document": "cash 10"}))
+			require.ErrorContains(t, err, secret, "the run's own error is not redacted")
+			require.EqualError(t, log.finishedStep(t, "extract", 1).Err, tt.wantErr)
+			require.EqualError(t, log.runsFinished[0].Err, `pipeline step "extract": `+tt.wantErr)
+			trace := recorder.Traces()[0]
+			data, err := json.Marshal(trace)
+			require.NoError(t, err)
+			require.NotContains(t, string(data), secret)
+			report, err := HTMLRunReport(trace, HTMLReportOptions{})
+			require.NoError(t, err)
+			require.NotContains(t, report, secret)
+		})
+	}
 }

@@ -240,13 +240,32 @@ func traceValue(value any) (out any) {
 	return out
 }
 
-// TraceDatasetBuilder turns recorded pipeline traces into reflection records, as the agents
-// package's DefaultTraceReflector does for agent traces, so a proposer can learn from how the
-// steps that own a component ran.
+// TraceDatasetBuilder is a ReflectiveDatasetBuilder that adds pipeline traces to the default
+// reflection records, as the agents package's TraceDatasetBuilder does for agent traces, so a
+// proposer learns from how the steps that own a component ran. Set it as CompileConfig's
+// DatasetBuilder, or as an OptimizationConfig's with a ProgramEvaluator that has RecordTraces
+// set, and the evaluator records the traces when the optimiser asks for them.
 type TraceDatasetBuilder struct{}
 
-// BuildReflectiveDataset returns, for each component, a record for every execution in traces
-// of a step that owns it, in the order the executions started.
+var _ ReflectiveDatasetBuilder = TraceDatasetBuilder{}
+
+// isTraceDatasetBuilder reports whether builder is a TraceDatasetBuilder or a non-nil pointer
+// to one.
+func isTraceDatasetBuilder(builder ReflectiveDatasetBuilder) bool {
+	switch b := builder.(type) {
+	case TraceDatasetBuilder:
+		return true
+	case *TraceDatasetBuilder:
+		return b != nil
+	}
+	return false
+}
+
+// BuildReflectiveDataset returns the records DefaultReflectiveDatasetBuilder builds for each
+// evaluation item and component. When the item's Trace holds a PipelineTrace, a *PipelineTrace
+// or a []PipelineTrace, each of its records also holds the traces under "trace", as a
+// PipelineTrace or a []PipelineTrace, and under "steps" a record for every execution in them of
+// a step that owns the component, in the order the executions started.
 //
 // A step's path is the names of the executions that contain it, from the top-level step down
 // through composite steps and nested pipelines, and its own, joined with '.', which is how a
@@ -254,28 +273,80 @@ type TraceDatasetBuilder struct{}
 // executions and its path followed by '.' starts the component's key. A composite step that
 // failed before running any nested step therefore owns the components of its nested steps.
 //
-// Each record holds "component", "current_value", "trace_id", "step", the step's name,
-// "attempt", "reads", "writes" and "usage", and for a failed execution "error" and, when the
-// step attached any, "details". A cache hit adds "cached" and a skip "skipped".
+// Each step record holds "trace_id", "step", the step's name, "attempt", "reads", "writes" and
+// "usage", and for a failed execution "error" and, when the step attached any, "details". A
+// cache hit adds "cached" and a skip "skipped".
 func (TraceDatasetBuilder) BuildReflectiveDataset(
 	candidate Candidate,
-	traces []PipelineTrace,
+	eval EvaluationResult,
 	components []string,
 ) ReflectiveDataset {
 	dataset := make(ReflectiveDataset, len(components))
 	for _, component := range components {
-		records := []ReflectiveRecord{}
-		for _, trace := range traces {
-			walkStepTraces(trace.Steps, "", func(path string, step StepTrace) {
-				if len(step.Steps) > 0 || len(step.Runs) > 0 || !strings.HasPrefix(component, path+".") {
-					return
+		dataset[component] = []ReflectiveRecord{}
+	}
+	for _, item := range eval.Items {
+		traces, trace := pipelineTraces(item.Trace)
+		records := DefaultReflectiveDatasetBuilder(candidate, EvaluationResult{Items: []EvaluationItem{item}}, components)
+		for _, component := range components {
+			for _, record := range records[component] {
+				if traces != nil {
+					record["trace"] = trace
+					record["steps"] = ownedSteps(component, traces)
 				}
-				records = append(records, stepRecord(component, candidate[component], trace.TraceID, step))
-			})
+				dataset[component] = append(dataset[component], record)
+			}
 		}
-		dataset[component] = records
 	}
 	return dataset
+}
+
+// pipelineTraces returns the traces an evaluation item's Trace holds, and the value records
+// show for them, or nil when it holds none.
+func pipelineTraces(value any) ([]PipelineTrace, any) {
+	switch trace := value.(type) {
+	case PipelineTrace:
+		return []PipelineTrace{trace}, trace
+	case *PipelineTrace:
+		if trace != nil {
+			return []PipelineTrace{*trace}, *trace
+		}
+	case []PipelineTrace:
+		if trace != nil {
+			return trace, trace
+		}
+	}
+	return nil, nil
+}
+
+// evaluationTrace returns what recorder captured while a programme ran for one evaluation
+// item: nil when it ran no pipeline, the trace of the one it ran, or every trace when it ran
+// several.
+func evaluationTrace(recorder *RecordingObserver) any {
+	if recorder == nil {
+		return nil
+	}
+	traces := recorder.Traces()
+	switch len(traces) {
+	case 0:
+		return nil
+	case 1:
+		return traces[0]
+	}
+	return traces
+}
+
+// ownedSteps returns a record for every execution in traces of a step that owns component.
+func ownedSteps(component string, traces []PipelineTrace) []ReflectiveRecord {
+	records := []ReflectiveRecord{}
+	for _, trace := range traces {
+		walkStepTraces(trace.Steps, "", func(path string, step StepTrace) {
+			if len(step.Steps) == 0 && len(step.Runs) == 0 && strings.HasPrefix(component, path+".") {
+				records = append(records, stepRecord(trace.TraceID, step))
+			}
+		})
+	}
+	return records
 }
 
 // walkStepTraces calls visit with every execution in steps and their nested executions and
@@ -291,16 +362,14 @@ func walkStepTraces(steps []StepTrace, prefix string, visit func(path string, st
 	}
 }
 
-func stepRecord(component, value, traceID string, step StepTrace) ReflectiveRecord {
+func stepRecord(traceID string, step StepTrace) ReflectiveRecord {
 	record := ReflectiveRecord{
-		"component":     component,
-		"current_value": value,
-		"trace_id":      traceID,
-		"step":          step.Step,
-		"attempt":       step.Attempt,
-		"reads":         step.Reads,
-		"writes":        step.Writes,
-		"usage":         step.Usage,
+		"trace_id": traceID,
+		"step":     step.Step,
+		"attempt":  step.Attempt,
+		"reads":    step.Reads,
+		"writes":   step.Writes,
+		"usage":    step.Usage,
 	}
 	if step.Err != "" {
 		record["error"] = step.Err

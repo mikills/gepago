@@ -27,7 +27,9 @@ import (
 // Redactor changes, as reflect.DeepEqual compares it, is removed from them instead: from then
 // on in the trace, each of its text forms (each string it holds, and for a value that is not a
 // string its %v, %+v and JSON forms) is replaced by the redacted value when that is a string,
-// and otherwise by RedactedText. This is best effort and errs on the side of removing text: a
+// and otherwise by RedactedText. The values a failed step wrote, or tried to write but was
+// refused, such as a value its type's Validate method rejected, pass through the Redactor for
+// this purpose too, though no event carries them. This is best effort and errs on the side of removing text: a
 // short or common value is removed wherever it appears. An event's Err is then an error with
 // that message that keeps the original error's ErrorKind and matches ErrInvalidOutput,
 // context.Canceled and context.DeadlineExceeded through errors.Is when the original does, but
@@ -209,7 +211,7 @@ func textForms(value any) []string {
 			forms = append(forms, string(data[1:len(data)-1]))
 		}
 	})
-	if _, ok := value.(string); ok || value == nil {
+	if value == nil || reflect.TypeOf(value).Kind() == reflect.String {
 		return forms
 	}
 	forms = append(forms, fmt.Sprintf("%v", value), fmt.Sprintf("%+v", value))

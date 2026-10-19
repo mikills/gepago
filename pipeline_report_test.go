@@ -102,3 +102,31 @@ func TestWriteHTMLRunReport(t *testing.T) {
 	err = WriteHTMLRunReport(filepath.Join(t.TempDir(), "missing", "run.html"), trace, HTMLReportOptions{})
 	require.ErrorIs(t, err, os.ErrNotExist)
 }
+
+func TestHTMLRunReportEscapesEveryField(t *testing.T) {
+	trace := PipelineTrace{
+		TraceID: "<script>t</script>",
+		SpanID:  "<script>s</script>",
+		Err:     "<script>e</script>",
+		Inputs:  map[string]any{"<script>k</script>": "<script>v</script>"},
+		Steps: []StepTrace{{
+			Step:    "<script>n</script>",
+			Err:     "<script>x</script>",
+			ErrKind: "<script>k</script>",
+			Reads:   map[string]any{"a": "</pre><script>r</script>"},
+			Writes:  map[string]any{"b": "<script>w</script>"},
+			Details: map[string]any{"d": "<img src=x onerror=alert(1)>"},
+			Runs: []PipelineTrace{{
+				SpanID: "<script>",
+				Err:    "<script>",
+				Steps:  []StepTrace{{Step: "<script>z</script>"}},
+			}},
+		}},
+	}
+	report, err := HTMLRunReport(trace, HTMLReportOptions{Title: "<script>title</script>"})
+	require.NoError(t, err)
+	require.NotContains(t, report, "<script")
+	require.NotContains(t, report, "<img")
+	require.Contains(t, report, "&lt;/pre&gt;&lt;script&gt;r&lt;/script&gt;")
+	require.Contains(t, report, "&lt;script&gt;z&lt;/script&gt;")
+}

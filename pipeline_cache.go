@@ -57,7 +57,7 @@ func (c *cacheStep) runCandidate(ctx context.Context, candidate Candidate, s Sta
 		if result, ok := run.cached(c.child.name, key); ok {
 			finish := beginStandIn(ctx, cacheHit, c.child, s.values)
 			result.commitTo(s, c.child)
-			finish(result)
+			finish(result, nil)
 			return nil
 		}
 	}
