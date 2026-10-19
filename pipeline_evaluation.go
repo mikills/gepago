@@ -17,9 +17,12 @@ type evaluationKey struct{}
 const maxProgramDepth = 32
 
 // evaluationCapture collects what ProgramEvaluator needs to redact one evaluated example: the
-// Redactors and key types of the pipelines the programme holds or runs, every value those runs
-// were given, wrote or tried to write, and, when recorder is set, the traces of the top-level
-// runs. known holds the pipelines already accounted for, by their first step.
+// Redactors and key types of the pipelines the programme holds or runs, the values those runs
+// were given, wrote, tried to write or attached to their errors while the capture had a
+// Redactor, and, when recorder is set, the traces of the top-level runs. Without a Redactor it
+// keeps no values, so an evaluation without one holds no more than it would without the
+// capture; a Redactor that joins when its pipeline runs applies only to values offered after
+// it joined. known holds the pipelines already accounted for, by their first step.
 type evaluationCapture struct {
 	recorder  *RecordingObserver
 	mu        sync.Mutex
@@ -145,28 +148,37 @@ func (c *evaluationCapture) join(p Pipeline, topLevel bool) *RecordingObserver {
 }
 
 // offer keeps the values a run was given or a step committed, for redaction once the example
-// has run.
+// has run, when the capture has a Redactor.
 func (c *evaluationCapture) offer(values map[string]any) {
 	if c == nil || len(values) == 0 {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if len(c.redactors) == 0 {
+		return
+	}
 	for key, value := range values {
 		c.values = append(c.values, stateWrite{key: key, value: value})
 	}
 }
 
 // offerStep keeps the values an execution wrote or tried to write and the details it attached
-// to err, its error.
+// to err, its error, when the capture has a Redactor.
 func (c *evaluationCapture) offerStep(writes []stateWrite, err error) {
+	if c == nil {
+		return
+	}
 	var detailed *stepDetailsError
 	hasDetails := errors.As(err, &detailed) && len(detailed.details) > 0
-	if c == nil || len(writes) == 0 && !hasDetails {
+	if len(writes) == 0 && !hasDetails {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if len(c.redactors) == 0 {
+		return
+	}
 	c.values = append(c.values, writes...)
 	if hasDetails {
 		for name, detail := range detailed.details {

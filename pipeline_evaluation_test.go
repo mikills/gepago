@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -278,10 +280,76 @@ func TestEvaluationCaptureRedactsWhatTheRunsLeft(t *testing.T) {
 	}})
 	require.Equal(t, "[letter], [note] and [note], [letter]", item.SideInfo["feedback"])
 
+	plain, err := PipelineSpec{Inputs: refs(docKey.Ref()), Steps: []Step{lengthStep()}}.Build()
+	require.NoError(t, err)
+	bare := newEvaluationCapture(plain).fork(nil)
+	bare.offer(map[string]any{"letter": "dear sir"})
+	bare.offerStep([]stateWrite{{key: "letter", value: "dear sir"}}, WithStepDetails(errors.New("refused"), map[string]any{"note": "x"}))
+	require.Empty(t, bare.values, "without a Redactor nothing is kept")
+	require.Empty(t, bare.details)
+	require.Nil(t, bare.join(pipeline, false))
+	bare.offer(map[string]any{"letter": "yours truly"})
+	item = bare.apply(EvaluationItem{SideInfo: map[string]any{"feedback": "dear sir, yours truly"}})
+	require.Equal(t, "dear sir, [letter]", item.SideInfo["feedback"], "a Redactor that joins applies to values offered after it")
+
 	var none *evaluationCapture
 	require.Nil(t, none.join(pipeline, true))
 	none.offer(map[string]any{"letter": "dear sir"})
 	none.offerStep([]stateWrite{{key: "letter", value: "dear sir"}}, nil)
 	require.Nil(t, evaluationCaptureFrom(context.Background()))
 	require.Same(t, capture, evaluationCaptureFrom(withEvaluationCapture(context.Background(), capture)))
+}
+
+// TestProgramEvaluatorReleasesEachExamplesValues checks that the heap an evaluation holds does
+// not grow with the number of examples, with or without a Redactor, though a pipeline in each
+// example writes a large value.
+func TestProgramEvaluatorReleasesEachExamplesValues(t *testing.T) {
+	large := strings.Repeat("x", 1<<20)
+	scratchKey := Key[string]{Name: "scratch"}
+	for _, redactor := range []Redactor{nil, hideKey("document", "[doc]")} {
+		written := 0
+		inner, err := PipelineSpec{
+			Inputs: refs(docKey.Ref()),
+			Steps: []Step{
+				NewStep("expand", refs(docKey.Ref()), refs(scratchKey.Ref()), func(_ context.Context, s State) error {
+					written++
+					scratchKey.Set(s, large+fmt.Sprint(written))
+					return nil
+				}),
+				NewStep("shrink", refs(scratchKey.Ref()), refs(amountKey.Ref()), func(_ context.Context, s State) error {
+					scratch, err := scratchKey.Get(s)
+					if err != nil {
+						return err
+					}
+					amountKey.Set(s, len(scratch))
+					return nil
+				}),
+			},
+			Redactor: redactor,
+		}.Build()
+		require.NoError(t, err)
+		outer, err := PipelineSpec{
+			Inputs: refs(docKey.Ref()),
+			Steps:  []Step{NewProgramStep("inner", inner, refs(docKey.Ref()), refs(amountKey.Ref()))},
+		}.Build()
+		require.NoError(t, err)
+		var heap []int64
+		metric := MetricFunc(func(context.Context, Prediction, Prediction) (MetricResult, error) {
+			runtime.GC()
+			var stats runtime.MemStats
+			runtime.ReadMemStats(&stats)
+			heap = append(heap, int64(stats.HeapAlloc))
+			return MetricResult{Score: 1}, nil
+		})
+		var examples []Example
+		for i := range 40 {
+			examples = append(examples, NewIOExample(fmt.Sprint(i), Prediction{"document": "d"}, Prediction{}))
+		}
+		_, err = ProgramEvaluator{Program: outer, Metric: metric}.
+			Evaluate(context.Background(), outer.SeedCandidate(), examples, false)
+		require.NoError(t, err)
+		require.Len(t, heap, 40)
+		growth := heap[39] - heap[4]
+		require.Less(t, growth, int64(8<<20), "with a Redactor: %v; heap grew by %d bytes over 35 examples", redactor != nil, growth)
+	}
 }
