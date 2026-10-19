@@ -186,7 +186,11 @@ type ProgramEvaluator struct {
 // example runs: the programme itself when it is a Pipeline, the Pipelines its steps run
 // through NewProgramStep, inside composite steps and policy fallbacks too, and the steps of a
 // PipelineProgram; a Pipeline reached only through another kind of Program adds its Redactor
-// for the examples on which it runs. The Metric still scores the real values.
+// for the examples on which it runs, from when it starts: the values runs gave, wrote or
+// attached to errors before then do not pass through it, so it removes their text only where
+// it changes one of the item's own values that holds them. Without any Redactor no values are
+// kept, and each example's values are released once its item is redacted. The Metric still
+// scores the real values.
 func (e ProgramEvaluator) Evaluate(
 	ctx context.Context,
 	candidate Candidate,
@@ -194,7 +198,6 @@ func (e ProgramEvaluator) Evaluate(
 	captureTraces bool,
 ) (EvaluationResult, error) {
 	items := make([]EvaluationItem, 0, len(examples))
-	captures := make([]*evaluationCapture, 0, len(examples))
 	programCapture := newEvaluationCapture(e.Program)
 	usage := Usage{}
 	for _, example := range examples {
@@ -210,9 +213,8 @@ func (e ProgramEvaluator) Evaluate(
 		capture := programCapture.fork(recorder)
 		actual, err := e.Program.RunCandidate(withEvaluationCapture(runCtx, capture), candidate, ioExample.Inputs)
 		usage = usage.Add(collector.Usage())
-		captures = append(captures, capture)
 		if errors.Is(err, ErrInvalidOutput) {
-			items = append(items, invalidOutputItem(example.ID, ioExample, actual, err))
+			items = append(items, capture.apply(invalidOutputItem(example.ID, ioExample, actual, err)))
 			continue
 		}
 		if err != nil {
@@ -226,7 +228,7 @@ func (e ProgramEvaluator) Evaluate(
 			err = fmt.Errorf("evaluate example %q: score prediction: %w", example.ID, err)
 			return EvaluationResult{Usage: usage}, err
 		}
-		items = append(items, EvaluationItem{
+		items = append(items, capture.apply(EvaluationItem{
 			ExampleID:       example.ID,
 			Output:          actual,
 			Score:           metricResult.Score,
@@ -238,11 +240,7 @@ func (e ProgramEvaluator) Evaluate(
 				"feedback": metricResult.Feedback,
 				"details":  metricResult.Details,
 			},
-		})
-	}
-	// every example that did not end the evaluation added one item
-	for i := range min(len(items), len(captures)) {
-		items[i] = captures[i].apply(items[i])
+		}))
 	}
 	return EvaluationResult{Items: items, Usage: usage}, nil
 }

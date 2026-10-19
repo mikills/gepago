@@ -241,8 +241,8 @@ func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any)
 ) {
 	parent := observeScopeFrom(ctx)
 	capture := evaluationCaptureFrom(ctx)
-	capture.offer(inputs)
 	recorder := capture.join(p, parent == nil)
+	capture.offer(inputs)
 	if parent == nil {
 		parent = &observeScope{}
 	}
