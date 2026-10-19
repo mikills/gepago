@@ -16,6 +16,7 @@ type pipelineRunKey struct{}
 // concurrent use, and a nil run, outside a pipeline, records and caches nothing.
 type pipelineRun struct {
 	defaults map[string]any
+	optional map[string]map[string]bool
 	mu       sync.Mutex
 	cache    map[stepCacheKey]stepResult
 	attempts map[string]int
@@ -42,8 +43,13 @@ type stepOutcome struct {
 	Err      error
 }
 
-func newPipelineRun(defaults map[string]any) *pipelineRun {
-	return &pipelineRun{defaults: defaults, cache: map[stepCacheKey]stepResult{}, attempts: map[string]int{}}
+func newPipelineRun(defaults map[string]any, optional map[string]map[string]bool) *pipelineRun {
+	return &pipelineRun{
+		defaults: defaults,
+		optional: optional,
+		cache:    map[stepCacheKey]stepResult{},
+		attempts: map[string]int{},
+	}
 }
 
 func pipelineRunFrom(ctx context.Context) *pipelineRun {
@@ -68,6 +74,16 @@ func (r *pipelineRun) record(outcome stepOutcome) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.outcomes = append(r.outcomes, outcome)
+}
+
+// optionalOutputs returns the optional outputs Build recorded for the programme step named step,
+// and false when Build recorded none, as outside a pipeline.
+func (r *pipelineRun) optionalOutputs(step string) (map[string]bool, bool) {
+	if r == nil {
+		return nil, false
+	}
+	optional, ok := r.optional[step]
+	return optional, ok
 }
 
 func (r *pipelineRun) defaultFor(key string) (any, bool) {

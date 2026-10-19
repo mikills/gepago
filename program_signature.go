@@ -22,7 +22,7 @@ type ProgramSignature struct {
 	// output without an entry is a JSON value.
 	OutputTypes map[string]reflect.Type
 	// OmittableOutputs lists outputs a step need not declare as writes, such as
-	// ChainOfThought's reasoning field.
+	// ChainOfThought's reasoning field and TypedPredict's optional fields.
 	OmittableOutputs []string
 }
 

@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -560,4 +562,52 @@ func mustMetricText(t *testing.T, value any) string {
 	text, ok := metricText(value)
 	require.True(t, ok)
 	return text
+}
+
+type metricRecursive struct {
+	Next *metricRecursive `json:"next"`
+	V    int              `json:"v"`
+}
+
+type metricWithAny struct {
+	X any `json:"x"`
+}
+
+type metricCacheProbe struct {
+	A int `json:"a"`
+}
+
+func TestMayHideFields(t *testing.T) {
+	cases := []struct {
+		typ   reflect.Type
+		hides bool
+	}{
+		{reflect.TypeFor[metricObligation](), false},
+		{reflect.TypeFor[[]metricObligation](), false},
+		{reflect.TypeFor[metricRecursive](), false},
+		{reflect.TypeFor[time.Time](), false},
+		{reflect.TypeFor[string](), false},
+		{reflect.TypeFor[metricHidden](), true},
+		{reflect.TypeFor[map[string]metricHidden](), true},
+		{reflect.TypeFor[*[2]metricHidden](), true},
+		{reflect.TypeFor[metricWithAny](), true},
+		{reflect.TypeFor[metricHolder](), true},
+	}
+	for _, c := range cases {
+		require.Equal(t, c.hides, mayHideFields(c.typ), c.typ.String())
+		require.Equal(t, c.hides, mayHideFields(c.typ), "cached: %s", c.typ)
+	}
+}
+
+func TestJSONFieldsIsCachedPerType(t *testing.T) {
+	results := make([]map[string]jsonField, 8)
+	var wg sync.WaitGroup
+	for i := range results {
+		wg.Go(func() { results[i] = jsonFields(reflect.TypeFor[metricCacheProbe]()) })
+	}
+	wg.Wait()
+	for _, fields := range results {
+		require.Equal(t, reflect.ValueOf(results[0]).Pointer(), reflect.ValueOf(fields).Pointer())
+		require.Contains(t, fields, "a")
+	}
 }

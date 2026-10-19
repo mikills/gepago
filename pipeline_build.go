@@ -256,6 +256,8 @@ type pipelineBuilder struct {
 	maybeAbsent map[string]string
 	skippable   []skippableStep
 	index       int
+	// optional holds the optional outputs of each programme step, by step name.
+	optional map[string]map[string]bool
 }
 
 func newPipelineBuilder(
@@ -274,6 +276,7 @@ func newPipelineBuilder(
 		sources:     sources,
 		names:       map[string]bool{},
 		maybeAbsent: map[string]string{},
+		optional:    map[string]map[string]bool{},
 	}
 }
 
@@ -292,6 +295,9 @@ func (b *pipelineBuilder) checkStep(node *stepNode, position stepPosition) error
 	}
 	if err := validateStep(node); err != nil {
 		return err
+	}
+	if program, ok := node.step.(programStep); ok {
+		b.optional[node.name] = optionalOutputs(program.program)
 	}
 	if composite != nil {
 		for _, child := range composite.children() {

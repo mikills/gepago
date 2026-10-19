@@ -598,6 +598,7 @@ func TestProgramSignature(t *testing.T) {
 		"ref":    reflect.TypeFor[*string](),
 		"score":  reflect.TypeFor[int](),
 	}, got.OutputTypes)
+	require.Equal(t, []string{"note", "ref"}, got.OmittableOutputs, "optional fields may be left out of the writes")
 
 	given := TypedPredict[map[string]any, typedStepOut]{
 		Signature: Signature{Inputs: []Field{{Name: "q"}}},

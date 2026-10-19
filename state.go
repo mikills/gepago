@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // State holds the values passed between Pipeline steps. Outside a run it is unrestricted;
@@ -408,10 +409,23 @@ type jsonFieldCandidate struct {
 	tagged bool
 }
 
+// jsonFieldCache holds the result of jsonFields for each type it has seen.
+var jsonFieldCache sync.Map
+
 // jsonFields lists the JSON object keys encoding/json decodes into typ, following its rules
 // for embedded structs: the shallowest field wins, a tagged field wins a tie at the same
-// depth, and fields that still tie cancel out and are not decoded at all.
+// depth, and fields that still tie cancel out and are not decoded at all. The result is
+// cached per type and shared, so callers must not change it.
 func jsonFields(typ reflect.Type) map[string]jsonField {
+	if cached, ok := jsonFieldCache.Load(typ); ok {
+		return cached.(map[string]jsonField)
+	}
+	cached, _ := jsonFieldCache.LoadOrStore(typ, findJSONFields(typ))
+	return cached.(map[string]jsonField)
+}
+
+// findJSONFields computes jsonFields.
+func findJSONFields(typ reflect.Type) map[string]jsonField {
 	candidates := map[string][]jsonFieldCandidate{}
 	visited := map[reflect.Type]bool{}
 	indexes := map[reflect.Type][]int{typ: nil}

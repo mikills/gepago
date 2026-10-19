@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 var (
@@ -50,6 +51,9 @@ func (w *metricWalker) walk(v reflect.Value) (any, bool) {
 	if v.CanInterface() {
 		if self, ok := selfEncoded(v); ok {
 			return self, false
+		}
+		if !mayHideFields(v.Type()) {
+			return v.Interface(), false
 		}
 	}
 	switch v.Kind() {
@@ -221,6 +225,47 @@ func selfEncoded(v reflect.Value) (any, bool) {
 		return v.Addr().Interface(), true
 	}
 	return nil, false
+}
+
+// hiddenFieldTypes caches mayHideFields for each type it has seen.
+var hiddenFieldTypes sync.Map
+
+// mayHideFields reports whether a value of typ may hold, at any depth, a struct whose fields
+// JSON cannot see: typ reaches such a struct, or an interface that may hold one, through its
+// elements and JSON fields. A type that encodes itself with a value-receiver MarshalJSON or
+// MarshalText holds none, as far as JSON is concerned.
+func mayHideFields(typ reflect.Type) bool {
+	if cached, ok := hiddenFieldTypes.Load(typ); ok {
+		return cached.(bool)
+	}
+	hides := typeHidesFields(typ, map[reflect.Type]bool{})
+	hiddenFieldTypes.Store(typ, hides)
+	return hides
+}
+
+// typeHidesFields computes mayHideFields. A type already being checked adds nothing new, so a
+// recursive type ends there.
+func typeHidesFields(typ reflect.Type, checking map[reflect.Type]bool) bool {
+	if checking[typ] || typ.Implements(jsonMarshalerType) || typ.Implements(textMarshalerType) {
+		return false
+	}
+	checking[typ] = true
+	switch typ.Kind() {
+	case reflect.Interface:
+		return true
+	case reflect.Pointer, reflect.Slice, reflect.Array, reflect.Map:
+		return typeHidesFields(typ.Elem(), checking)
+	case reflect.Struct:
+		if hiddenFields(typ) {
+			return true
+		}
+		for _, field := range jsonFields(typ) {
+			if typeHidesFields(field.typ, checking) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // hiddenFields reports whether a struct type has fields but none that JSON can see, such as

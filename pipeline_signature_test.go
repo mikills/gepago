@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -47,16 +48,24 @@ func TestTypedPredictStepBuildChecksKeys(t *testing.T) {
 			inputs: refs(stepQuestion.Ref()),
 			reads:  refs(stepQuestion.Ref()),
 			writes: refs(wrongType.Ref()),
-			wantErr: `pipeline step "s": signature outputs ["answer" "note" "ref" "score"] ` +
+			wantErr: `pipeline step "s": signature outputs ["answer" "score"] (optionally plus ["note" "ref"]) ` +
 				`do not match declared writes ["answer"]`,
 		},
 		{
-			name:   "an optional output left out",
+			name:   "a required output left out",
 			inputs: refs(stepQuestion.Ref()),
 			reads:  refs(stepQuestion.Ref()),
-			writes: refs(stepAnswer.Ref(), stepRef.Ref(), stepScore.Ref()),
-			wantErr: `pipeline step "s": signature outputs ["answer" "note" "ref" "score"] ` +
-				`do not match declared writes ["answer" "ref" "score"]`,
+			writes: refs(stepAnswer.Ref(), stepNote.Ref(), stepRef.Ref()),
+			wantErr: `pipeline step "s": signature outputs ["answer" "score"] (optionally plus ["note" "ref"]) ` +
+				`do not match declared writes ["answer" "note" "ref"]`,
+		},
+		{
+			name:   "a write Out does not have",
+			inputs: refs(stepQuestion.Ref()),
+			reads:  refs(stepQuestion.Ref()),
+			writes: refs(stepAnswer.Ref(), stepScore.Ref(), Key[string]{Name: "extra"}.Ref()),
+			wantErr: `pipeline step "s": signature outputs ["answer" "score"] (optionally plus ["note" "ref"]) ` +
+				`do not match declared writes ["answer" "extra" "score"]`,
 		},
 		{
 			name:    "reads not In's fields",
@@ -96,14 +105,128 @@ func TestTypedPredictStepBuildChecksKeys(t *testing.T) {
 	}
 	require.Zero(t, calls, "Build makes no model call")
 
+	for _, writes := range [][]KeyRef{
+		typedStepWrites(),
+		refs(stepAnswer.Ref(), stepRef.Ref(), stepScore.Ref()),
+		refs(stepAnswer.Ref(), stepScore.Ref()),
+	} {
+		pipeline, err := PipelineSpec{
+			Inputs: refs(stepQuestion.Ref()),
+			Steps:  []Step{NewProgramStep("s", program, refs(stepQuestion.Ref()), writes)},
+		}.Build()
+		require.NoError(t, err, "optional outputs may be left out of the writes")
+		out, err := pipeline.Run(context.Background(), NewState(Prediction{"q": "x"}))
+		require.NoError(t, err)
+		require.Len(t, out.Prediction(), len(writes))
+	}
+	require.Equal(t, 3, calls)
+}
+
+type triageOut struct {
+	Priority string `json:"priority"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+type summaryOut struct {
+	Summary string `json:"summary"`
+	Reason  string `json:"reason,omitempty"`
+}
+
+// TestTypedStepsShareAnOptionalField builds two TypedPredict steps whose Out types share an
+// optional field, which each may leave out of its writes.
+func TestTypedStepsShareAnOptionalField(t *testing.T) {
+	priority := Key[string]{Name: "priority"}
+	summary := Key[string]{Name: "summary"}
+	reason := Key[string]{Name: "reason"}
+	lm := textModel(func(_ context.Context, prompt string) (string, error) {
+		if strings.Contains(prompt, "summary") {
+			return `{"summary": "s", "reason": "r"}`, nil
+		}
+		return `{"priority": "high"}`, nil
+	})
+	steps := func(triageWrites, summaryWrites []KeyRef) []Step {
+		return []Step{
+			NewProgramStep(
+				"triage",
+				TypedPredict[typedStepIn, triageOut]{LM: lm},
+				refs(stepQuestion.Ref()),
+				triageWrites,
+			),
+			NewProgramStep(
+				"summary",
+				TypedPredict[typedStepIn, summaryOut]{LM: lm},
+				refs(stepQuestion.Ref()),
+				summaryWrites,
+			),
+		}
+	}
 	pipeline, err := PipelineSpec{
 		Inputs: refs(stepQuestion.Ref()),
-		Steps:  []Step{NewProgramStep("s", program, refs(stepQuestion.Ref()), typedStepWrites())},
+		Steps:  steps(refs(priority.Ref()), refs(summary.Ref(), reason.Ref())),
 	}.Build()
 	require.NoError(t, err)
-	_, err = pipeline.Run(context.Background(), NewState(Prediction{"q": "x"}))
+	out, err := pipeline.Run(context.Background(), NewState(Prediction{"q": "x"}))
 	require.NoError(t, err)
-	require.Equal(t, 1, calls)
+	require.Equal(t, Prediction{"priority": "high", "summary": "s", "reason": "r"}, out.Prediction())
+
+	_, err = PipelineSpec{
+		Inputs: refs(stepQuestion.Ref()),
+		Steps:  steps(refs(priority.Ref(), reason.Ref()), refs(summary.Ref(), reason.Ref())),
+	}.Build()
+	require.EqualError(
+		t,
+		err,
+		`pipeline steps "triage" and "summary" both write "reason"; declare a MergeRule to combine them`,
+	)
+}
+
+func TestBuildFixesOptionalOutputs(t *testing.T) {
+	note := Key[string]{Name: "note"}
+	answer := Key[string]{Name: "answer"}
+	program := &Predict{
+		Signature: Signature{
+			Name:    "p",
+			Inputs:  []Field{{Name: "q"}},
+			Outputs: []Field{{Name: "answer"}, {Name: "note"}},
+		},
+	}
+	step := NewProgramStep("p", program, refs(stepQuestion.Ref()), refs(answer.Ref(), note.Ref()))
+	program.LM = textModel(func(context.Context, string) (string, error) { return `{"answer": "a"}`, nil })
+	program.Signature.Outputs[1].Optional = true
+
+	optionalAtBuild, err := PipelineSpec{Inputs: refs(stepQuestion.Ref()), Steps: []Step{step}}.Build()
+	require.NoError(t, err)
+	out, err := optionalAtBuild.Run(context.Background(), NewState(Prediction{"q": "x"}))
+	require.NoError(t, err, "note was Optional when Build checked the step")
+	require.Equal(t, Prediction{"answer": "a", "note": ""}, out.Prediction())
+
+	program.Signature.Outputs[1].Optional = false
+	requiredAtBuild, err := PipelineSpec{Inputs: refs(stepQuestion.Ref()), Steps: []Step{step}}.Build()
+	require.NoError(t, err)
+	program.Signature.Outputs[1].Optional = true
+	_, err = requiredAtBuild.Run(context.Background(), NewState(Prediction{"q": "x"}))
+	require.ErrorIs(t, err, ErrInvalidOutput, "note was required when Build checked the step")
+	require.ErrorContains(t, err, `"note" is missing`)
+	_, err = optionalAtBuild.Run(context.Background(), NewState(Prediction{"q": "x"}))
+	require.NoError(t, err, "each built pipeline keeps its own record")
+
+	state := NewState(Prediction{"q": "x"})
+	require.NoError(t, step.Run(context.Background(), state), "outside a pipeline the signature is read at run time")
+	require.Equal(t, Prediction{"q": "x", "answer": "a", "note": ""}, state.Prediction())
+}
+
+func TestTypedPredictStepWithLateModel(t *testing.T) {
+	note := Key[string]{Name: "note"}
+	program := &TypedPredict[typedStepIn, typedStepOut]{}
+	step := NewProgramStep("s", program, refs(stepQuestion.Ref()), refs(stepAnswer.Ref(), note.Ref(), stepScore.Ref()))
+	program.LM = textModel(func(context.Context, string) (string, error) {
+		return `{"answer": "a", "note": null, "ref": null, "score": 2}`, nil
+	})
+	pipeline, err := PipelineSpec{Inputs: refs(stepQuestion.Ref()), Steps: []Step{step}}.Build()
+	require.NoError(t, err)
+	out, err := pipeline.Run(context.Background(), NewState(Prediction{"q": "x"}))
+	require.NoError(t, err)
+	require.Equal(t, Prediction{"answer": "a", "note": "", "score": 2}, out.Prediction())
 }
 
 func TestSignatureStepChecksInsideComposites(t *testing.T) {
@@ -312,4 +435,52 @@ func TestProgramStepReportsSignatureErrors(t *testing.T) {
 		append(typedStepWrites()[1:], KeyRef{Name: "answer"}))
 	_, err = PipelineSpec{Inputs: refs(stepQuestion.Ref()), Steps: []Step{untyped}}.Build()
 	require.EqualError(t, err, `pipeline step "s" writes: state key "answer" type is required; use Key.Ref`)
+}
+
+func TestTypedPredictStepNullPointer(t *testing.T) {
+	program := TypedPredict[typedStepIn, typedStepOut]{
+		LM: textModel(func(context.Context, string) (string, error) {
+			return `{"answer": "a", "note": "n", "ref": null, "score": 1}`, nil
+		}),
+	}
+	step := NewProgramStep(
+		"s",
+		program,
+		refs(stepQuestion.Ref()),
+		refs(stepAnswer.Ref(), stepRef.Ref(), stepScore.Ref()),
+	)
+	pipeline, err := PipelineSpec{Inputs: refs(stepQuestion.Ref()), Steps: []Step{step}}.Build()
+	require.NoError(t, err, "the optional note may be left out of the writes")
+
+	out, err := pipeline.Run(context.Background(), NewState(Prediction{"q": "x"}))
+
+	require.NoError(t, err)
+	require.Equal(t, Prediction{"answer": "a", "ref": (*string)(nil), "score": 1}, out.Prediction())
+}
+
+func TestBuildFixesOptionalOutputsOfNestedSteps(t *testing.T) {
+	note := Key[string]{Name: "note"}
+	answer := Key[string]{Name: "answer"}
+	program := &Predict{
+		Signature: Signature{
+			Name:    "p",
+			Inputs:  []Field{{Name: "q"}},
+			Outputs: []Field{{Name: "answer"}, {Name: "note", Optional: true}},
+		},
+		LM: textModel(func(context.Context, string) (string, error) { return `{"answer": "a"}`, nil }),
+	}
+	nested := func() Step {
+		return NewProgramStep("p", program, refs(stepQuestion.Ref()), refs(answer.Ref(), note.Ref()))
+	}
+	for name, step := range map[string]Step{
+		"Parallel":   Parallel("fan", nested()),
+		"WithPolicy": WithPolicy(nested(), StepPolicy{}),
+		"WithCache":  WithCache(nested(), func(State) (string, error) { return "k", nil }),
+	} {
+		pipeline, err := PipelineSpec{Inputs: refs(stepQuestion.Ref()), Steps: []Step{step}}.Build()
+		require.NoError(t, err, name)
+		out, err := pipeline.Run(context.Background(), NewState(Prediction{"q": "x"}))
+		require.NoError(t, err, name)
+		require.Equal(t, Prediction{"answer": "a", "note": ""}, out.Prediction(), name)
+	}
 }

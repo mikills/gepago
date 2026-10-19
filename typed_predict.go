@@ -96,13 +96,20 @@ func (p TypedPredict[In, Out]) RunCandidate(
 }
 
 // ProgramSignature implements SignatureProgram: the derived signature, the Go type of each of
-// In's fields when In is a struct, and the Go type of each of Out's fields.
+// In's fields when In is a struct, and the Go type of each of Out's fields. Out's optional
+// fields, those tagged omitempty or omitzero and those that admit null, such as pointers, are
+// OmittableOutputs, so a step may leave them out of its writes.
 func (p TypedPredict[In, Out]) ProgramSignature() (ProgramSignature, error) {
 	predict, err := p.predict()
 	if err != nil {
 		return ProgramSignature{}, err
 	}
 	signature := ProgramSignature{Signature: predict.Signature, OutputTypes: fieldTypesOf(reflect.TypeFor[Out]())}
+	for _, field := range predict.Signature.Outputs {
+		if field.Optional {
+			signature.OmittableOutputs = append(signature.OmittableOutputs, field.Name)
+		}
+	}
 	if in := reflect.TypeFor[In](); structType(in) {
 		signature.InputTypes = fieldTypesOf(in)
 	}

@@ -76,23 +76,17 @@ func (s funcStep) Run(ctx context.Context, state State) error {
 // A run fails with ErrInvalidOutput when the reply omits a declared write, sets it to null, or
 // gives a value that does not convert to its type. An output the signature marks Optional may
 // be omitted or null: the step then commits the zero value of the write's key type, which
-// must pass that type's Validate method, if it has one.
+// must pass that type's Validate method, if it has one. Which outputs are optional is fixed
+// when Build checks the step, so the built pipeline keeps it even if the programme changes.
 func NewProgramStep(name string, program Program, reads, writes []KeyRef) ComponentStep {
-	return programStep{
-		name:     name,
-		program:  program,
-		reads:    slices.Clone(reads),
-		writes:   slices.Clone(writes),
-		optional: optionalOutputs(program),
-	}
+	return programStep{name: name, program: program, reads: slices.Clone(reads), writes: slices.Clone(writes)}
 }
 
 type programStep struct {
-	name     string
-	program  Program
-	reads    []KeyRef
-	writes   []KeyRef
-	optional map[string]bool
+	name    string
+	program Program
+	reads   []KeyRef
+	writes  []KeyRef
 }
 
 // optionalOutputs returns the outputs the signature of program marks Optional, if program is a
@@ -228,8 +222,12 @@ func (s programStep) RunCandidate(ctx context.Context, candidate Candidate, stat
 	if err != nil {
 		return err
 	}
+	optional, bound := pipelineRunFrom(ctx).optionalOutputs(strings.TrimSpace(s.name))
+	if !bound {
+		optional = optionalOutputs(s.program)
+	}
 	for _, key := range s.writes {
-		value, err := programOutput(outputs, key, s.optional[key.Name])
+		value, err := programOutput(outputs, key, optional[key.Name])
 		if err != nil {
 			return WithStepDetails(err, map[string]any{"output": clonePrediction(outputs)})
 		}
@@ -307,6 +305,9 @@ type Pipeline struct {
 	merges           map[string]func(prev, next any) (any, error)
 	defaults         map[string]any
 	budget           RunBudget
+	// optional holds, for each programme step, the outputs its signature marked Optional when
+	// Build checked it.
+	optional map[string]map[string]bool
 }
 
 // keySource records the type of an available key and where it comes from; an empty step
@@ -390,6 +391,7 @@ func (s PipelineSpec) Build() (Pipeline, error) {
 		merges:           merges,
 		defaults:         defaultValues,
 		budget:           s.Budget.clone(),
+		optional:         builder.optional,
 	}, nil
 }
 
@@ -557,7 +559,7 @@ func (p Pipeline) execute(ctx context.Context, candidate Candidate, inputs Predi
 		}
 		values[key.Name] = converted
 	}
-	run := newPipelineRun(p.defaults)
+	run := newPipelineRun(p.defaults, p.optional)
 	ctx, release := startRunBudget(context.WithValue(ctx, pipelineRunKey{}, run), p.budget)
 	defer release()
 	state := State{values: values}
