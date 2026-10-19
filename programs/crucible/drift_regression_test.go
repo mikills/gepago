@@ -810,3 +810,21 @@ func comparisonFixtureRun(t *testing.T, runID string, answer string) RunResult {
 	require.NoError(t, err)
 	return result
 }
+
+func TestSubjectErrorIsReportedBeforeOutputRetention(t *testing.T) {
+	subject := FuncSubject{
+		SubjectName: "pipeline",
+		Func: func(context.Context, gepa.Prediction) (SubjectOutput, error) {
+			partial := gepa.Prediction{"unencodable": make(chan int)}
+			return SubjectOutput{Value: partial, Usage: gepa.Usage{TotalTokens: 7}}, errors.New("real failure")
+		},
+	}
+	result, err := Run(context.Background(), RunConfig{
+		Suite:      Suite{Name: "partial", Cases: []EvalCase{{ID: "case", Expected: gepa.Prediction{"answer": "ok"}}}},
+		Subjects:   []Subject{subject},
+		Evaluators: []WeightedEvaluator{ExactMatch("answer")},
+	})
+	require.NoError(t, err)
+	require.Equal(t, "real failure", result.Results[0].Error)
+	require.Equal(t, 7, result.Results[0].Output.Usage.TotalTokens)
+}

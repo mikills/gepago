@@ -27,10 +27,7 @@ func (c ChainOfThought) ToPredict() Predict {
 	if strings.TrimSpace(instruction) == "" {
 		instruction = c.Signature.Description
 	}
-	reasoningField := c.ReasoningField
-	if reasoningField == "" {
-		reasoningField = "reasoning"
-	}
+	reasoningField := c.reasoningFieldName()
 	instruction = strings.Join([]string{
 		strings.TrimSpace(instruction),
 		"Think step by step before answering.",
@@ -44,6 +41,13 @@ func (c ChainOfThought) ToPredict() Predict {
 		MaxParseRetries: c.MaxParseRetries,
 		RepairLM:        c.RepairLM,
 	}
+}
+
+func (c ChainOfThought) reasoningFieldName() string {
+	if c.ReasoningField == "" {
+		return "reasoning"
+	}
+	return c.ReasoningField
 }
 
 // Run executes the programme with its seed candidate.

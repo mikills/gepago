@@ -21,7 +21,7 @@ Original paper:
 - Load parsed text documents into examples for extraction-focused optimisation.
 - Build reflective datasets from evaluation feedback and optional agent traces.
 - Use built-in exact-match, contains, numeric, classification, and LLM judge metrics.
-- Compile a `Predict`, `ChainOfThought`, or sequential `PipelineProgram` from examples, a metric, and a reflection model.
+- Compile a `Predict`, `ChainOfThought`, or typed sequential `Pipeline` from examples, a metric, and a reflection model.
 - Use a reflective LLM proposer to generate improved candidate text.
 - Select candidates from a Pareto frontier or current-best strategy.
 - Accept/reject candidates using configurable score criteria.
@@ -99,38 +99,60 @@ Use `ChainOfThought` when the programme should expose a concise reasoning field.
 Use `DemosFromExamples` and the `demos` component when you want examples optimised with the instruction.
 Use `LLMJudgeMetric` when exact labels are too rigid for the task.
 
-For multi-step workflows, compose programmes with `PipelineProgram`. Each step has its own scoped components such as `extract.instruction` and `decide.instruction`, so GEPA can improve the steps independently while `Compile` still sees one programme.
+For multi-step workflows, build a `Pipeline` from a `PipelineSpec`. Each step that wraps a programme has its own scoped components such as `extract.instruction`, so GEPA can improve the steps independently while `Compile` still sees one programme.
 
 ```go
+document := gepa.Key[string]{Name: "document"}
+amount := gepa.Key[int]{Name: "amount"}
+decision := gepa.Key[string]{Name: "decision"}
+
 extractProgram := gepa.Predict{
     Signature: gepa.Signature{
-        Name:    "extract_obligation",
+        Name:    "extract_amount",
         Inputs:  []gepa.Field{{Name: "document"}},
-        Outputs: []gepa.Field{{Name: "amount"}, {Name: "deadline"}},
+        Outputs: []gepa.Field{{Name: "amount"}},
     },
-    Instruction: "Extract the obligation amount and deadline.",
+    Instruction: "Extract the obligation amount.",
     LM:          lm,
 }
 
-decideProgram := gepa.Predict{
-    Signature: gepa.Signature{
-        Name:    "underwriting_decision",
-        Inputs:  []gepa.Field{{Name: "amount"}, {Name: "deadline"}},
-        Outputs: []gepa.Field{{Name: "decision"}, {Name: "reason"}},
+pipeline, err := gepa.PipelineSpec{
+    Inputs: []gepa.KeyRef{document.Ref()},
+    Steps: []gepa.Step{
+        gepa.NewProgramStep("extract", extractProgram, []gepa.KeyRef{document.Ref()}, []gepa.KeyRef{amount.Ref()}),
+        gepa.NewStep("decide", []gepa.KeyRef{amount.Ref()}, []gepa.KeyRef{decision.Ref()}, func(_ context.Context, s gepa.State) error {
+            value, err := amount.Get(s)
+            if err != nil {
+                return err
+            }
+            if value > 100000 {
+                decision.Set(s, "needs_review")
+            } else {
+                decision.Set(s, "approve")
+            }
+            return nil
+        }),
     },
-    Instruction: "Decide whether this obligation can be approved automatically.",
-    LM:          lm,
-}
-
-program := gepa.PipelineProgram{
-    Steps: []gepa.PipelineStep{
-        {Name: "extract", Program: extractProgram},
-        {Name: "decide", Program: decideProgram, InputKeys: []string{"amount", "deadline"}},
-    },
-}
+}.Build()
 ```
 
-This mirrors the GEPA paper's compound-system formulation `Φ = (M, C, X, Y)`: `PipelineProgram` is `Φ`, each `PipelineStep` is a language module `Mᵢ`, each child `Predict` carries the prompt and local input/output schema `(πᵢ, Xᵢ, Yᵢ)`, and the ordered pipeline is the control flow `C`.
+Steps declare the keys they read and write as `KeyRef`s, which carry the value type. `Build` checks the contract once:
+
+- every key a step reads is a pipeline input or written by an earlier step, with the same type
+- a key written by more than one step needs a `MergeRule`
+- pipeline inputs are read-only
+
+At run time each step only sees the keys it declared. Its writes must have the declared type, and they are copied into state only when the step succeeds. Values are copied whenever they cross into or out of state, so a step cannot change an input or an earlier result through a shared map or slice. A run fails when its inputs hold a key not declared in `Inputs`, unless `AllowExtraInputs` is set, and input values are converted to their declared types before the first step runs.
+
+`NewProgramStep` copies only the declared outputs from a programme's reply into state, so a model cannot overwrite a document or record identifier. For `Predict` and `ChainOfThought` the signature's inputs must be exactly the declared reads and its outputs exactly the declared writes; a `ChainOfThought` may also declare its reasoning field. A reply that omits a declared output, sets it to null or gives a value that does not fit its type fails the step with `ErrInvalidOutput`. During `Compile` such an example scores zero, with the error as reflection feedback, instead of stopping optimisation. Deterministic steps built with `NewStep` take no candidate; only steps that carry components appear in `SeedCandidate`.
+
+`Key.Get` converts model output into `T` strictly: unknown fields, fields that match only by case, missing fields not tagged `omitempty` and nulls in non-nullable positions are errors, not zero values. If `T` has a `Validate() error` method, `Get` calls it too.
+
+`Run` returns the full state; `RunCandidate`, which `Compile` uses, returns only the values the steps wrote. A failed run returns what was accumulated before the failing step together with a `*StepError` naming it. A step can attach diagnostics with `WithStepDetails`, a panicking step's stack is kept under `Details["stack"]`, and usage from a failed model call is still recorded.
+
+This mirrors the GEPA paper's compound-system formulation `Φ = (M, C, X, Y)`: the `Pipeline` is `Φ`, each step is a language module `Mᵢ`, each wrapped `Predict` carries the prompt and local input/output schema `(πᵢ, Xᵢ, Yᵢ)`, and the ordered steps are the control flow `C`.
+
+`PipelineProgram`, which passes one untyped `Prediction` between steps, remains for the WASM compile bridge. Use `Pipeline` in Go code. Artifacts trained on a `PipelineProgram` load into a `Pipeline` with the same step names.
 
 ## Reusable programme artifacts
 
