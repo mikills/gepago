@@ -347,6 +347,52 @@ func TestRedactedTextKeepsWhatTheRedactorKept(t *testing.T) {
 	require.Equal(t, RedactedText, text.scrub("{Bob 123-45-6789}"), "the whole value's text is still removed")
 }
 
+// TestRedactorRemovesSecretsInsideKeptStringsAndMapKeys checks that a value whose redacted
+// form keeps a string holding a secret, and a secret used as a map key, are still removed from
+// an error.
+func TestRedactorRemovesSecretsInsideKeptStringsAndMapKeys(t *testing.T) {
+	type contact struct {
+		Name    string
+		Email   string
+		Display string
+	}
+	contactKey := Key[contact]{Name: "contact"}
+	idsKey := Key[map[string]int]{Name: "ids"}
+	log := &eventLog{}
+	send := NewStep("send", refs(contactKey.Ref(), idsKey.Ref()), refs(letterKey.Ref()), func(_ context.Context, s State) error {
+		recipient, err := contactKey.Get(s)
+		if err != nil {
+			return err
+		}
+		return errors.New("cannot send to " + recipient.Email + " for " + recipient.Name + " (id 123-45-6789)")
+	})
+	pipeline, err := PipelineSpec{
+		Inputs:    refs(contactKey.Ref(), idsKey.Ref()),
+		Steps:     []Step{send},
+		Observers: []PipelineObserver{log},
+		Redactor: func(_ string, value any) any {
+			switch value := value.(type) {
+			case contact:
+				value.Email = "[email]" // keeps Display, which repeats the email
+				return value
+			case map[string]int:
+				return map[string]int{"[id]": len(value)}
+			}
+			return value
+		},
+	}.Build()
+	require.NoError(t, err)
+	_, err = pipeline.Run(context.Background(), NewState(Prediction{
+		"contact": contact{Name: "Bob", Email: "bob@x.io", Display: "Bob <bob@x.io>"},
+		"ids":     map[string]int{"123-45-6789": 1},
+	}))
+	require.Error(t, err)
+	finished := log.finishedStep(t, "send", 1)
+	require.Equal(t, "cannot send to [redacted] for Bob (id [redacted])", finished.Err.Error())
+	require.Equal(t, contact{Name: "Bob", Email: "[email]", Display: "Bob <bob@x.io>"}, finished.Reads["contact"],
+		"the event carries what the Redactor returned")
+}
+
 func TestTextFormsSurviveValuesThatPanic(t *testing.T) {
 	forms := textForms(panickyJSON{})
 	require.Contains(t, forms, "panicked")

@@ -232,6 +232,7 @@ func beginExecution(ctx context.Context, node *stepNode, values map[string]any) 
 ) {
 	run := pipelineRunFrom(ctx)
 	attempt := run.nextAttempt(node.name)
+	capture := evaluationCaptureFrom(ctx)
 	ctx, observed := observeStep(ctx, node, attempt, values)
 	ctx, frame, release := usageFrameFrom(ctx).enterStep(ctx, node.name)
 	start := time.Now()
@@ -245,6 +246,7 @@ func beginExecution(ctx context.Context, node *stepNode, values map[string]any) 
 			Err:      err,
 		}
 		run.record(outcome)
+		capture.offerStep(attempted, err)
 		observed.finish(outcome, result, attempted)
 	}
 }
@@ -267,6 +269,7 @@ const (
 func beginStandIn(ctx context.Context, kind standIn, node *stepNode, values map[string]any) func(stepResult, error) {
 	run := pipelineRunFrom(ctx)
 	attempt := run.nextAttempt(node.name)
+	capture := evaluationCaptureFrom(ctx)
 	_, observed := observeStep(ctx, node, attempt, values)
 	start := time.Now()
 	return func(result stepResult, err error) {
@@ -279,6 +282,8 @@ func beginStandIn(ctx context.Context, kind standIn, node *stepNode, values map[
 			Err:      err,
 		}
 		run.record(outcome)
+		capture.offer(result.writes)
+		capture.offerStep(nil, err)
 		observed.finish(outcome, result, nil)
 	}
 }

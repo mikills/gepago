@@ -145,13 +145,14 @@ func (r *runObservation) scrubValues(values map[string]any) map[string]any {
 }
 
 // evaluationRedaction redacts the values an evaluation item carries for reflection: redactors
-// are those of the pipelines the programme ran, types the types of the keys those pipelines
-// declare, and forms the text their runs' redaction removed from errors, failed writes
-// included.
+// are those of the pipelines the programme holds or ran, types the types of the keys those
+// pipelines declare, values the values the example's runs were given, wrote or tried to write,
+// and details the details their steps attached to errors.
 type evaluationRedaction struct {
 	redactors []Redactor
 	types     map[string]reflect.Type
-	forms     map[string]string
+	values    []stateWrite
+	details   []stateWrite
 }
 
 // apply returns item with the values reflection reads passed through the redactors. Its Output
@@ -159,15 +160,20 @@ type evaluationRedaction struct {
 // "inputs" and "expected" entries first converted to their keys' types where they convert, so a
 // Redactor sees them as it sees a run's values, SideInfo's "details" one level further, as an
 // event's details, and the inputs, reads, writes and details of any PipelineTrace in its Trace
-// as an event's. Then the text of every value the redactors changed, here or in the runs, is
-// removed from every string in them, errors included. Without redactors it returns item
-// unchanged.
+// as an event's. Then the text of every value the redactors change, among those and the
+// values and details of the runs, is removed from every string in them, errors included.
+// Without redactors it returns item unchanged.
 func (e evaluationRedaction) apply(item EvaluationItem) EvaluationItem {
-	if len(e.redactors) == 0 && len(e.forms) == 0 {
+	if len(e.redactors) == 0 {
 		return item
 	}
 	run := &runObservation{trace: &traceObservation{}, redactors: e.redactors}
-	run.trace.forms = maps.Clone(e.forms)
+	for _, value := range e.values {
+		run.redact(value.key, value.value)
+	}
+	for _, detail := range e.details {
+		run.redactEntry(detail.key, detail.value)
+	}
 	if output, ok := item.Output.(Prediction); item.Output != nil && (!ok || len(output) > 0) {
 		item.Output = run.redactEntry("output", item.Output)
 	}

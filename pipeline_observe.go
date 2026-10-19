@@ -3,7 +3,6 @@ package gepa
 import (
 	"context"
 	"errors"
-	"maps"
 	"reflect"
 	"slices"
 	"sync"
@@ -134,96 +133,20 @@ type StepFinishedEvent struct {
 type observeKey struct{}
 
 // observeScope is what an observed run's context carries: the run and the span of the
-// innermost execution, which becomes the parent of the next span.
+// innermost execution, which becomes the parent of the next span. While ProgramEvaluator
+// records the trace of a run that nothing else observes, recording and recordingSpan observe
+// it for the evaluation's RecordingObserver, and run, the run as its observers see it outside
+// an evaluation, is nil until a nested pipeline with observers of its own starts a trace.
 type observeScope struct {
-	run  *runObservation
-	span string
+	run           *runObservation
+	span          string
+	recording     *runObservation
+	recordingSpan string
 }
 
 func observeScopeFrom(ctx context.Context) *observeScope {
 	scope, _ := ctx.Value(observeKey{}).(*observeScope)
 	return scope
-}
-
-// evaluationKey carries an evaluationCapture, which every pipeline run started with the
-// context reports to; see ProgramEvaluator.
-type evaluationKey struct{}
-
-// evaluationCapture collects what ProgramEvaluator needs from the pipeline runs of one
-// evaluated example: the Redactors of every run, nested ones included, the types of the keys
-// those pipelines declare, the text the runs' redaction removed from errors, failed writes
-// included, and, when recorder is set, the traces of the top-level runs.
-type evaluationCapture struct {
-	recorder  *RecordingObserver
-	mu        sync.Mutex
-	redactors []Redactor
-	types     map[string]reflect.Type
-	forms     map[string]string
-}
-
-func withEvaluationCapture(ctx context.Context, capture *evaluationCapture) context.Context {
-	return context.WithValue(ctx, evaluationKey{}, capture)
-}
-
-// join records a run of p and returns the recorder a top-level run reports to, if any. The
-// first pipeline to declare a key gives its type.
-func (c *evaluationCapture) join(p Pipeline, topLevel bool) *RecordingObserver {
-	if c == nil {
-		return nil
-	}
-	c.mu.Lock()
-	if p.redactor != nil {
-		c.redactors = append(c.redactors, p.redactor)
-	}
-	if c.types == nil {
-		c.types = map[string]reflect.Type{}
-	}
-	for name, typ := range p.inputTypes {
-		if c.types[name] == nil {
-			c.types[name] = typ
-		}
-	}
-	for _, node := range p.steps {
-		for name, typ := range node.writeTypes {
-			if c.types[name] == nil {
-				c.types[name] = typ
-			}
-		}
-	}
-	c.mu.Unlock()
-	if !topLevel {
-		return nil
-	}
-	return c.recorder
-}
-
-// remember keeps the text a run's redaction removed. The caller holds the run's trace lock.
-func (c *evaluationCapture) remember(text *redactedText) {
-	if c == nil || len(text.forms) == 0 {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.forms == nil {
-		c.forms = map[string]string{}
-	}
-	maps.Copy(c.forms, text.forms)
-}
-
-// apply returns the evaluation item of the example the capture watched, with the traces it
-// recorded and its reflection values redacted by the Redactors of the pipelines it ran.
-func (c *evaluationCapture) apply(item EvaluationItem) EvaluationItem {
-	if trace := evaluationTrace(c.recorder); trace != nil {
-		item.Trace = trace
-	}
-	c.mu.Lock()
-	redaction := evaluationRedaction{
-		redactors: slices.Clone(c.redactors),
-		types:     maps.Clone(c.types),
-		forms:     maps.Clone(c.forms),
-	}
-	c.mu.Unlock()
-	return redaction.apply(item)
 }
 
 // observerContext returns ctx, a context of the run, as observers receive it: with its values,
@@ -271,17 +194,20 @@ func sameObserver(a, b PipelineObserver) (same bool) {
 }
 
 // traceObservation is shared by the runs of one trace. Its lock serialises their observer and
-// redactor calls and guards the text it removes from errors; see Redactor.
+// redactor calls and guards the text it removes from errors; see Redactor. A trace started
+// inside a recorded trace shares that trace's lock.
 type traceObservation struct {
 	id string
-	mu sync.Mutex
+	mu *sync.Mutex
 	redactedText
 }
 
 // runObservation reports one run to its observers: its own and those of the runs around it,
 // with its own redactor followed by theirs. life ends when the context the caller passed to the
 // trace's top-level run ends, when the MaxDuration of the run or a run around it expires, or
-// when endLife ends it once the run has finished.
+// when endLife ends it once the run has finished. recording, when set, reports the same run to
+// the RecordingObserver of an evaluation that records traces, in a trace of its own; see
+// observeScope.
 type runObservation struct {
 	trace     *traceObservation
 	observers []PipelineObserver
@@ -290,46 +216,100 @@ type runObservation struct {
 	start     time.Time
 	life      context.Context
 	endLife   context.CancelFunc
-	capture   *evaluationCapture
+	recording *runObservation
 }
 
 // observeRun starts observing a run of p over its converted inputs, as part of the trace in ctx
 // if there is one, and emits RunStarted. caller is the context the caller passed to the run.
 // It returns ctx carrying the run, and nil when nothing observes the run.
+//
+// A top-level run of an example that ProgramEvaluator records traces for reports to the
+// evaluation's RecordingObserver as well as to its own observers. When it has no observers of
+// its own, the recorder alone observes it, apart from its observers' trace: the runs inside it
+// report to the recorder as part of the recorded trace and, separately, to their own observers
+// as they would outside an evaluation.
 func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any) (
 	context.Context,
 	*runObservation,
 ) {
 	parent := observeScopeFrom(ctx)
-	capture, _ := ctx.Value(evaluationKey{}).(*evaluationCapture)
-	sink := capture.join(p, parent == nil)
-	// an evaluated run with a Redactor is observed even without observers, so that the text
-	// its redaction removes reaches the evaluation
-	evaluated := capture != nil && p.redactor != nil
-	if parent == nil && len(p.observers) == 0 && sink == nil && !evaluated {
+	capture := evaluationCaptureFrom(ctx)
+	capture.offer(inputs)
+	recorder := capture.join(p, parent == nil)
+	if parent == nil {
+		parent = &observeScope{}
+	}
+	var run, recording *runObservation
+	switch {
+	case recorder != nil && len(p.observers) == 0:
+		recording = p.startRun(nil, "", caller, []PipelineObserver{recorder}, nil)
+	case recorder != nil:
+		run = p.startRun(nil, "", caller, append(slices.Clone(p.observers), recorder), nil)
+	default:
+		var lock *sync.Mutex
+		if parent.recording != nil {
+			recording = p.startRun(parent.recording, parent.recordingSpan, caller, nil, nil)
+			lock = recording.trace.mu
+		}
+		run = p.startRun(parent.run, parent.span, caller, p.observers, lock)
+	}
+	scope := &observeScope{}
+	if recording != nil {
+		scope.recording, scope.recordingSpan = recording, recording.span.ID
+	}
+	if run != nil {
+		scope.run, scope.span = run, run.span.ID
+		run.recording = recording
+	} else {
+		run = recording
+	}
+	if run == nil {
 		return ctx, nil
 	}
-	run := &runObservation{
-		observers: appendObservers(nil, p.observers...),
-		start:     time.Now(),
-		life:      caller,
-		capture:   capture,
+	ctx = context.WithValue(ctx, observeKey{}, scope)
+
+	run.trace.mu.Lock()
+	defer run.trace.mu.Unlock()
+	for lane := run; lane != nil; lane = lane.recording {
+		event := RunStartedEvent{Span: lane.span, Inputs: lane.redactValues(inputs)}
+		observerCtx := lane.observerContext(ctx)
+		lane.deliver(func(observer PipelineObserver) {
+			event := event
+			event.Inputs = copyValues(event.Inputs)
+			observer.RunStarted(observerCtx, event)
+		})
 	}
+	return ctx, run
+}
+
+// startRun returns the observation of a run of p, with observers added to those of parent: in
+// parent's trace, under the span parentSpan, when parent is set, and otherwise in a new trace
+// serialised by lock, or by a lock of its own when lock is nil. It returns nil when there is
+// neither a parent nor an observer. caller is the context the caller passed to the run.
+func (p Pipeline) startRun(
+	parent *runObservation,
+	parentSpan string,
+	caller context.Context,
+	observers []PipelineObserver,
+	lock *sync.Mutex,
+) *runObservation {
+	if parent == nil && len(observers) == 0 {
+		return nil
+	}
+	run := &runObservation{observers: appendObservers(nil, observers...), start: time.Now(), life: caller}
 	if p.redactor != nil {
 		run.redactors = []Redactor{p.redactor}
 	}
-	parentSpan := ""
 	if parent != nil {
-		run.trace = parent.run.trace
-		run.observers = appendObservers(run.observers, parent.run.observers...)
-		run.redactors = append(run.redactors, parent.run.redactors...)
-		run.life = parent.run.life
-		parentSpan = parent.span
+		run.trace = parent.trace
+		run.observers = appendObservers(run.observers, parent.observers...)
+		run.redactors = append(run.redactors, parent.redactors...)
+		run.life = parent.life
 	} else {
-		if sink != nil {
-			run.observers = appendObservers(run.observers, sink)
+		if lock == nil {
+			lock = &sync.Mutex{}
 		}
-		run.trace = &traceObservation{id: NewID()}
+		run.trace = &traceObservation{id: NewID(), mu: lock}
 	}
 	if limit := p.budget.MaxDuration; limit > 0 {
 		run.life, run.endLife = context.WithDeadline(run.life, run.start.Add(limit))
@@ -337,18 +317,7 @@ func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any)
 		run.life, run.endLife = context.WithCancel(run.life)
 	}
 	run.span = NewUsageSpan(run.trace.id, parentSpan, UsageSpanPipelineRun, "pipeline")
-	ctx = context.WithValue(ctx, observeKey{}, &observeScope{run: run, span: run.span.ID})
-
-	run.trace.mu.Lock()
-	defer run.trace.mu.Unlock()
-	event := RunStartedEvent{Span: run.span, Inputs: run.redactValues(inputs)}
-	observerCtx := run.observerContext(ctx)
-	run.deliver(func(observer PipelineObserver) {
-		event := event
-		event.Inputs = copyValues(event.Inputs)
-		observer.RunStarted(observerCtx, event)
-	})
-	return ctx, run
+	return run
 }
 
 // finish emits RunFinished with err, the run's error. ctx is the run's context.
@@ -360,23 +329,31 @@ func (r *runObservation) finish(ctx context.Context, err error) {
 	usage := usageFrameFrom(ctx).total()
 	r.trace.mu.Lock()
 	defer r.trace.mu.Unlock()
-	err = r.redactError(err)
-	event := RunFinishedEvent{Span: finishSpan(r.span, duration, usage, err), Duration: duration, Usage: usage, Err: err}
-	observerCtx := r.observerContext(ctx)
-	r.deliver(func(observer PipelineObserver) {
-		observer.RunFinished(observerCtx, event)
-	})
-	r.capture.remember(&r.trace.redactedText)
-	r.endLife()
+	for lane := r; lane != nil; lane = lane.recording {
+		laneErr := lane.redactError(err)
+		event := RunFinishedEvent{
+			Span:     finishSpan(lane.span, duration, usage, laneErr),
+			Duration: duration,
+			Usage:    usage,
+			Err:      laneErr,
+		}
+		observerCtx := lane.observerContext(ctx)
+		lane.deliver(func(observer PipelineObserver) {
+			observer.RunFinished(observerCtx, event)
+		})
+		lane.endLife()
+	}
 }
 
-// stepObservation reports one execution of a step.
+// stepObservation reports one execution of a step, and recording, when set, reports it to an
+// evaluation's RecordingObserver; see runObservation.
 type stepObservation struct {
-	run   *runObservation
-	ctx   context.Context
-	span  UsageSpan
-	step  string
-	reads map[string]any
+	run       *runObservation
+	ctx       context.Context
+	span      UsageSpan
+	step      string
+	reads     map[string]any
+	recording *stepObservation
 }
 
 // observeStep emits StepStarted for an execution of node over values, the state its view
@@ -390,9 +367,22 @@ func observeStep(ctx context.Context, node *stepNode, attempt int, values map[st
 	if scope == nil {
 		return ctx, nil
 	}
-	run := scope.run
-	span := NewUsageSpan(run.trace.id, scope.span, UsageSpanPipelineStep, node.name)
-	ctx = context.WithValue(ctx, observeKey{}, &observeScope{run: run, span: span.ID})
+	next := &observeScope{}
+	var lanes []*stepObservation
+	if scope.run != nil {
+		span := NewUsageSpan(scope.run.trace.id, scope.span, UsageSpanPipelineStep, node.name)
+		next.run, next.span = scope.run, span.ID
+		lanes = append(lanes, &stepObservation{run: scope.run, span: span, step: node.name})
+	}
+	if scope.recording != nil {
+		span := NewUsageSpan(scope.recording.trace.id, scope.recordingSpan, UsageSpanPipelineStep, node.name)
+		next.recording, next.recordingSpan = scope.recording, span.ID
+		lanes = append(lanes, &stepObservation{run: scope.recording, span: span, step: node.name})
+	}
+	if len(lanes) == 0 {
+		return ctx, nil
+	}
+	ctx = context.WithValue(ctx, observeKey{}, next)
 	reads := make(map[string]any, len(node.reads))
 	for _, key := range node.reads {
 		if value, ok := values[key.Name]; ok {
@@ -400,16 +390,23 @@ func observeStep(ctx context.Context, node *stepNode, attempt int, values map[st
 		}
 	}
 
-	run.trace.mu.Lock()
-	defer run.trace.mu.Unlock()
-	observed := &stepObservation{run: run, ctx: ctx, span: span, step: node.name, reads: run.redactValues(reads)}
-	event := StepStartedEvent{Span: span, Step: node.name, Attempt: attempt, Reads: observed.reads}
-	observerCtx := run.observerContext(ctx)
-	run.deliver(func(observer PipelineObserver) {
-		event := event
-		event.Reads = copyValues(event.Reads)
-		observer.StepStarted(observerCtx, event)
-	})
+	observed := lanes[0]
+	observed.run.trace.mu.Lock()
+	defer observed.run.trace.mu.Unlock()
+	for i, lane := range lanes {
+		if i > 0 {
+			lanes[i-1].recording = lane
+		}
+		lane.ctx = ctx
+		lane.reads = lane.run.redactValues(reads)
+		event := StepStartedEvent{Span: lane.span, Step: node.name, Attempt: attempt, Reads: lane.reads}
+		observerCtx := lane.run.observerContext(ctx)
+		lane.run.deliver(func(observer PipelineObserver) {
+			event := event
+			event.Reads = copyValues(event.Reads)
+			observer.StepStarted(observerCtx, event)
+		})
+	}
 	return ctx, observed
 }
 
@@ -421,7 +418,6 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 	if s == nil {
 		return
 	}
-	run := s.run
 	var writes map[string]any
 	if outcome.Err == nil {
 		writes = result.writes
@@ -432,34 +428,37 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 		details = detailed.details
 	}
 
-	run.trace.mu.Lock()
-	defer run.trace.mu.Unlock()
-	if outcome.Err != nil {
-		for _, write := range attempted {
-			run.redact(write.key, write.value)
+	s.run.trace.mu.Lock()
+	defer s.run.trace.mu.Unlock()
+	for lane := s; lane != nil; lane = lane.recording {
+		run := lane.run
+		if outcome.Err != nil {
+			for _, write := range attempted {
+				run.redact(write.key, write.value)
+			}
 		}
+		event := StepFinishedEvent{
+			Step:     lane.step,
+			Attempt:  outcome.Attempt,
+			Duration: outcome.Duration,
+			Usage:    outcome.Usage,
+			Writes:   run.redactValues(writes),
+			Details:  run.redactDetails(details),
+			Reads:    lane.reads,
+			Cached:   outcome.Cached,
+			Skipped:  outcome.Skipped,
+		}
+		event.Err = run.redactError(outcome.Err)
+		event.Span = finishSpan(lane.span, outcome.Duration, outcome.Usage, event.Err)
+		observerCtx := run.observerContext(lane.ctx)
+		run.deliver(func(observer PipelineObserver) {
+			event := event
+			event.Reads = copyValues(event.Reads)
+			event.Writes = copyValues(event.Writes)
+			event.Details = copyValues(event.Details)
+			observer.StepFinished(observerCtx, event)
+		})
 	}
-	event := StepFinishedEvent{
-		Step:     s.step,
-		Attempt:  outcome.Attempt,
-		Duration: outcome.Duration,
-		Usage:    outcome.Usage,
-		Writes:   run.redactValues(writes),
-		Details:  run.redactDetails(details),
-		Reads:    s.reads,
-		Cached:   outcome.Cached,
-		Skipped:  outcome.Skipped,
-	}
-	event.Err = run.redactError(outcome.Err)
-	event.Span = finishSpan(s.span, outcome.Duration, outcome.Usage, event.Err)
-	observerCtx := run.observerContext(s.ctx)
-	run.deliver(func(observer PipelineObserver) {
-		event := event
-		event.Reads = copyValues(event.Reads)
-		event.Writes = copyValues(event.Writes)
-		event.Details = copyValues(event.Details)
-		observer.StepFinished(observerCtx, event)
-	})
 }
 
 // deliver calls each observer, recovering any panic so it neither fails the run nor keeps the

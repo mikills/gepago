@@ -160,7 +160,8 @@ type ProgramEvaluator struct {
 	// RecordTraces makes Evaluate record pipeline traces for TraceDatasetBuilder when it is
 	// asked to capture traces. Compile sets it when its DatasetBuilder is a TraceDatasetBuilder;
 	// set it when you pair a ProgramEvaluator with a TraceDatasetBuilder in an
-	// OptimizationConfig.
+	// OptimizationConfig. Recording does not change the events a pipeline's own observers
+	// receive.
 	RecordTraces bool
 }
 
@@ -169,14 +170,19 @@ type ProgramEvaluator struct {
 // PipelineTrace of the run, as the pipeline's Redactor redacts it, or a []PipelineTrace when
 // the programme ran several; see TraceDatasetBuilder.
 //
-// When the programme runs Pipelines that have Redactors, nested pipelines included, the values
-// each item carries for reflection pass through all of them, whether or not traces are
-// recorded, so reflection prompts never show what a pipeline redacts: its Output and each
+// When the programme holds or runs Pipelines that have Redactors, nested pipelines included,
+// the values each item carries for reflection pass through all of them, whether or not traces
+// are recorded, so reflection prompts never show what a pipeline redacts: its Output and each
 // SideInfo entry are redacted as an event's details are, the example's inputs and expected
 // values first converted to their keys' types where they convert, SideInfo's "details" as an
 // event's details, and the values of its PipelineTraces by key. Then the text of every value
-// the Redactors changed, here or in the runs, such as a failed step's writes, is removed from
-// every string in them (see Redactor). The Metric still scores the real values.
+// the Redactors change, among those and those the example's runs were given, wrote, tried to
+// write or attached to their errors, is removed from every string in them (see Redactor). The
+// Redactors are those of the Pipelines the programme's structure shows, found before any
+// example runs: the programme itself when it is a Pipeline, the Pipelines its steps run
+// through NewProgramStep, inside composite steps and policy fallbacks too, and the steps of a
+// PipelineProgram; a Pipeline reached only through another kind of Program adds its Redactor
+// for the examples on which it runs. The Metric still scores the real values.
 func (e ProgramEvaluator) Evaluate(
 	ctx context.Context,
 	candidate Candidate,
@@ -185,6 +191,7 @@ func (e ProgramEvaluator) Evaluate(
 ) (EvaluationResult, error) {
 	items := make([]EvaluationItem, 0, len(examples))
 	captures := make([]*evaluationCapture, 0, len(examples))
+	programCapture := newEvaluationCapture(e.Program)
 	usage := Usage{}
 	for _, example := range examples {
 		ioExample, ok := example.Input.(IOExample)
@@ -192,10 +199,11 @@ func (e ProgramEvaluator) Evaluate(
 			return EvaluationResult{}, errors.New("program evaluator examples must contain IOExample input")
 		}
 		runCtx, collector := WithUsageCollector(ctx)
-		capture := &evaluationCapture{}
+		var recorder *RecordingObserver
 		if captureTraces && e.RecordTraces {
-			capture.recorder = &RecordingObserver{}
+			recorder = &RecordingObserver{}
 		}
+		capture := programCapture.fork(recorder)
 		actual, err := e.Program.RunCandidate(withEvaluationCapture(runCtx, capture), candidate, ioExample.Inputs)
 		usage = usage.Add(collector.Usage())
 		captures = append(captures, capture)
