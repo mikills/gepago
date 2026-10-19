@@ -3,6 +3,7 @@ package gepa
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -72,6 +73,14 @@ func stableTraceText(t *testing.T, trace PipelineTrace) (data, report string) {
 	return string(encoded), report
 }
 
+// stableSpan returns span without its ids, times and duration, keeping its name, kind, model,
+// usage, error and attributes, which a test searches for secrets.
+func stableSpan(span UsageSpan) UsageSpan {
+	span.ID, span.ParentID, span.TraceID = "", "", ""
+	span.StartedAt, span.EndedAt, span.Duration = time.Time{}, time.Time{}, 0
+	return span
+}
+
 // stableEventText returns every event log recorded, formatted with %+v, without ids, times and
 // durations.
 func stableEventText(log *eventLog) string {
@@ -79,23 +88,37 @@ func stableEventText(log *eventLog) string {
 	defer log.mu.Unlock()
 	var text []string
 	for _, event := range log.runsStarted {
-		event.Span, event.RunContext = UsageSpan{}, stableRunContext(event.RunContext)
+		event.Span, event.RunContext = stableSpan(event.Span), stableRunContext(event.RunContext)
 		text = append(text, fmt.Sprintf("%+v", event))
 	}
 	for _, event := range log.stepsStarted {
-		event.Span, event.RunContext = UsageSpan{}, stableRunContext(event.RunContext)
+		event.Span, event.RunContext = stableSpan(event.Span), stableRunContext(event.RunContext)
 		text = append(text, fmt.Sprintf("%+v", event))
 	}
 	for _, event := range log.finished {
-		event.Span, event.RunContext, event.Duration = UsageSpan{}, stableRunContext(event.RunContext), 0
+		event.Span, event.RunContext, event.Duration = stableSpan(event.Span), stableRunContext(event.RunContext), 0
 		event.ToolCalls = stableToolCalls(event.ToolCalls)
 		text = append(text, fmt.Sprintf("%+v", event))
 	}
 	for _, event := range log.runsFinished {
-		event.Span, event.RunContext, event.Duration = UsageSpan{}, stableRunContext(event.RunContext), 0
+		event.Span, event.RunContext, event.Duration = stableSpan(event.Span), stableRunContext(event.RunContext), 0
 		text = append(text, fmt.Sprintf("%+v", event))
 	}
 	return fmt.Sprint(text)
+}
+
+func TestStableSpanKeepsWhatATestSearches(t *testing.T) {
+	span := NewUsageSpan("trace", "parent", UsageSpanPipelineRun, "pipeline").Finish(Usage{TotalTokens: 3}, errors.New("boom"))
+	span.Model, span.Attributes = "m", map[string]any{"a": "b"}
+
+	require.Equal(t, UsageSpan{
+		Kind:       UsageSpanPipelineRun,
+		Name:       "pipeline",
+		Model:      "m",
+		Usage:      Usage{TotalTokens: 3},
+		Err:        "boom",
+		Attributes: map[string]any{"a": "b"},
+	}, stableSpan(span))
 }
 
 func TestStableTraceDropsWhatDiffersBetweenRuns(t *testing.T) {
