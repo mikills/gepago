@@ -287,9 +287,9 @@ func MergeWith[T any](k Key[T], merge func(prev, next T) (T, error)) MergeRule {
 
 // PipelineSpec declares a Pipeline: its read-only inputs, its ordered steps, merge rules for
 // keys written by more than one step, defaults for the writes of steps that skip on error,
-// the budget of each run, and the tools its steps call. A run fails when its inputs hold a key
-// that is not declared in Inputs, unless AllowExtraInputs is set, in which case such keys are
-// dropped.
+// the budget of each run, the tools its steps call, and who observes its runs. A run fails
+// when its inputs hold a key that is not declared in Inputs, unless AllowExtraInputs is set, in
+// which case such keys are dropped.
 type PipelineSpec struct {
 	Inputs   []KeyRef
 	Steps    []Step
@@ -320,6 +320,10 @@ type PipelineSpec struct {
 	// tool Tools does not hold, a step that names a tool the policy does not allow, and a
 	// Predict or TypedPredict step that sets a ToolPolicy of its own.
 	ToolPolicy ToolPolicy
+	// Observers receive the events of every run, in this order; see PipelineObserver.
+	Observers []PipelineObserver
+	// Redactor rewrites the values events carry; see Redactor. Nil lets them through.
+	Redactor Redactor
 }
 
 // Pipeline is a validated, immutable sequence of steps created by PipelineSpec.Build. It
@@ -338,6 +342,8 @@ type Pipeline struct {
 	budget           RunBudget
 	tools            *ToolRegistry
 	toolPolicy       ToolPolicy
+	observers        []PipelineObserver
+	redactor         Redactor
 	// optional holds, for each programme step, the outputs its signature marked Optional when
 	// Build checked it.
 	optional map[string]map[string]bool
@@ -393,6 +399,11 @@ func (s PipelineSpec) Build() (Pipeline, error) {
 	if err := s.ToolPolicy.check(registered(s.Tools)); err != nil {
 		return Pipeline{}, fmt.Errorf("pipeline %w", err)
 	}
+	for i, observer := range s.Observers {
+		if isNil(observer) {
+			return Pipeline{}, fmt.Errorf("pipeline observer %d is nil", i)
+		}
+	}
 	builder := newPipelineBuilder(inputs, merges, defaults)
 	builder.tools, builder.toolPolicy = s.Tools, s.ToolPolicy
 	steps := make([]*stepNode, 0, len(s.Steps))
@@ -435,6 +446,8 @@ func (s PipelineSpec) Build() (Pipeline, error) {
 		tools:            s.Tools,
 		toolPolicy:       s.ToolPolicy.clone(),
 		optional:         builder.optional,
+		observers:        slices.Clone(s.Observers),
+		redactor:         s.Redactor,
 	}, nil
 }
 
@@ -606,6 +619,7 @@ func (p Pipeline) execute(ctx context.Context, candidate Candidate, inputs Predi
 		}
 		values[key.Name] = converted
 	}
+	caller := ctx
 	run := newPipelineRun(p.defaults, p.optional)
 	ctx, release := startRunBudget(context.WithValue(ctx, pipelineRunKey{}, run), p.budget)
 	defer release()
@@ -619,12 +633,16 @@ func (p Pipeline) execute(ctx context.Context, candidate Candidate, inputs Predi
 		env := &toolEnv{registry: p.tools, session: session, parent: toolEnvFrom(ctx)}
 		ctx = withToolEnv(WithToolMemory(ctx, session.Memory()), env)
 	}
+	ctx, observed := p.observeRun(ctx, caller, values)
 	state := State{values: values}
 	for _, node := range p.steps {
 		if err := p.runStep(ctx, candidate, node, state); err != nil {
-			return state, run, failStep(node, state.values, err)
+			stepErr := failStep(node, state.values, err)
+			observed.finish(ctx, stepErr)
+			return state, run, stepErr
 		}
 	}
+	observed.finish(ctx, nil)
 	return state, run, nil
 }
 
@@ -646,42 +664,59 @@ func (p Pipeline) checkUndeclaredInputs(inputs Prediction) error {
 }
 
 // runStep runs a top-level step on a view limited to its declared keys and commits its writes
-// only when it succeeds, so a failed step leaves the state as the previous step left it. What
-// the step staged for tools commits after its state writes (see commitStaged).
-// Pending writes are already copies of the declared type; only merge results are converted
-// here. A key left unwritten by a skipped step keeps any value it already had. A panic in the
-// step or its merges becomes an error.
-func (p Pipeline) runStep(ctx context.Context, candidate Candidate, node *stepNode, state State) (err error) {
-	result, err := runNode(ctx, childCandidate(candidate, node), node, state.values)
+// only when it succeeds, so a failed step leaves the state as the previous step left it. The
+// step's writes are merged with the values already in state as part of its execution, so a
+// merge that fails fails the step's execution. A key left unwritten by a skipped step keeps
+// any value it already had. What the step staged for tools commits after its state writes
+// (see commitStaged).
+func (p Pipeline) runStep(ctx context.Context, candidate Candidate, node *stepNode, state State) error {
+	var committed map[string]any
+	result, err := runNode(ctx, childCandidate(candidate, node), node, state.values, func(result stepResult) error {
+		var err error
+		committed, err = p.mergeWrites(node, result, state.values)
+		return err
+	})
 	if err != nil {
 		return err
 	}
+	maps.Copy(state.values, committed)
+	commitStaged(ctx, result.staged)
+	return nil
+}
+
+// mergeWrites returns the values a top-level step's result commits: its pending writes,
+// already copies of their declared types, with each key that already has a value in values
+// combined with it by the key's MergeRule and converted back to its type. A panic in a merge
+// becomes an error.
+func (p Pipeline) mergeWrites(node *stepNode, result stepResult, values map[string]any) (
+	committed map[string]any,
+	err error,
+) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			committed = nil
 			err = WithStepDetails(
 				fmt.Errorf("step panicked: %v", recovered),
 				map[string]any{"stack": string(debug.Stack())},
 			)
 		}
 	}()
-	committed := make(map[string]any, len(result.writes))
+	committed = make(map[string]any, len(result.writes))
 	for _, key := range node.writeNames {
 		next, ok := result.writes[key]
 		if !ok {
 			continue
 		}
-		if prev, exists := state.values[key]; exists {
+		if prev, exists := values[key]; exists {
 			merged, err := p.merges[key](deepCopy(prev), next)
 			if err != nil {
-				return fmt.Errorf("merge state key %q: %w", key, err)
+				return nil, fmt.Errorf("merge state key %q: %w", key, err)
 			}
 			if next, err = convertStateValue(key, node.writeTypes[key], merged); err != nil {
-				return err
+				return nil, err
 			}
 		}
 		committed[key] = next
 	}
-	maps.Copy(state.values, committed)
-	commitStaged(ctx, result.staged)
-	return nil
+	return committed, nil
 }

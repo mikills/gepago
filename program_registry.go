@@ -195,6 +195,8 @@ type ProgramTrainConfig struct {
 	Seed                int64
 	Persistence         OptimizationPersistence
 	AcceptanceCriterion AcceptanceCriterion
+	// DatasetBuilder is passed to CompileConfig.DatasetBuilder.
+	DatasetBuilder ReflectiveDatasetBuilder
 }
 
 // TrainAndSave builds a registered programme, compiles it, and writes a reusable artifact that
@@ -223,6 +225,7 @@ func (r *ProgramRegistry) TrainAndSave(
 		Seed:                config.Seed,
 		Persistence:         config.Persistence,
 		AcceptanceCriterion: config.AcceptanceCriterion,
+		DatasetBuilder:      config.DatasetBuilder,
 	})
 	if err != nil {
 		return CompiledProgram{}, state, ProgramArtifact{}, err

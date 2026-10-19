@@ -33,7 +33,7 @@ func TestStepDoesNotStartOnceABudgetIsSpent(t *testing.T) {
 		return nil
 	})
 
-	_, err := runNode(ctx, nil, newStepNode(step), map[string]any{})
+	_, err := runNode(ctx, nil, newStepNode(step), map[string]any{}, nil)
 	require.ErrorIs(t, err, spent)
 	require.False(t, ran)
 }
