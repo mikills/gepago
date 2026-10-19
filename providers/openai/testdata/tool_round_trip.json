@@ -5,6 +5,7 @@
       "request": {
         "model": "gpt-4.1-mini",
         "max_completion_tokens": 512,
+        "parallel_tool_calls": false,
         "messages": [{"role": "user"}],
         "tools": [
           {
@@ -94,7 +95,8 @@
             "content": "{\"status\":\"shipped\",\"carrier\":\"DHL\"}"
           }
         ],
-        "tools": [{"type": "function", "function": {"name": "lookup_order"}}]
+        "tools": [{"type": "function", "function": {"name": "lookup_order"}}],
+        "parallel_tool_calls": false
       },
       "response": {
         "id": "chatcmpl-CQ7nIb5uT0pYc6eHkVr2wN9dF1g",

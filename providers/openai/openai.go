@@ -191,8 +191,10 @@ func classifyErrorAs(ctx context.Context, operation string, err error) error {
 // use it. An empty Model, MaxTokens or Temperature takes the configured value.
 //
 // Each tool is a function whose parameters are the tool's InputSchema, marked strict when the
-// schema stays within the strict subset (see gepa.StrictJSONSchema), so its arguments are
-// guaranteed to match. A response format is sent as a json_schema response_format with the
+// schema stays within the strict subset (see gepa.StrictJSONSchema), so its arguments match
+// the schema. OpenAI enforces strict schemas only without parallel tool calls, so a request
+// with a strict tool also sets parallel_tool_calls to false, and the model calls at most one
+// tool per reply. A response format is sent as a json_schema response_format with the
 // format's Strict flag. Assistant messages carry their tool calls and tool messages their
 // call's id, so a transcript round-trips.
 //
@@ -276,6 +278,8 @@ func (m *LanguageModel) chatParams(req gepa.ChatRequest) (openai.ChatCompletionN
 		}
 		if gepa.StrictJSONSchema(schema) {
 			function.Strict = openai.Bool(true)
+			// OpenAI enforces a strict schema only when the model makes one call per reply.
+			params.ParallelToolCalls = openai.Bool(false)
 		}
 		params.Tools = append(params.Tools, openai.ChatCompletionFunctionTool(function))
 	}

@@ -63,6 +63,23 @@ func TestToolInputSchema(t *testing.T) {
 	schema[0] = '['
 	require.Equal(t, `{"type":"object"}`, string(tool.Parameters), "InputSchema returns a copy")
 	require.True(t, StrictJSONSchema(Tool{}.InputSchema()), "the empty arguments schema is strict")
+
+	for _, tt := range []struct{ parameters, want string }{
+		{parameters: `{}`, want: `{"type":"object"}`},
+		{parameters: ` { } `, want: `{"type":"object"}`},
+		{
+			parameters: `{"properties":{"b":{"type":"string"},"a":{}},"required":["b"]}`,
+			want:       `{"type":"object","properties":{"b":{"type":"string"},"a":{}},"required":["b"]}`,
+		},
+		{parameters: ` {"type":"object","properties":{}} `, want: `{"type":"object","properties":{}}`},
+		{parameters: `[1]`, want: `[1]`},
+	} {
+		got := Tool{Parameters: json.RawMessage(tt.parameters)}.InputSchema()
+		require.Equal(t, tt.want, string(got), "parameters %s", tt.parameters)
+	}
+	untyped := Tool{Parameters: json.RawMessage(`{"properties":{}}`)}
+	_ = untyped.InputSchema()
+	require.Equal(t, `{"properties":{}}`, string(untyped.Parameters), "adding the type leaves Parameters alone")
 }
 
 func TestChatClientFunc(t *testing.T) {

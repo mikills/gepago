@@ -215,9 +215,12 @@ func TestToolSessionCachedCallMakesNoInvocation(t *testing.T) {
 	require.Equal(t, "2", secondRecord.CallID)
 	require.Equal(t, []Provenance{{Source: "db", Detail: "row 1"}}, secondRecord.Provenance)
 	require.Equal(t, Usage{TotalTokens: 5}, collector.Usage(), "a cached call records no usage")
+	require.Equal(t, Usage{TotalTokens: 5}, firstRecord.Usage)
+	require.Zero(t, secondRecord.Usage, "a cached call's record spends nothing")
 	records := session.Records()
 	require.Len(t, records, 2)
 	require.True(t, records[1].Cached)
+	require.Zero(t, records[1].Usage)
 
 	_, _, err = session.Call(collectorCtx, ToolCall{ID: "3", Name: "a", Arguments: `{"x":2}`})
 	require.ErrorIs(t, err, ErrToolCallLimit, "different arguments miss the cache")
@@ -252,6 +255,89 @@ func TestToolSessionCachedCallMakesNoInvocation(t *testing.T) {
 			require.False(t, record.Cached)
 		}
 		require.EqualValues(t, 2, calls.Load())
+	})
+}
+
+func TestToolSessionCacheKeySortsKeysButKeepsNumberForms(t *testing.T) {
+	calls := &atomic.Int32{}
+	session := newSession(t, ToolPolicy{Cache: true}, countingTool("a", calls, ToolResult{Output: json.RawMessage(`{}`)}, nil))
+	tests := []struct {
+		arguments  string
+		wantCached bool
+	}{
+		{arguments: `{"n":1,"m":{"y":2,"x":1}}`},
+		{arguments: ` { "m" : {"x":1, "y":2}, "n" : 1 } `, wantCached: true},
+		{arguments: `{"n":1.0,"m":{"x":1,"y":2}}`},
+		{arguments: `{"n":1e0,"m":{"x":1,"y":2}}`},
+		{arguments: `{"m":{"y":2,"x":1},"n":1.0}`, wantCached: true},
+	}
+	for _, tt := range tests {
+		_, record, err := session.Call(context.Background(), ToolCall{Name: "a", Arguments: tt.arguments})
+		require.NoError(t, err)
+		require.Equal(t, tt.wantCached, record.Cached, "arguments %s", tt.arguments)
+	}
+	require.EqualValues(t, 3, calls.Load(), "1, 1.0 and 1e0 are different arguments")
+}
+
+func TestToolSessionInsideAPipelineRunMeetsItsPolicy(t *testing.T) {
+	calls := &atomic.Int32{}
+	tools := []ToolProvider{
+		countingTool("a", calls, ToolResult{Output: json.RawMessage(`{}`)}, nil),
+		countingTool("b", calls, ToolResult{Output: json.RawMessage(`{}`)}, nil),
+	}
+	top := newSession(t, ToolPolicy{Allow: []string{"a"}, MaxCalls: 1}, tools...)
+	middle := newSession(t, ToolPolicy{MaxCalls: 2}, tools...)
+	inner := newSession(t, ToolPolicy{Cache: true}, tools...)
+	topEnv := &toolEnv{session: top}
+	ctx := withToolEnv(context.Background(), &toolEnv{session: middle, parent: topEnv})
+
+	_, _, err := inner.Call(ctx, ToolCall{ID: "1", Name: "b", Arguments: `{}`})
+	require.ErrorIs(t, err, ErrToolNotAllowed)
+	require.EqualError(t, err, `tool not allowed: tool "b" is not in the Allow list ["a"] of the enclosing `+
+		"pipeline run's tool policy")
+	require.False(t, IsTransient(err))
+	require.Zero(t, calls.Load(), "a call an enclosing policy refuses invokes nothing")
+
+	_, _, err = inner.Call(ctx, ToolCall{ID: "2", Name: "a", Arguments: `{"q":1}`})
+	require.NoError(t, err)
+	_, record, err := inner.Call(ctx, ToolCall{ID: "3", Name: "a", Arguments: `{"q":1}`})
+	require.NoError(t, err)
+	require.True(t, record.Cached, "the session that makes the call answers it from its cache")
+
+	_, _, err = inner.Call(ctx, ToolCall{ID: "4", Name: "a", Arguments: `{"q":2}`})
+	require.ErrorIs(t, err, ErrToolCallLimit)
+	require.True(t, IsBudget(err))
+	require.EqualError(t, err, `tool call limit reached: tool "a" refused: the enclosing pipeline run reached its `+
+		"MaxCalls limit of 1 tool calls")
+	require.EqualValues(t, 1, calls.Load())
+
+	for _, session := range []*ToolSession{inner, middle, top} {
+		records := session.Records()
+		require.Len(t, records, 2, "every enclosing run records the calls made inside it")
+		require.Equal(t, "2", records[0].CallID)
+		require.True(t, records[1].Cached)
+	}
+
+	middleOnly := withToolEnv(context.Background(), &toolEnv{session: middle})
+	_, _, err = middle.Call(middleOnly, ToolCall{Name: "a", Arguments: `{"q":3}`})
+	require.NoError(t, err, "the refused call gave back what the middle run counted")
+	_, _, err = middle.Call(middleOnly, ToolCall{Name: "a", Arguments: `{"q":4}`})
+	require.EqualError(t, err, `tool call limit reached: tool "a" refused: the run reached its MaxCalls limit of 2 `+
+		"tool calls", "a session is not its own enclosing session")
+	_, _, err = inner.Call(context.Background(), ToolCall{Name: "a", Arguments: `{"q":5}`})
+	require.NoError(t, err, "outside the runs only the session's own policy applies")
+
+	t.Run("an enclosing per-tool limit names the enclosing run", func(t *testing.T) {
+		outer := newSession(t, ToolPolicy{MaxCallsPerTool: map[string]int{"a": 1}}, tools...)
+		own := newSession(t, ToolPolicy{}, tools...)
+		ctx := withToolEnv(context.Background(), &toolEnv{session: outer})
+		_, _, err := own.Call(ctx, ToolCall{Name: "a", Arguments: `{}`})
+		require.NoError(t, err)
+
+		_, _, err = own.Call(ctx, ToolCall{Name: "a", Arguments: `{}`})
+
+		require.EqualError(t, err, `tool call limit reached: tool "a" reached the enclosing pipeline run's `+
+			"MaxCallsPerTool limit of 1; call 2 refused")
 	})
 }
 

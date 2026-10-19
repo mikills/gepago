@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -100,6 +101,46 @@ func TestAgentOperationWithToolAndMemory(t *testing.T) {
 	}
 	if result.Usage.TotalTokens != 10 || result.Ledger.ToolCalls != 1 {
 		t.Fatalf("usage/ledger = %+v / %+v", result.Usage, result.Ledger)
+	}
+}
+
+func TestAgentHostChatRequestToolSchemas(t *testing.T) {
+	payload := `{"name":"a","model":"m","run_id":"r","messages":[{"role":"user","content":"hi"}],"tools":[` +
+		`{"name":"now","description":"current time","parameters":{}},` +
+		`{"name":"find","description":"find","parameters":{"properties":{"q":{"type":"string"}},"required":["q"]}},` +
+		`{"name":"typed","description":"typed","parameters":{"type":"object","properties":{}}},` +
+		`{"name":"bare","description":"no parameters"},` +
+		`{"name":"null","description":"null parameters","parameters":null}]}`
+	var sent map[string]any
+	callbacks := agentHostCallbacks{
+		chat: func(_ context.Context, requestJSON string) (string, error) {
+			if err := json.Unmarshal([]byte(requestJSON), &sent); err != nil {
+				t.Fatal(err)
+			}
+			return `{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}`, nil
+		},
+	}
+
+	if _, err := runAgentOperation(context.Background(), payload, callbacks); err != nil {
+		t.Fatalf("runAgentOperation error = %v", err)
+	}
+
+	tools := sent["tools"].([]any)
+	want := []any{
+		map[string]any{"type": "object"},
+		map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"q": map[string]any{"type": "string"}},
+			"required":   []any{"q"},
+		},
+		map[string]any{"type": "object", "properties": map[string]any{}},
+		nil,
+		nil,
+	}
+	for i, tool := range tools {
+		if got := tool.(map[string]any)["parameters"]; !reflect.DeepEqual(got, want[i]) {
+			t.Fatalf("tool %d parameters = %#v, want %#v", i, got, want[i])
+		}
 	}
 }
 

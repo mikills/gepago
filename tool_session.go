@@ -25,15 +25,23 @@ type ToolPolicy struct {
 	// every tool once it is spent. Each limit must be positive; use Allow to forbid a tool.
 	MaxCallsPerTool map[string]int
 	// Cache reuses the result of a successful call for each later call in the same run to the
-	// same tool with the same arguments, compared after re-encoding them with sorted keys. A
+	// same tool with the same arguments. Arguments are the same when their JSON is equal after
+	// sorting object keys and dropping spacing; numbers are compared as written, so {"n":1} and
+	// {"n":1.0} are different calls, since a typed tool may accept one and reject the other. A
 	// cached call invokes nothing, spends no call limit, records no usage and applies no memory
-	// writes; its record is marked Cached. Calls made at the same moment may both invoke.
+	// writes; its record is marked Cached and has zero Usage. Calls made at the same moment may
+	// both invoke.
 	Cache bool
 }
 
 // Allows reports whether the policy lets a run call the named tool.
 func (p ToolPolicy) Allows(name string) bool {
 	return p.Allow == nil || slices.Contains(p.Allow, name)
+}
+
+// isZero reports whether the policy sets nothing: every tool allowed, no limits, no cache.
+func (p ToolPolicy) isZero() bool {
+	return p.Allow == nil && p.MaxCalls == 0 && len(p.MaxCallsPerTool) == 0 && !p.Cache
 }
 
 // check reports a setting the policy cannot hold, and every tool it names that known does not.
@@ -74,18 +82,22 @@ type ToolCallRecord struct {
 	Output     json.RawMessage `json:"output,omitempty"`
 	Text       string          `json:"text,omitempty"`
 	Provenance []Provenance    `json:"provenance,omitempty"`
-	Usage      Usage           `json:"usage"`
-	Err        string          `json:"err,omitempty"`
-	Duration   time.Duration   `json:"duration"`
+	// Usage is what the call spent; a cached call spends nothing.
+	Usage    Usage         `json:"usage"`
+	Err      string        `json:"err,omitempty"`
+	Duration time.Duration `json:"duration"`
 	// Cached reports a call answered from the run's cache, without invoking the tool.
 	Cached bool `json:"cached,omitempty"`
 }
 
 // ToolMemory is the memory the tools of one run share. A tool reads it through
 // ToolMemoryFrom(ctx) and writes it through ToolResult.MemoryWrites, which apply only when its
-// call succeeds. An agent run's memory is its *agents.Memory; a pipeline run uses the memory
-// its context carries (see WithToolMemory) or a new one of its own. Implementations must be
-// safe for concurrent use.
+// call succeeds. An agent run's memory is its *agents.Memory, and an agent or a standalone
+// Predict applies a call's writes as soon as the call succeeds. A pipeline run uses the memory
+// its context carries (see WithToolMemory) or a new one of its own, and stages the writes of
+// each step like its state writes: a tool in the step reads the step's own writes, and they
+// reach the run's memory only when the step's state writes commit, so a step that fails, times
+// out or is skipped leaves no writes behind. Implementations must be safe for concurrent use.
 type ToolMemory interface {
 	Get(key string) (any, bool)
 	Set(key string, value any)
@@ -136,11 +148,19 @@ func ToolMemoryFrom(ctx context.Context) ToolMemory {
 // calls and records each call's usage with RecordUsage. Pipelines, agents and a Predict with
 // tools each start one per run. Create one with NewToolSession; a nil session refuses every
 // call. It is safe for concurrent use.
+//
+// A session used inside a pipeline run, such as an agent's in a step or a nested pipeline's,
+// is also governed by the session of every enclosing pipeline run: each call must be allowed
+// by their policies too, counts against their limits and is recorded in them as well. Only
+// the session that makes the call answers it from its cache.
 type ToolSession struct {
 	tools   map[string]ToolProvider
 	schemas map[string]Tool
 	policy  ToolPolicy
 	memory  ToolMemory
+	// stages makes calls read and write the memory their context carries, which is a step's
+	// staged memory inside a pipeline run, rather than memory. Pipeline runs set it.
+	stages bool
 
 	mu      sync.Mutex
 	calls   map[string]int
@@ -254,7 +274,8 @@ func (s *ToolSession) Records() []ToolCallRecord {
 // step details, output that is not valid JSON is an error, and so is a result that arrives
 // after ctx ended, which fails with the cause of ctx ending. The call's usage is recorded with
 // RecordUsage, failed calls included, and its memory writes apply only when it succeeds. Every
-// call that reaches the tool or the cache is recorded.
+// call that reaches the tool or the cache is recorded. Inside a pipeline run the policies of the
+// enclosing runs' sessions apply too, and the call is recorded in them (see ToolSession).
 func (s *ToolSession) Call(ctx context.Context, call ToolCall) (ToolResult, ToolCallRecord, error) {
 	record := ToolCallRecord{
 		Step:      currentStep(ctx),
@@ -265,21 +286,34 @@ func (s *ToolSession) Call(ctx context.Context, call ToolCall) (ToolResult, Tool
 	if err := s.admissible(call.Name); err != nil {
 		return ToolResult{}, record, err
 	}
+	enclosing := s.enclosing(ctx)
+	for _, outer := range enclosing {
+		if !outer.policy.Allows(call.Name) {
+			return ToolResult{}, record, PermanentError(fmt.Errorf(
+				"%w: tool %q is not in the Allow list %q of the enclosing pipeline run's tool policy",
+				ErrToolNotAllowed, call.Name, outer.policy.Allow))
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return ToolResult{}, record, err
 	}
 	cacheKey, cacheable := s.cacheKey(call)
 	if result, ok := s.cached(cacheKey, cacheable); ok {
-		record.Cached = true
 		record = withResult(record, result)
-		s.record(record)
+		record.Cached = true
+		record.Usage = Usage{}
+		s.record(record, enclosing)
 		return result, cloneRecord(record), nil
 	}
-	if err := s.reserve(call.Name); err != nil {
+	if err := s.reserve(call.Name, enclosing); err != nil {
 		return ToolResult{}, record, err
 	}
+	memory := s.memory
+	if staged := ToolMemoryFrom(ctx); s.stages && !isNil(staged) {
+		memory = staged
+	}
 	start := time.Now()
-	result, err := s.invoke(WithToolMemory(ctx, s.memory), call)
+	result, err := s.invoke(WithToolMemory(ctx, memory), call)
 	record.Duration = time.Since(start)
 	RecordUsage(ctx, result.Usage)
 	record = withResult(record, result)
@@ -289,17 +323,34 @@ func (s *ToolSession) Call(ctx context.Context, call ToolCall) (ToolResult, Tool
 	if err != nil {
 		err = fmt.Errorf("tool %q: %w", call.Name, err)
 		record.Err = err.Error()
-		s.record(record)
+		s.record(record, enclosing)
 		return ToolResult{}, cloneRecord(record), err
 	}
-	for _, key := range slices.Sorted(maps.Keys(result.MemoryWrites)) {
-		s.memory.Set(key, deepCopy(result.MemoryWrites[key]))
-	}
+	applyMemoryWrites(memory, result.MemoryWrites)
 	if cacheable {
 		s.store(cacheKey, result)
 	}
-	s.record(record)
+	s.record(record, enclosing)
 	return result.clone(), cloneRecord(record), nil
+}
+
+// enclosing returns the sessions of the pipeline runs ctx runs inside, innermost first, other
+// than s.
+func (s *ToolSession) enclosing(ctx context.Context) []*ToolSession {
+	var sessions []*ToolSession
+	for env := toolEnvFrom(ctx); env != nil; env = env.parent {
+		if env.session != nil && env.session != s && !slices.Contains(sessions, env.session) {
+			sessions = append(sessions, env.session)
+		}
+	}
+	return sessions
+}
+
+// applyMemoryWrites sets each write on memory, in key order.
+func applyMemoryWrites(memory ToolMemory, writes map[string]any) {
+	for _, key := range slices.Sorted(maps.Keys(writes)) {
+		memory.Set(key, deepCopy(writes[key]))
+	}
 }
 
 // invoke runs the tool, turning a panic into an error and rejecting output that is not JSON.
@@ -348,21 +399,44 @@ func (s *ToolSession) store(key toolCacheKey, result ToolResult) {
 	s.cache[key] = result.clone()
 }
 
-// reserve counts one invocation of the named tool against the policy's limits, or returns the
-// Budget error of the limit that refuses it.
-func (s *ToolSession) reserve(name string) error {
+// reserve counts one invocation of the named tool against the limits of the session's policy
+// and of each enclosing session's, or returns the Budget error of the first limit that refuses
+// it and counts nothing.
+func (s *ToolSession) reserve(name string, enclosing []*ToolSession) error {
+	if err := s.reserveOne(name, "the run"); err != nil {
+		return err
+	}
+	for i, outer := range enclosing {
+		if err := outer.reserveOne(name, "the enclosing pipeline run"); err != nil {
+			s.unreserve(name)
+			for _, counted := range enclosing[:i] {
+				counted.unreserve(name)
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// reserveOne counts one invocation of the named tool against this session's limits alone. run
+// names the session's run in the error of a limit that refuses the call.
+func (s *ToolSession) reserveOne(name, run string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if limit, ok := s.policy.MaxCallsPerTool[name]; ok && s.calls[name] >= limit {
+		whose := "its"
+		if run != "the run" {
+			whose = run + "'s"
+		}
 		return BudgetError(fmt.Errorf(
-			"%w: tool %q reached its MaxCallsPerTool limit of %d; call %d refused",
-			ErrToolCallLimit, name, limit, s.calls[name]+1,
+			"%w: tool %q reached %s MaxCallsPerTool limit of %d; call %d refused",
+			ErrToolCallLimit, name, whose, limit, s.calls[name]+1,
 		))
 	}
 	if limit := s.policy.MaxCalls; limit > 0 && s.total >= limit {
 		return BudgetError(fmt.Errorf(
-			"%w: tool %q refused: the run reached its MaxCalls limit of %d tool calls",
-			ErrToolCallLimit, name, limit,
+			"%w: tool %q refused: %s reached its MaxCalls limit of %d tool calls",
+			ErrToolCallLimit, name, run, limit,
 		))
 	}
 	s.calls[name]++
@@ -370,10 +444,21 @@ func (s *ToolSession) reserve(name string) error {
 	return nil
 }
 
-func (s *ToolSession) record(record ToolCallRecord) {
+// unreserve gives back one invocation of the named tool that reserveOne counted.
+func (s *ToolSession) unreserve(name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.records = append(s.records, cloneRecord(record))
+	s.calls[name]--
+	s.total--
+}
+
+// record keeps record in the session and in each enclosing session.
+func (s *ToolSession) record(record ToolCallRecord, enclosing []*ToolSession) {
+	for _, session := range append([]*ToolSession{s}, enclosing...) {
+		session.mu.Lock()
+		session.records = append(session.records, cloneRecord(record))
+		session.mu.Unlock()
+	}
 }
 
 func withResult(record ToolCallRecord, result ToolResult) ToolCallRecord {
@@ -403,10 +488,11 @@ func currentStep(ctx context.Context) string {
 type toolEnvKey struct{}
 
 // toolEnv is what a pipeline run gives its steps for tools: the registry, for middleware, and
-// the run's session.
+// the run's session. parent is the environment of the pipeline run this one is nested in.
 type toolEnv struct {
 	registry *ToolRegistry
 	session  *ToolSession
+	parent   *toolEnv
 }
 
 func withToolEnv(ctx context.Context, env *toolEnv) context.Context {

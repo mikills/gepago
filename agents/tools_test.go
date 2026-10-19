@@ -138,6 +138,35 @@ func TestAgentToolPolicy(t *testing.T) {
 		require.Equal(t, `{"status":"shipped"}`, result.ToolCalls[1].Output)
 	})
 
+	t.Run("a cached call adds no usage", func(t *testing.T) {
+		calls := &atomic.Int32{}
+		client := &fakeChatClient{responses: []ChatResponse{
+			callReply("call-1", "lookup_order", `{"order_id":"A-1"}`),
+			callReply("call-2", "lookup_order", `{"order_id":"A-1"}`),
+		}}
+		agent := Agent{
+			Name:         "orders",
+			Client:       client,
+			Model:        "fake",
+			ToolRegistry: orderRegistry(t, calls),
+			ToolNames:    []string{"lookup_order"},
+			ToolPolicy:   gepa.ToolPolicy{Cache: true},
+		}
+		ctx, collector := gepa.WithUsageCollector(context.Background())
+
+		result, err := agent.Run(ctx, RunRequest{Memory: NewMemory("run"), Messages: []Message{{Role: RoleUser, Content: "hi"}}})
+
+		require.NoError(t, err)
+		require.EqualValues(t, 1, calls.Load())
+		require.True(t, result.ToolCalls[1].Cached)
+		require.Equal(t, Usage{TotalTokens: 2}, result.Usage, "only the one invocation spent tokens")
+		require.Equal(t, 2, result.Ledger.TotalTokens)
+		require.Equal(t, Usage{TotalTokens: 2}, collector.Usage())
+		require.Equal(t, gepa.UsageSpanToolCall, result.Spans[3].Kind)
+		require.Zero(t, result.Spans[3].Usage, "the cached call's span spends nothing")
+		require.Equal(t, Usage{TotalTokens: 2}, result.Spans[1].Usage)
+	})
+
 	t.Run("a per-tool limit fails the run", func(t *testing.T) {
 		calls := &atomic.Int32{}
 		client := &fakeChatClient{responses: []ChatResponse{

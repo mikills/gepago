@@ -70,14 +70,26 @@ func (t Tool) Validate() error {
 // emptyToolParameters is the schema of an arguments object with no properties.
 var emptyToolParameters = json.RawMessage(`{"type":"object","properties":{},"required":[],"additionalProperties":false}`)
 
-// InputSchema returns the JSON Schema of the tool's arguments: Parameters, or the schema of an
-// object with no properties when Parameters is empty or null. Providers send it as the tool's
-// parameters.
+// InputSchema returns the JSON Schema of the tool's arguments: the schema of an object with no
+// properties when Parameters is empty or null, Parameters with "type": "object" added when it
+// names no type, such as {}, and Parameters as it is otherwise. Providers send it as the tool's
+// parameters, since they require an object schema.
 func (t Tool) InputSchema() json.RawMessage {
 	if !hasSchema(t.Parameters) {
 		return bytes.Clone(emptyToolParameters)
 	}
-	return bytes.Clone(t.Parameters)
+	schema := bytes.TrimSpace(t.Parameters)
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(schema, &root); err != nil || root == nil {
+		return bytes.Clone(t.Parameters)
+	}
+	if _, typed := root["type"]; typed {
+		return bytes.Clone(schema)
+	}
+	if len(root) == 0 {
+		return json.RawMessage(`{"type":"object"}`)
+	}
+	return append([]byte(`{"type":"object",`), schema[1:]...)
 }
 
 // hasSchema reports whether raw holds a schema rather than nothing or null.

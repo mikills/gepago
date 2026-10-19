@@ -182,6 +182,7 @@ func TestPredictToolLoopAdmitsEveryTurn(t *testing.T) {
 			wantChats: 2,
 		},
 		{name: "budget at the turns", maxCalls: 3, wantChats: 3},
+		{name: "budget one above the turns", maxCalls: 4, wantChats: 3},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -430,6 +431,19 @@ func TestPredictValidateWithTools(t *testing.T) {
 				ToolPolicy: ToolPolicy{MaxCallsPerTool: map[string]int{"nope": 1}}},
 			wantErr: `tool policy MaxCallsPerTool names unknown tool "nope"`,
 		},
+		{
+			name:    "policy without a registry",
+			predict: Predict{LM: chat, Tools: []string{"echo"}, ToolPolicy: ToolPolicy{MaxCalls: 1}},
+			wantErr: "predict ToolPolicy is set without a ToolRegistry; set ToolRegistry, or in a pipeline set " +
+				"PipelineSpec.ToolPolicy instead",
+		},
+		{
+			name:    "policy without a registry or tools",
+			predict: Predict{LM: generator, ToolPolicy: ToolPolicy{Allow: []string{}}},
+			wantErr: "predict ToolPolicy is set without a ToolRegistry; set ToolRegistry, or in a pipeline set " +
+				"PipelineSpec.ToolPolicy instead",
+		},
+		{name: "empty per-tool limits are no policy", predict: Predict{LM: generator, ToolPolicy: ToolPolicy{MaxCallsPerTool: map[string]int{}}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -625,15 +639,127 @@ func TestPredictToolsInAPipeline(t *testing.T) {
 		require.ErrorIs(t, err, ErrToolNotAllowed)
 	})
 
-	t.Run("a Predict with its own registry uses it in a pipeline", func(t *testing.T) {
-		own, err := NewToolRegistry(lookupTool(calls))
-		require.NoError(t, err)
-		lm := newScriptedChat(toolCallReply("1", "lookup_order", `{"order_id":"A-1"}`, Usage{}), textReply(orderAnswer, Usage{}))
-		pipeline, err := newSpec(lm, Predict{Tools: []string{"lookup_order"}, ToolRegistry: own}, nil, ToolPolicy{}).Build()
+	t.Run("a Predict that names the pipeline's registry uses the run's session", func(t *testing.T) {
+		lm := newScriptedChat(
+			toolCallReply("1", "lookup_order", `{"order_id":"A-1"}`, Usage{}),
+			toolCallReply("2", "lookup_order", `{"order_id":"A-1"}`, Usage{}),
+			textReply(orderAnswer, Usage{}),
+		)
+		before := calls.Load()
+		predict := Predict{Tools: []string{"lookup_order"}, ToolRegistry: registry}
+		pipeline, err := newSpec(lm, predict, registry, ToolPolicy{Cache: true}).Build()
 		require.NoError(t, err)
 
-		_, err = pipeline.Run(context.Background(), NewState(Prediction{"question": "?"}))
+		_, run, err := pipeline.execute(context.Background(), nil, Prediction{"question": "?"})
 
 		require.NoError(t, err)
+		require.Equal(t, before+1, calls.Load(), "the run's cache answers the second call")
+		require.Len(t, run.tools.Records(), 2)
+	})
+
+	own, err := NewToolRegistry(lookupTool(calls))
+	require.NoError(t, err)
+	for _, tt := range []struct {
+		name    string
+		step    Step
+		wantErr string
+	}{
+		{
+			name:    "a Predict with a registry of its own fails Build",
+			step:    NewProgramStep("answer", Predict{Signature: orderSignature, LM: newScriptedChat(), Tools: []string{"lookup_order"}, ToolRegistry: own}, refs(question.Ref()), refs(status.Ref(), summary.Ref())),
+			wantErr: `pipeline step "answer": predict sets a ToolRegistry other than the pipeline's`,
+		},
+		{
+			name:    "a Predict with a registry of its own but no tools fails Build",
+			step:    NewProgramStep("answer", Predict{Signature: orderSignature, LM: newScriptedChat(), ToolRegistry: own}, refs(question.Ref()), refs(status.Ref(), summary.Ref())),
+			wantErr: `pipeline step "answer": predict sets a ToolRegistry other than the pipeline's`,
+		},
+		{
+			name: "a Predict with a policy of its own fails Build",
+			step: NewProgramStep("answer", Predict{
+				Signature: orderSignature, LM: newScriptedChat(), Tools: []string{"lookup_order"},
+				ToolRegistry: registry, ToolPolicy: ToolPolicy{MaxCalls: 9},
+			}, refs(question.Ref()), refs(status.Ref(), summary.Ref())),
+			wantErr: `pipeline step "answer": predict sets its own ToolPolicy, but a pipeline run's tool calls all ` +
+				"go through the run's session; set PipelineSpec.ToolPolicy instead",
+		},
+		{
+			name: "a policy without a registry fails Validate",
+			step: NewProgramStep("answer", Predict{
+				Signature: orderSignature, LM: newScriptedChat(), Tools: []string{"lookup_order"},
+				ToolPolicy: ToolPolicy{Cache: true},
+			}, refs(question.Ref()), refs(status.Ref(), summary.Ref())),
+			wantErr: `pipeline step "answer": predict ToolPolicy is set without a ToolRegistry; set ToolRegistry, ` +
+				"or in a pipeline set PipelineSpec.ToolPolicy instead",
+		},
+		{
+			name: "a TypedPredict with a policy of its own fails Build",
+			step: NewProgramStep("answer", TypedPredict[orderQuestion, orderAnswerFields]{
+				Signature: Signature{Name: "order_status"}, LM: newScriptedChat(), Tools: []string{"lookup_order"},
+				ToolRegistry: registry, ToolPolicy: ToolPolicy{Allow: []string{"lookup_order"}},
+			}, refs(question.Ref()), refs(status.Ref(), summary.Ref())),
+			wantErr: `pipeline step "answer": predict sets its own ToolPolicy`,
+		},
+		{
+			name: "a nested Predict with a registry of its own fails Build",
+			step: WithPolicy(NewProgramStep("answer", Predict{
+				Signature: orderSignature, LM: newScriptedChat(), Tools: []string{"lookup_order"}, ToolRegistry: own,
+			}, refs(question.Ref()), refs(status.Ref(), summary.Ref())), StepPolicy{}),
+			wantErr: `pipeline step "answer": predict sets a ToolRegistry other than the pipeline's`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := PipelineSpec{
+				Inputs: refs(question.Ref()),
+				Steps:  []Step{tt.step},
+				Tools:  registry,
+			}.Build()
+			require.ErrorContains(t, err, tt.wantErr)
+			require.ErrorContains(t, err, "PipelineSpec.Tool")
+		})
+	}
+
+	t.Run("a Predict whose registry escapes the run's policy fails Build", func(t *testing.T) {
+		lm := newScriptedChat(
+			toolCallReply("1", "lookup_order", `{"order_id":"A-1"}`, Usage{}),
+			toolCallReply("2", "lookup_order", `{"order_id":"A-2"}`, Usage{}),
+			textReply(orderAnswer, Usage{}),
+		)
+		predict := Predict{Tools: []string{"lookup_order"}, ToolRegistry: own}
+		_, err := newSpec(lm, predict, registry, ToolPolicy{Allow: []string{"echo"}, MaxCalls: 1}).Build()
+
+		require.ErrorContains(t, err, `pipeline step "answer": predict sets a ToolRegistry other than the pipeline's`)
+		require.Zero(t, lm.calls())
+	})
+
+	t.Run("a Predict with its own registry in a step's code meets the run's policy and records", func(t *testing.T) {
+		lm := newScriptedChat(
+			toolCallReply("1", "lookup_order", `{"order_id":"A-1"}`, Usage{}),
+			toolCallReply("2", "lookup_order", `{"order_id":"A-2"}`, Usage{}),
+			textReply(orderAnswer, Usage{}),
+		)
+		predict := Predict{Signature: orderSignature, LM: lm, Tools: []string{"lookup_order"}, ToolRegistry: own}
+		answer := NewStep("answer", refs(question.Ref()), nil, func(ctx context.Context, s State) error {
+			_, err := predict.Run(ctx, Prediction{"question": "?"})
+			return err
+		})
+		pipeline, err := PipelineSpec{
+			Inputs:     refs(question.Ref()),
+			Steps:      []Step{answer},
+			Tools:      registry,
+			ToolPolicy: ToolPolicy{MaxCalls: 1},
+		}.Build()
+		require.NoError(t, err)
+		before := calls.Load()
+
+		_, run, err := pipeline.execute(context.Background(), nil, Prediction{"question": "?"})
+
+		require.ErrorIs(t, err, ErrToolCallLimit)
+		require.ErrorContains(t, err, `tool "lookup_order" refused: the enclosing pipeline run reached its MaxCalls limit of 1`)
+		require.Equal(t, before+1, calls.Load())
+		records := run.tools.Records()
+		require.Len(t, records, 1, "the run records the call its own session did not make")
+		require.Equal(t, "answer", records[0].Step)
+		require.Equal(t, `{"order_id":"A-1"}`, records[0].Arguments)
 	})
 }

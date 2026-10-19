@@ -45,7 +45,8 @@ type Agent struct {
 	// ToolNames names registry tools the agent offers the model besides Tools. Validate fails
 	// on a name that is not registered.
 	ToolNames []string
-	// ToolPolicy governs the tool calls of each run: allow-list, call limits and caching.
+	// ToolPolicy governs the tool calls of each run: allow-list, call limits and caching. In a
+	// pipeline step the pipeline run's ToolPolicy also governs them, and the run records them.
 	ToolPolicy gepa.ToolPolicy
 	// Middleware names chat middleware from ToolRegistry, outermost first, that wraps Client
 	// for every chat call of a run.

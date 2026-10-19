@@ -38,7 +38,8 @@ type ToolProvider interface {
 // Output is the structured result, a JSON value; a ToolStep converts its fields into state.
 // Text is what the model sees in the transcript; when it is empty, the transcript carries
 // Output's JSON. MemoryWrites are applied to the run's ToolMemory only when the call succeeds,
-// and are dropped with the rest of the result when it fails. Provenance says where the result
+// and are dropped with the rest of the result when it fails; inside a pipeline they also wait
+// for the step that made the call to commit (see ToolMemory). Provenance says where the result
 // came from. Usage is what the tool spent on model calls it did not record itself: the caller
 // records it with RecordUsage, so it counts against the run's budget; a tool that calls
 // RecordUsage, for example by running a Predict, must not report the same usage here.

@@ -28,6 +28,12 @@ func (p Predict) chats() bool {
 }
 
 func (p Predict) validateChat() error {
+	if p.ToolRegistry == nil && !p.ToolPolicy.isZero() {
+		return errors.New(
+			"predict ToolPolicy is set without a ToolRegistry; set ToolRegistry, or in a pipeline " +
+				"set PipelineSpec.ToolPolicy instead",
+		)
+	}
 	if !p.chats() {
 		return nil
 	}
@@ -61,9 +67,23 @@ func (p Predict) validateChat() error {
 }
 
 // bindTools checks the Predict's tools and middleware against the pipeline's registry and
-// policy. A Predict with a registry of its own was checked by Validate.
+// policy. Every tool call of a pipeline run goes through the run's session, so a Predict step
+// must not set a ToolPolicy or a ToolRegistry other than the pipeline's.
 func (p Predict) bindTools(registry *ToolRegistry, policy ToolPolicy) error {
-	if !p.chats() || p.ToolRegistry != nil {
+	if !p.ToolPolicy.isZero() {
+		return errors.New(
+			"predict sets its own ToolPolicy, but a pipeline run's tool calls all go through the run's " +
+				"session; set PipelineSpec.ToolPolicy instead",
+		)
+	}
+	if p.ToolRegistry != nil && p.ToolRegistry != registry {
+		return errors.New(
+			"predict sets a ToolRegistry other than the pipeline's, but a pipeline run's tool calls all go " +
+				"through the run's session; register its tools and middleware on PipelineSpec.Tools and leave " +
+				"Predict.ToolRegistry unset",
+		)
+	}
+	if !p.chats() {
 		return nil
 	}
 	if registry == nil {
@@ -161,11 +181,17 @@ func (p Predict) runChat(
 	return prediction, err
 }
 
-// chatEnv returns the registry and tool session the Predict chats with: its own, with a new
-// session, when it sets ToolRegistry, and otherwise the pipeline run's.
+// chatEnv returns the registry and tool session the Predict chats with: the pipeline run's,
+// when it sets no ToolRegistry or the run's own and no ToolPolicy, and otherwise its
+// ToolRegistry with a new session, whose calls the enclosing pipeline runs' sessions also
+// govern and record.
 func (p Predict) chatEnv(ctx context.Context) (*toolEnv, error) {
+	env := toolEnvFrom(ctx)
+	if env != nil && p.ToolRegistry == env.registry && p.ToolPolicy.isZero() {
+		return env, nil
+	}
 	if p.ToolRegistry == nil {
-		if env := toolEnvFrom(ctx); env != nil {
+		if env != nil {
 			return env, nil
 		}
 		return nil, fmt.Errorf(

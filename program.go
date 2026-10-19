@@ -139,8 +139,11 @@ type Predict struct {
 	// same chat with RepairPrompt's message; RepairLM is not used.
 	//
 	// Inside a pipeline the tools come from PipelineSpec.Tools under PipelineSpec.ToolPolicy,
-	// and Build checks the names. Outside one, or when ToolRegistry is set, they come from
-	// ToolRegistry under ToolPolicy, with a session of their own for each call.
+	// through the run's ToolSession, and Build checks the names; Build rejects a Predict step
+	// that sets a ToolPolicy or a ToolRegistry other than PipelineSpec.Tools. Outside one they
+	// come from ToolRegistry under ToolPolicy, with a session of their own for each call. A
+	// Predict with a registry of its own that runs inside a pipeline run anyway, in a step's
+	// own code, keeps its own session, and the run's ToolPolicy governs its calls too.
 	Tools []string
 	// MaxToolTurns bounds the replies that call tools: a reply that calls a tool after
 	// MaxToolTurns such replies fails with ErrToolTurnLimit without running the calls. Zero
@@ -149,16 +152,18 @@ type Predict struct {
 	// Middleware names chat middleware from the same registry as Tools, outermost first, that
 	// wraps LM for every chat call. Setting it makes Predict chat even without Tools.
 	Middleware []string
-	// ToolRegistry, when set, supplies Tools and Middleware even inside a pipeline.
+	// ToolRegistry supplies Tools and Middleware outside a pipeline. In a pipeline step it must
+	// be unset or PipelineSpec.Tools.
 	ToolRegistry *ToolRegistry
-	// ToolPolicy governs the tool calls made through ToolRegistry.
+	// ToolPolicy governs the tool calls made through ToolRegistry outside a pipeline. It needs
+	// a ToolRegistry, and a pipeline step must leave it unset.
 	ToolPolicy ToolPolicy
 }
 
-// Validate checks that the programme has a valid signature and language model. With Tools or
-// Middleware, LM must also be a ChatClient, the names must be unique, MaxToolTurns must not be
-// negative, and when ToolRegistry is set every name must be registered and every tool allowed
-// by ToolPolicy.
+// Validate checks that the programme has a valid signature and language model, and that a
+// ToolPolicy comes with a ToolRegistry. With Tools or Middleware, LM must also be a
+// ChatClient, the names must be unique, MaxToolTurns must not be negative, and when
+// ToolRegistry is set every name must be registered and every tool allowed by ToolPolicy.
 func (p Predict) Validate() error {
 	if err := p.Signature.Validate(); err != nil {
 		return err

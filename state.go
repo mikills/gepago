@@ -36,6 +36,8 @@ type stepScope struct {
 	pending map[string]any
 	skipped map[string]bool
 	err     error
+	// memory stages the tool memory writes of the step, nil when its run has no tool memory.
+	memory *stagedMemory
 }
 
 func (s *stepScope) fail(err error) {

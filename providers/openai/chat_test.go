@@ -164,6 +164,7 @@ func TestChatRequestShape(t *testing.T) {
 	}, first["messages"])
 	function := first["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)
 	require.NotContains(t, function, "strict", "a schema outside the strict subset is not marked strict")
+	require.NotContains(t, first, "parallel_tool_calls", "without a strict tool parallel calls stay allowed")
 	require.Equal(t, map[string]any{"type": "object"}, function["parameters"])
 	require.Equal(t, map[string]any{
 		"type":        "json_schema",
@@ -174,6 +175,7 @@ func TestChatRequestShape(t *testing.T) {
 	require.EqualValues(t, 0.1, second["temperature"])
 	noArgs := second["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)
 	require.Equal(t, true, noArgs["strict"])
+	require.Equal(t, false, second["parallel_tool_calls"], "a strict tool turns parallel calls off")
 	require.Equal(t, map[string]any{
 		"type": "object", "properties": map[string]any{}, "required": []any{}, "additionalProperties": false,
 	}, noArgs["parameters"])
