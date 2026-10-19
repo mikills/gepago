@@ -204,6 +204,31 @@ func TestProgramRegistryTrainingStoresTheFingerprint(t *testing.T) {
 	require.Equal(t, Prediction{"instruction": "trained"}, got)
 }
 
+func TestProgramRegistryLoadOrTrainChecksTheFingerprintOfAVersionedArtefact(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "echo.json")
+	original, renamed := echoPipeline(t, "instruction"), echoPipeline(t, "answer")
+	registry := NewProgramRegistry()
+	require.NoError(t, registry.Register("echo", func() (Program, error) { return original, nil }))
+	config := echoTrainingConfig(path)
+	config.ProgramVersion = "v1"
+
+	_, artifact, _, trained, err := registry.LoadOrTrain(context.Background(), config)
+	require.NoError(t, err)
+	require.True(t, trained)
+	require.Equal(t, "v1", artifact.ProgramVersion)
+	require.Equal(t, original.Fingerprint(), artifact.Fingerprint)
+
+	require.NoError(t, registry.Replace("echo", func() (Program, error) { return renamed, nil }))
+	_, _, state, trained, err := registry.LoadOrTrain(context.Background(), config)
+	require.EqualError(t, err, mismatchMessage(original.Fingerprint(), renamed.Fingerprint()))
+	require.False(t, trained)
+	require.Zero(t, state.MetricCalls)
+
+	// an expected version given to the loader still stands in for the fingerprint.
+	_, _, err = registry.LoadCompiledVersion(path, "v1")
+	require.NoError(t, err)
+}
+
 func TestProgramRegistryChecksTheFingerprint(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "echo.program.json")

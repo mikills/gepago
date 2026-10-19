@@ -69,7 +69,7 @@ var (
 // failed step's own. Its budget is its own, not the failed step's: it is limited by
 // PerStepTokens[<step>] if set and by the run limits, so it can stand in for a step that
 // failed on its own PerStepTokens limit. When step fails too, the error keeps both errors for
-// errors.Is and errors.As.
+// errors.Is and errors.As, each in a StepError holding its own step's reads and details.
 //
 // Unlike Fallback, which falls back only on a non-permanent error, OnErrorFallback falls back
 // on any error left after the policy's retries.
@@ -222,7 +222,9 @@ func (p *policyStep) onError(ctx context.Context, candidate Candidate, s State, 
 	case errorActionFallback:
 		result, fallbackErr := runChild(ctx, candidate, p.child.name, p.fallback, s.values)
 		if fallbackErr != nil {
-			return &fallbackError{primary: err, fallback: fallbackErr}
+			// the failed step gets a StepError of its own, with its own reads and details, so
+			// they are not confused with the fallback step's.
+			return &fallbackError{primary: failStep(p.child, s.values, err), fallback: fallbackErr, named: true}
 		}
 		result.commitTo(s, p.fallback)
 		return nil
@@ -244,14 +246,20 @@ func DefaultValue[T any](k Key[T], value T) KeyDefault {
 
 // fallbackError keeps both errors of a step that failed, fell back and failed again. The
 // fallback's error comes first in Unwrap, so when it has a kind, that kind is the kind of
-// the whole.
+// the whole. named marks a primary StepError for a step that the enclosing StepError already
+// names, as with a WithPolicy fallback, so Error prints only the error inside it.
 type fallbackError struct {
 	primary  error
 	fallback error
+	named    bool
 }
 
 func (e *fallbackError) Error() string {
-	return fmt.Sprintf("%v; fallback failed: %v", e.primary, e.fallback)
+	primary := e.primary
+	if stepErr, ok := primary.(*StepError); ok && e.named {
+		primary = stepErr.Err
+	}
+	return fmt.Sprintf("%v; fallback failed: %v", primary, e.fallback)
 }
 
 func (e *fallbackError) Unwrap() []error {

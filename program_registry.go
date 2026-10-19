@@ -239,7 +239,9 @@ func (r *ProgramRegistry) TrainAndSave(
 
 // LoadOrTrain loads a saved programme artifact, or trains and saves it if the artifact is missing.
 // An artefact that does not fit the programme, by programme version or fingerprint, is an error
-// rather than a reason to retrain.
+// rather than a reason to retrain. The fingerprint is always checked: config.ProgramVersion
+// labels the artefacts TrainAndSave writes, so it does not stand in for the fingerprint as an
+// expected version given to LoadCompiledVersion does.
 func (r *ProgramRegistry) LoadOrTrain(
 	ctx context.Context,
 	config ProgramTrainConfig,
@@ -248,7 +250,7 @@ func (r *ProgramRegistry) LoadOrTrain(
 	pathMu.Lock()
 	defer pathMu.Unlock()
 
-	compiled, artifact, err := r.LoadCompiledVersion(config.ArtifactPath, config.ProgramVersion)
+	compiled, artifact, err := r.loadCompiled(config.ArtifactPath, config.ProgramVersion, "")
 	if err == nil {
 		return compiled, artifact, OptimizationState{}, false, nil
 	}

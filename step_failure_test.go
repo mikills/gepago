@@ -116,6 +116,65 @@ func TestReflectionRecordNamesTheFailingStep(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestReflectionRecordNamesAPolicyStepWhoseFallbackFailed(t *testing.T) {
+	label := Key[string]{Name: "label"}
+	classify := NewProgramStep("classify", Predict{
+		Signature: Signature{Name: "classify", Inputs: []Field{{Name: "amount"}}, Outputs: []Field{{Name: "label"}}},
+		LM:        textModel(func(context.Context, string) (string, error) { return `{"label": null}`, nil }),
+	}, refs(amountKey.Ref()), refs(label.Ref()))
+	backup := NewStep("backup", refs(docKey.Ref()), refs(label.Ref()), func(context.Context, State) error {
+		return WithStepDetails(errors.New("no backup"), map[string]any{"backup_detail": "from backup"})
+	})
+	pipeline := fpBuild(t, PipelineSpec{
+		Inputs: refs(docKey.Ref()),
+		Steps:  []Step{amountStep(), WithPolicy(classify, StepPolicy{OnError: OnErrorFallback(backup)})},
+	})
+
+	_, err := pipeline.Run(context.Background(), NewState(Prediction{"document": "cash"}))
+	require.EqualError(t, err, `pipeline step "classify": invalid programme output: signature "classify": `+
+		`output "label" is null; fallback failed: pipeline step "backup": no backup`)
+	var outer, backupErr *StepError
+	require.ErrorAs(t, err, &outer)
+	require.Equal(t, map[string]any{"amount": 125000, "document": "cash"}, outer.Reads)
+	require.ErrorAs(t, outer.Err, &backupErr)
+	require.Equal(t, "backup", backupErr.Step)
+	require.Equal(t, map[string]any{"document": "cash"}, backupErr.Reads)
+
+	evaluator := ProgramEvaluator{Program: pipeline, Metric: ExactMatchMetric{Fields: []string{"label"}}}
+	examples := []Example{NewIOExample("1", Prediction{"document": "cash"}, Prediction{"label": "large"})}
+	candidate := pipeline.SeedCandidate()
+	eval, err := evaluator.Evaluate(context.Background(), candidate, examples, false)
+	require.NoError(t, err)
+	component := "classify.instruction"
+	dataset := DefaultReflectiveDatasetBuilder(candidate, eval, []string{component})
+
+	require.Len(t, dataset[component], 1)
+	sideInfo, ok := dataset[component][0]["side_info"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "classify", sideInfo["step"])
+	require.Equal(t, map[string]any{"amount": 125000}, sideInfo["reads"])
+	require.Equal(t, map[string]any{"output": Prediction{"label": nil}}, sideInfo["details"])
+}
+
+func TestNestedPolicyFallbackErrorsNameEachStepOnce(t *testing.T) {
+	failing := func(name string, reads []KeyRef) Step {
+		return NewStep(name, reads, refs(decisionKey.Ref()), func(context.Context, State) error {
+			return errors.New(name + " failed")
+		})
+	}
+	inner := WithPolicy(
+		failing("decide", refs(amountKey.Ref())),
+		StepPolicy{OnError: OnErrorFallback(failing("first", refs(docKey.Ref())))},
+	)
+	outer := WithPolicy(inner, StepPolicy{OnError: OnErrorFallback(failing("second", refs(amountKey.Ref())))})
+	pipeline := fpBuild(t, PipelineSpec{Inputs: refs(docKey.Ref()), Steps: []Step{amountStep(), outer}})
+
+	_, err := pipeline.Run(context.Background(), NewState(Prediction{"document": "cash"}))
+
+	require.EqualError(t, err, `pipeline step "decide": decide failed; fallback failed: pipeline step "first": `+
+		`first failed; fallback failed: pipeline step "second": second failed`)
+}
+
 func TestInvalidOutputItemWithoutAStep(t *testing.T) {
 	example := IOExample{Inputs: Prediction{"document": "x"}, Expected: Prediction{"label": "a"}}
 	item := invalidOutputItem("1", example, nil, fmt.Errorf("%w: label is null", ErrInvalidOutput))
