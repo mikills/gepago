@@ -508,6 +508,34 @@ func TestTypedPredictWithTools(t *testing.T) {
 	})
 }
 
+func TestBuildAcceptsPredictStepsThatUseThePipelinesTools(t *testing.T) {
+	question := Key[string]{Name: "question"}
+	status := Key[string]{Name: "status"}
+	summary := Key[string]{Name: "summary"}
+	registry, err := NewToolRegistry(lookupTool(&atomic.Int32{}))
+	require.NoError(t, err)
+	lm := newScriptedChat()
+	same := Predict{Signature: orderSignature, LM: lm, Tools: []string{"lookup_order"}, ToolRegistry: registry}
+	typed := TypedPredict[orderQuestion, orderAnswerFields]{
+		LM: lm, Tools: []string{"lookup_order"}, ToolRegistry: registry,
+	}
+	plain := Predict{Signature: orderSignature, LM: lm}
+	for name, step := range map[string]Step{
+		"the pipeline's registry":               NewProgramStep("answer", same, refs(question.Ref()), refs(status.Ref(), summary.Ref())),
+		"a TypedPredict with the same":          NewProgramStep("answer", typed, refs(question.Ref()), refs(status.Ref(), summary.Ref())),
+		"a Predict without tools":               NewProgramStep("answer", plain, refs(question.Ref()), refs(status.Ref(), summary.Ref())),
+		"the pipeline's registry in WithPolicy": WithPolicy(NewProgramStep("answer", same, refs(question.Ref()), refs(status.Ref(), summary.Ref())), StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}}),
+	} {
+		_, err := PipelineSpec{
+			Inputs:     refs(question.Ref()),
+			Steps:      []Step{step},
+			Tools:      registry,
+			ToolPolicy: ToolPolicy{MaxCalls: 3},
+		}.Build()
+		require.NoError(t, err, name)
+	}
+}
+
 func TestPredictMiddlewareWrapsEveryTurnOutermostFirst(t *testing.T) {
 	var trace []string
 	var mu sync.Mutex

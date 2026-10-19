@@ -146,18 +146,29 @@ func TestPredictValidateChecksWhatARetryingModelWraps(t *testing.T) {
 func TestPredictToolLoopRetriesThroughRetryingLanguageModel(t *testing.T) {
 	question := Key[string]{Name: "question"}
 	tests := []struct {
-		name      string
-		maxCalls  int
-		wantCalls int32
-		wantErr   string
+		name       string
+		budget     RunBudget
+		wantCalls  int32
+		wantTokens int
+		wantErr    string
 	}{
-		{name: "every attempt is admitted", maxCalls: 3, wantCalls: 3},
+		{name: "every attempt is admitted", budget: RunBudget{MaxModelCalls: 3}, wantCalls: 3, wantTokens: 7},
 		{
-			name:      "a budget one below the attempts refuses the last turn",
-			maxCalls:  2,
-			wantCalls: 2,
-			wantErr:   `pipeline step "answer": run budget MaxModelCalls 2 exceeded: model call 3 refused`,
+			name:       "a budget one below the attempts refuses the last turn",
+			budget:     RunBudget{MaxModelCalls: 2},
+			wantCalls:  2,
+			wantTokens: 3,
+			wantErr:    `pipeline step "answer": run budget MaxModelCalls 2 exceeded: model call 3 refused`,
 		},
+		{
+			name:       "a token budget one below counts the failed attempt's tokens",
+			budget:     RunBudget{MaxTokens: 6},
+			wantCalls:  3,
+			wantTokens: 7,
+			wantErr:    `pipeline step "answer": run budget MaxTokens 6 exceeded: 7 tokens spent`,
+		},
+		{name: "a token budget at the spend", budget: RunBudget{MaxTokens: 7}, wantCalls: 3, wantTokens: 7},
+		{name: "a token budget one above the spend", budget: RunBudget{MaxTokens: 8}, wantCalls: 3, wantTokens: 7},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -178,7 +189,7 @@ func TestPredictToolLoopRetriesThroughRetryingLanguageModel(t *testing.T) {
 				Inputs: refs(question.Ref()),
 				Steps: []Step{NewProgramStep("answer", predict, refs(question.Ref()),
 					refs(Key[string]{Name: "status"}.Ref(), Key[string]{Name: "summary"}.Ref()))},
-				Budget: RunBudget{MaxModelCalls: tt.maxCalls},
+				Budget: tt.budget,
 				Tools:  registry,
 			}.Build()
 			require.NoError(t, err)
@@ -187,13 +198,13 @@ func TestPredictToolLoopRetriesThroughRetryingLanguageModel(t *testing.T) {
 			_, err = pipeline.Run(ctx, NewState(Prediction{"question": "?"}))
 
 			require.EqualValues(t, tt.wantCalls, inner.calls())
+			require.Equal(t, Usage{TotalTokens: tt.wantTokens}, collector.Usage(), "each attempt's usage is recorded once")
 			if tt.wantErr != "" {
 				require.EqualError(t, err, tt.wantErr)
-				require.Equal(t, Usage{TotalTokens: 3}, collector.Usage())
+				require.True(t, IsBudget(err))
 				return
 			}
 			require.NoError(t, err)
-			require.Equal(t, Usage{TotalTokens: 7}, collector.Usage(), "the retried turn's usage is recorded once")
 		})
 	}
 }

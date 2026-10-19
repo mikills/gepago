@@ -3,6 +3,7 @@ package agents
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 
@@ -105,6 +106,114 @@ func TestAgentInAPipelineMeetsTheRunsToolPolicy(t *testing.T) {
 			}
 			require.ErrorIs(t, err, tt.wantIs)
 			require.EqualError(t, err, tt.wantErr)
+		})
+	}
+}
+
+func TestAgentInAPipelineWithAPolicyButNoTools(t *testing.T) {
+	tests := []struct {
+		name      string
+		spec      gepa.PipelineSpec
+		wantChats int
+		wantIs    error
+		wantErr   string
+	}{
+		{name: "no policy governs nothing", wantChats: 3},
+		{
+			name:      "MaxCalls counts the agent's calls",
+			spec:      gepa.PipelineSpec{ToolPolicy: gepa.ToolPolicy{MaxCalls: 1}},
+			wantChats: 2,
+			wantIs:    gepa.ErrToolCallLimit,
+			wantErr: `pipeline step "agent": agent "budgeted" tool call limit reached: tool "echo" refused: the ` +
+				"enclosing pipeline run reached its MaxCalls limit of 1 tool calls",
+		},
+		{
+			name:      "an empty Allow list refuses every call",
+			spec:      gepa.PipelineSpec{ToolPolicy: gepa.ToolPolicy{Allow: []string{}}},
+			wantChats: 1,
+			wantIs:    gepa.ErrToolNotAllowed,
+			wantErr: `pipeline step "agent": agent "budgeted" tool not allowed: tool "echo" is not in the Allow ` +
+				"list [] of the enclosing pipeline run's tool policy",
+		},
+		{
+			name:      "an empty registry is the same",
+			spec:      gepa.PipelineSpec{Tools: &gepa.ToolRegistry{}, ToolPolicy: gepa.ToolPolicy{MaxCalls: 1}},
+			wantChats: 2,
+			wantIs:    gepa.ErrToolCallLimit,
+			wantErr: `pipeline step "agent": agent "budgeted" tool call limit reached: tool "echo" refused: the ` +
+				"enclosing pipeline run reached its MaxCalls limit of 1 tool calls",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			agent, client := threeTurnAgent()
+			pipeline := agentPipelineSpec(t, agent, tt.spec)
+
+			_, err := pipeline.Run(context.Background(), gepa.NewState(gepa.Prediction{"question": "hi"}))
+
+			require.Len(t, client.requests, tt.wantChats)
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorIs(t, err, tt.wantIs)
+			require.EqualError(t, err, tt.wantErr)
+		})
+	}
+}
+
+// flakyChat fails its first chat call transiently after spending three tokens, then answers.
+type flakyChat struct{ calls atomic.Int32 }
+
+func (c *flakyChat) Generate(context.Context, string) (gepa.Generation, error) {
+	return gepa.Generation{}, errors.New("flaky chat: Generate is not expected")
+}
+
+func (c *flakyChat) Chat(context.Context, ChatRequest) (ChatResponse, error) {
+	if c.calls.Add(1) == 1 {
+		return ChatResponse{Usage: Usage{TotalTokens: 3}}, gepa.TransientError(errors.New("busy"))
+	}
+	return ChatResponse{
+		Message:      Message{Role: RoleAssistant, Content: "done"},
+		Usage:        Usage{TotalTokens: 5},
+		FinishReason: FinishStop,
+	}, nil
+}
+
+func TestAgentWithARetryingClientInABudgetedPipeline(t *testing.T) {
+	tests := []struct {
+		maxCalls     int
+		wantAttempts int32
+		wantTokens   int
+		wantErr      string
+	}{
+		{
+			maxCalls:     1,
+			wantAttempts: 1,
+			wantTokens:   3,
+			wantErr: `pipeline step "agent": agent "a" chat turn 1: run budget MaxModelCalls 1 exceeded: model ` +
+				"call 2 refused",
+		},
+		{maxCalls: 2, wantAttempts: 2, wantTokens: 8},
+		{maxCalls: 3, wantAttempts: 2, wantTokens: 8},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("MaxModelCalls %d", tt.maxCalls), func(t *testing.T) {
+			inner := &flakyChat{}
+			agent := &Agent{Name: "a", Client: &gepa.RetryingLanguageModel{LM: inner, MaxAttempts: 2}, Model: "m"}
+			pipeline := agentPipeline(t, agent, gepa.RunBudget{MaxModelCalls: tt.maxCalls})
+			ctx, collector := gepa.WithUsageCollector(context.Background())
+
+			_, err := pipeline.Run(ctx, gepa.NewState(gepa.Prediction{"question": "hi"}))
+
+			require.Equal(t, tt.wantAttempts, inner.calls.Load(), "each attempt is a model call")
+			require.Equal(t, tt.wantTokens, collector.Usage().TotalTokens, "each attempt's usage is recorded once")
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.EqualError(t, err, tt.wantErr)
+			require.True(t, gepa.IsBudget(err))
 		})
 	}
 }

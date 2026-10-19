@@ -322,10 +322,13 @@ func TestToolStepMemoryWritesInAPipeline(t *testing.T) {
 }
 
 // rememberTool stores the argument value under the argument key and returns what the memory
-// held under that key before.
-func rememberTool() ToolProvider {
+// held under that key before. It counts its invocations in calls, when calls is not nil.
+func rememberTool(calls *atomic.Int32) ToolProvider {
 	schema := Tool{Name: "remember", Description: "remember a value", Parameters: json.RawMessage(`{"type":"object"}`)}
 	return NewToolFunc(schema, func(ctx context.Context, call ToolCall) (ToolResult, error) {
+		if calls != nil {
+			calls.Add(1)
+		}
 		var args struct {
 			Key   string `json:"key"`
 			Value string `json:"value"`
@@ -368,7 +371,7 @@ func rememberStep(name, key, value string, err error) Step {
 }
 
 func TestPipelineStagesToolMemoryWritesUntilTheStepCommits(t *testing.T) {
-	registry, err := NewToolRegistry(rememberTool())
+	registry, err := NewToolRegistry(rememberTool(nil))
 	require.NoError(t, err)
 	errStep := errors.New("step failed")
 	run := func(t *testing.T, memory ToolMemory, steps ...Step) error {
@@ -549,6 +552,327 @@ func TestPipelineStagesToolMemoryWritesUntilTheStepCommits(t *testing.T) {
 
 		require.Error(t, err)
 		requireMemory(t, memory, map[string]any{"charged": true})
+	})
+}
+
+func TestPipelineStagesCachedToolResultsWithTheStep(t *testing.T) {
+	errStep := errors.New("step failed")
+	type outcome struct {
+		err     error
+		memory  ToolMemory
+		calls   int32
+		records []ToolCallRecord
+	}
+	run := func(t *testing.T, cache bool, steps ...Step) outcome {
+		t.Helper()
+		calls := &atomic.Int32{}
+		registry, err := NewToolRegistry(rememberTool(calls))
+		require.NoError(t, err)
+		pipeline, err := PipelineSpec{Steps: steps, Tools: registry, ToolPolicy: ToolPolicy{Cache: cache}}.Build()
+		require.NoError(t, err)
+		memory := NewToolMemory()
+		_, pipelineRun, err := pipeline.execute(WithToolMemory(context.Background(), memory), nil, Prediction{})
+		return outcome{err: err, memory: memory, calls: calls.Load(), records: pipelineRun.tools.Records()}
+	}
+	requireCharged := func(t *testing.T, got outcome) {
+		t.Helper()
+		require.NoError(t, got.err)
+		value, ok := got.memory.Get("charged")
+		require.True(t, ok, "the committed call's memory write must reach the run")
+		require.Equal(t, "yes", value)
+	}
+
+	t.Run("a retry repeats the failed attempt's call, with or without Cache", func(t *testing.T) {
+		for _, cache := range []bool{false, true} {
+			attempts := &atomic.Int32{}
+			flaky := NewStep("flaky", nil, nil, func(ctx context.Context, _ State) error {
+				if _, err := remember(ctx, "charged", "yes"); err != nil {
+					return err
+				}
+				if attempts.Add(1) == 1 {
+					return TransientError(errStep)
+				}
+				return nil
+			})
+
+			got := run(t, cache, WithPolicy(flaky, StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}}))
+
+			requireCharged(t, got)
+			require.EqualValues(t, 2, got.calls, "Cache=%v: the dropped attempt's result is not cached", cache)
+			require.Len(t, got.records, 2)
+			require.False(t, got.records[1].Cached)
+		}
+	})
+
+	t.Run("a fallback repeats the failed step's call", func(t *testing.T) {
+		got := run(t, true, WithPolicy(rememberStep("primary", "charged", "yes", errStep), StepPolicy{
+			OnError: OnErrorFallback(rememberStep("backup", "charged", "yes", nil)),
+		}))
+		requireCharged(t, got)
+		require.EqualValues(t, 2, got.calls)
+	})
+
+	t.Run("a later step repeats a skipped step's call", func(t *testing.T) {
+		got := run(t, true,
+			WithPolicy(rememberStep("skipped", "charged", "yes", errStep), StepPolicy{OnError: OnErrorSkip}),
+			rememberStep("later", "charged", "yes", nil),
+		)
+		requireCharged(t, got)
+		require.EqualValues(t, 2, got.calls)
+	})
+
+	t.Run("a retried parallel step repeats its children's calls", func(t *testing.T) {
+		attempts := &atomic.Int32{}
+		charged := make(chan struct{}, 2)
+		charge := NewStep("charge", nil, nil, func(ctx context.Context, _ State) error {
+			_, err := remember(ctx, "charged", "yes")
+			charged <- struct{}{}
+			return err
+		})
+		flaky := NewStep("flaky", nil, nil, func(context.Context, State) error {
+			if attempts.Add(1) == 1 {
+				<-charged
+				return TransientError(errStep)
+			}
+			return nil
+		})
+		both := Parallel("both", charge, flaky)
+
+		got := run(t, true, WithPolicy(both, StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}}))
+
+		requireCharged(t, got)
+		require.EqualValues(t, 2, got.calls)
+	})
+
+	t.Run("a repeated call in one execution and in later steps hits the cache", func(t *testing.T) {
+		twice := NewStep("twice", nil, nil, func(ctx context.Context, _ State) error {
+			if _, err := remember(ctx, "charged", "yes"); err != nil {
+				return err
+			}
+			_, err := remember(ctx, "charged", "yes")
+			return err
+		})
+		nested := WithPolicy(rememberStep("nested", "charged", "yes", nil), StepPolicy{})
+
+		got := run(t, true, twice, nested, rememberStep("later", "charged", "yes", nil))
+
+		requireCharged(t, got)
+		require.EqualValues(t, 1, got.calls)
+		require.Len(t, got.records, 4)
+		for i, record := range got.records {
+			require.Equal(t, i > 0, record.Cached, "record %d", i)
+		}
+	})
+
+	t.Run("a nested step hits what the step it runs inside staged", func(t *testing.T) {
+		calls := &atomic.Int32{}
+		registry, err := NewToolRegistry(rememberTool(calls))
+		require.NoError(t, err)
+		inner, err := PipelineSpec{Steps: []Step{rememberStep("inner", "charged", "yes", nil)}}.Build()
+		require.NoError(t, err)
+		outer := NewStep("outer", nil, nil, func(ctx context.Context, _ State) error {
+			if _, err := remember(ctx, "charged", "yes"); err != nil {
+				return err
+			}
+			_, err := inner.Run(ctx, NewState(nil))
+			return err
+		})
+		pipeline, err := PipelineSpec{Steps: []Step{outer}, Tools: registry, ToolPolicy: ToolPolicy{Cache: true}}.Build()
+		require.NoError(t, err)
+
+		_, err = pipeline.Run(context.Background(), NewState(nil))
+
+		require.NoError(t, err)
+		require.EqualValues(t, 1, calls.Load())
+	})
+
+	t.Run("a nested pipeline's staged results wait for the enclosing step", func(t *testing.T) {
+		calls := &atomic.Int32{}
+		registry, err := NewToolRegistry(rememberTool(calls))
+		require.NoError(t, err)
+		inner, err := PipelineSpec{Steps: []Step{rememberStep("inner", "charged", "yes", nil)}}.Build()
+		require.NoError(t, err)
+		attempts := &atomic.Int32{}
+		outer := NewStep("outer", nil, nil, func(ctx context.Context, _ State) error {
+			if _, err := inner.Run(ctx, NewState(nil)); err != nil {
+				return err
+			}
+			if attempts.Add(1) == 1 {
+				return TransientError(errStep)
+			}
+			return nil
+		})
+		pipeline, err := PipelineSpec{
+			Steps:      []Step{WithPolicy(outer, StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}}), rememberStep("later", "charged", "yes", nil)},
+			Tools:      registry,
+			ToolPolicy: ToolPolicy{Cache: true},
+		}.Build()
+		require.NoError(t, err)
+		memory := NewToolMemory()
+
+		_, err = pipeline.Run(WithToolMemory(context.Background(), memory), NewState(nil))
+
+		require.NoError(t, err)
+		require.EqualValues(t, 2, calls.Load(), "the retry invokes again; the later step hits what the retry committed")
+		value, _ := memory.Get("charged")
+		require.Equal(t, "yes", value)
+	})
+
+	t.Run("a step cache hit commits its staged writes again", func(t *testing.T) {
+		attempts := &atomic.Int32{}
+		remembered := make(chan struct{}, 2)
+		cached := WithCache(NewStep("cached", nil, nil, func(ctx context.Context, _ State) error {
+			_, err := remember(ctx, "cached", "1")
+			remembered <- struct{}{}
+			return err
+		}), func(State) (string, error) { return "k", nil })
+		flaky := NewStep("flaky", nil, nil, func(ctx context.Context, _ State) error {
+			if attempts.Add(1) == 1 {
+				<-remembered
+				return TransientError(errStep)
+			}
+			_, err := remember(ctx, "flaky", "2")
+			return err
+		})
+
+		got := run(t, true, WithPolicy(Parallel("both", cached, flaky), StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}}))
+
+		require.NoError(t, got.err)
+		require.EqualValues(t, 2, got.calls, "the step cache answers the cached step's second execution")
+		for key, want := range map[string]string{"cached": "1", "flaky": "2"} {
+			value, ok := got.memory.Get(key)
+			require.True(t, ok, key)
+			require.Equal(t, want, value)
+		}
+	})
+
+	t.Run("a retried Predict step repeats its tool call", func(t *testing.T) {
+		tool := NewToolFunc(Tool{Name: "lookup_order", Description: "d"}, func(context.Context, ToolCall) (ToolResult, error) {
+			return ToolResult{Output: json.RawMessage(`{"status":"shipped"}`), MemoryWrites: map[string]any{"looked_up": "A-1"}}, nil
+		})
+		registry, err := NewToolRegistry(tool)
+		require.NoError(t, err)
+		lm := newScriptedChat(
+			toolCallReply("1", "lookup_order", `{"order_id":"A-1"}`, Usage{}),
+			chatReply{err: TransientError(errStep)},
+			toolCallReply("2", "lookup_order", `{"order_id":"A-1"}`, Usage{}),
+			textReply(orderAnswer, Usage{}),
+		)
+		predict := Predict{Signature: orderSignature, LM: lm, Tools: []string{"lookup_order"}}
+		question := Key[string]{Name: "question"}
+		pipeline, err := PipelineSpec{
+			Inputs: refs(question.Ref()),
+			Steps: []Step{WithPolicy(NewProgramStep("answer", predict, refs(question.Ref()),
+				refs(statusKey.Ref(), Key[string]{Name: "summary"}.Ref())), StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}})},
+			Tools:      registry,
+			ToolPolicy: ToolPolicy{Cache: true},
+		}.Build()
+		require.NoError(t, err)
+		memory := NewToolMemory()
+
+		_, pipelineRun, err := pipeline.execute(WithToolMemory(context.Background(), memory), nil, Prediction{"question": "?"})
+
+		require.NoError(t, err)
+		value, ok := memory.Get("looked_up")
+		require.True(t, ok)
+		require.Equal(t, "A-1", value)
+		records := pipelineRun.tools.Records()
+		require.Len(t, records, 2)
+		require.False(t, records[1].Cached, "the failed attempt's cached result was dropped with it")
+	})
+}
+
+func TestPipelinePolicyWithoutToolsGovernsWhatItsStepsRun(t *testing.T) {
+	calls := &atomic.Int32{}
+	registry, err := NewToolRegistry(lookupTool(calls))
+	require.NoError(t, err)
+	inner, err := toolPipeline(registry, ToolPolicy{}, ToolStep("lookup", "lookup_order", refs(orderIDKey.Ref()), nil))
+	require.NoError(t, err)
+	nested := NewStep("nested", nil, nil, func(ctx context.Context, _ State) error {
+		for _, orderID := range []string{"A-1", "A-2"} {
+			if _, err := inner.Run(ctx, NewState(Prediction{"order_id": orderID})); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	tests := []struct {
+		name        string
+		policy      ToolPolicy
+		wantSession bool
+		wantCalls   int32
+		wantIs      error
+		wantErr     string
+	}{
+		{name: "the zero policy starts no session", wantCalls: 2},
+		{
+			name:        "MaxCalls counts the nested run's calls",
+			policy:      ToolPolicy{MaxCalls: 1},
+			wantSession: true,
+			wantCalls:   1,
+			wantIs:      ErrToolCallLimit,
+			wantErr: `pipeline step "nested": pipeline step "lookup": tool call limit reached: tool "lookup_order" ` +
+				"refused: the enclosing pipeline run reached its MaxCalls limit of 1 tool calls",
+		},
+		{
+			name:        "an empty Allow list refuses every call",
+			policy:      ToolPolicy{Allow: []string{}},
+			wantSession: true,
+			wantIs:      ErrToolNotAllowed,
+			wantErr: `pipeline step "nested": pipeline step "lookup": tool not allowed: tool "lookup_order" is not in ` +
+				"the Allow list [] of the enclosing pipeline run's tool policy",
+		},
+		{name: "Cache alone starts a session", policy: ToolPolicy{Cache: true}, wantSession: true, wantCalls: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls.Store(0)
+			outer, err := PipelineSpec{Inputs: refs(orderIDKey.Ref()), Steps: []Step{nested}, ToolPolicy: tt.policy}.Build()
+			require.NoError(t, err)
+
+			_, run, err := outer.execute(context.Background(), nil, Prediction{"order_id": "A-1"})
+
+			require.Equal(t, tt.wantCalls, calls.Load())
+			require.Equal(t, tt.wantSession, run.tools != nil)
+			if tt.wantErr != "" {
+				require.ErrorIs(t, err, tt.wantIs)
+				require.EqualError(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			if tt.wantSession {
+				require.Len(t, run.tools.Records(), 2, "the run records the calls made inside it")
+			}
+		})
+	}
+
+	t.Run("a Predict in a run without Tools uses the tools of the run it is nested in", func(t *testing.T) {
+		calls.Store(0)
+		lm := newScriptedChat(
+			toolCallReply("1", "lookup_order", `{"order_id":"A-1"}`, Usage{}),
+			toolCallReply("2", "lookup_order", `{"order_id":"A-2"}`, Usage{}),
+			textReply(orderAnswer, Usage{}),
+		)
+		predict := Predict{Signature: orderSignature, LM: lm, Tools: []string{"lookup_order"}}
+		middle, err := PipelineSpec{
+			Steps: []Step{NewStep("answer", nil, nil, func(ctx context.Context, _ State) error {
+				_, err := predict.Run(ctx, Prediction{"question": "?"})
+				return err
+			})},
+			ToolPolicy: ToolPolicy{MaxCalls: 1},
+		}.Build()
+		require.NoError(t, err)
+		outer, err := toolPipeline(registry, ToolPolicy{}, NewStep("middle", nil, nil, func(ctx context.Context, _ State) error {
+			_, err := middle.Run(ctx, NewState(nil))
+			return err
+		}))
+		require.NoError(t, err)
+
+		_, err = outer.Run(context.Background(), NewState(Prediction{"order_id": "A-1"}))
+
+		require.ErrorIs(t, err, ErrToolCallLimit)
+		require.ErrorContains(t, err, "the enclosing pipeline run reached its MaxCalls limit of 1 tool calls")
+		require.EqualValues(t, 1, calls.Load())
 	})
 }
 

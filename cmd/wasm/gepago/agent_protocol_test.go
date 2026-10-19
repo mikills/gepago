@@ -110,7 +110,9 @@ func TestAgentHostChatRequestToolSchemas(t *testing.T) {
 		`{"name":"find","description":"find","parameters":{"properties":{"q":{"type":"string"}},"required":["q"]}},` +
 		`{"name":"typed","description":"typed","parameters":{"type":"object","properties":{}}},` +
 		`{"name":"bare","description":"no parameters"},` +
-		`{"name":"null","description":"null parameters","parameters":null}]}`
+		`{"name":"null","description":"null parameters","parameters":null},` +
+		`{"name":"spaced","description":"spaced","parameters":{ }},` +
+		`{"name":"any","description":"any of","parameters":{"anyOf":[{"type":"object"}]}}]}`
 	var sent map[string]any
 	callbacks := agentHostCallbacks{
 		chat: func(_ context.Context, requestJSON string) (string, error) {
@@ -136,6 +138,11 @@ func TestAgentHostChatRequestToolSchemas(t *testing.T) {
 		map[string]any{"type": "object", "properties": map[string]any{}},
 		nil,
 		nil,
+		map[string]any{"type": "object"},
+		map[string]any{"type": "object", "anyOf": []any{map[string]any{"type": "object"}}},
+	}
+	if len(tools) != len(want) {
+		t.Fatalf("sent %d tools, want %d", len(tools), len(want))
 	}
 	for i, tool := range tools {
 		if got := tool.(map[string]any)["parameters"]; !reflect.DeepEqual(got, want[i]) {

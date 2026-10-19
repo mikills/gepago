@@ -1,6 +1,7 @@
 package gepa
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"runtime/debug"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,7 +32,8 @@ type ToolPolicy struct {
 	// {"n":1.0} are different calls, since a typed tool may accept one and reject the other. A
 	// cached call invokes nothing, spends no call limit, records no usage and applies no memory
 	// writes; its record is marked Cached and has zero Usage. Calls made at the same moment may
-	// both invoke.
+	// both invoke. In a pipeline run, the results a step caches commit or drop with the step's
+	// memory writes (see PipelineSpec.Tools).
 	Cache bool
 }
 
@@ -154,12 +157,16 @@ func ToolMemoryFrom(ctx context.Context) ToolMemory {
 // by their policies too, counts against their limits and is recorded in them as well. Only
 // the session that makes the call answers it from its cache.
 type ToolSession struct {
+	// id orders sessions by creation, so an enclosing session, always created first, has the
+	// lower id; reserve locks sessions in id order.
+	id      uint64
 	tools   map[string]ToolProvider
 	schemas map[string]Tool
 	policy  ToolPolicy
 	memory  ToolMemory
-	// stages makes calls read and write the memory their context carries, which is a step's
-	// staged memory inside a pipeline run, rather than memory. Pipeline runs set it.
+	// stages makes calls stage their memory writes and cached results in the step execution
+	// their context carries (see stepStage), rather than apply them to memory and the cache at
+	// once. Pipeline runs set it.
 	stages bool
 
 	mu      sync.Mutex
@@ -174,6 +181,9 @@ type toolCacheKey struct {
 	arguments string
 }
 
+// lastToolSessionID numbers the sessions NewToolSession starts.
+var lastToolSessionID atomic.Uint64
+
 // NewToolSession starts a session over tools under policy. Tool names must be unique, the
 // policy must name only these tools, and the memory writes of successful calls go to memory, or
 // to a new ToolMemory when memory is nil. A panic in a provider's Schema method is returned as
@@ -185,6 +195,7 @@ func NewToolSession(tools []ToolProvider, policy ToolPolicy, memory ToolMemory) 
 		}
 	}()
 	session = &ToolSession{
+		id:      lastToolSessionID.Add(1),
 		tools:   make(map[string]ToolProvider, len(tools)),
 		schemas: make(map[string]Tool, len(tools)),
 		policy:  policy.clone(),
@@ -297,8 +308,12 @@ func (s *ToolSession) Call(ctx context.Context, call ToolCall) (ToolResult, Tool
 	if err := ctx.Err(); err != nil {
 		return ToolResult{}, record, err
 	}
+	var stage *stepStage
+	if s.stages {
+		stage = stepStageFrom(ctx)
+	}
 	cacheKey, cacheable := s.cacheKey(call)
-	if result, ok := s.cached(cacheKey, cacheable); ok {
+	if result, ok := s.cached(stage, cacheKey, cacheable); ok {
 		record = withResult(record, result)
 		record.Cached = true
 		record.Usage = Usage{}
@@ -309,8 +324,8 @@ func (s *ToolSession) Call(ctx context.Context, call ToolCall) (ToolResult, Tool
 		return ToolResult{}, record, err
 	}
 	memory := s.memory
-	if staged := ToolMemoryFrom(ctx); s.stages && !isNil(staged) {
-		memory = staged
+	if stage != nil {
+		memory = stage
 	}
 	start := time.Now()
 	result, err := s.invoke(WithToolMemory(ctx, memory), call)
@@ -327,7 +342,10 @@ func (s *ToolSession) Call(ctx context.Context, call ToolCall) (ToolResult, Tool
 		return ToolResult{}, cloneRecord(record), err
 	}
 	applyMemoryWrites(memory, result.MemoryWrites)
-	if cacheable {
+	switch {
+	case cacheable && stage != nil:
+		stage.storeCached(s, cacheKey, result)
+	case cacheable:
 		s.store(cacheKey, result)
 	}
 	s.record(record, enclosing)
@@ -383,9 +401,16 @@ func (s *ToolSession) cacheKey(call ToolCall) (toolCacheKey, bool) {
 	return toolCacheKey{name: call.Name, arguments: arguments}, true
 }
 
-func (s *ToolSession) cached(key toolCacheKey, cacheable bool) (ToolResult, bool) {
+// cached returns a copy of the result cached for key: one that stage or a stage it runs inside
+// holds for the session, or else one the session's cache holds.
+func (s *ToolSession) cached(stage *stepStage, key toolCacheKey, cacheable bool) (ToolResult, bool) {
 	if !cacheable {
 		return ToolResult{}, false
+	}
+	for ; stage != nil; stage = stage.parent {
+		if result, ok := stage.cachedResult(s, key); ok {
+			return result, true
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -401,28 +426,41 @@ func (s *ToolSession) store(key toolCacheKey, result ToolResult) {
 
 // reserve counts one invocation of the named tool against the limits of the session's policy
 // and of each enclosing session's, or returns the Budget error of the first limit that refuses
-// it and counts nothing.
+// it, the session's own first, and counts nothing. It holds every session's lock while it
+// checks and counts, so a concurrent call sees all of the counts or none of them, and takes the
+// locks in id order, enclosing sessions first, so two calls never wait on each other.
 func (s *ToolSession) reserve(name string, enclosing []*ToolSession) error {
-	if err := s.reserveOne(name, "the run"); err != nil {
+	sessions := append([]*ToolSession{s}, enclosing...)
+	locked := slices.SortedFunc(slices.Values(sessions), func(a, b *ToolSession) int {
+		return cmp.Compare(a.id, b.id)
+	})
+	for _, session := range locked {
+		session.mu.Lock()
+	}
+	defer func() {
+		for _, session := range locked {
+			session.mu.Unlock()
+		}
+	}()
+	if err := s.limitRefusal(name, "the run"); err != nil {
 		return err
 	}
-	for i, outer := range enclosing {
-		if err := outer.reserveOne(name, "the enclosing pipeline run"); err != nil {
-			s.unreserve(name)
-			for _, counted := range enclosing[:i] {
-				counted.unreserve(name)
-			}
+	for _, outer := range enclosing {
+		if err := outer.limitRefusal(name, "the enclosing pipeline run"); err != nil {
 			return err
 		}
+	}
+	for _, session := range sessions {
+		session.calls[name]++
+		session.total++
 	}
 	return nil
 }
 
-// reserveOne counts one invocation of the named tool against this session's limits alone. run
-// names the session's run in the error of a limit that refuses the call.
-func (s *ToolSession) reserveOne(name, run string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// limitRefusal returns the Budget error of the session's limit that refuses one more
+// invocation of the named tool, or nil. run names the session's run in the error. The caller
+// holds the session's lock.
+func (s *ToolSession) limitRefusal(name, run string) error {
 	if limit, ok := s.policy.MaxCallsPerTool[name]; ok && s.calls[name] >= limit {
 		whose := "its"
 		if run != "the run" {
@@ -439,17 +477,7 @@ func (s *ToolSession) reserveOne(name, run string) error {
 			ErrToolCallLimit, name, run, limit,
 		))
 	}
-	s.calls[name]++
-	s.total++
 	return nil
-}
-
-// unreserve gives back one invocation of the named tool that reserveOne counted.
-func (s *ToolSession) unreserve(name string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.calls[name]--
-	s.total--
 }
 
 // record keeps record in the session and in each enclosing session.

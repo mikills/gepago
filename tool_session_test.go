@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -339,6 +340,80 @@ func TestToolSessionInsideAPipelineRunMeetsItsPolicy(t *testing.T) {
 		require.EqualError(t, err, `tool call limit reached: tool "a" reached the enclosing pipeline run's `+
 			"MaxCallsPerTool limit of 1; call 2 refused")
 	})
+}
+
+func TestToolSessionCountsNothingUntilEveryLimitAdmitsTheCall(t *testing.T) {
+	a := countingTool("a", &atomic.Int32{}, ToolResult{}, nil)
+	b := countingTool("b", &atomic.Int32{}, ToolResult{}, nil)
+	outer := newSession(t, ToolPolicy{MaxCallsPerTool: map[string]int{"a": 1}}, a, b)
+	inner := newSession(t, ToolPolicy{MaxCalls: 1}, a, b)
+	ctx := withToolEnv(context.Background(), &toolEnv{session: outer})
+	_, _, err := outer.Call(context.Background(), ToolCall{Name: "a"})
+	require.NoError(t, err, "the enclosing run spends its one call of a")
+	innerTotal := func() int {
+		inner.mu.Lock()
+		defer inner.mu.Unlock()
+		return inner.total
+	}
+
+	outer.mu.Lock()
+	refused, admitted := make(chan error, 1), make(chan error, 1)
+	go func() {
+		_, _, err := inner.Call(ctx, ToolCall{Name: "a"})
+		refused <- err
+	}()
+	go func() {
+		_, _, err := inner.Call(ctx, ToolCall{Name: "b"})
+		admitted <- err
+	}()
+	require.Never(t, func() bool { return innerTotal() != 0 }, 20*time.Millisecond, time.Millisecond,
+		"a call waiting on the enclosing session has counted nothing in its own")
+	outer.mu.Unlock()
+
+	require.ErrorIs(t, <-refused, ErrToolCallLimit)
+	require.NoError(t, <-admitted, "b is never refused by a count that a refused call of a took")
+	require.Equal(t, 1, innerTotal())
+}
+
+func TestToolSessionConcurrentNestedRunsShareTheEnclosingLimit(t *testing.T) {
+	calls := &atomic.Int32{}
+	registry, err := NewToolRegistry(lookupTool(calls))
+	require.NoError(t, err)
+	inner, err := toolPipeline(registry, ToolPolicy{MaxCalls: 3},
+		ToolStep("first", "lookup_order", refs(orderIDKey.Ref()), nil),
+		ToolStep("second", "lookup_order", refs(orderIDKey.Ref()), nil),
+	)
+	require.NoError(t, err)
+	var steps []Step
+	for i := range 6 {
+		steps = append(steps, NewStep(fmt.Sprintf("n%d", i), refs(orderIDKey.Ref()), nil,
+			func(ctx context.Context, s State) error {
+				orderID, err := orderIDKey.Get(s)
+				if err != nil {
+					return err
+				}
+				_, err = inner.Run(ctx, NewState(Prediction{"order_id": orderID}))
+				if errors.Is(err, ErrToolCallLimit) {
+					return nil
+				}
+				return err
+			}))
+	}
+	outer, err := toolPipeline(registry, ToolPolicy{MaxCallsPerTool: map[string]int{"lookup_order": 5}},
+		Parallel("par", steps...))
+	require.NoError(t, err)
+
+	for range 50 {
+		calls.Store(0)
+		_, run, err := outer.execute(context.Background(), nil, Prediction{"order_id": "A"})
+
+		require.NoError(t, err)
+		require.EqualValues(t, 5, calls.Load(), "the enclosing limit admits exactly five calls")
+		require.Len(t, run.tools.Records(), 5)
+		run.tools.mu.Lock()
+		require.Equal(t, 5, run.tools.total)
+		run.tools.mu.Unlock()
+	}
 }
 
 func TestToolSessionMemoryWritesApplyOnlyOnSuccess(t *testing.T) {

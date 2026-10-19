@@ -102,15 +102,15 @@ func (r *pipelineRun) storeCached(step, key string, result stepResult) {
 
 // stepResult is what a successful step leaves to commit: its pending writes, already copies
 // of their declared types, the declared writes it left unwritten because it was skipped, and
-// the tool memory writes it staged.
+// the tool memory writes and cached tool results it staged.
 type stepResult struct {
 	writes  map[string]any
 	skipped map[string]bool
-	memory  map[string]any
+	staged  stagedTools
 }
 
 func (r stepResult) clone() stepResult {
-	out := stepResult{writes: make(map[string]any, len(r.writes))}
+	out := stepResult{writes: make(map[string]any, len(r.writes)), staged: r.staged.clone()}
 	for key, value := range r.writes {
 		out.writes[key] = deepCopy(value)
 	}
@@ -120,14 +120,11 @@ func (r stepResult) clone() stepResult {
 		}
 		out.skipped[key] = true
 	}
-	if r.memory != nil {
-		out.memory = deepCopy(r.memory).(map[string]any)
-	}
 	return out
 }
 
-// commitTo copies a child's result into the view of the composite step that ran it, its tool
-// memory writes into the composite's staged memory.
+// commitTo copies a child's result into the view of the composite step that ran it, and what
+// it staged for tools into the composite's stage.
 func (r stepResult) commitTo(s State, child *stepNode) {
 	for key, value := range r.writes {
 		s.store(key, child.writeTypes[key], value, true)
@@ -135,61 +132,148 @@ func (r stepResult) commitTo(s State, child *stepNode) {
 	for key := range r.skipped {
 		s.skip(key)
 	}
-	if s.scope != nil && s.scope.memory != nil {
-		applyMemoryWrites(s.scope.memory, r.memory)
+	if s.scope != nil && s.scope.stage != nil {
+		s.scope.stage.add(r.staged)
 	}
 }
 
-// stagedMemory is the tool memory of one step execution. It reads through to the memory the
-// step runs with and holds the step's writes until the step commits, so the writes of a step
-// that fails, times out or is skipped never reach the run's memory. It is safe for concurrent
-// use.
-type stagedMemory struct {
+// commitStaged applies what a top-level step of a pipeline run staged for tools, once its
+// state writes have committed: its memory writes to the run's memory, results cached by the
+// run's own session to that session's cache, and results cached by an enclosing run's session
+// to the stage of the step this run is nested in, or to that session when there is none.
+func commitStaged(ctx context.Context, staged stagedTools) {
+	if memory := ToolMemoryFrom(ctx); !isNil(memory) {
+		applyMemoryWrites(memory, staged.memory)
+	}
+	var own *ToolSession
+	if run := pipelineRunFrom(ctx); run != nil {
+		own = run.tools
+	}
+	enclosing := stepStageFrom(ctx)
+	for key, result := range staged.cache {
+		switch {
+		case key.session == own || enclosing == nil:
+			key.session.store(key.key, result)
+		default:
+			enclosing.storeCached(key.session, key.key, result)
+		}
+	}
+}
+
+// stagedTools is what one step execution staged for tools: the memory writes and the cached
+// results of the tool calls it made through a pipeline run's session.
+type stagedTools struct {
+	memory map[string]any
+	cache  map[stagedCacheKey]ToolResult
+}
+
+// stagedCacheKey identifies a staged cached result: the session whose cache it belongs to and
+// the key in that cache.
+type stagedCacheKey struct {
+	session *ToolSession
+	key     toolCacheKey
+}
+
+func (t stagedTools) clone() stagedTools {
+	var out stagedTools
+	if t.memory != nil {
+		out.memory = deepCopy(t.memory).(map[string]any)
+	}
+	if t.cache != nil {
+		out.cache = make(map[stagedCacheKey]ToolResult, len(t.cache))
+		for key, result := range t.cache {
+			out.cache[key] = result.clone()
+		}
+	}
+	return out
+}
+
+// stepStage holds what one step execution stages for tools until the step commits, so the
+// memory writes and cached results of a step that fails, times out or is skipped never reach
+// the run, and a retry, a fallback or a later step calls the tool again. As the step's
+// ToolMemory it reads through to the memory the step runs with; a pipeline session's call
+// first looks in the stages of the step and of the steps it runs inside for a cached result.
+// It is safe for concurrent use.
+type stepStage struct {
 	base   ToolMemory
+	parent *stepStage
 	mu     sync.RWMutex
-	writes map[string]any
+	staged stagedTools
 }
 
-// stageToolMemory returns ctx with a staged memory over the tool memory ctx carries, or ctx
-// and nil when it carries none.
-func stageToolMemory(ctx context.Context) (context.Context, *stagedMemory) {
-	base := ToolMemoryFrom(ctx)
-	if isNil(base) {
-		return ctx, nil
+type stepStageKey struct{}
+
+// beginStepStage returns ctx with a new stage for one step execution, inside the stage ctx
+// carries. The stage is also the tool memory of ctx when ctx carries one.
+func beginStepStage(ctx context.Context) (context.Context, *stepStage) {
+	stage := &stepStage{parent: stepStageFrom(ctx)}
+	if base := ToolMemoryFrom(ctx); !isNil(base) {
+		stage.base = base
+		ctx = WithToolMemory(ctx, stage)
 	}
-	memory := &stagedMemory{base: base, writes: map[string]any{}}
-	return WithToolMemory(ctx, memory), memory
+	return context.WithValue(ctx, stepStageKey{}, stage), stage
+}
+
+func stepStageFrom(ctx context.Context) *stepStage {
+	stage, _ := ctx.Value(stepStageKey{}).(*stepStage)
+	return stage
 }
 
 // Get returns a copy of the value the step wrote under key, or else the base memory's value.
-func (m *stagedMemory) Get(key string) (any, bool) {
+func (m *stepStage) Get(key string) (any, bool) {
 	m.mu.RLock()
-	value, ok := m.writes[key]
+	value, ok := m.staged.memory[key]
 	m.mu.RUnlock()
 	if ok {
 		return deepCopy(value), true
+	}
+	if m.base == nil {
+		return nil, false
 	}
 	return m.base.Get(key)
 }
 
 // Set stages a copy of value under key.
-func (m *stagedMemory) Set(key string, value any) {
+func (m *stepStage) Set(key string, value any) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.writes[key] = deepCopy(value)
+	if m.staged.memory == nil {
+		m.staged.memory = map[string]any{}
+	}
+	m.staged.memory[key] = deepCopy(value)
 }
 
-// staged returns a copy of the writes staged so far, nil when there are none.
-func (m *stagedMemory) staged() map[string]any {
-	if m == nil {
-		return nil
-	}
+// cachedResult returns a copy of the result the stage holds for session under key.
+func (m *stepStage) cachedResult(session *ToolSession, key toolCacheKey) (ToolResult, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if len(m.writes) == 0 {
-		return nil
+	result, ok := m.staged.cache[stagedCacheKey{session: session, key: key}]
+	return result.clone(), ok
+}
+
+// storeCached stages a copy of result as session's cached result under key.
+func (m *stepStage) storeCached(session *ToolSession, key toolCacheKey, result ToolResult) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.staged.cache == nil {
+		m.staged.cache = map[stagedCacheKey]ToolResult{}
 	}
-	return deepCopy(m.writes).(map[string]any)
+	m.staged.cache[stagedCacheKey{session: session, key: key}] = result.clone()
+}
+
+// add stages what a child step staged, as if this step had staged it.
+func (m *stepStage) add(staged stagedTools) {
+	applyMemoryWrites(m, staged.memory)
+	for key, result := range staged.cache {
+		m.storeCached(key.session, key.key, result)
+	}
+}
+
+// snapshot returns a copy of what the stage holds.
+func (m *stepStage) snapshot() stagedTools {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.staged.clone()
 }
 
 // runChild runs a step nested in the composite step named parent, on a fresh view over the
@@ -209,8 +293,8 @@ func runChild(ctx context.Context, candidate Candidate, parent string, child *st
 }
 
 // runNode runs one step on a fresh view of values limited to its declared keys and returns its
-// writes when it succeeds, with the tool memory writes it staged; those of a step that fails
-// are dropped with its state writes. The candidate is the step's, as childCandidate selects it. Each execution of a
+// writes when it succeeds, with the tool memory writes and cached tool results it staged;
+// those of a step that fails are dropped with its state writes. The candidate is the step's, as childCandidate selects it. Each execution of a
 // step other than a WithPolicy or WithCache wrapper gets its own usage frame and outcome
 // record. A panic becomes an error with the stack in its details. When the step's context
 // ended because a budget ran out or an attempt timed out, that cause replaces the step's
@@ -241,7 +325,7 @@ func runNode(ctx context.Context, candidate Candidate, node *stepNode, values ma
 		return stepResult{}, err
 	}
 	scope := &stepScope{reads: node.readTypes, writes: node.writeTypes, pending: map[string]any{}}
-	ctx, scope.memory = stageToolMemory(ctx)
+	ctx, scope.stage = beginStepStage(ctx)
 	view := State{values: values, scope: scope}
 	var runErr error
 	if componentStep, ok := node.step.(ComponentStep); ok {
@@ -265,7 +349,7 @@ func runNode(ctx context.Context, candidate Candidate, node *stepNode, values ma
 			return stepResult{}, fmt.Errorf("step did not write declared state key %q", key)
 		}
 	}
-	return stepResult{writes: scope.pending, skipped: scope.skipped, memory: scope.memory.staged()}, nil
+	return stepResult{writes: scope.pending, skipped: scope.skipped, staged: scope.stage.snapshot()}, nil
 }
 
 // beginExecution starts one execution of the named step: it numbers the attempt, opens a usage

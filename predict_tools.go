@@ -187,6 +187,11 @@ func (p Predict) runChat(
 // govern and record.
 func (p Predict) chatEnv(ctx context.Context) (*toolEnv, error) {
 	env := toolEnvFrom(ctx)
+	// a run with a ToolPolicy but no Tools has a session but no registry; the tools come from
+	// the nearest run that has them.
+	for env != nil && env.registry == nil {
+		env = env.parent
+	}
 	if env != nil && p.ToolRegistry == env.registry && p.ToolPolicy.isZero() {
 		return env, nil
 	}

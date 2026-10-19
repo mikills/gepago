@@ -305,16 +305,22 @@ type PipelineSpec struct {
 	// TypedPredict step that sets a ToolRegistry other than Tools, since every tool call of a
 	// run goes through the run's one ToolSession. Its ToolMemory is the one the run's context
 	// carries (see WithToolMemory) or a new one; each step's memory writes reach it only when
-	// the step's state writes commit (see ToolMemory).
+	// the step's state writes commit (see ToolMemory), and so do the results the step adds to
+	// the session's cache under ToolPolicy.Cache, so a retry, a fallback or a later step that
+	// repeats a call of a failed step invokes the tool again. Within one step execution a
+	// repeated call is answered from the results that execution and the steps it runs inside
+	// staged.
 	Tools *ToolRegistry
 	// ToolPolicy governs every tool call made during a run: those of its ToolSteps and Predict
 	// steps, which call through the run's session, and those of sessions started inside the
 	// run, such as an agent's in a step or a nested pipeline's, which must also be allowed by
 	// it, count against its limits and are recorded in the run too. A nested pipeline's own
-	// policy governs its own run as well, so each call meets every enclosing run's policy. Build
-	// rejects a policy that names a tool Tools does not hold, a step that names a tool the
-	// policy does not allow, and a Predict or TypedPredict step that sets a ToolPolicy of its
-	// own.
+	// policy governs its own run as well, so each call meets every enclosing run's policy. A run
+	// starts its session when Tools is set or ToolPolicy is not the zero value, so a policy
+	// without Tools still governs the calls of the agents and pipelines its steps run; an
+	// empty, non-nil Allow then refuses every one of them. Build rejects a policy that names a
+	// tool Tools does not hold, a step that names a tool the policy does not allow, and a
+	// Predict or TypedPredict step that sets a ToolPolicy of its own.
 	ToolPolicy ToolPolicy
 }
 
@@ -597,7 +603,7 @@ func (p Pipeline) execute(ctx context.Context, candidate Candidate, inputs Predi
 	run := newPipelineRun(p.defaults)
 	ctx, release := startRunBudget(context.WithValue(ctx, pipelineRunKey{}, run), p.budget)
 	defer release()
-	if p.tools != nil {
+	if p.tools != nil || !p.toolPolicy.isZero() {
 		session, err := NewToolSession(p.tools.providers(), p.toolPolicy, ToolMemoryFrom(ctx))
 		if err != nil {
 			return State{}, nil, err
@@ -634,8 +640,8 @@ func (p Pipeline) checkUndeclaredInputs(inputs Prediction) error {
 }
 
 // runStep runs a top-level step on a view limited to its declared keys and commits its writes
-// only when it succeeds, so a failed step leaves the state as the previous step left it. The
-// tool memory writes the step staged apply to the run's memory after its state writes commit.
+// only when it succeeds, so a failed step leaves the state as the previous step left it. What
+// the step staged for tools commits after its state writes (see commitStaged).
 // Pending writes are already copies of the declared type; only merge results are converted
 // here. A key left unwritten by a skipped step keeps any value it already had. A panic in the
 // step or its merges becomes an error.
@@ -670,8 +676,6 @@ func (p Pipeline) runStep(ctx context.Context, candidate Candidate, node *stepNo
 		committed[key] = next
 	}
 	maps.Copy(state.values, committed)
-	if memory := ToolMemoryFrom(ctx); !isNil(memory) {
-		applyMemoryWrites(memory, result.memory)
-	}
+	commitStaged(ctx, result.staged)
 	return nil
 }
