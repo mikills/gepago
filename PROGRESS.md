@@ -10,11 +10,12 @@ Branch `feat/v0.8.0-flow-runtime`, started from `1e3cc7b` (v0.7.0).
 | B. Structured output | done | 6eb19d9, 59c26b8, 04521cf, fb9e31a, 096233f, 3ff9b8c, 75803f9, c468be7 | 1: 11, 2: 3, 3: 3, 4: 2 + deferred, 5: 2 + perf, 6: 1, 7: 2, all fixed; 8: none | none |
 | C. Pipeline control flow and policy | done (merged in 1306f2b) | 8a69ad8, 9b95e07, c76a7b9, 82e32ca, 3c5a14b, merge 1306f2b | 1: 5, 2: 3, 3: 1, 4: 1 finding, all fixed; 5: none | none |
 | I. Tools | done (merged in 19cc05e) | 3344220, acc200b, 58cf7ec, a696312, merge 19cc05e | 1: 8, 2: 3, all fixed; 3: none | none |
-| D. Observability | fixing round 5 | 5351b86, 40af86e, 0e0d914, bbeaf71, 040c8a6 (worktree branch) | 1: 4 + D2 partial, 2: 4, 3: 4 + 1 decision, 4: 2, all fixed; 5: 2, fixing | |
-| E. Run context | not started | | | |
+| D. Observability | done (merged in fdaa382, 7e33dda) | 5351b86, 40af86e, 0e0d914, bbeaf71, 040c8a6, 72d5707, 0459b30 (worktree branch) | 1: 4 + D2 partial, 2: 4, 3: 4 + 1 decision, 4: 2, 5: 2, 6: 1, all fixed; 7: none | none |
+| D/F/I integration | done | merge fdaa382, 6bd1530, merge 7e33dda, 108cc8d, 8cf4f9d, 773ba2d | 1: 2, 2: 3, 3: 1, all fixed; 4: none | none |
+| E. Run context | done (feature branch fast-forwarded to 93b9125) | 802e2ab, merge ac100ad, 2e1ecb5, merge 15de703, a7313f7, 93b9125 | 1: 2 + doc nit, fixed; 2: none; flaky test found by the orchestrator, fixed; 3: 1 (test helper too broad), fixed; 4: none | none |
 | F. Artefacts and compile | done (merged in 8212dbf) | 442358c, 4c92e2a, 309504d, merge 8212dbf | 1: 2, 2: 1, all fixed; 3: none | none |
-| G. Test kit | not started | | | |
-| H. Housekeeping | not started | | | |
+| G. Test kit | implementing (worktree from ac100ad) | | | |
+| H. Housekeeping | implementing (worktree from a7313f7) | | | |
 
 ## Commands
 
@@ -42,6 +43,14 @@ Branch `feat/v0.8.0-flow-runtime`, started from `1e3cc7b` (v0.7.0).
 | clean worktree: full set | pass | 58cf7ec, a696312 (I, worktree branch) |
 | clean worktree: fmt, diff, test, vet, staticcheck | pass | 0e0d914, bbeaf71, 040c8a6 (D, worktree branch) |
 | clean worktree: full set (after merging I; three conflicts in pipeline.go, pipeline_build.go, pipeline_exec.go resolved as the union of both sides) | pass | 19cc05e |
+| clean worktree: fmt, diff, test, vet, staticcheck | pass | 72d5707, 0459b30 (D, worktree branch) |
+| clean worktree: full set | pass | 7e33dda (D merged and integrated) |
+| clean worktree: fmt, diff, test, vet, staticcheck | pass | 108cc8d, 8cf4f9d, 773ba2d (integration) |
+| clean worktree: full set | pass | ac100ad (E) |
+| clean worktree: full set | FAIL (make diago: disk full, "no space left on device") | 15de703 |
+| clean worktree: full set (after freeing disk) | pass | 15de703 |
+| clean worktree: fmt, diff, test, vet, staticcheck | pass | a7313f7, 93b9125 |
+| `go test -race -count=300` on the redaction tests | pass | 93b9125 |
 | clean worktree: same plus `npm ci`, `make diago`, `make wasm-test` | pass | 6eb19d9 |
 
 ## Decisions
@@ -74,6 +83,17 @@ Branch `feat/v0.8.0-flow-runtime`, started from `1e3cc7b` (v0.7.0).
   step with its own `ToolPolicy` or another `ToolRegistry`. Tool memory writes in a pipeline commit with
   the step's state writes. The tool cache key does not normalise number forms. Pi has no `ChatClient`
   (its print mode cannot return tool calls). Compile records pipeline traces only for `TraceDatasetBuilder`.
+- Redaction covers reflection records: with a pipeline `Redactor`, `ProgramEvaluator` redacts each item's
+  `Output` and `SideInfo` (Redactors found from the programme's structure, plus run-time joins for custom
+  Programs); the metric sees real values. Observer contexts end with the caller's context, the run's
+  `MaxDuration` or the run's end. Only comparable observers are de-duplicated.
+- A Redactor's plain-string result is used verbatim as its replacement in text; a Redactor must not
+  put other hidden values into its own result (to document in H). Per-field replacements from JSON
+  results never enter text (integration review round 3).
+- Run context: every run takes the ctx RunContext (TraceID and Attributes kept, its RunID becomes
+  ParentRunID, fresh RunID); attributes pass the Redactor as "attribute:<name>"; provider logs carry
+  attributes unredacted (filter in the slog handler). A run with a Redactor and no observers is
+  observed silently so nested runs inherit it.
 - `programs/kiln` and `programs/documentscout` are gitignored local projects inside the root
   module. They are not part of the repo; the final `make verify` runs in a clean worktree,
   as CI does.
@@ -119,6 +139,21 @@ I (tools):
 - A pipeline `ToolPolicy` governs nested agents' and pipelines' tool calls, even without `Tools`.
 - Pipeline tool memory writes and cache entries commit with the step; a cached record has zero `Usage`.
 - crucible callers marshal their schema maps.
+
+D (observability):
+- An `OnErrorSkip`, and a failed top-level merge under a wrapper, each use an attempt number (`extract#2 skipped`).
+- `PipelineSpec`, `CompileConfig`, `ProgramTrainConfig` and `ProgramEvaluator` gain fields (unkeyed literals break).
+- A failing top-level merge is now a failed step execution.
+- With a pipeline `Redactor`, `ProgramEvaluator` returns redacted `Output` and `SideInfo`.
+
+E (run context) and the D/F/I integration:
+- Provider `Config` types gain `Logger`; panicking model calls are logged before the panic continues.
+- Event types and `PipelineTrace` gain `RunContext`; a run's span ID is its `RunID` and the trace ID is the `RunContext` `TraceID`; the HTML report gains a Run context section.
+- Observer contexts hide the RunContext, the run's tool session, tool memory and step stage.
+- A pipeline with a `Redactor` and no observers calls the Redactor for every value; nested observers see outer-redacted values with a `ParentID` they never saw.
+- `StepFinishedEvent.ToolCalls` and `StepTrace.ToolCalls`; Redactors receive `"tool:<name>"` and `"attribute:<name>"` keys.
+- Scrubbed `json.RawMessage` keeps key order and duplicates; scrubbed numbers may become strings; `ProgramEvaluator` redacts SideInfo "reads".
+- The HTML report shows JSON compact past 32 levels or 64 KiB.
 
 C (pipeline control flow):
 - `StepError.Err` is the step's own error, not a one-element `errors.Join` (messages and `errors.Is` unchanged).
