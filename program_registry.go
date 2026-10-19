@@ -137,14 +137,28 @@ func (r *ProgramRegistry) Build(name string) (Program, error) {
 }
 
 // LoadCompiled loads an artifact, finds its registered programme, and attaches the saved candidate.
+// Like LoadCompiledProgram, it refuses an artefact whose fingerprint differs from the programme's.
 func (r *ProgramRegistry) LoadCompiled(path string) (CompiledProgram, ProgramArtifact, error) {
 	return r.LoadCompiledVersion(path, "")
 }
 
-// LoadCompiledVersion loads an artifact and checks the expected programme version when set.
+// LoadCompiledVersion loads an artifact and checks the expected programme version when set. It
+// checks the artefact's fingerprint as LoadCompiledProgramVersion does, skipping the check
+// only when expectedProgramVersion is set and the artefact records that same ProgramVersion.
 func (r *ProgramRegistry) LoadCompiledVersion(
 	path string,
 	expectedProgramVersion string,
+) (CompiledProgram, ProgramArtifact, error) {
+	return r.loadCompiled(path, expectedProgramVersion, expectedProgramVersion)
+}
+
+// loadCompiled loads the artefact at path into its registered programme. The artefact must
+// record expectedProgramVersion when both are set; statedProgramVersion is the version the
+// caller asked for, which skips the fingerprint check when the artefact records it.
+func (r *ProgramRegistry) loadCompiled(
+	path string,
+	expectedProgramVersion string,
+	statedProgramVersion string,
 ) (CompiledProgram, ProgramArtifact, error) {
 	artifact, err := LoadProgramArtifact(path)
 	if err != nil {
@@ -155,6 +169,9 @@ func (r *ProgramRegistry) LoadCompiledVersion(
 	}
 	program, err := r.Build(artifact.Name)
 	if err != nil {
+		return CompiledProgram{}, ProgramArtifact{}, err
+	}
+	if err := checkArtifactFingerprint(artifact, program, statedProgramVersion); err != nil {
 		return CompiledProgram{}, ProgramArtifact{}, err
 	}
 	return CompiledProgram{Program: program, Candidate: candidateWithArtifact(program, artifact)}, artifact, nil
@@ -180,7 +197,8 @@ type ProgramTrainConfig struct {
 	AcceptanceCriterion AcceptanceCriterion
 }
 
-// TrainAndSave builds a registered programme, compiles it, and writes a reusable artifact.
+// TrainAndSave builds a registered programme, compiles it, and writes a reusable artifact that
+// records the programme's fingerprint when it has one (see Fingerprinter).
 func (r *ProgramRegistry) TrainAndSave(
 	ctx context.Context,
 	config ProgramTrainConfig,
@@ -209,7 +227,7 @@ func (r *ProgramRegistry) TrainAndSave(
 	if err != nil {
 		return CompiledProgram{}, state, ProgramArtifact{}, err
 	}
-	artifact := NewProgramArtifact(config.Name, compiled.Candidate)
+	artifact := compiled.Artifact(config.Name)
 	artifact.Version = config.Version
 	artifact.ProgramVersion = config.ProgramVersion
 	artifact.Metadata = cloneMetadata(config.Metadata)
@@ -220,6 +238,10 @@ func (r *ProgramRegistry) TrainAndSave(
 }
 
 // LoadOrTrain loads a saved programme artifact, or trains and saves it if the artifact is missing.
+// An artefact that does not fit the programme, by programme version or fingerprint, is an error
+// rather than a reason to retrain. The fingerprint is always checked: config.ProgramVersion
+// labels the artefacts TrainAndSave writes, so it does not stand in for the fingerprint as an
+// expected version given to LoadCompiledVersion does.
 func (r *ProgramRegistry) LoadOrTrain(
 	ctx context.Context,
 	config ProgramTrainConfig,
@@ -228,7 +250,7 @@ func (r *ProgramRegistry) LoadOrTrain(
 	pathMu.Lock()
 	defer pathMu.Unlock()
 
-	compiled, artifact, err := r.LoadCompiledVersion(config.ArtifactPath, config.ProgramVersion)
+	compiled, artifact, err := r.loadCompiled(config.ArtifactPath, config.ProgramVersion, "")
 	if err == nil {
 		return compiled, artifact, OptimizationState{}, false, nil
 	}

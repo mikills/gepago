@@ -69,7 +69,7 @@ var (
 // failed step's own. Its budget is its own, not the failed step's: it is limited by
 // PerStepTokens[<step>] if set and by the run limits, so it can stand in for a step that
 // failed on its own PerStepTokens limit. When step fails too, the error keeps both errors for
-// errors.Is and errors.As.
+// errors.Is and errors.As, each in a StepError holding its own step's reads and details.
 //
 // Unlike Fallback, which falls back only on a non-permanent error, OnErrorFallback falls back
 // on any error left after the policy's retries.
@@ -170,7 +170,7 @@ func (p *policyStep) runCandidate(ctx context.Context, candidate Candidate, s St
 			return nil
 		}
 		if ctx.Err() != nil {
-			return err
+			return p.failure(s, err)
 		}
 		if attempt >= attempts || !retryIf(err) {
 			if attempt > 1 {
@@ -179,7 +179,7 @@ func (p *policyStep) runCandidate(ctx context.Context, candidate Candidate, s St
 			break
 		}
 		if !sleepContext(ctx, p.backoff(attempt)) {
-			return errors.Join(err, ctx.Err())
+			return p.failure(s, errors.Join(err, ctx.Err()))
 		}
 	}
 	return p.onError(ctx, candidate, s, err)
@@ -222,7 +222,7 @@ func (p *policyStep) onError(ctx context.Context, candidate Candidate, s State, 
 	case errorActionFallback:
 		result, fallbackErr := runChild(ctx, candidate, p.child.name, p.fallback, s.values)
 		if fallbackErr != nil {
-			return &fallbackError{primary: err, fallback: fallbackErr}
+			return &fallbackError{primary: p.failure(s, err), fallback: fallbackErr}
 		}
 		result.commitTo(s, p.fallback)
 		return nil

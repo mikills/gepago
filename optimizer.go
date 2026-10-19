@@ -973,6 +973,8 @@ func MergeCandidate(base Candidate, patch Candidate) Candidate {
 }
 
 // DefaultReflectiveDatasetBuilder turns evaluation items into reflection records for each component.
+// Each record holds the item's SideInfo under "side_info"; for an invalid output from a
+// pipeline step, ProgramEvaluator puts the step's name, details and reads there.
 func DefaultReflectiveDatasetBuilder(
 	candidate Candidate,
 	eval EvaluationResult,

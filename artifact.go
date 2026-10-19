@@ -12,11 +12,15 @@ import (
 const ProgramArtifactFormatVersion = 1
 
 // ProgramArtifact is a portable prompt bundle produced by optimisation and loaded at runtime.
+// Fingerprint is the fingerprint of the programme the candidate was trained for (see
+// Fingerprinter); it is empty when that programme has none and in artefacts saved by v0.7 and
+// earlier.
 type ProgramArtifact struct {
 	FormatVersion  int            `json:"format_version"`
 	Name           string         `json:"name"`
 	Version        string         `json:"version,omitempty"`
 	ProgramVersion string         `json:"program_version,omitempty"`
+	Fingerprint    string         `json:"fingerprint,omitempty"`
 	Candidate      Candidate      `json:"candidate"`
 	Metadata       map[string]any `json:"metadata,omitempty"`
 	CreatedAt      time.Time      `json:"created_at"`
@@ -30,6 +34,14 @@ func NewProgramArtifact(name string, candidate Candidate) ProgramArtifact {
 		Candidate:     CloneCandidate(candidate),
 		CreatedAt:     time.Now().UTC(),
 	}
+}
+
+// Artifact returns an artefact named name holding the compiled candidate and, when the
+// programme is a Fingerprinter, its fingerprint, ready for SaveProgramArtifact.
+func (p CompiledProgram) Artifact(name string) ProgramArtifact {
+	artifact := NewProgramArtifact(name, p.Candidate)
+	artifact.Fingerprint = programFingerprint(p.Program)
+	return artifact
 }
 
 // SaveProgramArtifact writes a prompt bundle as JSON.
@@ -119,11 +131,18 @@ func LoadProgramArtifact(path string) (ProgramArtifact, error) {
 }
 
 // LoadCompiledProgram pairs a runtime programme definition with a saved optimised candidate.
+// It fails with a *FingerprintMismatchError when the artefact has a fingerprint and the
+// programme's differs, or the programme has none; an artefact without one still loads.
 func LoadCompiledProgram(path string, program Program) (CompiledProgram, ProgramArtifact, error) {
 	return LoadCompiledProgramVersion(path, program, "")
 }
 
-// LoadCompiledProgramVersion loads a programme artifact and checks the expected programme version when set.
+// LoadCompiledProgramVersion loads a programme artifact and checks the expected programme version
+// when set. It checks the artefact's fingerprint as LoadCompiledProgram does, unless
+// expectedProgramVersion is set and the artefact records that same ProgramVersion: a version
+// stated by both the artefact and the caller stands in for the fingerprint, so a programme
+// whose shape changed can still load an artefact known to fit it. An expected version that the
+// artefact does not record, because it has none, does not skip the check.
 func LoadCompiledProgramVersion(
 	path string,
 	program Program,
@@ -140,6 +159,9 @@ func LoadCompiledProgramVersion(
 		return CompiledProgram{}, ProgramArtifact{}, err
 	}
 	if err := validateArtifactProgramVersion(artifact, expectedProgramVersion); err != nil {
+		return CompiledProgram{}, ProgramArtifact{}, err
+	}
+	if err := checkArtifactFingerprint(artifact, program, expectedProgramVersion); err != nil {
 		return CompiledProgram{}, ProgramArtifact{}, err
 	}
 	return CompiledProgram{Program: program, Candidate: candidateWithArtifact(program, artifact)}, artifact, nil
