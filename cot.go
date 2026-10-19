@@ -8,12 +8,12 @@ import (
 // ChainOfThought wraps Predict with an added reasoning output field.
 type ChainOfThought struct {
 	Signature       Signature
-	LM              LanguageModel
+	LM              Generator
 	Instruction     string
 	Demos           []Demo
 	ReasoningField  string
 	MaxParseRetries int
-	RepairLM        LanguageModel
+	RepairLM        Generator
 }
 
 // Validate checks the underlying Predict programme produced by ToPredict.
@@ -68,10 +68,6 @@ func (c ChainOfThought) SeedCandidate() Candidate {
 // BuildPrompt renders the prompt used for a candidate and input.
 func (c ChainOfThought) BuildPrompt(candidate Candidate, inputs Prediction) (string, error) {
 	return c.ToPredict().BuildPrompt(candidate, inputs)
-}
-
-func (c ChainOfThought) LastUsage() Usage {
-	return c.ToPredict().LastUsage()
 }
 
 func (c ChainOfThought) signatureWithReasoning(reasoningField string) Signature {

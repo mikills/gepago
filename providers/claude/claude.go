@@ -11,6 +11,7 @@ import (
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 	gepa "github.com/mikills/gepago"
+	"github.com/mikills/gepago/internal/providererr"
 )
 
 // Config controls Anthropic Claude model access.
@@ -34,18 +35,21 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// LanguageModel adapts Claude messages to gepa.LanguageModel.
+// LanguageModel adapts Claude messages to gepa.Generator. It keeps no per-call state, so one
+// value is safe for concurrent use.
 type LanguageModel struct {
 	client    anthropic.Client
 	model     string
 	headers   map[string]string
 	maxTokens int
-	lastUsage gepa.Usage
-	lastModel string
 }
 
 // NewLanguageModel constructs a Claude language model.
 func NewLanguageModel(config Config) (*LanguageModel, error) {
+	return newLanguageModel(config)
+}
+
+func newLanguageModel(config Config, extra ...option.RequestOption) (*LanguageModel, error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
@@ -61,6 +65,7 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 	for key, value := range headers {
 		opts = append(opts, option.WithHeader(key, value))
 	}
+	opts = append(opts, extra...)
 	maxTokens := config.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = 512
@@ -73,10 +78,13 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 	}, nil
 }
 
-// Generate sends a prompt and returns the model's text response.
-func (m *LanguageModel) Generate(ctx context.Context, prompt string) (string, error) {
-	m.lastUsage = gepa.Usage{}
-	m.lastModel = ""
+// Generate sends a prompt and returns the model's reply with its usage, resolved model and
+// finish reason. HTTP failures are classified: 429 and 5xx (529 overloaded included) are
+// transient, other 4xx permanent, and dropped connections transient; a cancelled or expired
+// ctx returns ctx.Err() unwrapped. A reply that fails after the API reported usage returns
+// that usage with the error. A reply with no text is an error unless it stopped at the token
+// limit.
+func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Generation, error) {
 	message, err := m.client.Messages.New(ctx, anthropic.MessageNewParams{
 		Model:     anthropic.Model(m.model),
 		MaxTokens: int64(m.maxTokens),
@@ -88,31 +96,55 @@ func (m *LanguageModel) Generate(ctx context.Context, prompt string) (string, er
 		},
 	})
 	if err != nil {
-		return "", fmt.Errorf("claude reflection completion: %w", err)
+		return gepa.Generation{}, classifyError(ctx, err)
 	}
-	m.lastUsage = gepa.Usage{
-		PromptTokens: int(
-			message.Usage.InputTokens + message.Usage.CacheCreationInputTokens + message.Usage.CacheReadInputTokens,
-		),
-		CompletionTokens: int(message.Usage.OutputTokens),
-		TotalTokens: int(
-			message.Usage.InputTokens + message.Usage.CacheCreationInputTokens +
-				message.Usage.CacheReadInputTokens + message.Usage.OutputTokens,
-		),
+	generation := gepa.Generation{
+		Text:         strings.TrimSpace(claudeText(message.Content)),
+		Usage:        claudeUsage(message.Usage),
+		Model:        string(message.Model),
+		FinishReason: claudeFinishReason(message.StopReason),
 	}
-	m.lastModel = string(message.Model)
-	text := strings.TrimSpace(claudeText(message.Content))
-	if text == "" {
-		return "", errors.New("claude reflection completion: no text returned")
+	if generation.Text == "" && generation.FinishReason != gepa.FinishLength {
+		return generation, errors.New("claude reflection completion: no text returned")
 	}
-	return text, nil
+	return generation, nil
 }
 
-func (m *LanguageModel) LastUsage() gepa.Usage {
-	return m.lastUsage
+func classifyError(ctx context.Context, err error) error {
+	status := 0
+	var apiErr *anthropic.Error
+	if errors.As(err, &apiErr) {
+		status = apiErr.StatusCode
+	}
+	return providererr.Classify(ctx, status, fmt.Errorf("claude reflection completion: %w", err))
 }
 
-func (m *LanguageModel) LastResolvedModel() string { return m.lastModel }
+// claudeUsage maps message usage. Claude reports input_tokens without the cached part, so
+// PromptTokens adds cache reads and writes back. ReasoningTokens stays zero: Claude counts
+// extended-thinking tokens inside output_tokens and does not report them separately.
+func claudeUsage(usage anthropic.Usage) gepa.Usage {
+	prompt := usage.InputTokens + usage.CacheCreationInputTokens + usage.CacheReadInputTokens
+	return gepa.Usage{
+		PromptTokens:        int(prompt),
+		CompletionTokens:    int(usage.OutputTokens),
+		TotalTokens:         int(prompt + usage.OutputTokens),
+		CachedInputTokens:   int(usage.CacheReadInputTokens),
+		CacheCreationTokens: int(usage.CacheCreationInputTokens),
+	}
+}
+
+func claudeFinishReason(reason anthropic.StopReason) gepa.FinishReason {
+	switch reason {
+	case anthropic.StopReasonMaxTokens:
+		return gepa.FinishLength
+	case anthropic.StopReasonToolUse:
+		return gepa.FinishToolCalls
+	case anthropic.StopReasonRefusal:
+		return gepa.FinishContentFilter
+	default:
+		return gepa.FinishStop
+	}
+}
 
 func claudeText(content []anthropic.ContentBlockUnion) string {
 	parts := make([]string, 0, len(content))

@@ -45,11 +45,7 @@ func (s ProgramSubject) Run(ctx context.Context, input gepa.Prediction) (Subject
 	}
 	runCtx, collector := gepa.WithUsageCollector(ctx)
 	value, err := s.Program.RunCandidate(runCtx, candidate, input)
-	usage := collector.Usage()
-	if isZeroUsage(usage) {
-		usage = gepa.ProgramLastUsage(s.Program)
-	}
-	return SubjectOutput{Value: value, Usage: usage}, err
+	return SubjectOutput{Value: value, Usage: collector.Usage()}, err
 }
 
 // CompiledProgramSubject adapts a GEPA compiled programme into an evaluation subject.
@@ -68,7 +64,7 @@ func (s CompiledProgramSubject) Run(ctx context.Context, input gepa.Prediction) 
 // RawModelSubject adapts a text-generating model into an evaluation subject.
 type RawModelSubject struct {
 	SubjectName    string
-	LM             gepa.LanguageModel
+	LM             gepa.Generator
 	PromptTemplate string
 	ParseJSON      bool
 	OutputField    string
@@ -84,19 +80,11 @@ func (s RawModelSubject) Run(ctx context.Context, input gepa.Prediction) (Subjec
 	if err != nil {
 		return SubjectOutput{}, err
 	}
-	raw, err := s.LM.Generate(ctx, prompt)
-	usage := gepa.Usage{}
-	if reporter, ok := s.LM.(gepa.UsageReporter); ok {
-		usage = reporter.LastUsage()
-	}
-	metadata := map[string]any{}
-	if reporter, ok := s.LM.(gepa.ResolvedModelReporter); ok {
-		if model := strings.TrimSpace(reporter.LastResolvedModel()); model != "" {
-			metadata["resolved_model"] = model
-		}
-	}
-	if len(metadata) == 0 {
-		metadata = nil
+	generation, err := s.LM.Generate(ctx, prompt)
+	raw, usage := generation.Text, generation.Usage
+	var metadata map[string]any
+	if model := strings.TrimSpace(generation.Model); model != "" {
+		metadata = map[string]any{"resolved_model": model}
 	}
 	if err != nil {
 		return SubjectOutput{Raw: raw, Usage: usage, Metadata: metadata}, err
@@ -130,8 +118,4 @@ func renderPromptTemplate(promptTemplate string, input gepa.Prediction) (string,
 
 func (s RawModelSubject) parseRaw(raw string) (gepa.Prediction, error) {
 	return parseRawOutput(raw, s.ParseJSON, s.OutputField)
-}
-
-func isZeroUsage(usage gepa.Usage) bool {
-	return usage.PromptTokens == 0 && usage.CompletionTokens == 0 && usage.TotalTokens == 0
 }

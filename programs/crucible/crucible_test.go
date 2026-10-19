@@ -15,6 +15,7 @@ import (
 	"time"
 
 	gepa "github.com/mikills/gepago"
+	"github.com/mikills/gepago/agents"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -60,7 +61,7 @@ func TestRun(t *testing.T) {
 
 func TestJudges(t *testing.T) {
 	t.Run("rubric and pairwise", func(t *testing.T) {
-		judge := gepa.LanguageModelFunc(func(_ context.Context, prompt string) (string, error) {
+		judge := textJudge(func(_ context.Context, prompt string) (string, error) {
 			if strings.Contains(prompt, "Compare two subject outputs") {
 				return `{"winner":"a","score_a":0.9,"score_b":0.2,"feedback":"A is clearer"}`, nil
 			}
@@ -592,4 +593,80 @@ func findSummary(summaries []SubjectSummary, subject string) SubjectSummary {
 		}
 	}
 	return SubjectSummary{}
+}
+
+func TestAgentSubjectFinishReasons(t *testing.T) {
+	chat := func(reason string) string {
+		return fmt.Sprintf(
+			`{"model":"m","choices":[{"message":{"role":"assistant","content":"x"},"finish_reason":%q}]}`,
+			reason,
+		)
+	}
+	responses := func(reason string) string {
+		return fmt.Sprintf(
+			`{"model":"m","output":[{"type":"message","content":[{"type":"output_text","text":"x"}]}],`+
+				`"incomplete_details":{"reason":%q}}`,
+			reason,
+		)
+	}
+	anthropic := func(reason string) string {
+		return fmt.Sprintf(`{"model":"m","content":[{"type":"text","text":"x"}],"stop_reason":%q}`, reason)
+	}
+	tests := []struct {
+		name   string
+		decode func([]byte) (agents.ChatResponse, error)
+		body   string
+		want   agents.FinishReason
+	}{
+		{"chat stop", decodeOpenAIChatResponse, chat("stop"), agents.FinishStop},
+		{"chat length", decodeOpenAIChatResponse, chat("length"), agents.FinishLength},
+		{"chat tool calls", decodeOpenAIChatResponse, chat("tool_calls"), agents.FinishToolCalls},
+		{"chat content filter", decodeOpenAIChatResponse, chat("content_filter"), agents.FinishContentFilter},
+		{"responses complete", decodeOpenAIResponsesResponse, responses(""), agents.FinishStop},
+		{"responses length", decodeOpenAIResponsesResponse, responses("max_output_tokens"), agents.FinishLength},
+		{
+			"responses content filter",
+			decodeOpenAIResponsesResponse,
+			responses("content_filter"),
+			agents.FinishContentFilter,
+		},
+		{"anthropic end turn", decodeAnthropicResponse, anthropic("end_turn"), agents.FinishStop},
+		{"anthropic max tokens", decodeAnthropicResponse, anthropic("max_tokens"), agents.FinishLength},
+		{"anthropic tool use", decodeAnthropicResponse, anthropic("tool_use"), agents.FinishToolCalls},
+		{"anthropic refusal", decodeAnthropicResponse, anthropic("refusal"), agents.FinishContentFilter},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.decode([]byte(tt.body))
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got.FinishReason)
+		})
+	}
+}
+
+func TestRawModelSubjectReportsUsageOfFailedCall(t *testing.T) {
+	cause := fmt.Errorf("model failed after billing")
+	usage := gepa.Usage{PromptTokens: 4, CompletionTokens: 2, TotalTokens: 6}
+	subject := RawModelSubject{
+		SubjectName: "raw",
+		LM: gepa.GeneratorFunc(func(context.Context, string) (gepa.Generation, error) {
+			return gepa.Generation{Usage: usage, Model: "resolved"}, cause
+		}),
+	}
+
+	got, err := subject.Run(context.Background(), gepa.Prediction{"q": "?"})
+
+	require.ErrorIs(t, err, cause)
+	assert.Equal(t, usage, got.Usage)
+	assert.Equal(t, map[string]any{"resolved_model": "resolved"}, got.Metadata)
+}
+
+func TestBuildLanguageModel(t *testing.T) {
+	lm, err := BuildLanguageModel(SubjectSpec{Type: "openai"})
+	require.EqualError(t, err, "openai model is required")
+	assert.Nil(t, lm, "a failed build must not return a typed nil generator")
+
+	lm, err = BuildLanguageModel(SubjectSpec{Type: "openai", Model: "m", APIKey: "key"})
+	require.NoError(t, err)
+	assert.NotNil(t, lm)
 }

@@ -8,9 +8,11 @@ import (
 	"strings"
 )
 
-// LLMJudgeMetric uses a language model and rubric to score semantic prediction quality.
+// LLMJudgeMetric uses a language model and rubric to score semantic prediction quality. It
+// records the usage of every judge call, repair calls and failed calls included, into the
+// context's UsageCollector.
 type LLMJudgeMetric struct {
-	LM         LanguageModel
+	LM         Generator
 	Rubric     string
 	MaxScore   float64
 	Fields     []string
@@ -36,19 +38,19 @@ func (m LLMJudgeMetric) Score(ctx context.Context, expected Prediction, actual P
 	if err != nil {
 		return MetricResult{}, err
 	}
-	raw, err := m.LM.Generate(ctx, prompt)
-	recordUsage(ctx, languageModelUsage(m.LM))
+	generation, err := m.LM.Generate(ctx, prompt)
+	RecordUsage(ctx, generation.Usage)
 	if err != nil {
 		return MetricResult{}, err
 	}
-	judge, err := parseJudgeResponse(raw)
+	judge, err := parseJudgeResponse(generation.Text)
 	if err != nil && m.ParseRetry {
-		repaired, repairErr := m.LM.Generate(ctx, judgeRepairPrompt(raw, err))
-		recordUsage(ctx, languageModelUsage(m.LM))
+		repaired, repairErr := m.LM.Generate(ctx, judgeRepairPrompt(generation.Text, err))
+		RecordUsage(ctx, repaired.Usage)
 		if repairErr != nil {
 			return MetricResult{}, repairErr
 		}
-		judge, err = parseJudgeResponse(repaired)
+		judge, err = parseJudgeResponse(repaired.Text)
 	}
 	if err != nil {
 		return MetricResult{}, err

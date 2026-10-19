@@ -6,25 +6,41 @@ import (
 	"time"
 )
 
-// UsageReporter exposes token usage from the most recent provider call. Implementations must
-// reset it when each call starts, so a call that fails before the provider reports usage
-// returns zero rather than the previous call's usage: callers record it for failed calls too.
+// UsageReporter exposes the token usage of an object's most recent call. Two readers remain:
+// AdaptLanguageModel reads it from a legacy LanguageModel after every call, and the optimiser
+// reads it from a Proposer or MergeProposer after every proposal. Both read it after failed
+// calls too, so implementations must reset it when each call starts; otherwise a call that
+// fails before the provider reports usage repeats the previous call's usage.
 type UsageReporter interface {
 	LastUsage() Usage
 }
 
 type usageCollectorKey struct{}
 
+// UsageCollector sums the usage that model calls record into a context. It is safe for
+// concurrent use.
 type UsageCollector struct {
 	mu    sync.Mutex
 	usage Usage
 }
 
+// WithUsageCollector returns a context that collects the usage RecordUsage records into it,
+// and the collector that sums it. A collector replaces any collector already in ctx.
 func WithUsageCollector(ctx context.Context) (context.Context, *UsageCollector) {
 	collector := &UsageCollector{}
 	return context.WithValue(ctx, usageCollectorKey{}, collector), collector
 }
 
+// RecordUsage adds usage to the collector carried by ctx, if there is one. Predict,
+// LLMJudgeMetric and other model consumers call it once for every model call, failed calls
+// included; a custom Program or Metric that calls a Generator directly should do the same so
+// its usage reaches CompiledProgram.RunWithUsage and ProgramEvaluator.
+func RecordUsage(ctx context.Context, usage Usage) {
+	collector, _ := ctx.Value(usageCollectorKey{}).(*UsageCollector)
+	collector.Add(usage)
+}
+
+// Add adds usage to the collector. A nil collector ignores it.
 func (c *UsageCollector) Add(usage Usage) {
 	if c == nil {
 		return
@@ -34,6 +50,7 @@ func (c *UsageCollector) Add(usage Usage) {
 	c.usage = c.usage.Add(usage)
 }
 
+// Usage returns the usage collected so far. A nil collector returns zero usage.
 func (c *UsageCollector) Usage() Usage {
 	if c == nil {
 		return Usage{}
@@ -43,11 +60,6 @@ func (c *UsageCollector) Usage() Usage {
 	return c.usage
 }
 
-func recordUsage(ctx context.Context, usage Usage) {
-	collector, _ := ctx.Value(usageCollectorKey{}).(*UsageCollector)
-	collector.Add(usage)
-}
-
 func errorString(err error) string {
 	if err == nil {
 		return ""
@@ -55,19 +67,30 @@ func errorString(err error) string {
 	return err.Error()
 }
 
-// Usage records model token counts for one operation.
+// Usage records model token counts for one operation. PromptTokens counts every input token,
+// cached ones included, and CompletionTokens every output token, reasoning included. The other
+// counts break those down: ReasoningTokens is the part of CompletionTokens spent on hidden
+// reasoning, CachedInputTokens the part of PromptTokens read from a prompt cache, and
+// CacheCreationTokens the part of PromptTokens written to one. A provider that does not report
+// a breakdown leaves it zero.
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	TotalTokens         int `json:"total_tokens"`
+	ReasoningTokens     int `json:"reasoning_tokens,omitempty"`
+	CachedInputTokens   int `json:"cached_input_tokens,omitempty"`
+	CacheCreationTokens int `json:"cache_creation_tokens,omitempty"`
 }
 
 // Add combines two usage values.
 func (u Usage) Add(other Usage) Usage {
 	return Usage{
-		PromptTokens:     u.PromptTokens + other.PromptTokens,
-		CompletionTokens: u.CompletionTokens + other.CompletionTokens,
-		TotalTokens:      u.TotalTokens + other.TotalTokens,
+		PromptTokens:        u.PromptTokens + other.PromptTokens,
+		CompletionTokens:    u.CompletionTokens + other.CompletionTokens,
+		TotalTokens:         u.TotalTokens + other.TotalTokens,
+		ReasoningTokens:     u.ReasoningTokens + other.ReasoningTokens,
+		CachedInputTokens:   u.CachedInputTokens + other.CachedInputTokens,
+		CacheCreationTokens: u.CacheCreationTokens + other.CacheCreationTokens,
 	}
 }
 
@@ -92,6 +115,9 @@ type UsageLedger struct {
 func (l UsageLedger) AddUsage(usage Usage) UsageLedger {
 	l.InputTokens += usage.PromptTokens
 	l.OutputTokens += usage.CompletionTokens
+	l.ReasoningTokens += usage.ReasoningTokens
+	l.CachedInputTokens += usage.CachedInputTokens
+	l.CacheCreationTokens += usage.CacheCreationTokens
 	l.TotalTokens += usage.TotalTokens
 	return l
 }

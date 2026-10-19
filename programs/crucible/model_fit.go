@@ -8,7 +8,7 @@ import (
 
 // ModelFitConfig configures the default model-fit evaluation profile.
 type ModelFitConfig struct {
-	JudgeLM        gepa.LanguageModel
+	JudgeLM        gepa.Generator
 	Rubric         string
 	RequiredFields []string
 	MaxLatency     time.Duration

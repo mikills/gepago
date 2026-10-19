@@ -131,19 +131,16 @@ func TestPipelineUsage(t *testing.T) {
 
 type sequenceUsageModel struct {
 	calls int
-	last  Usage
 }
 
-func (m *sequenceUsageModel) Generate(_ context.Context, _ string) (string, error) {
+func (m *sequenceUsageModel) Generate(_ context.Context, _ string) (Generation, error) {
 	m.calls++
-	m.last = Usage{PromptTokens: m.calls, CompletionTokens: m.calls * 10, TotalTokens: m.calls * 11}
+	usage := Usage{PromptTokens: m.calls, CompletionTokens: m.calls * 10, TotalTokens: m.calls * 11}
 	if m.calls == 1 {
-		return `{"plan":"find evidence"}`, nil
+		return Generation{Text: `{"plan":"find evidence"}`, Usage: usage}, nil
 	}
-	return `{"report":"found evidence"}`, nil
+	return Generation{Text: `{"report":"found evidence"}`, Usage: usage}, nil
 }
-
-func (m *sequenceUsageModel) LastUsage() Usage { return m.last }
 
 func TestPipelineReturnAll(t *testing.T) {
 	program := PipelineProgram{

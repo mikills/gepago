@@ -13,7 +13,7 @@ import (
 
 // RubricJudgeEvaluator asks a language model to score one output against a rubric.
 type RubricJudgeEvaluator struct {
-	LM       gepa.LanguageModel
+	LM       gepa.Generator
 	Rubric   string
 	MaxScore float64
 }
@@ -32,12 +32,12 @@ func (e RubricJudgeEvaluator) Evaluate(ctx context.Context, input EvalInput) (Sc
 		return Score{}, errors.New("rubric judge requires a rubric")
 	}
 	maxScore := positiveMaxScore(e.MaxScore)
-	raw, err := e.LM.Generate(ctx, rubricJudgePrompt(input, rubric, maxScore))
-	usage := languageModelUsage(e.LM)
+	generation, err := e.LM.Generate(ctx, rubricJudgePrompt(input, rubric, maxScore))
+	usage := generation.Usage
 	if err != nil {
 		return Score{Usage: usage}, err
 	}
-	response, err := parseJudgeResponse(raw)
+	response, err := parseJudgeResponse(generation.Text)
 	if err != nil {
 		return Score{Usage: usage}, err
 	}
@@ -60,7 +60,7 @@ func (e RubricJudgeEvaluator) Evaluate(ctx context.Context, input EvalInput) (Sc
 
 // PairwiseJudgeEvaluator asks a language model to compare two subject outputs.
 type PairwiseJudgeEvaluator struct {
-	LM     gepa.LanguageModel
+	LM     gepa.Generator
 	Rubric string
 }
 
@@ -78,12 +78,12 @@ func (e PairwiseJudgeEvaluator) Compare(ctx context.Context, input PairwiseInput
 		return PairwiseScore{}, errors.New("pairwise judge requires a rubric")
 	}
 	presented, swapped := pairwisePresentation(input)
-	raw, err := e.LM.Generate(ctx, pairwiseJudgePrompt(presented, rubric))
-	usage := languageModelUsage(e.LM)
+	generation, err := e.LM.Generate(ctx, pairwiseJudgePrompt(presented, rubric))
+	usage := generation.Usage
 	if err != nil {
 		return PairwiseScore{Usage: usage}, err
 	}
-	response, err := parsePairwiseJudgeResponse(raw, presented.SubjectA, presented.SubjectB)
+	response, err := parsePairwiseJudgeResponse(generation.Text, presented.SubjectA, presented.SubjectB)
 	if err != nil {
 		return PairwiseScore{Usage: usage}, err
 	}
@@ -96,13 +96,6 @@ func (e PairwiseJudgeEvaluator) Compare(ctx context.Context, input PairwiseInput
 	response.Details["presentation_swapped"] = swapped
 	response.Usage = usage
 	return response, nil
-}
-
-func languageModelUsage(model gepa.LanguageModel) gepa.Usage {
-	if reporter, ok := model.(gepa.UsageReporter); ok {
-		return reporter.LastUsage()
-	}
-	return gepa.Usage{}
 }
 
 func pairwisePresentation(input PairwiseInput) (PairwiseInput, bool) {

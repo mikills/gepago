@@ -140,7 +140,7 @@ type OptimizationConfig struct {
 	Evaluator           Evaluator
 	DatasetBuilder      ReflectiveDatasetBuilder
 	Proposer            Proposer
-	ReflectionLM        LanguageModel
+	ReflectionLM        Generator
 	Objective           string
 	Background          string
 	PromptTemplates     map[string]string
@@ -516,15 +516,11 @@ func (o *Optimizer) proposeForIteration(
 	if lessonAware, ok := o.config.Proposer.(LessonAwareProposer); ok {
 		lessonAware.SetLessons(state.Lessons)
 	}
+	span := NewUsageSpan(state.RunID, "", "llm.reflect", "proposer")
 	proposed, err := o.config.Proposer.Propose(ctx, CloneCandidate(parent.Candidate), dataset, components)
+	recordProposerUsage(state, o.config.Proposer, span, err)
 	if err != nil {
 		return proposalAttempt{}, false, err
-	}
-	if reporter, ok := o.config.Proposer.(UsageReporter); ok {
-		usage := reporter.LastUsage()
-		state.Ledger = state.Ledger.AddUsage(usage)
-		state.Ledger.ModelCalls++
-		state.Spans = append(state.Spans, NewUsageSpan(state.RunID, "", "llm.reflect", "proposer").Finish(usage, nil))
 	}
 	proposed = MergeCandidate(parent.Candidate, proposed)
 	if err := o.emit(ctx, OptimizationEvent{
@@ -581,7 +577,9 @@ func (o *Optimizer) evaluateMerge(
 	right CandidateRecord,
 ) (CandidateRecord, bool, error) {
 	components := componentsForProposal(o.config.Components, left.Candidate)
+	span := NewUsageSpan(state.RunID, "", "llm.merge", "merge proposer")
 	patch, err := o.config.MergeProposer.ProposeMerge(ctx, left, right, components)
+	recordProposerUsage(state, o.config.MergeProposer, span, err)
 	if err != nil {
 		return CandidateRecord{}, false, err
 	}
@@ -607,6 +605,19 @@ func (o *Optimizer) evaluateMerge(
 		ScoresByExample:          scoresByExample(valEval),
 		ObjectiveScoresByExample: objectiveScoresByExample(valEval),
 	}, true, nil
+}
+
+// recordProposerUsage adds the usage a proposer reports for its latest call to the ledger,
+// after failed calls too. Proposers that do not report usage are skipped.
+func recordProposerUsage(state *OptimizationState, proposer any, span UsageSpan, err error) {
+	reporter, ok := proposer.(UsageReporter)
+	if !ok {
+		return
+	}
+	usage := reporter.LastUsage()
+	state.Ledger = state.Ledger.AddUsage(usage)
+	state.Ledger.ModelCalls++
+	state.Spans = append(state.Spans, span.Finish(usage, err))
 }
 
 func (o *Optimizer) evaluateBeforeProposal(

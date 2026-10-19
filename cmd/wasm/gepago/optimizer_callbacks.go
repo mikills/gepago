@@ -76,6 +76,10 @@ func (p *hostProposer) Propose(
 	dataset gepa.ReflectiveDataset,
 	components []string,
 ) (gepa.Candidate, error) {
+	// the optimizer reads LastUsage after failed proposals too, so clear the previous call's.
+	p.mu.Lock()
+	p.usage = gepa.Usage{}
+	p.mu.Unlock()
 	if p.callback == nil {
 		return nil, errors.New("host proposer callback is required")
 	}
@@ -796,8 +800,20 @@ func validateEvaluationItem(item gepa.EvaluationItem, index int, wanted, seen ma
 }
 
 func validateUsage(usage gepa.Usage) error {
-	if usage.PromptTokens < 0 || usage.CompletionTokens < 0 || usage.TotalTokens < 0 {
+	if negativeUsage(usage) {
 		return errors.New("token counts must not be negative")
 	}
 	return nil
+}
+
+// negativeUsage reports whether a host-supplied usage has any negative token count.
+func negativeUsage(usage gepa.Usage) bool {
+	return min(
+		usage.PromptTokens,
+		usage.CompletionTokens,
+		usage.TotalTokens,
+		usage.ReasoningTokens,
+		usage.CachedInputTokens,
+		usage.CacheCreationTokens,
+	) < 0
 }

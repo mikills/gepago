@@ -45,31 +45,29 @@ func (fn compileModelInvokerFunc) GenerateModel(
 	return fn(ctx, request)
 }
 
-// compileLanguageModel adapts the role-aware host callback to Gepago's
-// provider-neutral LanguageModel interface. Each role has an independent
-// attempt counter and reports the most recent host usage to the optimizer.
+// compileLanguageModel adapts the role-aware host callback to Gepago's provider-neutral
+// Generator interface. Each role has an independent attempt counter, and every result carries
+// the host-reported usage so the optimizer records it once per call. The type keeps its name
+// because the optimizer's config fingerprint includes it: renaming it would stop runs saved by
+// earlier releases from resuming.
 type compileLanguageModel struct {
 	invoker compileModelInvoker
 	role    string
 
 	mu          sync.Mutex
 	nextAttempt int
-	lastUsage   gepa.Usage
 }
 
 func newCompileLanguageModel(invoker compileModelInvoker, role string) *compileLanguageModel {
 	return &compileLanguageModel{invoker: invoker, role: role}
 }
 
-func (m *compileLanguageModel) Generate(ctx context.Context, prompt string) (string, error) {
+func (m *compileLanguageModel) Generate(ctx context.Context, prompt string) (gepa.Generation, error) {
 	if m == nil || m.invoker == nil {
-		return "", errors.New("compile host model is required")
+		return gepa.Generation{}, errors.New("compile host model is required")
 	}
-	m.mu.Lock()
-	m.lastUsage = gepa.Usage{}
-	m.mu.Unlock()
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return gepa.Generation{}, err
 	}
 
 	m.mu.Lock()
@@ -84,24 +82,13 @@ func (m *compileLanguageModel) Generate(ctx context.Context, prompt string) (str
 		Attempt: attempt,
 	})
 	if err != nil {
-		return "", err
+		return gepa.Generation{}, err
 	}
-	m.mu.Lock()
-	m.lastUsage = result.Usage
-	m.mu.Unlock()
 	if err := ctx.Err(); err != nil {
-		return "", err
+		// the host already spent the tokens, so report them with the cancellation.
+		return gepa.Generation{Usage: result.Usage}, err
 	}
-	return result.Text, nil
-}
-
-func (m *compileLanguageModel) LastUsage() gepa.Usage {
-	if m == nil {
-		return gepa.Usage{}
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.lastUsage
+	return gepa.Generation{Text: result.Text, Usage: result.Usage}, nil
 }
 
 // compileWireConfig is the JSON-only compile protocol. It intentionally does

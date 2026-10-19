@@ -13,6 +13,7 @@ import (
 
 	gepa "github.com/mikills/gepago"
 	"github.com/mikills/gepago/agents"
+	"github.com/mikills/gepago/internal/providererr"
 )
 
 const defaultBaseURL = "https://generativelanguage.googleapis.com"
@@ -39,13 +40,12 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// LanguageModel adapts Google Gemini generateContent to gepa.LanguageModel.
+// LanguageModel adapts Google Gemini generateContent to gepa.Generator. It keeps no per-call
+// state, so one value is safe for concurrent use.
 type LanguageModel struct {
 	client      *ChatClient
 	maxTokens   int
 	temperature *float64
-	lastUsage   gepa.Usage
-	lastModel   string
 }
 
 // NewLanguageModel constructs a Google Gemini language model.
@@ -61,10 +61,12 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 	return &LanguageModel{client: chatClient, maxTokens: maxTokens, temperature: config.Temperature}, nil
 }
 
-// Generate sends a prompt and returns the model's text response.
-func (m *LanguageModel) Generate(ctx context.Context, prompt string) (string, error) {
-	m.lastUsage = gepa.Usage{}
-	m.lastModel = ""
+// Generate sends a prompt and returns the model's reply with its usage, resolved model and
+// finish reason. Failures are classified as ChatClient.Chat classifies them, and a cancelled
+// or expired ctx returns its error unwrapped. A reply that fails after the API reported usage
+// returns that usage with the error. An empty reply is an error unless it stopped at the token
+// limit.
+func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Generation, error) {
 	resp, err := m.client.Chat(ctx, agents.ChatRequest{
 		Model:       m.client.model,
 		MaxTokens:   &m.maxTokens,
@@ -77,23 +79,23 @@ func (m *LanguageModel) Generate(ctx context.Context, prompt string) (string, er
 			{Role: agents.RoleUser, Content: prompt},
 		},
 	})
+	generation := gepa.Generation{
+		Text:         strings.TrimSpace(resp.Message.Content),
+		Usage:        resp.Usage,
+		Model:        resp.ResolvedModel,
+		FinishReason: resp.FinishReason,
+	}
 	if err != nil {
-		return "", fmt.Errorf("google reflection completion: %w", err)
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return generation, err
+		}
+		return generation, fmt.Errorf("google reflection completion: %w", err)
 	}
-	m.lastUsage = resp.Usage
-	m.lastModel = resp.ResolvedModel
-	content := strings.TrimSpace(resp.Message.Content)
-	if content == "" {
-		return "", errors.New("google reflection completion: empty content")
+	if generation.Text == "" && generation.FinishReason != gepa.FinishLength {
+		return generation, errors.New("google reflection completion: empty content")
 	}
-	return content, nil
+	return generation, nil
 }
-
-func (m *LanguageModel) LastUsage() gepa.Usage {
-	return m.lastUsage
-}
-
-func (m *LanguageModel) LastResolvedModel() string { return m.lastModel }
 
 // ChatClient adapts Google Gemini generateContent to agents.ChatClient.
 type ChatClient struct {
@@ -129,6 +131,9 @@ func NewChatClient(config Config) (*ChatClient, error) {
 }
 
 // Chat sends one Gemini generateContent request and returns a provider-neutral agent response.
+// HTTP failures are classified: 429 and 5xx are transient, other 4xx permanent, and dropped
+// connections transient; a cancelled or expired ctx returns ctx.Err() unwrapped. A response
+// without candidates still returns its usage with the error.
 func (c *ChatClient) Chat(ctx context.Context, req agents.ChatRequest) (agents.ChatResponse, error) {
 	toolNames := googleToolNameMap(req.Tools)
 	payload := googleGenerateRequest{
@@ -171,19 +176,22 @@ func (c *ChatClient) post(ctx context.Context, model string, data []byte) ([]byt
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, providererr.Classify(ctx, 0, err)
 	}
 	defer resp.Body.Close()
 	var response bytes.Buffer
 	if _, err := response.ReadFrom(resp.Body); err != nil {
-		return nil, err
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, gepa.TransientError(fmt.Errorf("google generateContent read response: %w", err))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf(
+		return nil, providererr.Classify(ctx, resp.StatusCode, fmt.Errorf(
 			"google generateContent status %d: %s",
 			resp.StatusCode,
 			strings.TrimSpace(response.String()),
-		)
+		))
 	}
 	return response.Bytes(), nil
 }
@@ -251,11 +259,35 @@ type googleGenerateResponse struct {
 		Content      googleContent `json:"content"`
 		FinishReason string        `json:"finishReason"`
 	} `json:"candidates"`
-	UsageMetadata struct {
-		PromptTokenCount     int `json:"promptTokenCount"`
-		CandidatesTokenCount int `json:"candidatesTokenCount"`
-		TotalTokenCount      int `json:"totalTokenCount"`
-	} `json:"usageMetadata"`
+	PromptFeedback struct {
+		BlockReason string `json:"blockReason"`
+	} `json:"promptFeedback"`
+	UsageMetadata googleUsageMetadata `json:"usageMetadata"`
+}
+
+type googleUsageMetadata struct {
+	PromptTokenCount        int `json:"promptTokenCount"`
+	CandidatesTokenCount    int `json:"candidatesTokenCount"`
+	TotalTokenCount         int `json:"totalTokenCount"`
+	ThoughtsTokenCount      int `json:"thoughtsTokenCount"`
+	CachedContentTokenCount int `json:"cachedContentTokenCount"`
+}
+
+// googleUsage maps usage metadata. Gemini counts thinking tokens apart from candidate tokens,
+// so CompletionTokens adds them back. CacheCreationTokens stays zero: Gemini writes caches
+// through the separate cachedContents API, and generateContent reports only cache reads.
+func googleUsage(metadata googleUsageMetadata) gepa.Usage {
+	usage := gepa.Usage{
+		PromptTokens:      metadata.PromptTokenCount,
+		CompletionTokens:  metadata.CandidatesTokenCount + metadata.ThoughtsTokenCount,
+		TotalTokens:       metadata.TotalTokenCount,
+		ReasoningTokens:   metadata.ThoughtsTokenCount,
+		CachedInputTokens: metadata.CachedContentTokenCount,
+	}
+	if usage.TotalTokens == 0 {
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	}
+	return usage
 }
 
 func googleSystemInstruction(messages []agents.Message) *googleContent {
@@ -424,21 +456,19 @@ func decodeGoogleResponse(data []byte, toolNames map[string]string) (agents.Chat
 	if err := json.Unmarshal(data, &response); err != nil {
 		return agents.ChatResponse{}, err
 	}
+	usage := googleUsage(response.UsageMetadata)
 	if len(response.Candidates) == 0 {
-		return agents.ChatResponse{}, errors.New("google generateContent returned no candidates")
+		failed := agents.ChatResponse{Usage: usage, ResolvedModel: response.ModelVersion}
+		if reason := response.PromptFeedback.BlockReason; reason != "" {
+			failed.FinishReason = agents.FinishContentFilter
+			return failed, fmt.Errorf("google generateContent blocked the prompt: %s", reason)
+		}
+		return failed, errors.New("google generateContent returned no candidates")
 	}
 	candidate := response.Candidates[0]
 	message := agents.Message{Role: agents.RoleAssistant}
 	for _, part := range candidate.Content.Parts {
 		applyGooglePart(&message, part, toolNames)
-	}
-	usage := gepa.Usage{
-		PromptTokens:     response.UsageMetadata.PromptTokenCount,
-		CompletionTokens: response.UsageMetadata.CandidatesTokenCount,
-		TotalTokens:      response.UsageMetadata.TotalTokenCount,
-	}
-	if usage.TotalTokens == 0 {
-		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	}
 	return agents.ChatResponse{
 		Message:       message,
@@ -466,8 +496,12 @@ func googleFinishReason(reason string, message agents.Message) agents.FinishReas
 	if len(message.ToolCalls) > 0 {
 		return agents.FinishToolCalls
 	}
-	if strings.EqualFold(reason, "MAX_TOKENS") {
+	switch strings.ToUpper(reason) {
+	case "MAX_TOKENS":
 		return agents.FinishLength
+	case "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY":
+		return agents.FinishContentFilter
+	default:
+		return agents.FinishStop
 	}
-	return agents.FinishStop
 }

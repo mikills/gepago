@@ -14,19 +14,8 @@ import (
 func main() {
 	ctx, stop := interruptContext()
 	defer stop()
-	lm := gepa.LanguageModelFunc(func(_ context.Context, prompt string) (string, error) {
-		lower := strings.ToLower(prompt)
-		if strings.Contains(prompt, "Evaluation records and traces") {
-			return "```\nClassify text as exactly positive or negative. Use negative for broken, slow, or bad experiences.\n```", nil
-		}
-		if strings.Contains(lower, "broken") || strings.Contains(lower, "slow") || strings.Contains(lower, "bad") {
-			return `{"label":"negative"}`, nil
-		}
-		if strings.Contains(lower, "loved") || strings.Contains(lower, "great") ||
-			strings.Contains(lower, "excellent") {
-			return `{"label":"positive"}`, nil
-		}
-		return `{"label":"unknown"}`, nil
+	lm := gepa.GeneratorFunc(func(_ context.Context, prompt string) (gepa.Generation, error) {
+		return gepa.Generation{Text: scriptedReply(prompt), FinishReason: gepa.FinishStop}, nil
 	})
 
 	program := gepa.Predict{
@@ -79,6 +68,22 @@ func main() {
 	}
 	fmt.Printf("best candidate: %s\n", state.BestCandidateID)
 	fmt.Printf("prediction: %#v\n", prediction)
+}
+
+// scriptedReply stands in for a model: it improves the instruction when asked to reflect and
+// otherwise labels the feedback by keyword.
+func scriptedReply(prompt string) string {
+	lower := strings.ToLower(prompt)
+	if strings.Contains(prompt, "Evaluation records and traces") {
+		return "```\nClassify text as exactly positive or negative. Use negative for broken, slow, or bad experiences.\n```"
+	}
+	if strings.Contains(lower, "broken") || strings.Contains(lower, "slow") || strings.Contains(lower, "bad") {
+		return `{"label":"negative"}`
+	}
+	if strings.Contains(lower, "loved") || strings.Contains(lower, "great") || strings.Contains(lower, "excellent") {
+		return `{"label":"positive"}`
+	}
+	return `{"label":"unknown"}`
 }
 
 var rootContext = context.Background()

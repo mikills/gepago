@@ -50,7 +50,7 @@ func TestProgramRegistryTrainAndSave(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "program.json")
 	registry := NewProgramRegistry()
 	require.NoError(t, registry.Register("echo", func() (Program, error) { return artifactEchoProgram{}, nil }))
-	lm := LanguageModelFunc(func(context.Context, string) (string, error) {
+	lm := textModel(func(context.Context, string) (string, error) {
 		return "```\ntrained\n```", nil
 	})
 
@@ -87,7 +87,7 @@ func TestProgramRegistryLoadOrTrain(t *testing.T) {
 		ArtifactPath:   path,
 		Trainset:       []Example{NewIOExample("one", Prediction{}, Prediction{"instruction": "trained"})},
 		Metric:         ExactMatchMetric{Fields: []string{"instruction"}},
-		ReflectionLM:   LanguageModelFunc(func(context.Context, string) (string, error) { return "trained", nil }),
+		ReflectionLM:   textModel(func(context.Context, string) (string, error) { return "trained", nil }),
 		MaxMetricCalls: 4,
 		MinibatchSize:  1,
 	}
@@ -115,7 +115,7 @@ func TestProgramRegistryVersionMismatch(t *testing.T) {
 		ProgramVersion: "v2",
 		Trainset:       []Example{NewIOExample("one", Prediction{}, Prediction{"instruction": "trained"})},
 		Metric:         ExactMatchMetric{Fields: []string{"instruction"}},
-		ReflectionLM:   LanguageModelFunc(func(context.Context, string) (string, error) { return "trained", nil }),
+		ReflectionLM:   textModel(func(context.Context, string) (string, error) { return "trained", nil }),
 	})
 	require.EqualError(t, err, `program artifact "echo" has program version "v1", expected "v2"`)
 }

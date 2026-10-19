@@ -59,14 +59,22 @@ func DecodeDemos(text string) ([]Demo, error) {
 	return demos, nil
 }
 
+// ErrOutputTruncated marks a model reply cut off at the output token limit (FinishLength).
+// It matches ErrInvalidOutput through errors.Is, so ProgramEvaluator scores such examples
+// zero instead of stopping optimisation.
+var ErrOutputTruncated = fmt.Errorf("%w: reply truncated at the output token limit", ErrInvalidOutput)
+
 // Predict is a prompt-backed programme: signature + instruction + model call + JSON parsing.
+// It records the usage of every model call, repair calls and failed calls included, into the
+// context's UsageCollector. A reply that stops at the token limit fails with ErrOutputTruncated
+// and is not sent for repair.
 type Predict struct {
 	Signature       Signature
-	LM              LanguageModel
+	LM              Generator
 	Instruction     string
 	Demos           []Demo
 	MaxParseRetries int
-	RepairLM        LanguageModel
+	RepairLM        Generator
 }
 
 // Validate checks that the programme has a valid signature and language model.
@@ -106,26 +114,32 @@ func (p Predict) RunCandidate(ctx context.Context, candidate Candidate, inputs P
 	if err != nil {
 		return nil, err
 	}
-	raw, err := p.LM.Generate(ctx, prompt)
-	recordUsage(ctx, languageModelUsage(p.LM))
+	raw, err := p.generate(ctx, p.LM, prompt)
 	if err != nil {
 		return nil, err
 	}
 	return p.parseOrRepair(ctx, raw)
 }
 
-// BuildPrompt renders the signature, candidate text, demos, and inputs into a model prompt.
-func (p Predict) LastUsage() Usage {
-	return languageModelUsage(p.LM).Add(languageModelUsage(p.RepairLM))
-}
-
-func languageModelUsage(lm LanguageModel) Usage {
-	if reporter, ok := lm.(UsageReporter); ok {
-		return reporter.LastUsage()
+// generate makes one model call, records its usage and rejects a truncated reply.
+func (p Predict) generate(ctx context.Context, lm Generator, prompt string) (string, error) {
+	generation, err := lm.Generate(ctx, prompt)
+	RecordUsage(ctx, generation.Usage)
+	if err != nil {
+		return "", err
 	}
-	return Usage{}
+	if generation.FinishReason == FinishLength {
+		return "", fmt.Errorf(
+			"%w: signature %q, %d completion tokens",
+			ErrOutputTruncated,
+			p.Signature.Name,
+			generation.Usage.CompletionTokens,
+		)
+	}
+	return generation.Text, nil
 }
 
+// BuildPrompt renders the signature, candidate text, demos, and inputs into a model prompt.
 func (p Predict) BuildPrompt(candidate Candidate, inputs Prediction) (string, error) {
 	inputJSON, err := json.MarshalIndent(inputs, "", "  ")
 	if err != nil {
@@ -157,8 +171,7 @@ func (p Predict) parseOrRepair(ctx context.Context, raw string) (Prediction, err
 		repairLM = p.LM
 	}
 	for attempt := 0; attempt < p.MaxParseRetries; attempt++ {
-		repaired, repairErr := repairLM.Generate(ctx, p.RepairPrompt(raw, err))
-		recordUsage(ctx, languageModelUsage(repairLM))
+		repaired, repairErr := p.generate(ctx, repairLM, p.RepairPrompt(raw, err))
 		if repairErr != nil {
 			return nil, repairErr
 		}

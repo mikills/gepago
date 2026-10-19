@@ -202,3 +202,26 @@ func containsString(values []string, want string) bool {
 	}
 	return false
 }
+
+func TestHostProposerClearsUsageOfFailedProposal(t *testing.T) {
+	fail := false
+	proposer := &hostProposer{callback: func(context.Context, string) (string, error) {
+		if fail {
+			return "", errors.New("host proposer failed")
+		}
+		return `{"patch":{"instruction":"better"},"usage":{"prompt_tokens":3,"total_tokens":3}}`, nil
+	}}
+	if _, err := proposer.Propose(context.Background(), gepa.Candidate{"instruction": "x"}, nil, nil); err != nil {
+		t.Fatalf("Propose() error = %v", err)
+	}
+	if got := proposer.LastUsage(); got != (gepa.Usage{PromptTokens: 3, TotalTokens: 3}) {
+		t.Fatalf("LastUsage() = %+v", got)
+	}
+	fail = true
+	if _, err := proposer.Propose(context.Background(), gepa.Candidate{"instruction": "x"}, nil, nil); err == nil {
+		t.Fatal("Propose() error = nil")
+	}
+	if got := proposer.LastUsage(); got != (gepa.Usage{}) {
+		t.Fatalf("LastUsage() after a failed proposal = %+v, want zero", got)
+	}
+}

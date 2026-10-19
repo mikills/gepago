@@ -10,7 +10,7 @@ func DefaultCompileConfig(
 	trainset []Example,
 	valset []Example,
 	metric Metric,
-	reflectionLM LanguageModel,
+	reflectionLM Generator,
 ) CompileConfig {
 	minibatchSize := defaultMinibatchSize(len(trainset))
 	valsetSize := len(valset)

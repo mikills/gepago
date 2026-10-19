@@ -108,6 +108,8 @@ const (
 	StopLength    StopReason = "length"
 	StopMaxTurns  StopReason = "max_turns"
 	StopToolError StopReason = "tool_error"
+	// StopContentFilter means the provider withheld or cut the final reply under a content policy.
+	StopContentFilter StopReason = "content_filter"
 )
 
 // ToolCallRecord records one executed tool call.
@@ -568,8 +570,12 @@ func (a *Agent) splitTools() ([]Tool, map[string]ToolHandler) {
 }
 
 func mapFinishReason(r FinishReason) StopReason {
-	if r == FinishLength {
+	switch r {
+	case FinishLength:
 		return StopLength
+	case FinishContentFilter:
+		return StopContentFilter
+	default:
+		return StopComplete
 	}
-	return StopComplete
 }

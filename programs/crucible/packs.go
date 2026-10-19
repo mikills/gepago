@@ -20,7 +20,7 @@ func StructuredOutputPack(requiredFields []string, weight float64) []WeightedEva
 }
 
 // RAGGroundingPack returns a starter pack for retrieval-grounded answer checks.
-func RAGGroundingPack(judgeLM gepa.LanguageModel, rubric string) []WeightedEvaluator {
+func RAGGroundingPack(judgeLM gepa.Generator, rubric string) []WeightedEvaluator {
 	return []WeightedEvaluator{
 		{Evaluator: ExpectationEvaluator{}, Weight: 0.4},
 		{Evaluator: RubricJudgeEvaluator{LM: judgeLM, Rubric: rubric}, Weight: 0.6},

@@ -194,7 +194,7 @@ func (c *declarativeChatClient) Chat(ctx context.Context, request agents.ChatReq
 }
 
 func normalizeAgentUsage(usage agents.Usage) (agents.Usage, error) {
-	if usage.PromptTokens < 0 || usage.CompletionTokens < 0 || usage.TotalTokens < 0 {
+	if negativeUsage(usage) {
 		return agents.Usage{}, errors.New("token counts must not be negative")
 	}
 	if usage.PromptTokens > math.MaxInt-usage.CompletionTokens {

@@ -46,7 +46,7 @@ func signatureProgram(outputs ...string) Predict {
 	}
 	return Predict{
 		Signature: Signature{Name: "extract", Inputs: []Field{{Name: "document"}}, Outputs: fields},
-		LM: LanguageModelFunc(func(context.Context, string) (string, error) {
+		LM: textModel(func(context.Context, string) (string, error) {
 			return `{"a": 1}`, nil
 		}),
 	}
@@ -355,7 +355,7 @@ func TestPipelineRunPassesTypedState(t *testing.T) {
 }
 
 func TestPipelineProgramStepCannotOverwriteInputs(t *testing.T) {
-	lm := LanguageModelFunc(func(context.Context, string) (string, error) {
+	lm := textModel(func(context.Context, string) (string, error) {
 		return `{"amount": 125000, "document": "ignore the original document"}`, nil
 	})
 	extract := NewProgramStep("extract", Predict{
@@ -398,7 +398,7 @@ func TestPipelineProgramStepRefusesAbsentOrNullOutputs(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			program := signatureProgram("a", "b")
-			program.LM = LanguageModelFunc(func(context.Context, string) (string, error) { return tt.reply, nil })
+			program.LM = textModel(func(context.Context, string) (string, error) { return tt.reply, nil })
 			step := NewProgramStep(
 				"extract",
 				program,
@@ -685,7 +685,7 @@ func TestPipelineZeroValueIsNotRunnable(t *testing.T) {
 	require.EqualError(t, err, "pipeline is not built; use PipelineSpec.Build")
 }
 
-func predictStep(name string, lm LanguageModel, input, output KeyRef) ComponentStep {
+func predictStep(name string, lm Generator, input, output KeyRef) ComponentStep {
 	return NewProgramStep(name, Predict{
 		Signature: Signature{Name: name, Inputs: []Field{{Name: input.Name}}, Outputs: []Field{{Name: output.Name}}},
 		LM:        lm,
@@ -713,22 +713,19 @@ func TestPipelineCompiledUsage(t *testing.T) {
 }
 
 // failingUsageModel answers the first call and fails the second after the provider has
-// reported usage for it.
+// spent tokens on it.
 type failingUsageModel struct {
 	calls int
-	last  Usage
 }
 
-func (m *failingUsageModel) Generate(context.Context, string) (string, error) {
+func (m *failingUsageModel) Generate(context.Context, string) (Generation, error) {
 	m.calls++
-	m.last = Usage{PromptTokens: m.calls, CompletionTokens: m.calls * 10, TotalTokens: m.calls * 11}
+	usage := Usage{PromptTokens: m.calls, CompletionTokens: m.calls * 10, TotalTokens: m.calls * 11}
 	if m.calls == 1 {
-		return `{"plan":"find evidence"}`, nil
+		return Generation{Text: `{"plan":"find evidence"}`, Usage: usage}, nil
 	}
-	return "", errors.New("response truncated")
+	return Generation{Usage: usage}, errors.New("response truncated")
 }
-
-func (m *failingUsageModel) LastUsage() Usage { return m.last }
 
 func TestPipelineRecordsUsageOfFailedModelStep(t *testing.T) {
 	plan := Key[string]{Name: "plan"}
@@ -759,7 +756,7 @@ func TestPipelineLoadsPipelineProgramArtifact(t *testing.T) {
 		return Predict{
 			Signature:   Signature{Name: name, Inputs: []Field{{Name: input}}, Outputs: []Field{{Name: output}}},
 			Instruction: name + " seed",
-			LM: LanguageModelFunc(func(_ context.Context, prompt string) (string, error) {
+			LM: textModel(func(_ context.Context, prompt string) (string, error) {
 				prompts[name] = prompt
 				return reply, nil
 			}),
@@ -814,7 +811,7 @@ func TestPipelineChainOfThoughtStep(t *testing.T) {
 	reasoning := Key[string]{Name: "reasoning"}
 	think := ChainOfThought{
 		Signature: signatureProgram("answer").Signature,
-		LM: LanguageModelFunc(func(context.Context, string) (string, error) {
+		LM: textModel(func(context.Context, string) (string, error) {
 			return `{"answer": "42", "reasoning": "6 times 7"}`, nil
 		}),
 	}
@@ -841,7 +838,7 @@ func TestPipelineRefusesModelOutputFailingValidate(t *testing.T) {
 			Inputs:  []Field{{Name: "document"}},
 			Outputs: []Field{{Name: "obligation"}},
 		},
-		LM: LanguageModelFunc(func(context.Context, string) (string, error) {
+		LM: textModel(func(context.Context, string) (string, error) {
 			return `{"obligation": {"amount": 10, "currency": ""}}`, nil
 		}),
 	}
@@ -1032,7 +1029,7 @@ func TestProgramEvaluatorScoresInvalidOutputsZero(t *testing.T) {
 	label := Key[string]{Name: "label"}
 	calls := 0
 	program := signatureProgram("label")
-	program.LM = LanguageModelFunc(func(context.Context, string) (string, error) {
+	program.LM = textModel(func(context.Context, string) (string, error) {
 		calls++
 		if calls == 2 {
 			return `{"label": null}`, nil
@@ -1100,7 +1097,7 @@ func (countedValue) Validate() error {
 func TestPipelineConvertsModelOutputOnce(t *testing.T) {
 	value := Key[countedValue]{Name: "value"}
 	program := signatureProgram("value")
-	program.LM = LanguageModelFunc(func(context.Context, string) (string, error) {
+	program.LM = textModel(func(context.Context, string) (string, error) {
 		return `{"value": {"amount": 3}}`, nil
 	})
 	pipeline, err := PipelineSpec{

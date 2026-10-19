@@ -237,11 +237,14 @@ func applyAnthropicBlock(message *agents.Message, block anthropicContentBlock) {
 }
 
 func anthropicFinishReason(reason string) agents.FinishReason {
-	if reason == "tool_use" {
+	switch reason {
+	case "tool_use":
 		return agents.FinishToolCalls
-	}
-	if reason == "max_tokens" {
+	case "max_tokens":
 		return agents.FinishLength
+	case "refusal":
+		return agents.FinishContentFilter
+	default:
+		return agents.FinishStop
 	}
-	return agents.FinishStop
 }

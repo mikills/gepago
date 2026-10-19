@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	gepa "github.com/mikills/gepago"
+	"github.com/mikills/gepago/internal/providererr"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 )
@@ -32,22 +33,25 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// LanguageModel adapts OpenAI chat completions to gepa.LanguageModel.
+// LanguageModel adapts OpenAI chat completions to gepa.Generator. It keeps no per-call state,
+// so one value is safe for concurrent use.
 type LanguageModel struct {
 	client      openai.Client
 	model       string
 	maxTokens   int
 	temperature *float64
-	lastUsage   gepa.Usage
-	lastModel   string
 }
 
 // NewLanguageModel constructs an OpenAI or OpenAI-compatible language model.
 func NewLanguageModel(config Config) (*LanguageModel, error) {
+	return newLanguageModel(config)
+}
+
+func newLanguageModel(config Config, extra ...option.RequestOption) (*LanguageModel, error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
-	opts := make([]option.RequestOption, 0, len(config.Headers)+2)
+	opts := make([]option.RequestOption, 0, len(config.Headers)+2+len(extra))
 	if strings.TrimSpace(config.APIKey) != "" {
 		opts = append(opts, option.WithAPIKey(config.APIKey))
 	}
@@ -57,6 +61,7 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 	for key, value := range config.Headers {
 		opts = append(opts, option.WithHeader(key, value))
 	}
+	opts = append(opts, extra...)
 	maxTokens := config.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = 512
@@ -69,10 +74,12 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 	}, nil
 }
 
-// Generate sends a prompt and returns the model's text response.
-func (m *LanguageModel) Generate(ctx context.Context, prompt string) (string, error) {
-	m.lastUsage = gepa.Usage{}
-	m.lastModel = ""
+// Generate sends a prompt and returns the model's reply with its usage, resolved model and
+// finish reason. HTTP failures are classified: 429 and 5xx are transient, other 4xx permanent,
+// and dropped connections transient; a cancelled or expired ctx returns ctx.Err() unwrapped.
+// A reply that fails after the API reported usage returns that usage with the error. An empty
+// reply is an error unless it stopped at the token limit.
+func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Generation, error) {
 	params := openai.ChatCompletionNewParams{
 		Model: openai.ChatModel(m.model),
 		Messages: []openai.ChatCompletionMessageParamUnion{
@@ -88,26 +95,51 @@ func (m *LanguageModel) Generate(ctx context.Context, prompt string) (string, er
 	}
 	completion, err := m.client.Chat.Completions.New(ctx, params)
 	if err != nil {
-		return "", fmt.Errorf("openai reflection completion: %w", err)
+		return gepa.Generation{}, classifyError(ctx, err)
 	}
-	m.lastUsage = gepa.Usage{
-		PromptTokens:     int(completion.Usage.PromptTokens),
-		CompletionTokens: int(completion.Usage.CompletionTokens),
-		TotalTokens:      int(completion.Usage.TotalTokens),
-	}
-	m.lastModel = completion.Model
+	generation := gepa.Generation{Usage: openAIUsage(completion.Usage), Model: completion.Model}
 	if len(completion.Choices) == 0 {
-		return "", errors.New("openai reflection completion: no choices returned")
+		return generation, errors.New("openai reflection completion: no choices returned")
 	}
-	content := completion.Choices[0].Message.Content
-	if strings.TrimSpace(content) == "" {
-		return "", errors.New("openai reflection completion: empty content")
+	choice := completion.Choices[0]
+	generation.Text = choice.Message.Content
+	generation.FinishReason = openAIFinishReason(choice.FinishReason)
+	if strings.TrimSpace(generation.Text) == "" && generation.FinishReason != gepa.FinishLength {
+		return generation, errors.New("openai reflection completion: empty content")
 	}
-	return content, nil
+	return generation, nil
 }
 
-func (m *LanguageModel) LastUsage() gepa.Usage {
-	return m.lastUsage
+func classifyError(ctx context.Context, err error) error {
+	status := 0
+	var apiErr *openai.Error
+	if errors.As(err, &apiErr) {
+		status = apiErr.StatusCode
+	}
+	return providererr.Classify(ctx, status, fmt.Errorf("openai reflection completion: %w", err))
 }
 
-func (m *LanguageModel) LastResolvedModel() string { return m.lastModel }
+// openAIUsage maps chat completion usage. CacheCreationTokens stays zero: OpenAI caches
+// prompts automatically and reports cache reads but not cache writes.
+func openAIUsage(usage openai.CompletionUsage) gepa.Usage {
+	return gepa.Usage{
+		PromptTokens:      int(usage.PromptTokens),
+		CompletionTokens:  int(usage.CompletionTokens),
+		TotalTokens:       int(usage.TotalTokens),
+		ReasoningTokens:   int(usage.CompletionTokensDetails.ReasoningTokens),
+		CachedInputTokens: int(usage.PromptTokensDetails.CachedTokens),
+	}
+}
+
+func openAIFinishReason(reason string) gepa.FinishReason {
+	switch reason {
+	case "length":
+		return gepa.FinishLength
+	case "tool_calls", "function_call":
+		return gepa.FinishToolCalls
+	case "content_filter":
+		return gepa.FinishContentFilter
+	default:
+		return gepa.FinishStop
+	}
+}

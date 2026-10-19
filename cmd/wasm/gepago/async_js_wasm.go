@@ -324,7 +324,7 @@ func decodeWASMModelResult(value js.Value) (compileModelResult, error) {
 }
 
 func validateCompileUsage(usage gepa.Usage) error {
-	if usage.PromptTokens < 0 || usage.CompletionTokens < 0 || usage.TotalTokens < 0 {
+	if negativeUsage(usage) {
 		return errors.New("model result.usage token counts must not be negative")
 	}
 	return nil

@@ -21,7 +21,7 @@ type CompileConfig struct {
 	Trainset            []Example
 	Valset              []Example
 	Metric              Metric
-	ReflectionLM        LanguageModel
+	ReflectionLM        Generator
 	Objective           string
 	Components          []string
 	MaxMetricCalls      int
@@ -46,15 +46,12 @@ func (p CompiledProgram) Run(ctx context.Context, inputs Prediction) (Prediction
 	return prediction, err
 }
 
-// RunWithUsage executes the compiled programme and returns usage recorded during the run.
+// RunWithUsage executes the compiled programme and returns the usage its model calls recorded
+// with RecordUsage, failed calls included.
 func (p CompiledProgram) RunWithUsage(ctx context.Context, inputs Prediction) (Prediction, Usage, error) {
 	runCtx, collector := WithUsageCollector(ctx)
 	prediction, err := p.Program.RunCandidate(runCtx, p.Candidate, inputs)
-	usage := collector.Usage()
-	if isZeroUsage(usage) {
-		usage = ProgramLastUsage(p.Program)
-	}
-	return prediction, usage, err
+	return prediction, collector.Usage(), err
 }
 
 // Compile runs GEPA over a prompt programme using structured examples and a metric.
@@ -165,11 +162,7 @@ func (e ProgramEvaluator) Evaluate(
 		}
 		runCtx, collector := WithUsageCollector(ctx)
 		actual, err := e.Program.RunCandidate(runCtx, candidate, ioExample.Inputs)
-		exampleUsage := collector.Usage()
-		if isZeroUsage(exampleUsage) {
-			exampleUsage = ProgramLastUsage(e.Program)
-		}
-		usage = usage.Add(exampleUsage)
+		usage = usage.Add(collector.Usage())
 		if errors.Is(err, ErrInvalidOutput) {
 			items = append(items, invalidOutputItem(example.ID, ioExample, actual, err))
 			continue
@@ -221,19 +214,6 @@ func invalidOutputItem(exampleID string, example IOExample, actual Prediction, e
 			"details":  details,
 		},
 	}
-}
-
-// ProgramLastUsage returns the most recent model usage reported by a programme's language models.
-func ProgramLastUsage(program Program) Usage {
-	reporter, ok := program.(UsageReporter)
-	if !ok {
-		return Usage{}
-	}
-	return reporter.LastUsage()
-}
-
-func isZeroUsage(usage Usage) bool {
-	return usage.PromptTokens == 0 && usage.CompletionTokens == 0 && usage.TotalTokens == 0
 }
 
 func bestCandidateFromState(state OptimizationState) CandidateRecord {

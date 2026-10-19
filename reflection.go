@@ -8,24 +8,6 @@ import (
 	"strings"
 )
 
-// LanguageModel is the provider-neutral text generation interface used by GEPA.
-type LanguageModel interface {
-	Generate(ctx context.Context, prompt string) (string, error)
-}
-
-// ResolvedModelReporter reports the provider-resolved model from the most recent call.
-// Providers may omit it when their response protocol does not expose that identity.
-type ResolvedModelReporter interface {
-	LastResolvedModel() string
-}
-
-// LanguageModelFunc adapts a function to the LanguageModel interface.
-type LanguageModelFunc func(ctx context.Context, prompt string) (string, error)
-
-func (fn LanguageModelFunc) Generate(ctx context.Context, prompt string) (string, error) {
-	return fn(ctx, prompt)
-}
-
 // ProposalMetadata captures the prompt, raw output, and parsed patch for one component.
 type ProposalMetadata struct {
 	Component string `json:"component"`
@@ -45,8 +27,10 @@ type LessonAwareProposer interface {
 }
 
 // ReflectiveProposer asks a language model to improve candidate components from feedback records.
+// LastUsage reports the usage of every model call in the most recent Propose, failed calls
+// included.
 type ReflectiveProposer struct {
-	LM              LanguageModel
+	LM              Generator
 	Objective       string
 	Background      string
 	PromptTemplates map[string]string
@@ -64,10 +48,10 @@ func (p *ReflectiveProposer) Propose(
 	dataset ReflectiveDataset,
 	components []string,
 ) (Candidate, error) {
+	p.lastUsage = Usage{}
 	if p.LM == nil {
 		return nil, errors.New("reflection language model is required")
 	}
-	p.lastUsage = Usage{}
 	patch := Candidate{}
 	metadata := make([]ProposalMetadata, 0, len(components))
 	for _, component := range components {
@@ -75,13 +59,12 @@ func (p *ReflectiveProposer) Propose(
 		if err != nil {
 			return nil, err
 		}
-		raw, err := p.LM.Generate(ctx, prompt)
+		generation, err := p.LM.Generate(ctx, prompt)
+		p.lastUsage = p.lastUsage.Add(generation.Usage)
 		if err != nil {
 			return nil, err
 		}
-		if reporter, ok := p.LM.(UsageReporter); ok {
-			p.lastUsage = p.lastUsage.Add(reporter.LastUsage())
-		}
+		raw := generation.Text
 		parsed := ParseComponentReplacement(raw, component)
 		if strings.TrimSpace(parsed) == "" {
 			return nil, fmt.Errorf("reflection output for %q did not contain replacement text", component)
@@ -96,11 +79,12 @@ func (p *ReflectiveProposer) Propose(
 	return patch, nil
 }
 
-// LastProposalMetadata returns metadata for the most recent proposal call.
+// LastUsage returns the usage of the most recent Propose call.
 func (p *ReflectiveProposer) LastUsage() Usage {
 	return p.lastUsage
 }
 
+// LastProposalMetadata returns metadata for the most recent proposal call.
 func (p *ReflectiveProposer) LastProposalMetadata() []ProposalMetadata {
 	metadata := make([]ProposalMetadata, len(p.last))
 	copy(metadata, p.last)
@@ -211,11 +195,13 @@ func ExtractFencedText(raw string) string {
 	return strings.TrimSpace(rest[:end])
 }
 
-// LLMMergeProposer asks a language model to merge two candidate records.
+// LLMMergeProposer asks a language model to merge two candidate records. LastUsage reports
+// the usage of the most recent ProposeMerge call, failed calls included.
 type LLMMergeProposer struct {
-	LM        LanguageModel
+	LM        Generator
 	Objective string
 	last      []ProposalMetadata
+	lastUsage Usage
 }
 
 // ProposeMerge returns a patch combining two parent candidates.
@@ -225,6 +211,7 @@ func (p *LLMMergeProposer) ProposeMerge(
 	right CandidateRecord,
 	components []string,
 ) (Candidate, error) {
+	p.lastUsage = Usage{}
 	if p.LM == nil {
 		return nil, errors.New("merge language model is required")
 	}
@@ -248,10 +235,12 @@ func (p *LLMMergeProposer) ProposeMerge(
 		rightJSON,
 		strings.Join(components, ", "),
 	)
-	raw, err := p.LM.Generate(ctx, prompt)
+	generation, err := p.LM.Generate(ctx, prompt)
+	p.lastUsage = generation.Usage
 	if err != nil {
 		return nil, err
 	}
+	raw := generation.Text
 	parsed := ExtractFencedText(raw)
 	var patch Candidate
 	if err := json.Unmarshal([]byte(parsed), &patch); err != nil {
@@ -261,6 +250,12 @@ func (p *LLMMergeProposer) ProposeMerge(
 	return patch, nil
 }
 
+// LastUsage returns the usage of the most recent ProposeMerge call.
+func (p *LLMMergeProposer) LastUsage() Usage {
+	return p.lastUsage
+}
+
+// LastProposalMetadata returns metadata for the most recent merge call.
 func (p *LLMMergeProposer) LastProposalMetadata() []ProposalMetadata {
 	metadata := make([]ProposalMetadata, len(p.last))
 	copy(metadata, p.last)

@@ -113,6 +113,31 @@ func TestAgentUsageValidation(t *testing.T) {
 	}
 }
 
+func TestHostUsageRejectsNegativeBreakdown(t *testing.T) {
+	for _, usage := range []agents.Usage{
+		{ReasoningTokens: -1},
+		{CachedInputTokens: -1},
+		{CacheCreationTokens: -1},
+		{PromptTokens: -1},
+	} {
+		if !negativeUsage(usage) {
+			t.Fatalf("negativeUsage(%+v) = false", usage)
+		}
+		if err := validateUsage(usage); err == nil {
+			t.Fatalf("validateUsage(%+v) accepted negative counts", usage)
+		}
+		if err := validatePredictUsage(usage); err == nil {
+			t.Fatalf("validatePredictUsage(%+v) accepted negative counts", usage)
+		}
+		if _, err := normalizeAgentUsage(usage); err == nil {
+			t.Fatalf("normalizeAgentUsage(%+v) accepted negative counts", usage)
+		}
+	}
+	if negativeUsage(agents.Usage{PromptTokens: 1, ReasoningTokens: 1, CachedInputTokens: 1}) {
+		t.Fatal("positive usage reported as negative")
+	}
+}
+
 func TestAgentToolResponseValidation(t *testing.T) {
 	result, err := parseAgentToolHostResultJSON(`{"output":"ok","memory":{"ready":true}}`)
 	if err != nil || !result.HasMemory || result.Memory["ready"] != true {

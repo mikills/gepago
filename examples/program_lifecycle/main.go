@@ -79,7 +79,7 @@ var rootContext = context.Background()
 
 const labelField = "label"
 
-func sentimentProgram(lm gepa.LanguageModel) gepa.Predict {
+func sentimentProgram(lm gepa.Generator) gepa.Predict {
 	return gepa.Predict{
 		Signature: gepa.Signature{
 			Name:        "sentiment_lifecycle_example",
@@ -134,7 +134,7 @@ func evaluate(
 	return result.AverageScore(), nil
 }
 
-func languageModelFromEnv() (gepa.LanguageModel, error) {
+func languageModelFromEnv() (gepa.Generator, error) {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("GEPA_PROVIDER"))) {
 	case "", "openai":
 		apiKey := strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))

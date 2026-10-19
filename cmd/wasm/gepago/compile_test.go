@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -298,25 +299,58 @@ func TestCompileJudgeUsage(t *testing.T) {
 	}
 }
 
-func TestCompileLanguageModelResetsUsageWhenCallIsCancelled(t *testing.T) {
+func TestCompileLanguageModelReportsHostUsage(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var requests []compileModelRequest
 	model := newCompileLanguageModel(compileModelInvokerFunc(
-		func(context.Context, compileModelRequest) (compileModelResult, error) {
-			return compileModelResult{Text: "ok", Usage: gepa.Usage{TotalTokens: 5}}, nil
+		func(_ context.Context, request compileModelRequest) (compileModelResult, error) {
+			requests = append(requests, request)
+			if request.Attempt == 2 {
+				cancel()
+			}
+			return compileModelResult{Text: "ok", Usage: gepa.Usage{TotalTokens: 5, ReasoningTokens: 2}}, nil
 		},
 	), "program")
-	if _, err := model.Generate(context.Background(), "prompt"); err != nil {
+
+	got, err := model.Generate(context.Background(), "prompt")
+	if err != nil {
 		t.Fatalf("Generate() error = %v", err)
 	}
-	if got := model.LastUsage().TotalTokens; got != 5 {
-		t.Fatalf("LastUsage().TotalTokens = %d, want 5", got)
+	want := gepa.Generation{Text: "ok", Usage: gepa.Usage{TotalTokens: 5, ReasoningTokens: 2}}
+	if got != want {
+		t.Fatalf("Generate() = %+v, want %+v", got, want)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if _, err := model.Generate(ctx, "prompt"); err != context.Canceled {
+	got, err = model.Generate(ctx, "prompt")
+	if err != context.Canceled {
 		t.Fatalf("Generate() error = %v, want context.Canceled", err)
 	}
-	if got := model.LastUsage(); got != (gepa.Usage{}) {
-		t.Fatalf("LastUsage() after cancelled call = %+v, want zero", got)
+	if got != (gepa.Generation{Usage: want.Usage}) {
+		t.Fatalf("Generate() after the host spent tokens = %+v, want only its usage", got)
+	}
+
+	got, err = model.Generate(ctx, "prompt")
+	if err != context.Canceled || got != (gepa.Generation{}) || len(requests) != 2 {
+		t.Fatalf("Generate() on a cancelled context = %+v, %v after %d host calls", got, err, len(requests))
+	}
+	if requests[0].Role != "program" || requests[1].Attempt != 2 {
+		t.Fatalf("requests = %+v", requests)
+	}
+}
+
+func TestCompileLanguageModelRequiresInvoker(t *testing.T) {
+	var model *compileLanguageModel
+	if _, err := model.Generate(context.Background(), "prompt"); err == nil {
+		t.Fatal("Generate() error = nil, want missing host model error")
+	}
+	hostErr := errors.New("host failed")
+	model = newCompileLanguageModel(compileModelInvokerFunc(
+		func(context.Context, compileModelRequest) (compileModelResult, error) {
+			return compileModelResult{}, hostErr
+		},
+	), "task")
+	if _, err := model.Generate(context.Background(), "prompt"); !errors.Is(err, hostErr) {
+		t.Fatalf("Generate() error = %v, want host error", err)
 	}
 }

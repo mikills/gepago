@@ -320,7 +320,7 @@ func validatePredictDemos(demos []gepa.Demo) error {
 }
 
 func validatePredictUsage(usage gepa.Usage) error {
-	if usage.PromptTokens < 0 || usage.CompletionTokens < 0 || usage.TotalTokens < 0 {
+	if negativeUsage(usage) {
 		return errors.New("predict.resume result.usage token counts must not be negative")
 	}
 	return nil

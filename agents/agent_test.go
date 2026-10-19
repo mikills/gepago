@@ -248,3 +248,47 @@ func eventKinds(events []Event) []EventKind {
 	}
 	return kinds
 }
+
+func TestAgentRunMapsFinishReasons(t *testing.T) {
+	tests := []struct {
+		finish FinishReason
+		want   StopReason
+	}{
+		{finish: FinishStop, want: StopComplete},
+		{finish: FinishLength, want: StopLength},
+		{finish: FinishContentFilter, want: StopContentFilter},
+		{finish: "", want: StopComplete},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.finish), func(t *testing.T) {
+			client := &fakeChatClient{responses: []ChatResponse{{
+				Message:      Message{Role: RoleAssistant, Content: "partial"},
+				Usage:        Usage{TotalTokens: 4, ReasoningTokens: 2, CachedInputTokens: 1},
+				FinishReason: tt.finish,
+			}}}
+			agent := Agent{Name: "test", Client: client, Model: "fake"}
+
+			result, err := agent.Run(context.Background(), RunRequest{
+				Memory:   NewMemory("run"),
+				Messages: []Message{{Role: RoleUser, Content: "hi"}},
+			})
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if result.StopReason != tt.want {
+				t.Fatalf("StopReason = %q, want %q", result.StopReason, tt.want)
+			}
+			if result.Ledger.ReasoningTokens != 2 || result.Ledger.CachedInputTokens != 1 {
+				t.Fatalf("Ledger = %#v", result.Ledger)
+			}
+		})
+	}
+}
+
+func TestFinishReasonAliasesGepa(t *testing.T) {
+	var reason gepa.FinishReason = FinishContentFilter
+	if reason != gepa.FinishContentFilter || FinishStop != gepa.FinishStop || FinishLength != gepa.FinishLength ||
+		FinishToolCalls != gepa.FinishToolCalls {
+		t.Fatalf("agents finish reasons diverge from gepa: %q", reason)
+	}
+}

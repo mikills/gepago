@@ -170,7 +170,7 @@ type ProgramTrainConfig struct {
 	Trainset            []Example
 	Valset              []Example
 	Metric              Metric
-	ReflectionLM        LanguageModel
+	ReflectionLM        Generator
 	Objective           string
 	Components          []string
 	MaxMetricCalls      int

@@ -23,7 +23,7 @@ func TestProgram(t *testing.T) {
 		program := Predict{
 			Signature:   signature,
 			Instruction: "Return JSON.",
-			LM: LanguageModelFunc(func(context.Context, string) (string, error) {
+			LM: textModel(func(context.Context, string) (string, error) {
 				return "```json\n{\"label\":\"positive\"}\n```", nil
 			}),
 		}
@@ -67,7 +67,7 @@ func TestProgram(t *testing.T) {
 				Inputs:  []Field{{Name: "text"}},
 				Outputs: []Field{{Name: "label"}},
 			},
-			LM: LanguageModelFunc(func(context.Context, string) (string, error) {
+			LM: textModel(func(context.Context, string) (string, error) {
 				calls++
 				if calls == 1 {
 					return "label: positive", nil
@@ -91,7 +91,7 @@ func TestProgram(t *testing.T) {
 				Inputs:  []Field{{Name: "question"}},
 				Outputs: []Field{{Name: "answer"}},
 			},
-			LM: LanguageModelFunc(func(_ context.Context, prompt string) (string, error) {
+			LM: textModel(func(_ context.Context, prompt string) (string, error) {
 				if !strings.Contains(prompt, "reasoning") || !strings.Contains(prompt, "Think step by step") {
 					t.Fatalf("prompt missing reasoning instructions: %s", prompt)
 				}
@@ -156,7 +156,7 @@ func TestMetrics(t *testing.T) {
 
 	t.Run("llm judge", func(t *testing.T) {
 		metric := LLMJudgeMetric{
-			LM: LanguageModelFunc(func(_ context.Context, prompt string) (string, error) {
+			LM: textModel(func(_ context.Context, prompt string) (string, error) {
 				if !strings.Contains(prompt, "Expected JSON") || !strings.Contains(prompt, "Actual JSON") {
 					t.Fatalf("prompt missing payloads: %s", prompt)
 				}
@@ -212,12 +212,12 @@ type usageModel struct {
 	usage    Usage
 }
 
-func (m *usageModel) Generate(context.Context, string) (string, error) { return m.response, nil }
-
-func (m *usageModel) LastUsage() Usage { return m.usage }
+func (m *usageModel) Generate(context.Context, string) (Generation, error) {
+	return Generation{Text: m.response, Usage: m.usage}, nil
+}
 
 func TestCompile(t *testing.T) {
-	lm := LanguageModelFunc(func(_ context.Context, prompt string) (string, error) {
+	lm := textModel(func(_ context.Context, prompt string) (string, error) {
 		if strings.Contains(prompt, "Evaluation records and traces") {
 			return "```\nClassify text as exactly positive or negative. Use negative when wording is ambiguous.\n```", nil
 		}

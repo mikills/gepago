@@ -18,13 +18,15 @@ const (
 	RoleTool      Role = "tool"
 )
 
-// FinishReason describes why a chat completion stopped.
-type FinishReason string
+// FinishReason describes why a chat completion stopped. It is an alias of gepa.FinishReason.
+type FinishReason = gepa.FinishReason
 
+// Finish reasons a chat client reports; they are the gepa constants of the same names.
 const (
-	FinishStop      FinishReason = "stop"
-	FinishLength    FinishReason = "length"
-	FinishToolCalls FinishReason = "tool_calls"
+	FinishStop          = gepa.FinishStop
+	FinishLength        = gepa.FinishLength
+	FinishToolCalls     = gepa.FinishToolCalls
+	FinishContentFilter = gepa.FinishContentFilter
 )
 
 // Message is one chat transcript entry.

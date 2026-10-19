@@ -9,7 +9,7 @@ import (
 func TestReflectiveProposer(t *testing.T) {
 	t.Run("builds prompt and parses fenced replacement", func(t *testing.T) {
 		var prompt string
-		lm := LanguageModelFunc(func(_ context.Context, p string) (string, error) {
+		lm := textModel(func(_ context.Context, p string) (string, error) {
 			prompt = p
 			return "```\nimproved prompt\n```", nil
 		})
@@ -36,7 +36,7 @@ func TestReflectiveProposer(t *testing.T) {
 
 	t.Run("parses json patch and includes lessons", func(t *testing.T) {
 		var prompt string
-		lm := LanguageModelFunc(func(_ context.Context, p string) (string, error) {
+		lm := textModel(func(_ context.Context, p string) (string, error) {
 			prompt = p
 			return "```json\n{\"prompt\":\"json improved\"}\n```", nil
 		})

@@ -199,10 +199,6 @@ func programOutput(outputs Prediction, key KeyRef) (any, error) {
 	return converted, nil
 }
 
-func (s programStep) LastUsage() Usage {
-	return ProgramLastUsage(s.program)
-}
-
 // MergeRule lets more than one step write Key. When a later step writes it, Merge combines
 // a copy of the value already in state with the new one.
 type MergeRule struct {
@@ -573,17 +569,6 @@ func (p Pipeline) written(state State) Prediction {
 		}
 	}
 	return written
-}
-
-// LastUsage sums the most recent usage reported by each step.
-func (p Pipeline) LastUsage() Usage {
-	usage := Usage{}
-	for _, step := range p.steps {
-		if reporter, ok := step.step.(UsageReporter); ok {
-			usage = usage.Add(reporter.LastUsage())
-		}
-	}
-	return usage
 }
 
 func (p Pipeline) run(ctx context.Context, candidate Candidate, inputs Prediction) (State, error) {

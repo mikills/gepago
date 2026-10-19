@@ -258,11 +258,14 @@ type usageLanguageModel struct {
 	usage    gepa.Usage
 }
 
-func (m usageLanguageModel) Generate(context.Context, string) (string, error) {
-	return m.response, m.err
+func (m usageLanguageModel) Generate(context.Context, string) (gepa.Generation, error) {
+	return gepa.Generation{Text: m.response, Usage: m.usage}, m.err
 }
 
-func (m usageLanguageModel) LastUsage() gepa.Usage { return m.usage }
+// textJudge adapts a text-only judge function to a gepa.Generator.
+func textJudge(fn gepa.LanguageModelFunc) gepa.Generator {
+	return gepa.AdaptLanguageModel(fn)
+}
 
 func (e funcPairwiseEvaluator) Name() string { return e.name }
 
@@ -342,7 +345,7 @@ func TestCancelledPairwiseWork(t *testing.T) {
 func TestPairwiseJudgeBlinding(t *testing.T) {
 	var mu sync.Mutex
 	var prompts []string
-	judge := gepa.LanguageModelFunc(func(_ context.Context, prompt string) (string, error) {
+	judge := textJudge(func(_ context.Context, prompt string) (string, error) {
 		mu.Lock()
 		prompts = append(prompts, prompt)
 		mu.Unlock()
@@ -372,7 +375,7 @@ func TestPairwiseJudgeBlinding(t *testing.T) {
 }
 
 func TestPairwiseScoreOrientation(t *testing.T) {
-	judge := gepa.LanguageModelFunc(func(context.Context, string) (string, error) {
+	judge := textJudge(func(context.Context, string) (string, error) {
 		return `{"winner":"a","score_a":0.9,"score_b":0.1,"feedback":"A"}`, nil
 	})
 	evaluator := PairwiseJudgeEvaluator{LM: judge, Rubric: "Prefer A."}
@@ -395,7 +398,7 @@ func TestPairwiseScoreOrientation(t *testing.T) {
 }
 
 func TestPairwiseJudgeRequiresRubric(t *testing.T) {
-	evaluator := PairwiseJudgeEvaluator{LM: gepa.LanguageModelFunc(func(context.Context, string) (string, error) {
+	evaluator := PairwiseJudgeEvaluator{LM: textJudge(func(context.Context, string) (string, error) {
 		return `{"winner":"tie","score_a":0.5,"score_b":0.5}`, nil
 	})}
 	_, err := evaluator.Compare(context.Background(), PairwiseInput{})
@@ -614,7 +617,7 @@ type concurrencyTrackingLM struct {
 	max    atomic.Int32
 }
 
-func (m *concurrencyTrackingLM) Generate(context.Context, string) (string, error) {
+func (m *concurrencyTrackingLM) Generate(context.Context, string) (gepa.Generation, error) {
 	active := m.active.Add(1)
 	for {
 		current := m.max.Load()
@@ -624,7 +627,7 @@ func (m *concurrencyTrackingLM) Generate(context.Context, string) (string, error
 	}
 	time.Sleep(10 * time.Millisecond)
 	m.active.Add(-1)
-	return "ok", nil
+	return gepa.Generation{Text: "ok"}, nil
 }
 
 func TestModelSubjectSerialization(t *testing.T) {
@@ -742,10 +745,12 @@ func TestArtifactPermissions(t *testing.T) {
 
 type resolvedModelLM struct{}
 
-func (resolvedModelLM) Generate(context.Context, string) (string, error) { return "ok", nil }
-func (resolvedModelLM) LastResolvedModel() string                        { return "snapshot-model" }
-func (resolvedModelLM) LastUsage() gepa.Usage {
-	return gepa.Usage{PromptTokens: 1_000_000, TotalTokens: 1_000_000}
+func (resolvedModelLM) Generate(context.Context, string) (gepa.Generation, error) {
+	return gepa.Generation{
+		Text:  "ok",
+		Model: "snapshot-model",
+		Usage: gepa.Usage{PromptTokens: 1_000_000, TotalTokens: 1_000_000},
+	}, nil
 }
 
 func TestResolvedModelProvenance(t *testing.T) {

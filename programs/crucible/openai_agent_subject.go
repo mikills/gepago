@@ -462,8 +462,11 @@ func decodeOpenAIResponsesResponse(data []byte) (agents.ChatResponse, error) {
 	if len(message.ToolCalls) > 0 {
 		finish = agents.FinishToolCalls
 	}
-	if response.IncompleteDetails.Reason == "max_output_tokens" {
+	switch response.IncompleteDetails.Reason {
+	case "max_output_tokens":
 		finish = agents.FinishLength
+	case "content_filter":
+		finish = agents.FinishContentFilter
 	}
 	return agents.ChatResponse{Message: message, Usage: usage, FinishReason: finish, ResolvedModel: response.Model}, nil
 }
@@ -505,13 +508,16 @@ func agentsToolCalls(calls []openAIToolCall) []agents.ToolCall {
 }
 
 func finishReason(reason string) agents.FinishReason {
-	if reason == toolCallsKey {
+	switch reason {
+	case toolCallsKey:
 		return agents.FinishToolCalls
-	}
-	if reason == "length" {
+	case "length":
 		return agents.FinishLength
+	case "content_filter":
+		return agents.FinishContentFilter
+	default:
+		return agents.FinishStop
 	}
-	return agents.FinishStop
 }
 
 func firstNonEmpty(values ...string) string {

@@ -550,7 +550,7 @@ func (r cliRunRequest) cache() crucible.Cache {
 	return crucible.DiskCache{Dir: r.cacheDir}
 }
 
-func (r cliRunRequest) judgeLM() (gepa.LanguageModel, error) {
+func (r cliRunRequest) judgeLM() (gepa.Generator, error) {
 	if strings.TrimSpace(r.judgeModel) == "" {
 		return nil, nil
 	}
