@@ -3,6 +3,8 @@ package gepa
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -282,6 +284,7 @@ func (e metricEnum) String() string { return [...]string{"low", "high"}[e] }
 func TestMetricTextPairs(t *testing.T) {
 	big := uint64(1<<53 + 1)
 	text := "r"
+	one, other, two := 1, 1, 2
 	pairs := []struct {
 		name  string
 		a, b  any
@@ -301,6 +304,30 @@ func TestMetricTextPairs(t *testing.T) {
 		{"string and bytes", "ab", []byte("ab"), false},
 		{"hidden structs that differ", metricHidden{1}, metricHidden{2}, false},
 		{"hidden structs that agree", metricHidden{1}, &metricHidden{1}, true},
+		{"nested hidden structs that differ", []metricHidden{{1}}, []metricHidden{{2}}, false},
+		{"nested hidden structs that agree", []metricHidden{{1}}, []*metricHidden{{1}}, true},
+		{
+			"mapped hidden structs that differ",
+			map[string]any{"k": metricHidden{1}},
+			map[string]any{"k": metricHidden{2}},
+			false,
+		},
+		{"hidden pointers to equal values", metricPtrHidden{&one}, metricPtrHidden{&other}, true},
+		{"hidden pointers to different values", metricPtrHidden{&one}, metricPtrHidden{&two}, false},
+		{
+			"hidden maps in any order",
+			metricMapHidden{map[string]int{"x": 1, "y": 2}},
+			metricMapHidden{map[string]int{"y": 2, "x": 1}},
+			true,
+		},
+		{
+			"hidden inside visible structs that differ",
+			metricHolder{Hidden: metricHidden{1}},
+			metricHolder{Hidden: metricHidden{2}},
+			false,
+		},
+		{"empty slice and an empty hidden slice", []any{}, []metricHidden{}, true},
+		{"nil slice and nil", []string(nil), nil, true},
 		{"label type", metricLabel("positive"), "positive", true},
 		{"Stringer is not its text", metricEnum(1), "high", false},
 		{"float and its fmt form", 1e20, "1e+20", false},
@@ -409,4 +436,128 @@ func TestLLMJudgeMetricRendersTypedValues(t *testing.T) {
 		`  "ref": "<r-1>"`,
 		"}\n```",
 	}, "\n"))
+}
+
+type metricPtrHidden struct{ p *int }
+
+type metricMapHidden struct{ m map[string]int }
+
+type metricOuterHidden struct {
+	in   metricHidden
+	name string
+}
+
+type metricScalars struct {
+	b  bool
+	u  uint8
+	f  float32
+	n  float64
+	c  complex64
+	bs []byte
+	ar [2]int
+	in any
+}
+
+type metricNode struct {
+	next *metricNode
+	v    int
+}
+
+type metricHolder struct {
+	Hidden metricHidden    `json:"hidden"`
+	Count  int             `json:"count,string"`
+	Note   string          `json:"note,omitempty"`
+	Empty  []string        `json:"empty,omitempty"`
+	Zero   struct{ A int } `json:"zero,omitzero"`
+	*metricEmbedded
+}
+
+type metricEmbedded struct {
+	Extra string `json:"extra"`
+}
+
+type metricTextKey struct{ id int }
+
+func (k metricTextKey) MarshalText() ([]byte, error) { return []byte(fmt.Sprintf("key-%d", k.id)), nil }
+
+type metricFailingKey struct{ id int }
+
+func (k metricFailingKey) MarshalText() ([]byte, error) { return nil, errors.New("no text") }
+
+type metricStructKey struct{ id int }
+
+type metricPointerMarshal struct {
+	V int
+}
+
+func (m *metricPointerMarshal) MarshalJSON() ([]byte, error) { return []byte(`"custom"`), nil }
+
+type metricMarshalHolder struct {
+	Hidden metricHidden         `json:"hidden"`
+	Custom metricPointerMarshal `json:"custom"`
+}
+
+func TestMetricTextWalksHiddenStructs(t *testing.T) {
+	one, two := 1, 1
+	self := &metricNode{v: 1}
+	self.next = self
+	cases := []struct {
+		name  string
+		value any
+		want  string
+	}{
+		{"pointer field followed", metricPtrHidden{&one}, "gepa.metricPtrHidden{p:1}"},
+		{"nil pointer field", metricPtrHidden{}, "gepa.metricPtrHidden{p:null}"},
+		{"map field sorted", metricMapHidden{map[string]int{"y": 2, "x": 1}}, `gepa.metricMapHidden{m:{"x":1,"y":2}}`},
+		{"nested hidden inline", metricOuterHidden{in: metricHidden{1}, name: "a"},
+			`gepa.metricOuterHidden{in:gepa.metricHidden{v:1}, name:"a"}`},
+		{"slice of hidden", []metricHidden{{1}, {2}}, `["gepa.metricHidden{v:1}","gepa.metricHidden{v:2}"]`},
+		{"map of hidden", map[string]any{"k": metricHidden{1}}, `{"k":"gepa.metricHidden{v:1}"}`},
+		{
+			"scalars",
+			metricScalars{b: true, u: 7, f: 0.5, n: math.Inf(1), c: complex(1, 2), bs: []byte("ab"), ar: [2]int{1, 2},
+				in: "x"},
+			`gepa.metricScalars{b:true, u:7, f:0.5, n:"+Inf", c:"(1+2i)", bs:"YWI=", ar:[1,2], in:"x"}`,
+		},
+		{"cycle", self, `gepa.metricNode{next:"<cycle>", v:1}`},
+		{"cycle below a copy", *self, `gepa.metricNode{next:gepa.metricNode{next:"<cycle>", v:1}, v:1}`},
+		{
+			"visible struct holding hidden",
+			metricHolder{Hidden: metricHidden{1}, Count: 3},
+			`{"count":"3","hidden":"gepa.metricHidden{v:1}"}`,
+		},
+		{
+			"visible struct fields kept",
+			&metricHolder{Hidden: metricHidden{1}, Count: 3, Note: "n", Empty: []string{"e"}, Zero: struct{ A int }{1},
+				metricEmbedded: &metricEmbedded{Extra: "x"}},
+			`{"count":"3","empty":["e"],"extra":"x","hidden":"gepa.metricHidden{v:1}","note":"n","zero":{"A":1}}`,
+		},
+		{
+			"map keys",
+			map[metricTextKey]metricHidden{{1}: {1}},
+			`{"key-1":"gepa.metricHidden{v:1}"}`,
+		},
+		{"int map keys", map[int]metricHidden{-1: {1}}, `{"-1":"gepa.metricHidden{v:1}"}`},
+		{"uint map keys", map[uint]metricHidden{1: {1}}, `{"1":"gepa.metricHidden{v:1}"}`},
+		{"failing text keys", map[metricFailingKey]metricHidden{{1}: {1}}, `{"{1}":"gepa.metricHidden{v:1}"}`},
+		{"struct keys", map[metricStructKey]metricHidden{{2}: {1}}, `{"{2}":"gepa.metricHidden{v:1}"}`},
+		{
+			"pointer receiver marshaler",
+			&metricMarshalHolder{Hidden: metricHidden{1}},
+			`{"custom":"custom","hidden":"gepa.metricHidden{v:1}"}`,
+		},
+	}
+	for _, c := range cases {
+		got, ok := metricText(c.value)
+		require.True(t, ok, c.name)
+		require.Equal(t, c.want, got, c.name)
+	}
+	require.Equal(t, mustMetricText(t, metricPtrHidden{&one}), mustMetricText(t, metricPtrHidden{&two}))
+}
+
+func mustMetricText(t *testing.T, value any) string {
+	t.Helper()
+	text, ok := metricText(value)
+	require.True(t, ok)
+	return text
 }

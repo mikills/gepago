@@ -38,8 +38,9 @@ func (fn MetricFunc) Score(ctx context.Context, expected Prediction, actual Pred
 // is compared as it is; any other value, typed Go values from TypedPredict or a pipeline
 // included, by its JSON encoding with object keys sorted, unquoted when that encoding is a
 // JSON string. A struct whose fields JSON cannot see, such as one with only unexported fields,
-// is compared by its Go syntax (%#v) instead, since its JSON is always {}. A missing or nil
-// value, a nil pointer included, has no text form and matches only another nil value.
+// is compared by its type and every field, at any depth, since its JSON is always {}. A
+// missing or nil value, a nil pointer included, has no text form and matches only another nil
+// value.
 type ExactMatchMetric struct {
 	Fields          []string
 	CaseInsensitive bool
@@ -338,21 +339,16 @@ func metricText(value any) (string, bool) {
 
 // metricJSON returns the canonical JSON encoding of value: pointers followed, object keys
 // sorted whether value is a struct or a map, numbers kept as encoded and HTML left unescaped.
-// A value JSON cannot encode, such as NaN or a channel, is a JSON string of its fmt form, and a
-// struct whose fields JSON cannot see, which encodes as {} whatever it holds, a JSON string of
-// its Go syntax (%#v).
+// A struct whose fields JSON cannot see, which would encode as {} whatever it holds, is a JSON
+// string of its type and fields at any depth, as metricWalker describes. A value JSON cannot
+// encode, such as NaN or a channel, is a JSON string of its fmt form.
 func metricJSON(value any) json.RawMessage {
-	encoded, err := encodeMetricJSON(value)
+	form, _ := newMetricWalker().walk(reflect.ValueOf(value))
+	encoded, err := encodeMetricJSON(form)
 	if err != nil {
 		// a string always encodes.
 		encoded, _ = encodeMetricJSON(fmt.Sprint(value))
 		return encoded
-	}
-	if string(encoded) == "{}" {
-		if hidden, ok := hiddenStruct(value); ok {
-			encoded, _ = encodeMetricJSON(fmt.Sprintf("%#v", hidden.Interface()))
-			return encoded
-		}
 	}
 	var decoded any
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
@@ -364,19 +360,6 @@ func metricJSON(value any) json.RawMessage {
 	// decoded values are maps, slices, strings, numbers, booleans and nil, which always encode.
 	canonical, _ := encodeMetricJSON(decoded)
 	return canonical
-}
-
-// hiddenStruct returns the struct value points to, following pointers and interfaces, when it
-// has fields but none that JSON can see, such as only unexported fields or fields tagged "-".
-func hiddenStruct(value any) (reflect.Value, bool) {
-	v := reflect.ValueOf(value)
-	for v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface {
-		if v.IsNil() {
-			return reflect.Value{}, false
-		}
-		v = v.Elem()
-	}
-	return v, v.Kind() == reflect.Struct && v.NumField() > 0 && len(jsonFields(v.Type())) == 0
 }
 
 // encodeMetricJSON encodes value as compact JSON without escaping HTML.

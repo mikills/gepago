@@ -66,19 +66,53 @@ func (s funcStep) Run(ctx context.Context, state State) error {
 // reads as its inputs, and only the declared writes are copied from its output back into
 // state, so a model reply cannot overwrite any other key.
 //
-// For Predict and ChainOfThought the signature's inputs must be exactly the declared reads
-// and its outputs exactly the declared writes; a ChainOfThought may also declare its
-// reasoning field as a write. A run fails with ErrInvalidOutput when the reply omits a
-// declared write, sets it to null, or gives a value that does not convert to its type.
+// For a SignatureProgram, such as Predict, ChainOfThought or TypedPredict, Build checks the
+// step against its ProgramSignature: the signature's inputs must be exactly the declared reads
+// and its outputs exactly the declared writes, apart from OmittableOutputs, such as
+// ChainOfThought's reasoning field, which the step may declare or leave out. A read or write
+// whose key type differs from the Go type the signature gives that field in InputTypes or
+// OutputTypes fails Build too.
+//
+// A run fails with ErrInvalidOutput when the reply omits a declared write, sets it to null, or
+// gives a value that does not convert to its type. An output the signature marks Optional may
+// be omitted or null: the step then commits the zero value of the write's key type, which
+// must pass that type's Validate method, if it has one.
 func NewProgramStep(name string, program Program, reads, writes []KeyRef) ComponentStep {
-	return programStep{name: name, program: program, reads: slices.Clone(reads), writes: slices.Clone(writes)}
+	return programStep{
+		name:     name,
+		program:  program,
+		reads:    slices.Clone(reads),
+		writes:   slices.Clone(writes),
+		optional: optionalOutputs(program),
+	}
 }
 
 type programStep struct {
-	name    string
-	program Program
-	reads   []KeyRef
-	writes  []KeyRef
+	name     string
+	program  Program
+	reads    []KeyRef
+	writes   []KeyRef
+	optional map[string]bool
+}
+
+// optionalOutputs returns the outputs the signature of program marks Optional, if program is a
+// valid SignatureProgram.
+func optionalOutputs(program Program) map[string]bool {
+	signed, ok := program.(SignatureProgram)
+	if !ok || isNil(program) {
+		return nil
+	}
+	signature, err := signed.ProgramSignature()
+	if err != nil {
+		return nil
+	}
+	optional := map[string]bool{}
+	for _, field := range signature.Signature.Outputs {
+		if field.Optional {
+			optional[field.Name] = true
+		}
+	}
+	return optional
 }
 
 func (s programStep) Name() string     { return s.name }
@@ -92,30 +126,42 @@ func (s programStep) Validate() error {
 	if err := s.program.Validate(); err != nil {
 		return err
 	}
-	signature, optionalOutputs, ok := programSignature(s.program)
+	signed, ok := s.program.(SignatureProgram)
 	if !ok {
 		return nil
 	}
-	if err := matchSignature("inputs", fieldNames(signature.Inputs), nil, "reads", s.reads); err != nil {
+	signature, err := signed.ProgramSignature()
+	if err != nil {
 		return err
 	}
-	return matchSignature("outputs", signature.OutputNames(), optionalOutputs, "writes", s.writes)
+	if err := matchSignature("inputs", fieldNames(signature.Signature.Inputs), nil, "reads", s.reads); err != nil {
+		return err
+	}
+	err = matchSignature(
+		"outputs",
+		signature.Signature.OutputNames(),
+		signature.OmittableOutputs,
+		"writes",
+		s.writes,
+	)
+	if err != nil {
+		return err
+	}
+	if err := matchKeyTypes("reads", s.reads, "takes", signature.InputTypes); err != nil {
+		return err
+	}
+	return matchKeyTypes("writes", s.writes, "returns", signature.OutputTypes)
 }
 
-// programSignature returns the signature of programmes that have one, and any output fields
-// a step may declare in addition to the signature's own.
-func programSignature(program Program) (Signature, []string, bool) {
-	switch p := program.(type) {
-	case Predict:
-		return p.Signature, nil, true
-	case *Predict:
-		return p.Signature, nil, true
-	case ChainOfThought:
-		return p.Signature, []string{p.reasoningFieldName()}, true
-	case *ChainOfThought:
-		return p.Signature, []string{p.reasoningFieldName()}, true
+// matchKeyTypes checks that each key's type is the Go type the programme gives its field, when
+// it gives one. A key without a type is left to Build, which rejects it.
+func matchKeyTypes(keyKind string, keys []KeyRef, verb string, types map[string]reflect.Type) error {
+	for _, key := range keys {
+		if typ, ok := types[key.Name]; ok && key.Type != nil && typ != key.Type {
+			return fmt.Errorf("%s %q as %s, but the programme %s it as %s", keyKind, key.Name, key.Type, verb, typ)
+		}
 	}
-	return Signature{}, nil, false
+	return nil
 }
 
 func fieldNames(fields []Field) []string {
@@ -126,26 +172,34 @@ func fieldNames(fields []Field) []string {
 	return names
 }
 
-func matchSignature(fieldKind string, fields, optional []string, keyKind string, keys []KeyRef) error {
+// matchSignature checks that keys name every field except the omittable ones, and nothing
+// else.
+func matchSignature(fieldKind string, fields, omittable []string, keyKind string, keys []KeyRef) error {
 	names := make([]string, 0, len(keys))
 	for _, key := range keys {
 		names = append(names, key.Name)
 	}
 	slices.Sort(names)
-	want := slices.Sorted(slices.Values(fields))
-	if slices.Equal(names, want) {
-		return nil
-	}
-	if len(optional) > 0 {
-		withOptional := slices.Compact(slices.Sorted(slices.Values(append(slices.Clone(fields), optional...))))
-		if slices.Equal(names, withOptional) {
-			return nil
+	var want []string
+	for _, field := range slices.Sorted(slices.Values(fields)) {
+		if !slices.Contains(omittable, field) {
+			want = append(want, field)
 		}
+	}
+	missing := slices.ContainsFunc(want, func(field string) bool { return !slices.Contains(names, field) })
+	unknown := slices.ContainsFunc(names, func(name string) bool {
+		return !slices.Contains(fields, name) && !slices.Contains(omittable, name)
+	})
+	duplicated := len(slices.Compact(slices.Clone(names))) != len(names)
+	switch {
+	case !missing && !unknown && !duplicated:
+		return nil
+	case len(omittable) > 0:
 		return fmt.Errorf(
 			"signature %s %q (optionally plus %q) do not match declared %s %q",
 			fieldKind,
 			want,
-			optional,
+			omittable,
 			keyKind,
 			names,
 		)
@@ -175,7 +229,7 @@ func (s programStep) RunCandidate(ctx context.Context, candidate Candidate, stat
 		return err
 	}
 	for _, key := range s.writes {
-		value, err := programOutput(outputs, key)
+		value, err := programOutput(outputs, key, s.optional[key.Name])
 		if err != nil {
 			return WithStepDetails(err, map[string]any{"output": clonePrediction(outputs)})
 		}
@@ -184,9 +238,13 @@ func (s programStep) RunCandidate(ctx context.Context, candidate Candidate, stat
 	return nil
 }
 
-func programOutput(outputs Prediction, key KeyRef) (any, error) {
+// programOutput converts the output for key to the key's type. An optional output that is
+// absent or null becomes the zero value of the key's type.
+func programOutput(outputs Prediction, key KeyRef, optional bool) (any, error) {
 	value, ok := outputs[key.Name]
 	switch {
+	case optional && (!ok || value == nil):
+		value = reflect.Zero(key.Type).Interface()
 	case !ok:
 		return nil, fmt.Errorf("%w: %q is missing", ErrInvalidOutput, key.Name)
 	case value == nil:

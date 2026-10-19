@@ -551,9 +551,8 @@ func TestTypedPredictAsAPipelineStep(t *testing.T) {
 	}
 }
 
-// TestPredictOptionalOutputAsAPipelineStep commits a non-null optional output. A null one fails
-// the step until programOutput in pipeline.go accepts null for an output the programme's
-// ProgramSignature marks Optional.
+// TestPredictOptionalOutputAsAPipelineStep commits a non-null optional output; see
+// TestPredictOptionalOutputsCommitZeroValues for null and omitted ones.
 func TestPredictOptionalOutputAsAPipelineStep(t *testing.T) {
 	note := Key[string]{Name: "note"}
 	program := Predict{
