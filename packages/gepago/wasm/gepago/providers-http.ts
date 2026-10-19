@@ -5,6 +5,7 @@ import type {
   ChatResponse,
   CompileModel,
   FinishReason,
+  JSONSchemaResponseFormat,
   Message,
   PredictModel,
   PredictHostRequest,
@@ -214,9 +215,31 @@ export function finishReasonField(
   const reason = finishReason(value, hasTools);
   return reason === undefined ? {} : { finish_reason: reason };
 }
+// strictResponseFormat returns a model request's response format when it is strict, so a
+// provider can enforce it. A format that is not strict is not enforced, as in the Go providers:
+// the prompt alone asks for the shape.
+function strictResponseFormat(
+  value: unknown,
+): JSONSchemaResponseFormat | undefined {
+  const format = asObject(value);
+  if (
+    format.strict !== true ||
+    typeof format.name !== "string" ||
+    Object.keys(asObject(format.schema)).length === 0
+  )
+    return undefined;
+  return {
+    name: format.name,
+    schema: format.schema as JSONSchemaResponseFormat["schema"],
+    strict: true,
+  };
+}
+// modelCallbackFromChat adapts a chat function to a Predict and Compile model callback. When
+// structured is true, a request's strict response_format goes to the chat request.
 export function modelCallbackFromChat(
   chat: AgentChat,
   modelName: string,
+  structured = false,
 ): ModelFunction {
   return async (
     request:
@@ -224,6 +247,9 @@ export function modelCallbackFromChat(
   ): Promise<PredictModelResult | string> => {
     const object = jsonObject(request, "model request");
     const prompt = nonEmptyString(object.prompt, "model request.prompt");
+    const format = structured
+      ? strictResponseFormat(object.response_format)
+      : undefined;
     const response = await chat({
       model: modelName,
       messages: [
@@ -234,6 +260,7 @@ export function modelCallbackFromChat(
         },
         { role: "user", content: prompt },
       ],
+      ...(format ? { response_format: format } : {}),
     });
     const result: PredictModelResult = {
       text: response.message.content ?? "",

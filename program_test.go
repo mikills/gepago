@@ -223,7 +223,7 @@ func TestCompile(t *testing.T) {
 		}
 		// only the chain of thought asks for reasoning; Predict rejects fields it did not ask for.
 		reasoning := ""
-		if strings.Contains(prompt, "output fields: label, reasoning.") {
+		if strings.Contains(prompt, "output fields: reasoning, label.") {
 			reasoning = ",\"reasoning\":\"weak instruction\""
 		}
 		if strings.Contains(strings.ToLower(prompt), "exactly positive or negative") {

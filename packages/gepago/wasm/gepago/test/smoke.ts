@@ -158,6 +158,36 @@ test("loads generated Go WASM and exposes deterministic APIs", async () => {
       (cotRequests[0].prompt.match(/thoughts field/g) ?? []).length,
       1,
     );
+    assert.match(cotRequests[0].prompt, /output fields: thoughts, label\./);
+    assert.equal(cotRequests[0].response_format?.strict, false);
+
+    const typedCotRequests: PredictHostRequest[] = [];
+    await gepago.predict(
+      {
+        program: {
+          kind: "chainOfThought",
+          signature: {
+            inputs: [{ name: "text" }],
+            outputs: [{ name: "label", type: "string" }],
+          },
+          reasoningField: "thoughts",
+        },
+        inputs: request.inputs,
+      },
+      async (hostRequest: PredictHostRequest): Promise<PredictModelResult> => {
+        typedCotRequests.push(hostRequest);
+        return { text: '{"thoughts":"matched","label":"positive"}' };
+      },
+    );
+    const typedFormat = typedCotRequests[0].response_format;
+    assert.ok(typedFormat);
+    assert.equal(typedFormat.strict, true);
+    const typedProperties = typedFormat.schema.properties as JSONObject;
+    assert.deepEqual(Object.keys(typedProperties), ["thoughts", "label"]);
+    assert.deepEqual(typedProperties.thoughts, {
+      type: "string",
+      description: "brief reasoning for the answer",
+    });
 
     const cotCompiled = await gepago.compile(
       {
@@ -221,7 +251,11 @@ test("loads generated Go WASM and exposes deterministic APIs", async () => {
     );
     assert.equal(repairRequests.length, 2);
     assert.equal(repairRequests[1].attempt, 2);
-    assert.match(repairRequests[1].prompt, /Invalid output/);
+    assert.match(
+      repairRequests[1].prompt,
+      /Your previous reply was not a valid JSON object/,
+    );
+    assert.ok(repairRequests[1].prompt.startsWith(repairRequests[0].prompt));
     assert.deepEqual(repaired, {
       prediction: { label: "repaired" },
       usage: { prompt_tokens: 4, completion_tokens: 3, total_tokens: 7 },

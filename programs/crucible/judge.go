@@ -98,16 +98,13 @@ func (e PairwiseJudgeEvaluator) Compare(ctx context.Context, input PairwiseInput
 	return response, nil
 }
 
-// judgeReplyError returns the call's error, or gepa.ErrOutputTruncated for a reply cut at the
-// token limit, which must not be scored.
+// judgeReplyError returns the call's error, or the gepa.FinishReasonError of a reply cut at the
+// token limit or refused under a content policy, which must not be scored.
 func judgeReplyError(generation gepa.Generation, err error) error {
 	if err != nil {
 		return err
 	}
-	if generation.FinishReason == gepa.FinishLength {
-		return fmt.Errorf("%w: judge reply", gepa.ErrOutputTruncated)
-	}
-	return nil
+	return gepa.FinishReasonError(generation, "judge reply")
 }
 
 func pairwisePresentation(input PairwiseInput) (PairwiseInput, bool) {

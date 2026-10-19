@@ -9,6 +9,7 @@ import (
 	"io"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -67,17 +68,55 @@ func DecodeDemos(text string) ([]Demo, error) {
 // zero instead of stopping optimisation.
 var ErrOutputTruncated = fmt.Errorf("%w: reply truncated at the output token limit", ErrInvalidOutput)
 
+// ErrContentFiltered marks a model reply that a content policy withheld or that the model
+// refused (FinishContentFilter). Like ErrOutputTruncated it matches ErrInvalidOutput, and the
+// reply is never sent for repair.
+var ErrContentFiltered = fmt.Errorf("%w: reply withheld or refused under a content policy", ErrInvalidOutput)
+
+// FinishReasonError returns the error for a reply that a model consumer must not use: one that
+// matches ErrOutputTruncated when it stopped at the output token limit, and one that matches
+// ErrContentFiltered and quotes the refusal when a content policy withheld or refused it. It
+// returns nil for any other finish reason. subject names the reply, such as "judge reply".
+func FinishReasonError(generation Generation, subject string) error {
+	switch generation.FinishReason {
+	case FinishLength:
+		return fmt.Errorf(
+			"%w: %s, %d completion tokens",
+			ErrOutputTruncated,
+			subject,
+			generation.Usage.CompletionTokens,
+		)
+	case FinishContentFilter:
+		return fmt.Errorf("%w: %s: %s", ErrContentFiltered, subject, refusalText(generation.Text))
+	}
+	return nil
+}
+
+// refusalText quotes a refusal for an error message, shortened to 200 characters.
+func refusalText(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "no reply text"
+	}
+	if runes := []rune(text); len(runes) > 200 {
+		text = string(runes[:200]) + "..."
+	}
+	return strconv.Quote(text)
+}
+
 // Predict is a prompt-backed programme: signature + instruction + model call + JSON parsing.
 // It records the usage of every model call, repair calls and failed calls included, into the
-// context's UsageCollector. A reply that stops at the token limit fails with ErrOutputTruncated
-// and is not sent for repair.
+// context's UsageCollector. A reply that stops at the token limit fails with ErrOutputTruncated,
+// and one a content policy withheld or refused fails with ErrContentFiltered; neither is sent
+// for repair.
 //
 // When LM (or RepairLM, for repairs) is a StructuredGenerator, Predict passes it the
 // signature's ResponseFormat; otherwise it sends the prompt alone. Either way it checks the
 // reply with ParseOutput before returning: each output not marked Optional must be present and
 // not null, an output with a Type must hold a value of that type, and the reply must have no
 // other fields. When MaxParseRetries is above zero, a reply that fails to parse or fails the
-// check is sent for repair up to MaxParseRetries times, with the error and the JSON schema.
+// check is sent for repair up to MaxParseRetries times, with the original request, the error
+// and the JSON schema (see RepairPrompt).
 type Predict struct {
 	Signature       Signature
 	LM              Generator
@@ -145,23 +184,18 @@ func (p Predict) run(
 	if err != nil {
 		return nil, err
 	}
-	return p.parseOrRepair(ctx, raw, format, check)
+	return p.parseOrRepair(ctx, prompt, raw, format, check)
 }
 
-// generate makes one model call, records its usage and rejects a truncated reply.
+// generate makes one model call, records its usage and rejects a truncated or refused reply.
 func (p Predict) generate(ctx context.Context, lm Generator, prompt string, format ResponseFormat) (string, error) {
 	generation, err := GenerateWithFormat(ctx, lm, prompt, format)
 	RecordUsage(ctx, generation.Usage)
 	if err != nil {
 		return "", err
 	}
-	if generation.FinishReason == FinishLength {
-		return "", fmt.Errorf(
-			"%w: signature %q, %d completion tokens",
-			ErrOutputTruncated,
-			p.Signature.Name,
-			generation.Usage.CompletionTokens,
-		)
+	if err := FinishReasonError(generation, fmt.Sprintf("signature %q", p.Signature.Name)); err != nil {
+		return "", err
 	}
 	return generation.Text, nil
 }
@@ -210,6 +244,7 @@ func schemaInstruction(schema json.RawMessage) string {
 
 func (p Predict) parseOrRepair(
 	ctx context.Context,
+	prompt string,
 	raw string,
 	format ResponseFormat,
 	check func(Prediction) error,
@@ -223,7 +258,7 @@ func (p Predict) parseOrRepair(
 		repairLM = p.LM
 	}
 	for attempt := 0; attempt < p.MaxParseRetries; attempt++ {
-		repaired, repairErr := p.generate(ctx, repairLM, p.RepairPrompt(raw, err), format)
+		repaired, repairErr := p.generate(ctx, repairLM, p.RepairPrompt(prompt, raw, err), format)
 		if repairErr != nil {
 			return nil, repairErr
 		}
@@ -263,22 +298,29 @@ func (p Predict) ParseOutput(raw string) (Prediction, error) {
 	return prediction, p.Signature.checkOutputs(prediction)
 }
 
-// RepairPrompt renders the prompt used to ask a language model to repair an output that
-// ParseOutput rejected, with the error, the expected fields and the signature's JSON schema.
-// It is exported so resumable integrations can preserve Predict's repair protocol without
-// duplicating its formatting.
-func (p Predict) RepairPrompt(raw string, outputErr error) string {
-	parts := []string{
-		"The model output is not a valid JSON object for this signature.",
-		"Return only a valid JSON object with these output fields: " + strings.Join(
-			p.Signature.OutputNames(),
-			", ",
-		) + ".",
+// RepairPrompt renders the prompt that asks a language model to repair an output ParseOutput
+// rejected. It repeats prompt, the original request, so the repair model answers from the
+// task, instruction and inputs instead of inventing missing values; then it gives the rejected
+// output, the error, the expected fields and the signature's JSON schema (unless prompt already
+// carries it). It is exported so resumable integrations can preserve Predict's repair protocol
+// without duplicating its formatting.
+func (p Predict) RepairPrompt(prompt, raw string, outputErr error) string {
+	var parts []string
+	if prompt = strings.TrimSpace(prompt); prompt != "" {
+		parts = append(parts, prompt)
 	}
+	parts = append(
+		parts,
+		"Your previous reply was not a valid JSON object for this signature:\n```\n"+raw+"\n```",
+		"Error: "+outputErr.Error(),
+		"Answer the request above again, using its inputs. Return only a valid JSON object with these output fields: "+
+			strings.Join(p.Signature.OutputNames(), ", ")+".",
+	)
 	if schema, err := p.Signature.JSONSchema(); err == nil {
-		parts = append(parts, schemaInstruction(schema))
+		if instruction := schemaInstruction(schema); !strings.Contains(prompt, instruction) {
+			parts = append(parts, instruction)
+		}
 	}
-	parts = append(parts, "Error: "+outputErr.Error(), "Invalid output:\n```\n"+raw+"\n```")
 	return strings.Join(parts, "\n\n")
 }
 

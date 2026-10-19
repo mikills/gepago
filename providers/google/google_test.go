@@ -218,6 +218,7 @@ func TestGenerateFinishReasons(t *testing.T) {
 		{reason: "MAX_TOKENS", text: "", want: gepa.FinishLength},
 		{reason: "MAX_TOKENS", text: `{"cut`, want: gepa.FinishLength},
 		{reason: "SAFETY", text: "partial", want: gepa.FinishContentFilter},
+		{reason: "SAFETY", text: "", want: gepa.FinishContentFilter},
 		{reason: "RECITATION", text: "partial", want: gepa.FinishContentFilter},
 		{reason: "PROHIBITED_CONTENT", text: "partial", want: gepa.FinishContentFilter},
 		{reason: "OTHER", text: "ok", want: ""},

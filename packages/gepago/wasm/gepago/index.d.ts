@@ -482,14 +482,20 @@ export interface CompileModelRequest {
   role: CompileModelRole;
   prompt: string;
   attempt?: number;
+  /**
+   * The JSON schema a structured reply must match, on task and repair requests. A model with
+   * structured output should enforce it when strict is true; the prompt asks for the same shape.
+   */
+  response_format?: JSONSchemaResponseFormat;
 }
 
 export interface CompileModelResult {
   text: string;
   usage?: Usage;
   /**
-   * Why the model stopped; "length" marks a truncated reply that is not repaired. Omit it,
-   * or pass null or "", when the provider does not report one.
+   * Why the model stopped; "length" marks a truncated reply and "content_filter" a refused
+   * one, neither of which is repaired. Omit it, or pass null or "", when the provider does not
+   * report one.
    */
   finishReason?: FinishReason | "" | null;
   /** The model the provider resolved the request to. */
@@ -507,6 +513,11 @@ export interface PredictHostRequest {
   role: "task";
   prompt: string;
   attempt: number;
+  /**
+   * The JSON schema the reply must match. A model with structured output should enforce it
+   * when strict is true; the prompt asks for the same shape.
+   */
+  response_format?: JSONSchemaResponseFormat;
 }
 
 export interface Usage {
@@ -527,8 +538,8 @@ export interface PredictModelResult {
   text: string;
   usage?: PredictModelUsage;
   /**
-   * Why the model stopped; "length" fails the prediction without a repair request. Omit it,
-   * or pass null or "", when the provider does not report one.
+   * Why the model stopped; "length" and "content_filter" fail the prediction without a repair
+   * request. Omit it, or pass null or "", when the provider does not report one.
    */
   finishReason?: FinishReason | "" | null;
   /** The model the provider resolved the request to. */

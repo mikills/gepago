@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 )
 
 // TypedPredict is a Predict whose inputs and outputs are Go values. Out must be a struct: the
@@ -16,7 +17,8 @@ import (
 // (the reply may set it to null). Signature.Outputs must be left empty.
 //
 // The signature's inputs are Signature.Inputs when given; otherwise In must be a struct and the
-// inputs are its JSON fields. An In value is encoded to JSON to make the prompt's inputs.
+// inputs are its JSON fields. Given inputs must name exactly In's JSON fields when In is a
+// struct. An In value is encoded to JSON to make the prompt's inputs.
 //
 // The reply is decoded into Out with the strict rules Key.Get uses: unknown fields, fields that
 // match only by case, missing fields not tagged omitempty or omitzero, nulls in non-nullable
@@ -25,8 +27,8 @@ import (
 // MaxParseRetries is above zero, goes through Predict's repair loop like any other invalid
 // reply.
 //
-// TypedPredict implements Program, so Compile can optimise it and NewProgramStep can run it as
-// a pipeline step that reads In's fields and writes Out's.
+// TypedPredict implements Program and SignatureProgram, so Compile can optimise it and
+// NewProgramStep can run it as a pipeline step that reads In's fields and writes Out's.
 type TypedPredict[In, Out any] struct {
 	// Signature names and describes the task, and may list the inputs; see TypedPredict.
 	Signature       Signature
@@ -68,8 +70,11 @@ func (p TypedPredict[In, Out]) RunTyped(ctx context.Context, candidate Candidate
 }
 
 // RunCandidate implements Program. It decodes inputs into In with Key.Get's strict rules, runs
-// the programme, and returns the decoded Out encoded as a Prediction. A reply that fails the
-// output checks is returned as the model gave it, together with the error.
+// the programme, and returns every output of the decoded Out under its JSON name, each as the
+// Go value of its field (so a pipeline step stores it without conversion): a field the reply
+// left null or out holds its zero value, such as a nil pointer, rather than being dropped. A
+// reply that fails the output checks is returned as the model gave it, together with the
+// error.
 func (p TypedPredict[In, Out]) RunCandidate(
 	ctx context.Context,
 	candidate Candidate,
@@ -87,11 +92,60 @@ func (p TypedPredict[In, Out]) RunCandidate(
 	if err != nil {
 		return reply, err
 	}
-	outputs, err := encodePrediction(out)
+	return typedOutputs(out, reply), nil
+}
+
+// ProgramSignature implements SignatureProgram: the derived signature, the Go type of each of
+// In's fields when In is a struct, and the Go type of each of Out's fields.
+func (p TypedPredict[In, Out]) ProgramSignature() (ProgramSignature, error) {
+	predict, err := p.predict()
 	if err != nil {
-		return nil, fmt.Errorf("typed predict outputs: %w", err)
+		return ProgramSignature{}, err
 	}
-	return outputs, nil
+	signature := ProgramSignature{Signature: predict.Signature, OutputTypes: fieldTypesOf(reflect.TypeFor[Out]())}
+	if in := reflect.TypeFor[In](); structType(in) {
+		signature.InputTypes = fieldTypesOf(in)
+	}
+	return signature, nil
+}
+
+// typedOutputs returns every JSON field of out by name, as the Go value of its field. A field
+// behind a nil embedded pointer is its type's zero value; a field reflection cannot read, inside
+// an unexported embedded struct, is decoded from the reply instead.
+func typedOutputs(out any, reply Prediction) Prediction {
+	value := reflect.ValueOf(out)
+	fields := jsonFields(value.Type())
+	outputs := make(Prediction, len(fields))
+	for name, field := range fields {
+		fieldValue, err := value.FieldByIndexErr(field.index)
+		switch {
+		case err != nil:
+			outputs[name] = reflect.Zero(field.typ).Interface()
+		case fieldValue.CanInterface():
+			outputs[name] = fieldValue.Interface()
+		default:
+			decoded, err := convertStateValue(name, field.typ, reply[name])
+			if err != nil {
+				decoded = reflect.Zero(field.typ).Interface()
+			}
+			outputs[name] = decoded
+		}
+	}
+	return outputs
+}
+
+func fieldTypesOf(typ reflect.Type) map[string]reflect.Type {
+	fields := jsonFields(typ)
+	types := make(map[string]reflect.Type, len(fields))
+	for name, field := range fields {
+		types[name] = field.typ
+	}
+	return types
+}
+
+// structType reports whether typ is a struct whose JSON fields describe its JSON form.
+func structType(typ reflect.Type) bool {
+	return typ.Kind() == reflect.Struct && !customJSON(typ)
 }
 
 // run executes the derived Predict and decodes its reply into Out inside the repair loop.
@@ -143,19 +197,33 @@ func typedSignature(base Signature, in, out reflect.Type) (Signature, error) {
 		return Signature{}, fmt.Errorf("typed predict outputs: %w", err)
 	}
 	signature.Outputs = outputs
-	if len(base.Inputs) == 0 {
-		inputs, err := structFields(in, false)
-		if err != nil {
-			return Signature{}, fmt.Errorf("typed predict inputs: %w", err)
-		}
-		signature.Inputs = inputs
+	if len(base.Inputs) > 0 {
+		return signature, checkGivenInputs(base.Inputs, in)
 	}
+	inputs, err := structFields(in, false)
+	if err != nil {
+		return Signature{}, fmt.Errorf("typed predict inputs: %w", err)
+	}
+	signature.Inputs = inputs
 	return signature, nil
+}
+
+// checkGivenInputs checks that inputs given for a struct In name exactly its JSON fields.
+func checkGivenInputs(inputs []Field, in reflect.Type) error {
+	if !structType(in) {
+		return nil
+	}
+	want := jsonFieldOrder(jsonFields(in))
+	given := fieldNames(inputs)
+	if slices.Equal(slices.Sorted(slices.Values(given)), slices.Sorted(slices.Values(want))) {
+		return nil
+	}
+	return fmt.Errorf("typed predict inputs %q do not match the JSON fields %q of %s", given, want, in)
 }
 
 // structFields lists the JSON fields of a struct type as signature fields.
 func structFields(typ reflect.Type, outputs bool) ([]Field, error) {
-	if typ.Kind() != reflect.Struct || customJSON(typ) {
+	if !structType(typ) {
 		return nil, fmt.Errorf("%s must be a struct without its own UnmarshalJSON or UnmarshalText", typ)
 	}
 	builder := newSchemaBuilder()

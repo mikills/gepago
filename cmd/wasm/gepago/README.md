@@ -30,8 +30,12 @@ immediately. `onComplete(job_id, resultJSON)` is called later, where
 shape `{text, usage?}`, or a Promise of either. Requests have this shape:
 
 ```json
-{"kind":"language_model.generate","role":"task","prompt":"...","attempt":1}
+{"kind":"language_model.generate","role":"task","prompt":"...","attempt":1,
+ "response_format":{"name":"sentiment","schema":{"type":"object"},"strict":true}}
 ```
+
+`response_format` is present on `task` and `repair` requests; a host with
+structured output should constrain the reply to `schema` when `strict` is true.
 
 `role` is `task`, `reflector`, `judge`, or `repair`. The host model is used for
 all four roles; the role lets the host route them independently. Token usage

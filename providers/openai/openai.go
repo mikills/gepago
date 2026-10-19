@@ -84,15 +84,16 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 // finish reason. Failures are classified: 429, 5xx, dropped connections and network
 // timeouts are transient; other 4xx and TLS, host or URL misconfiguration are permanent; a
 // cancelled or expired ctx returns ctx.Err() unwrapped. A reply that fails after the API
-// reported usage returns that usage with the error. An empty reply is an error unless it
-// stopped at the token limit.
+// reported usage returns that usage with the error. A refusal is not an error: it returns the
+// refusal as the text with FinishContentFilter. An empty reply is an error unless it stopped at
+// the token limit or under a content policy.
 func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Generation, error) {
 	return m.complete(ctx, m.params(prompt))
 }
 
 // GenerateStructured is Generate with a response format, making LanguageModel a
 // gepa.StructuredGenerator. A strict format is sent as a json_schema response_format with
-// strict true, so the reply is JSON matching the schema; a refusal is an error naming it. A
+// strict true, so the reply is JSON matching the schema or a refusal, as Generate reports it. A
 // format that is not strict is not enforced: the prompt is sent alone, as Generate does, so
 // models and OpenAI-compatible endpoints without structured outputs keep working with untyped
 // signatures. To keep the prompt-only path for typed signatures too, pass
@@ -157,13 +158,19 @@ func (m *LanguageModel) complete(ctx context.Context, params openai.ChatCompleti
 	generation.Text = choice.Message.Content
 	generation.FinishReason = openAIFinishReason(choice.FinishReason)
 	if refusal := strings.TrimSpace(choice.Message.Refusal); refusal != "" && strings.TrimSpace(generation.Text) == "" {
+		generation.Text = refusal
 		generation.FinishReason = gepa.FinishContentFilter
-		return generation, fmt.Errorf("openai reflection completion: model refused: %s", refusal)
 	}
-	if strings.TrimSpace(generation.Text) == "" && generation.FinishReason != gepa.FinishLength {
+	if strings.TrimSpace(generation.Text) == "" && !stoppedEarly(generation.FinishReason) {
 		return generation, errors.New("openai reflection completion: empty content")
 	}
 	return generation, nil
+}
+
+// stoppedEarly reports a finish reason under which an empty reply is expected: the token limit
+// or a content policy.
+func stoppedEarly(reason gepa.FinishReason) bool {
+	return reason == gepa.FinishLength || reason == gepa.FinishContentFilter
 }
 
 func classifyError(ctx context.Context, err error) error {

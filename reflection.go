@@ -28,8 +28,9 @@ type LessonAwareProposer interface {
 
 // ReflectiveProposer asks a language model to improve candidate components from feedback records.
 // LastUsage and LastModelCalls report the usage and number of model calls of the most recent
-// Propose, failed calls included. A reply cut at the token limit fails with ErrOutputTruncated
-// rather than becoming a candidate.
+// Propose, failed calls included. A reply cut at the token limit fails with ErrOutputTruncated,
+// and one withheld or refused under a content policy with ErrContentFiltered, rather than
+// becoming a candidate.
 type ReflectiveProposer struct {
 	LM              Generator
 	Objective       string
@@ -68,8 +69,8 @@ func (p *ReflectiveProposer) Propose(
 		if err != nil {
 			return nil, err
 		}
-		if generation.FinishReason == FinishLength {
-			return nil, fmt.Errorf("%w: reflection reply for %q", ErrOutputTruncated, component)
+		if err := FinishReasonError(generation, fmt.Sprintf("reflection reply for %q", component)); err != nil {
+			return nil, err
 		}
 		raw := generation.Text
 		parsed := ParseComponentReplacement(raw, component)
@@ -209,7 +210,8 @@ func ExtractFencedText(raw string) string {
 
 // LLMMergeProposer asks a language model to merge two candidate records. LastUsage and
 // LastModelCalls report the usage and number of model calls of the most recent ProposeMerge,
-// failed calls included. A reply cut at the token limit fails with ErrOutputTruncated.
+// failed calls included. A reply cut at the token limit fails with ErrOutputTruncated, and one
+// withheld or refused under a content policy with ErrContentFiltered.
 type LLMMergeProposer struct {
 	LM        Generator
 	Objective string
@@ -256,8 +258,8 @@ func (p *LLMMergeProposer) ProposeMerge(
 	if err != nil {
 		return nil, err
 	}
-	if generation.FinishReason == FinishLength {
-		return nil, fmt.Errorf("%w: merge reply", ErrOutputTruncated)
+	if err := FinishReasonError(generation, "merge reply"); err != nil {
+		return nil, err
 	}
 	raw := generation.Text
 	parsed := ExtractFencedText(raw)

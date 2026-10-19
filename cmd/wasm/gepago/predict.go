@@ -83,11 +83,12 @@ type predictCancelRequest struct {
 }
 
 type predictHostRequest struct {
-	RequestID string `json:"request_id"`
-	Kind      string `json:"kind"`
-	Role      string `json:"role"`
-	Prompt    string `json:"prompt"`
-	Attempt   int    `json:"attempt"`
+	RequestID      string              `json:"request_id"`
+	Kind           string              `json:"kind"`
+	Role           string              `json:"role"`
+	Prompt         string              `json:"prompt"`
+	Attempt        int                 `json:"attempt"`
+	ResponseFormat *hostResponseFormat `json:"response_format,omitempty"`
 }
 
 type predictPendingResponse struct {
@@ -108,6 +109,8 @@ type predictCompleteResponse struct {
 
 type predictJob struct {
 	signature       gepa.Signature
+	prompt          string
+	format          *hostResponseFormat
 	maxParseRetries int
 	parseRetries    int
 	usage           gepa.Usage
@@ -150,20 +153,27 @@ func predictStartOperation(payloadJSON string) (predictPendingResponse, error) {
 	if err != nil {
 		return predictPendingResponse{}, fmt.Errorf("predict.start prompt: %w", err)
 	}
+	format, err := program.Signature.ResponseFormat()
+	if err != nil {
+		return predictPendingResponse{}, fmt.Errorf("predict.start response format: %w", err)
+	}
 
 	predictState.Lock()
 	defer predictState.Unlock()
 	jobID := nextPredictID("job", &predictState.nextJobID)
 	requestID := nextPredictID("request", &predictState.nextRequestID)
 	pending := predictHostRequest{
-		RequestID: requestID,
-		Kind:      "language_model.generate",
-		Role:      "task",
-		Prompt:    prompt,
-		Attempt:   1,
+		RequestID:      requestID,
+		Kind:           "language_model.generate",
+		Role:           "task",
+		Prompt:         prompt,
+		Attempt:        1,
+		ResponseFormat: newHostResponseFormat(format),
 	}
 	predictState.jobs[jobID] = &predictJob{
 		signature:       program.Signature,
+		prompt:          prompt,
+		format:          pending.ResponseFormat,
 		maxParseRetries: program.MaxParseRetries,
 		pending:         pending,
 	}
@@ -223,10 +233,20 @@ func transitionPredictResume(request predictResumeRequest) (any, error) {
 		return nil, err
 	}
 	addPredictUsage(job, request.Result.Usage)
-	if request.Result.FinishReason != nil && gepa.FinishReason(*request.Result.FinishReason) == gepa.FinishLength {
-		// as in gepa.Predict, a reply cut at the token limit is not sent for repair.
-		delete(predictState.jobs, request.JobID)
-		return nil, fmt.Errorf("predict job %q: %w", request.JobID, gepa.ErrOutputTruncated)
+	if request.Result.FinishReason != nil {
+		// as in gepa.Predict, a reply cut at the token limit or refused under a content policy
+		// is not sent for repair.
+		generation := gepa.Generation{
+			Text:         *request.Result.Text,
+			FinishReason: gepa.FinishReason(*request.Result.FinishReason),
+		}
+		if request.Result.Usage != nil {
+			generation.Usage = *request.Result.Usage
+		}
+		if err := gepa.FinishReasonError(generation, fmt.Sprintf("signature %q", job.signature.Name)); err != nil {
+			delete(predictState.jobs, request.JobID)
+			return nil, fmt.Errorf("predict job %q: %w", request.JobID, err)
+		}
 	}
 
 	raw := *request.Result.Text
@@ -294,11 +314,12 @@ func queuePredictRepair(jobID string, job *predictJob, raw string, parseErr erro
 	job.parseRetries++
 	program := gepa.Predict{Signature: job.signature}
 	job.pending = predictHostRequest{
-		RequestID: nextPredictID("request", &predictState.nextRequestID),
-		Kind:      "language_model.generate",
-		Role:      "task",
-		Prompt:    program.RepairPrompt(raw, parseErr),
-		Attempt:   job.parseRetries + 1,
+		RequestID:      nextPredictID("request", &predictState.nextRequestID),
+		Kind:           "language_model.generate",
+		Role:           "task",
+		Prompt:         program.RepairPrompt(job.prompt, raw, parseErr),
+		Attempt:        job.parseRetries + 1,
+		ResponseFormat: job.format,
 	}
 	return predictPendingResponse{Status: "pending", JobID: jobID, HostRequest: job.pending}
 }

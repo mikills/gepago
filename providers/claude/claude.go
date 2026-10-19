@@ -84,8 +84,9 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 // finish reason. Failures are classified: 429, 5xx (529 overloaded included), dropped
 // connections and network timeouts are transient; other 4xx and TLS, host or URL
 // misconfiguration are permanent; a cancelled or expired ctx returns ctx.Err() unwrapped. A
-// reply that fails after the API reported usage returns that usage with the error. A reply
-// with no text is an error unless it stopped at the token limit.
+// reply that fails after the API reported usage returns that usage with the error. A refusal
+// is not an error: it returns the refusal text with FinishContentFilter. A reply with no text
+// is an error unless it stopped at the token limit or under a content policy.
 func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Generation, error) {
 	return m.complete(ctx, m.params(prompt))
 }
@@ -157,7 +158,8 @@ func (m *LanguageModel) complete(ctx context.Context, params anthropic.MessageNe
 		Model:        string(message.Model),
 		FinishReason: claudeFinishReason(message.StopReason),
 	}
-	if generation.Text == "" && generation.FinishReason != gepa.FinishLength {
+	if generation.Text == "" && generation.FinishReason != gepa.FinishLength &&
+		generation.FinishReason != gepa.FinishContentFilter {
 		return generation, errors.New("claude reflection completion: no text returned")
 	}
 	return generation, nil

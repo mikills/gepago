@@ -11,7 +11,8 @@ import (
 // LLMJudgeMetric uses a language model and rubric to score semantic prediction quality. It
 // records the usage of every judge call, repair calls and failed calls included, into the
 // context's UsageCollector. A judge reply cut at the token limit fails with
-// ErrOutputTruncated rather than being scored or repaired.
+// ErrOutputTruncated, and one withheld or refused under a content policy with
+// ErrContentFiltered, rather than being scored or repaired.
 type LLMJudgeMetric struct {
 	LM         Generator
 	Rubric     string
@@ -61,15 +62,15 @@ func (m LLMJudgeMetric) Score(ctx context.Context, expected Prediction, actual P
 	}, nil
 }
 
-// generate makes one judge call, records its usage and rejects a truncated reply.
+// generate makes one judge call, records its usage and rejects a truncated or refused reply.
 func (m LLMJudgeMetric) generate(ctx context.Context, prompt string) (string, error) {
 	generation, err := m.LM.Generate(ctx, prompt)
 	RecordUsage(ctx, generation.Usage)
 	if err != nil {
 		return "", err
 	}
-	if generation.FinishReason == FinishLength {
-		return "", fmt.Errorf("%w: judge reply", ErrOutputTruncated)
+	if err := FinishReasonError(generation, "judge reply"); err != nil {
+		return "", err
 	}
 	return generation.Text, nil
 }

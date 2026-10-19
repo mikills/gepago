@@ -119,6 +119,128 @@ test("OpenAI model callback keeps credentials out of the request payload", async
   assert.equal(seen.body.max_tokens, 64);
 });
 
+test("OpenAI and Claude model callbacks enforce a strict response format", async () => {
+  const schema = {
+    type: "object",
+    properties: { label: { type: "string" } },
+    required: ["label"],
+    additionalProperties: false,
+  };
+  const strict = {
+    ...modelRequest("classify"),
+    response_format: { name: "sentiment", schema, strict: true },
+  };
+  const loose = {
+    ...modelRequest("classify"),
+    response_format: {
+      name: "sentiment",
+      schema: { type: "object" },
+      strict: false,
+    },
+  };
+  const bodies: JSONObject[] = [];
+  const openAIFetch = fakeFetch<JSONObject>((_url, _init, body) => {
+    bodies.push(body);
+    return jsonResponse({
+      choices: [
+        {
+          message: { role: "assistant", content: '{"label":"yes"}' },
+          finish_reason: "stop",
+        },
+      ],
+    });
+  });
+  const openAI = createOpenAIModel({
+    apiKey: "k",
+    model: "m",
+    fetch: openAIFetch,
+  }) as PredictModel;
+  await openAI(strict);
+  await openAI(loose);
+  assert.deepEqual(bodies[0]?.response_format, {
+    type: "json_schema",
+    json_schema: { name: "sentiment", schema, strict: true },
+  });
+  assert.equal(
+    "response_format" in (bodies[1] ?? {}),
+    false,
+    "a loose format is not enforced",
+  );
+
+  bodies.length = 0;
+  const claudeFetch = fakeFetch<JSONObject>((_url, _init, body) => {
+    bodies.push(body);
+    return jsonResponse({
+      content: [{ type: "text", text: '{"label":"yes"}' }],
+      stop_reason: "end_turn",
+    });
+  });
+  const claude = createClaudeModel({
+    apiKey: "k",
+    model: "m",
+    fetch: claudeFetch,
+  }) as PredictModel;
+  await claude(strict);
+  await claude(loose);
+  assert.deepEqual(bodies[0]?.output_config, {
+    format: { type: "json_schema", schema },
+  });
+  assert.equal(
+    "output_config" in (bodies[1] ?? {}),
+    false,
+    "Claude has no loose schema mode",
+  );
+
+  bodies.length = 0;
+  const googleFetch = fakeFetch<JSONObject>((_url, _init, body) => {
+    bodies.push(body);
+    return jsonResponse({
+      candidates: [
+        {
+          content: { parts: [{ text: '{"label":"yes"}' }] },
+          finishReason: "STOP",
+        },
+      ],
+    });
+  });
+  const google = createGoogleModel({
+    apiKey: "k",
+    model: "m",
+    fetch: googleFetch,
+  }) as PredictModel;
+  await google(strict);
+  assert.equal(
+    "responseSchema" in
+      ((bodies[0]?.generationConfig as JSONObject | undefined) ?? {}),
+    false,
+    "Gemini model callbacks keep the prompt-only path, as the Go provider does",
+  );
+});
+
+test("OpenAI refusals are content-filtered replies", async () => {
+  const model = createOpenAIModel({
+    apiKey: "k",
+    model: "m",
+    fetch: fakeFetch(() =>
+      jsonResponse({
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: null,
+              refusal: "I can't help with that.",
+            },
+            finish_reason: "stop",
+          },
+        ],
+      }),
+    ),
+  }) as PredictModel;
+  const result = (await model(modelRequest("classify"))) as PredictModelResult;
+  assert.equal(result.text, "I can't help with that.");
+  assert.equal(result.finishReason, "content_filter");
+});
+
 test("model callbacks report normalised finish reasons", async () => {
   const cases: Array<{
     create: (fetch: ProviderFetch) => PredictModel;
@@ -129,9 +251,7 @@ test("model callbacks report normalised finish reasons", async () => {
       create: (fetch) =>
         createOpenAIModel({ apiKey: "k", model: "m", fetch }) as PredictModel,
       body: {
-        choices: [
-          { message: { content: '{"cut' }, finish_reason: "length" },
-        ],
+        choices: [{ message: { content: '{"cut' }, finish_reason: "length" }],
       },
       want: "length",
     },

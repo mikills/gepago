@@ -417,3 +417,71 @@ func TestCompileTreatsTruncatedHostRepliesAsInvalidOutput(t *testing.T) {
 		t.Fatalf("ledger = %+v, want the truncated call's usage", value.State.Ledger)
 	}
 }
+
+func TestCompileLanguageModelPassesTheResponseFormatToTheHost(t *testing.T) {
+	var requests []compileModelRequest
+	model := newCompileLanguageModel(compileModelInvokerFunc(
+		func(_ context.Context, request compileModelRequest) (compileModelResult, error) {
+			requests = append(requests, request)
+			return compileModelResult{Text: `{"label":"positive"}`}, nil
+		},
+	), "task")
+	var _ gepa.StructuredGenerator = model
+	format := gepa.ResponseFormat{Name: "sentiment", Schema: []byte(`{"type":"object"}`), Strict: true}
+
+	if _, err := model.GenerateStructured(context.Background(), "prompt", format); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := model.Generate(context.Background(), "prompt"); err != nil {
+		t.Fatal(err)
+	}
+
+	want := hostResponseFormat{Name: "sentiment", Schema: format.Schema, Strict: true}
+	if got := requests[0].ResponseFormat; got == nil || got.Name != want.Name ||
+		string(got.Schema) != string(want.Schema) ||
+		!got.Strict {
+		t.Fatalf("structured request response_format = %+v, want %+v", got, want)
+	}
+	if requests[1].ResponseFormat != nil {
+		t.Fatalf("plain request response_format = %+v, want none", requests[1].ResponseFormat)
+	}
+	encoded := mustJSON(t, requests[0])
+	if !strings.Contains(encoded, `"response_format":{"name":"sentiment","schema":{"type":"object"},"strict":true}`) {
+		t.Fatalf("encoded request = %s", encoded)
+	}
+	if strings.Contains(mustJSON(t, requests[1]), "response_format") {
+		t.Fatalf("plain request carries a response format: %s", mustJSON(t, requests[1]))
+	}
+}
+
+func TestCompileSendsTheResponseFormatOnTaskRequests(t *testing.T) {
+	var requests []compileModelRequest
+	invoker := compileModelInvokerFunc(
+		func(_ context.Context, request compileModelRequest) (compileModelResult, error) {
+			requests = append(requests, request)
+			return compileModelResult{Text: `{"label":"positive"}`}, nil
+		},
+	)
+	payload := map[string]any{
+		"program": map[string]any{
+			"signature": map[string]any{
+				"name":    "sentiment",
+				"inputs":  []map[string]any{{"name": "text"}},
+				"outputs": []map[string]any{{"name": "label", "type": "string"}},
+			},
+		},
+		"trainset": []map[string]any{{
+			"id": "one", "input": map[string]any{"text": "great"}, "expected": map[string]any{"label": "positive"},
+		}},
+		"metric":         map[string]any{"kind": "exactMatch", "fields": []string{"label"}},
+		"maxMetricCalls": 1,
+	}
+
+	if _, err := runCompileOperation(context.Background(), mustJSON(t, payload), invoker); err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) == 0 || requests[0].Role != "task" || requests[0].ResponseFormat == nil ||
+		!requests[0].ResponseFormat.Strict || requests[0].ResponseFormat.Name != "sentiment" {
+		t.Fatalf("task requests = %+v, want a strict response format", requests)
+	}
+}

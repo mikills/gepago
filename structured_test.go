@@ -184,3 +184,25 @@ func TestPredictRepairsThroughTheStructuredRepairModel(t *testing.T) {
 	require.NotNil(t, repair.calls[0].format)
 	require.Equal(t, lm.calls[0].format, repair.calls[0].format)
 }
+
+func TestPredictCountsUsageAcrossRetriesAndRepairs(t *testing.T) {
+	lm := &structuredModel{
+		replies: []string{`{"answer": "4"}`, `{"answer": "4"}`, `{"answer": "4", "confidence": 1}`},
+		errs:    []error{TransientError(errors.New("overloaded"))},
+	}
+	program := Predict{
+		Signature:       typedQASignature(),
+		LM:              &RetryingLanguageModel{LM: lm, MaxAttempts: 2},
+		MaxParseRetries: 1,
+	}
+	ctx, collector := WithUsageCollector(context.Background())
+
+	_, err := program.Run(ctx, Prediction{"question": "q"})
+
+	require.NoError(t, err)
+	require.Len(t, lm.calls, 3, "one retried call and one repair")
+	require.Equal(t, 9, collector.Usage().TotalTokens)
+	for _, call := range lm.calls {
+		require.NotNil(t, call.format, "retries and repairs keep the response format")
+	}
+}

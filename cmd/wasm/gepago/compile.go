@@ -17,10 +17,24 @@ const compileModelRequestKind = "language_model.generate"
 // The callback receives the JSON encoding of this value, rather than a Go or
 // JavaScript object, so the protocol is independent of the host wrapper.
 type compileModelRequest struct {
-	Kind    string `json:"kind"`
-	Role    string `json:"role"`
-	Prompt  string `json:"prompt"`
-	Attempt int    `json:"attempt,omitempty"`
+	Kind           string              `json:"kind"`
+	Role           string              `json:"role"`
+	Prompt         string              `json:"prompt"`
+	Attempt        int                 `json:"attempt,omitempty"`
+	ResponseFormat *hostResponseFormat `json:"response_format,omitempty"`
+}
+
+// hostResponseFormat is the wire form of a gepa.ResponseFormat in a host model request. A host
+// with structured output should constrain its reply to Schema when Strict is true, and may send
+// the prompt alone otherwise, as the Go providers do.
+type hostResponseFormat struct {
+	Name   string          `json:"name"`
+	Schema json.RawMessage `json:"schema"`
+	Strict bool            `json:"strict"`
+}
+
+func newHostResponseFormat(format gepa.ResponseFormat) *hostResponseFormat {
+	return &hostResponseFormat{Name: format.Name, Schema: format.Schema, Strict: format.Strict}
 }
 
 // compileModelResult is the normalized result returned by a host model. FinishReason and
@@ -80,6 +94,24 @@ func newCompileLanguageModel(invoker compileModelInvoker, role string) *compileL
 }
 
 func (m *compileLanguageModel) Generate(ctx context.Context, prompt string) (gepa.Generation, error) {
+	return m.generate(ctx, prompt, nil)
+}
+
+// GenerateStructured makes compileLanguageModel a gepa.StructuredGenerator: the host request
+// carries the response format, so a host with structured output can enforce it.
+func (m *compileLanguageModel) GenerateStructured(
+	ctx context.Context,
+	prompt string,
+	format gepa.ResponseFormat,
+) (gepa.Generation, error) {
+	return m.generate(ctx, prompt, newHostResponseFormat(format))
+}
+
+func (m *compileLanguageModel) generate(
+	ctx context.Context,
+	prompt string,
+	format *hostResponseFormat,
+) (gepa.Generation, error) {
 	if m == nil || m.invoker == nil {
 		return gepa.Generation{}, errors.New("compile host model is required")
 	}
@@ -93,10 +125,11 @@ func (m *compileLanguageModel) Generate(ctx context.Context, prompt string) (gep
 	m.mu.Unlock()
 
 	result, err := m.invoker.GenerateModel(ctx, compileModelRequest{
-		Kind:    compileModelRequestKind,
-		Role:    m.role,
-		Prompt:  prompt,
-		Attempt: attempt,
+		Kind:           compileModelRequestKind,
+		Role:           m.role,
+		Prompt:         prompt,
+		Attempt:        attempt,
+		ResponseFormat: format,
 	})
 	if err != nil {
 		return gepa.Generation{}, err

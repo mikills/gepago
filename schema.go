@@ -12,7 +12,7 @@ import (
 )
 
 // JSONSchemaFor returns the JSON Schema of the JSON values that Key[T].Get converts to T. It
-// follows the same field rules, so a value valid under the schema decodes without drift:
+// follows the same field rules:
 //
 //   - a struct is an object with one property per JSON field, as encoding/json finds them
 //     (json tags, embedded structs, "-"), in encoding order, with additionalProperties false;
@@ -22,8 +22,16 @@ import (
 //   - a type with its own UnmarshalJSON or UnmarshalText, an interface, and a struct that
 //     contains itself are unconstrained ({}), since their JSON form is not known;
 //   - []byte is a (base64) string, a map is an object whose additionalProperties hold the
-//     element schema, and a field with the ",string" tag option is a string;
+//     element schema, and an array [N]T has exactly N items (minItems and maxItems);
+//   - a field with the ",string" tag option is a string with a pattern for the JSON encoding
+//     of its value, such as "12" for an int or "\"bob\"" for a string;
 //   - a field's description tag becomes its property's description.
+//
+// A value Get accepts with every field present matches the schema, and a value that matches
+// the schema decodes with Get, except where the schema is unconstrained and where a number does
+// not fit its type (300 for an int8, 1e39 or 1e-50 for a float32), which Get refuses. The
+// array bounds and patterns fall outside the strict subset (see StrictJSONSchema), so
+// providers do not enforce them.
 //
 // Channels, functions, complex numbers and maps whose keys cannot come from a JSON object key
 // have no JSON form and return an error.
@@ -155,7 +163,8 @@ func (b *schemaBuilder) typeSchema(typ reflect.Type, path string) (schemaNode, b
 		return typeNode("array").with("items", items), true, err
 	case reflect.Array:
 		items, err := b.elementSchema(typ.Elem(), path+"[]")
-		return typeNode("array").with("items", items), false, err
+		node := typeNode("array").with("items", items).with("minItems", typ.Len()).with("maxItems", typ.Len())
+		return node, false, err
 	case reflect.Map:
 		if !jsonMapKey(typ.Key()) {
 			return nil, false, fmt.Errorf(
@@ -231,12 +240,32 @@ func (b *schemaBuilder) fieldSchema(field jsonField, path string) (schemaNode, b
 		return nil, false, err
 	}
 	if field.quoted && quotable(field.typ) {
-		node = typeNode("string")
+		node = quotedSchema(field.typ)
 	}
 	if field.description != "" {
 		node = node.with("description", field.description)
 	}
 	return node, nullable, nil
+}
+
+// quotedSchema is the schema of a field with the ",string" option: a string that holds the JSON
+// encoding of the value, as encoding/json requires.
+func quotedSchema(typ reflect.Type) schemaNode {
+	if typ.Name() == "" && typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	pattern := `^-?(0|[1-9][0-9]*)$`
+	switch typ.Kind() {
+	case reflect.Bool:
+		pattern = `^(true|false)$`
+	case reflect.String:
+		pattern = `^"([^"\\]|\\.)*"$`
+	case reflect.Float32, reflect.Float64:
+		pattern = `^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$`
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		pattern = `^(0|[1-9][0-9]*)$`
+	}
+	return typeNode("string").with("pattern", pattern)
 }
 
 // quotable reports whether encoding/json applies the ",string" option to a field of typ: a
@@ -423,17 +452,55 @@ var strictKeywords = map[string]bool{
 	"anyOf": true, "enum": true, "const": true, "description": true, "title": true,
 }
 
+// Limits that a strict schema must stay within for both providers. Claude: "Parameters with
+// union types: 16. Total parameters that use anyOf or type arrays (for example, "type":
+// ["string", "null"]) across all strict schemas"; exceeding it is a 400 "Schema is too complex
+// for compilation" (https://platform.claude.com/docs/en/build-with-claude/structured-outputs,
+// "Schema complexity limits"). OpenAI: "A schema may have up to 5000 object properties total,
+// with up to 10 levels of nesting", "the total string length of all property names,
+// definition names, enum values, and const values cannot exceed 120,000 characters", "up to
+// 1000 enum values across all enum properties", and a string enum with more than 250 values
+// may total at most 15,000 characters
+// (https://developers.openai.com/api/docs/guides/structured-outputs#supported-schemas).
+// Claude's limit of 24 optional parameters cannot be reached: strict objects list every
+// property as required.
+const (
+	maxStrictUnions         = 16
+	maxStrictProperties     = 5000
+	maxStrictNesting        = 10
+	maxStrictStringLength   = 120000
+	maxStrictEnumValues     = 1000
+	largeStrictEnum         = 250
+	maxLargeStrictEnumChars = 15000
+)
+
 // StrictJSONSchema reports whether schema stays within the subset of JSON Schema that both
-// OpenAI and Claude enforce in strict mode, so a provider can constrain its reply to it: every
-// schema is an object that names a type (or is an anyOf, enum or const); every object lists
-// all its properties in required and sets additionalProperties to false; every array has
-// items; and no schema uses a keyword other than type, properties, required,
-// additionalProperties, items, anyOf, enum, const, description and title. An unconstrained
-// value ({}), a map, a $ref and a numeric or string limit all fall outside it. Invalid JSON is
-// not strict.
+// OpenAI and Claude enforce in strict mode, so a provider can constrain its reply to it:
+//
+//   - the root is an object schema (not an anyOf);
+//   - every schema names valid types (a type array counts as a union), or is an anyOf of strict
+//     schemas, an enum of strings, numbers, booleans or nulls, or such a const;
+//   - every object lists each of its properties exactly once in required and sets
+//     additionalProperties to false, and every array has items;
+//   - no schema uses a keyword other than type, properties, required, additionalProperties,
+//     items, anyOf, enum, const, description and title, and descriptions and titles are strings;
+//   - the schema stays within the providers' documented limits: at most 16 unions (anyOf or
+//     type arrays), 5000 properties, 10 levels of object nesting, 1000 enum values, and 120,000
+//     characters of property names, enum and const values.
+//
+// An unconstrained value ({}), a map, a $ref and a numeric or string limit all fall outside
+// it. Invalid JSON is not strict.
 func StrictJSONSchema(schema json.RawMessage) bool {
 	node, err := decodeSchema(schema)
-	return err == nil && strictSchemaNode(node)
+	if err != nil {
+		return false
+	}
+	root, ok := node.(map[string]any)
+	if !ok || root["type"] != "object" {
+		return false
+	}
+	var check strictCheck
+	return check.node(root, 0) && check.withinLimits()
 }
 
 // decodeSchema decodes a schema document; content after the first value is an error.
@@ -445,51 +512,89 @@ func decodeSchema(schema json.RawMessage) (any, error) {
 	return node, nil
 }
 
-func strictSchemaNode(node any) bool {
-	object, ok := node.(map[string]any)
+// strictCheck walks a schema, judging each node and counting what the providers limit.
+type strictCheck struct {
+	unions       int
+	properties   int
+	enumValues   int
+	stringLength int
+}
+
+func (c *strictCheck) withinLimits() bool {
+	return c.unions <= maxStrictUnions && c.properties <= maxStrictProperties &&
+		c.enumValues <= maxStrictEnumValues && c.stringLength <= maxStrictStringLength
+}
+
+// node reports whether one schema is strict. depth counts the objects that enclose it.
+func (c *strictCheck) node(value any, depth int) bool {
+	object, ok := value.(map[string]any)
 	if !ok {
 		return false
 	}
-	for key := range object {
+	for key, keyword := range object {
 		if !strictKeywords[key] {
+			return false
+		}
+		if _, isText := keyword.(string); (key == "description" || key == "title") && !isText {
 			return false
 		}
 	}
 	if branches, ok := object["anyOf"]; ok {
-		return strictAnyOf(object, branches)
+		c.unions++
+		return c.anyOf(object, branches, depth)
 	}
-	value, ok := object["type"]
+	if enum, ok := object["enum"]; ok && !c.enum(enum) {
+		return false
+	}
+	if constant, ok := object["const"]; ok && !c.scalar(constant) {
+		return false
+	}
+	types, ok := c.types(object)
 	if !ok {
+		return false
+	}
+	if types == nil {
 		_, hasEnum := object["enum"]
 		_, hasConst := object["const"]
 		return (hasEnum || hasConst) && !hasAny(object, "properties", "required", "additionalProperties", "items")
 	}
-	types, ok := value.([]any)
-	if !ok {
-		types = []any{value}
-	}
-	isObject, isArray := false, false
-	for _, typeName := range types {
-		switch typeName {
-		case "object":
-			isObject = true
-		case "array":
-			isArray = true
-		}
-	}
-	if isObject != hasAny(object, "properties", "required", "additionalProperties") {
+	if types["object"] != hasAny(object, "properties", "required", "additionalProperties") {
 		return false
 	}
-	if isObject && !strictObject(object) {
+	if types["array"] != hasAny(object, "items") {
 		return false
 	}
-	if isArray != hasAny(object, "items") {
+	if types["object"] && !c.object(object, depth+1) {
 		return false
 	}
-	return !isArray || strictSchemaNode(object["items"])
+	return !types["array"] || c.node(object["items"], depth)
 }
 
-func strictAnyOf(object map[string]any, branches any) bool {
+// types returns the type names a schema declares, nil when it has no type keyword, and false
+// when the keyword is invalid. A type array counts as a union.
+func (c *strictCheck) types(object map[string]any) (map[string]bool, bool) {
+	value, ok := object["type"]
+	if !ok {
+		return nil, true
+	}
+	names, isList := value.([]any)
+	if isList {
+		c.unions++
+	} else {
+		names = []any{value}
+	}
+	types := make(map[string]bool, len(names))
+	for _, name := range names {
+		text, ok := name.(string)
+		if !ok || !jsonSchemaTypes[text] || types[text] {
+			return nil, false
+		}
+		types[text] = true
+	}
+	return types, len(types) > 0
+}
+
+func (c *strictCheck) anyOf(object map[string]any, branches any, depth int) bool {
 	items, ok := branches.([]any)
 	if !ok || len(items) == 0 {
 		return false
@@ -500,14 +605,17 @@ func strictAnyOf(object map[string]any, branches any) bool {
 		}
 	}
 	for _, item := range items {
-		if !strictSchemaNode(item) {
+		if !c.node(item, depth) {
 			return false
 		}
 	}
 	return true
 }
 
-func strictObject(object map[string]any) bool {
+func (c *strictCheck) object(object map[string]any, depth int) bool {
+	if depth > maxStrictNesting {
+		return false
+	}
 	if additional, ok := object["additionalProperties"].(bool); !ok || additional {
 		return false
 	}
@@ -519,21 +627,57 @@ func strictObject(object map[string]any) bool {
 	if !ok || len(required) != len(properties) {
 		return false
 	}
+	listed := make(map[string]bool, len(required))
 	for _, name := range required {
 		text, ok := name.(string)
-		if !ok {
+		if !ok || listed[text] {
 			return false
 		}
 		if _, ok := properties[text]; !ok {
 			return false
 		}
+		listed[text] = true
 	}
-	for _, property := range properties {
-		if !strictSchemaNode(property) {
+	c.properties += len(properties)
+	for name, property := range properties {
+		c.stringLength += len(name)
+		if !c.node(property, depth) {
 			return false
 		}
 	}
 	return true
+}
+
+// enum reports whether an enum lists only scalars, and counts its values and their length.
+func (c *strictCheck) enum(value any) bool {
+	values, ok := value.([]any)
+	if !ok || len(values) == 0 {
+		return false
+	}
+	before, texts := c.stringLength, 0
+	for _, item := range values {
+		if !c.scalar(item) {
+			return false
+		}
+		if _, ok := item.(string); ok {
+			texts++
+		}
+	}
+	c.enumValues += len(values)
+	return texts <= largeStrictEnum || c.stringLength-before <= maxLargeStrictEnumChars
+}
+
+// scalar reports whether value is a string, number, boolean or null, and counts a string's
+// length.
+func (c *strictCheck) scalar(value any) bool {
+	switch v := value.(type) {
+	case string:
+		c.stringLength += len(v)
+		return true
+	case float64, bool, nil:
+		return true
+	}
+	return false
 }
 
 func hasAny(object map[string]any, keys ...string) bool {

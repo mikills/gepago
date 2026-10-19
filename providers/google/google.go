@@ -66,7 +66,7 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 // finish reason. Failures are classified, and the API key redacted, as ChatClient.Chat does;
 // a cancelled or expired ctx returns its error unwrapped. A reply that fails after the API
 // reported usage returns that usage with the error. An empty reply is an error unless it
-// stopped at the token limit.
+// stopped at the token limit or under a content policy.
 func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Generation, error) {
 	resp, err := m.client.Chat(ctx, agents.ChatRequest{
 		Model:       m.client.model,
@@ -92,7 +92,8 @@ func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Gener
 		}
 		return generation, fmt.Errorf("google reflection completion: %w", err)
 	}
-	if generation.Text == "" && generation.FinishReason != gepa.FinishLength {
+	if generation.Text == "" && generation.FinishReason != gepa.FinishLength &&
+		generation.FinishReason != gepa.FinishContentFilter {
 		return generation, errors.New("google reflection completion: empty content")
 	}
 	return generation, nil

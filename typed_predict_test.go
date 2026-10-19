@@ -2,8 +2,9 @@ package gepa
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -128,6 +129,13 @@ func TestTypedPredictReportsDrift(t *testing.T) {
 			wantErr: `output "amount" is null`,
 		},
 		{
+			name:  "reshaped field",
+			run:   runTypedObligation,
+			reply: `{"amount": "ten", "deadline": "2026-06-30"}`,
+			wantErr: `decode as gepa.stateObligation: json: cannot unmarshal string into Go struct field ` +
+				`stateObligation.amount of type int`,
+		},
+		{
 			name:    "nested renamed field",
 			run:     runTypedDrift,
 			reply:   `{"obligation": {"amount_usd": 10, "deadline": "d"}, "items": [], "nested": [], "count": 1}`,
@@ -212,12 +220,19 @@ func TestTypedPredictRunsTheOutputValidateMethod(t *testing.T) {
 	)
 }
 
+// TestTypedPredictRepairsDrift uses a model that can name the currency only from the input in
+// its prompt, so the repair succeeds only if the repair prompt carries the inputs.
 func TestTypedPredictRepairsDrift(t *testing.T) {
 	var prompts []string
-	program := TypedPredict[typedTicket, validatedObligation]{
-		LM:              replyModel(&prompts, `{"amount": 10, "currency": ""}`, `{"amount": 10, "currency": "GBP"}`),
-		MaxParseRetries: 1,
-	}
+	lm := textModel(func(_ context.Context, prompt string) (string, error) {
+		prompts = append(prompts, prompt)
+		currency := ""
+		if len(prompts) > 1 && strings.Contains(prompt, `"text": "pay 10 pounds"`) {
+			currency = "GBP"
+		}
+		return fmt.Sprintf(`{"amount": 10, "currency": %q}`, currency), nil
+	})
+	program := TypedPredict[typedTicket, validatedObligation]{LM: lm, MaxParseRetries: 1}
 
 	got, err := program.Run(context.Background(), typedTicket{Text: "pay 10 pounds"})
 
@@ -293,6 +308,21 @@ func TestTypedPredictValidate(t *testing.T) {
 			validate: TypedPredict[map[string]any, typedTriage]{LM: lm}.Validate,
 			wantErr: "typed predict inputs: map[string]interface {} must be a struct without its own " +
 				"UnmarshalJSON or UnmarshalText",
+		},
+		{
+			name: "given inputs that are not In's fields",
+			validate: TypedPredict[typedTicket, stateObligation]{
+				Signature: Signature{Inputs: []Field{{Name: "document"}}},
+				LM:        lm,
+			}.Validate,
+			wantErr: `typed predict inputs ["document"] do not match the JSON fields ["text" "channel"] of gepa.typedTicket`,
+		},
+		{
+			name: "given inputs that are In's fields",
+			validate: TypedPredict[typedTicket, stateObligation]{
+				Signature: Signature{Inputs: []Field{{Name: "channel"}, {Name: "text", Description: "the message"}}},
+				LM:        lm,
+			}.Validate,
 		},
 		{
 			name:     "input and output share a name",
@@ -388,8 +418,8 @@ func TestTypedPredictRunCandidate(t *testing.T) {
 	got, err := program.RunCandidate(context.Background(), program.SeedCandidate(), Prediction{"text": "hi"})
 	require.NoError(t, err)
 	require.Equal(t, Prediction{
-		"reason": "r", "priority": "low", "score": json.Number("2"), "tags": []any{"a"},
-	}, got, "the output is the decoded Out, encoded again")
+		"reason": "r", "priority": "low", "score": 2, "tags": []string{"a"}, "note": "",
+	}, got, "every output is the Go value of its field, the null note included")
 
 	got, err = program.RunCandidate(context.Background(), program.SeedCandidate(), Prediction{"text": "hi"})
 	require.ErrorIs(t, err, ErrInvalidOutput)
@@ -429,53 +459,167 @@ func TestTypedPredictRunCandidateValidatesInputs(t *testing.T) {
 	require.EqualError(t, err, "typed predict inputs: gepa.typedValidatedInput: text is empty")
 }
 
-type typedUnencodable struct {
-	Amount float64 `json:"amount"`
+type typedHiddenBase struct {
+	Code string `json:"code"`
 }
 
-func (typedUnencodable) MarshalJSON() ([]byte, error) { return nil, errEmptyText }
+// TypedPromoted is exported because encoding/json cannot set a nil embedded pointer to an
+// unexported struct.
+type TypedPromoted struct {
+	Extra string `json:"extra,omitempty"`
+}
 
-func TestTypedPredictRunCandidateReportsAnUnencodableOutput(t *testing.T) {
-	program := TypedPredict[typedTicket, typedUnencodable]{
-		LM: textModel(func(context.Context, string) (string, error) { return `{"amount": 1}`, nil }),
+type typedEmbeddedOut struct {
+	typedHiddenBase `       json:"base"`
+	*TypedPromoted
+	Answer string `json:"answer"`
+}
+
+func TestTypedPredictRunCandidateReturnsEmbeddedFields(t *testing.T) {
+	program := TypedPredict[typedTicket, typedEmbeddedOut]{
+		LM: textModel(func(context.Context, string) (string, error) {
+			return `{"base": {"code": "c"}, "answer": "a"}`, nil
+		}),
 	}
 
-	_, err := program.RunCandidate(context.Background(), program.SeedCandidate(), Prediction{"text": "hi"})
+	got, err := program.RunCandidate(context.Background(), program.SeedCandidate(), Prediction{"text": "hi"})
 
-	require.ErrorContains(t, err, "typed predict outputs: json: error calling MarshalJSON")
+	require.NoError(t, err)
+	require.Equal(t, Prediction{"base": typedHiddenBase{Code: "c"}, "extra": "", "answer": "a"}, got,
+		"a field behind a nil embedded pointer is its zero value, and an unexported embedded struct is decoded")
+}
+
+type typedStepOut struct {
+	Answer string  `json:"answer"`
+	Note   string  `json:"note,omitempty"`
+	Ref    *string `json:"ref"`
+	Score  int     `json:"score"`
+}
+
+type typedStepIn struct {
+	Q string `json:"q"`
 }
 
 func TestTypedPredictAsAPipelineStep(t *testing.T) {
-	text := Key[string]{Name: "text"}
-	priority := Key[string]{Name: "priority"}
-	score := Key[int]{Name: "score"}
-	reason := Key[string]{Name: "reason"}
-	tags := Key[[]string]{Name: "tags"}
+	q := Key[string]{Name: "q"}
+	answer := Key[string]{Name: "answer"}
 	note := Key[string]{Name: "note"}
-	var prompts []string
-	program := TypedPredict[struct {
-		Text string `json:"text"`
-	}, typedTriage]{
-		LM: replyModel(&prompts, `{"reason": "r", "priority": "urgent", "score": 9, "tags": ["ops"], "note": "n"}`),
+	ref := Key[*string]{Name: "ref"}
+	score := Key[int]{Name: "score"}
+	tests := []struct {
+		name     string
+		reply    string
+		wantNote string
+		wantRef  *string
+	}{
+		{
+			name:     "every output set",
+			reply:    `{"answer": "a", "note": "n", "ref": "r", "score": 9}`,
+			wantNote: "n",
+			wantRef:  pointerTo("r"),
+		},
+		{name: "optional and pointer outputs null", reply: `{"answer": "a", "note": null, "ref": null, "score": 9}`},
+		{name: "optional output left out", reply: `{"answer": "a", "ref": null, "score": 9}`},
 	}
-	step := NewProgramStep(
-		"triage",
-		program,
-		refs(text.Ref()),
-		refs(reason.Ref(), priority.Ref(), score.Ref(), tags.Ref(), note.Ref()),
-	)
-	pipeline, err := PipelineSpec{Inputs: refs(text.Ref()), Steps: []Step{step}}.Build()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var prompts []string
+			program := TypedPredict[typedStepIn, typedStepOut]{LM: replyModel(&prompts, tt.reply)}
+			step := NewProgramStep(
+				"answer",
+				program,
+				refs(q.Ref()),
+				refs(answer.Ref(), note.Ref(), ref.Ref(), score.Ref()),
+			)
+			pipeline, err := PipelineSpec{Inputs: refs(q.Ref()), Steps: []Step{step}}.Build()
+			require.NoError(t, err)
+
+			out, err := pipeline.Run(context.Background(), NewState(Prediction{"q": "the site is down"}))
+
+			require.NoError(t, err, "a reply valid for Out commits every declared write")
+			require.Equal(
+				t,
+				Prediction{"answer": "a", "note": tt.wantNote, "ref": tt.wantRef, "score": 9},
+				out.Prediction(),
+			)
+			gotRef, err := ref.Get(out)
+			require.NoError(t, err)
+			require.Equal(t, tt.wantRef, gotRef)
+			require.Contains(t, pipeline.SeedCandidate(), StepComponentName("answer", InstructionComponent))
+			require.Contains(t, prompts[0], "\"q\": \"the site is down\"")
+		})
+	}
+}
+
+// TestPredictOptionalOutputAsAPipelineStep commits a non-null optional output. A null one fails
+// the step until programOutput in pipeline.go accepts null for an output the programme's
+// ProgramSignature marks Optional.
+func TestPredictOptionalOutputAsAPipelineStep(t *testing.T) {
+	note := Key[string]{Name: "note"}
+	program := Predict{
+		Signature: Signature{
+			Name:    "extract",
+			Inputs:  []Field{{Name: "document"}},
+			Outputs: []Field{{Name: "amount", Type: "int"}, {Name: "note", Type: "string", Optional: true}},
+		},
+		LM: textModel(func(context.Context, string) (string, error) {
+			return `{"amount": 10, "note": "paid late"}`, nil
+		}),
+	}
+	step := NewProgramStep("extract", program, refs(docKey.Ref()), refs(amountKey.Ref(), note.Ref()))
+	pipeline, err := PipelineSpec{Inputs: refs(docKey.Ref()), Steps: []Step{step}}.Build()
 	require.NoError(t, err)
 
-	out, err := pipeline.Run(context.Background(), NewState(Prediction{"text": "the site is down"}))
+	out, err := pipeline.Run(context.Background(), NewState(Prediction{"document": "cash 10"}))
 
 	require.NoError(t, err)
-	gotScore, err := score.Get(out)
+	require.Equal(t, Prediction{"amount": 10, "note": "paid late"}, out.Prediction())
+}
+
+func TestProgramSignature(t *testing.T) {
+	predict := Predict{Signature: typedQASignature()}
+	got, err := predict.ProgramSignature()
 	require.NoError(t, err)
-	require.Equal(t, 9, gotScore)
-	gotTags, err := tags.Get(out)
+	require.Equal(t, ProgramSignature{Signature: typedQASignature()}, got)
+
+	cot := ChainOfThought{Signature: typedQASignature(), ReasoningField: "why"}
+	got, err = cot.ProgramSignature()
 	require.NoError(t, err)
-	require.Equal(t, []string{"ops"}, gotTags)
-	require.Contains(t, pipeline.SeedCandidate(), StepComponentName("triage", InstructionComponent))
-	require.Contains(t, prompts[0], "\"text\": \"the site is down\"")
+	require.Equal(t, []string{"why", "answer", "confidence"}, got.Signature.OutputNames())
+	require.Equal(t, []string{"why"}, got.OmittableOutputs)
+
+	typed := TypedPredict[typedStepIn, typedStepOut]{LM: textModel(nil)}
+	got, err = typed.ProgramSignature()
+	require.NoError(t, err)
+	require.Equal(t, []string{"answer", "note", "ref", "score"}, got.Signature.OutputNames())
+	require.Equal(t, map[string]reflect.Type{"q": reflect.TypeFor[string]()}, got.InputTypes)
+	require.Equal(t, map[string]reflect.Type{
+		"answer": reflect.TypeFor[string](),
+		"note":   reflect.TypeFor[string](),
+		"ref":    reflect.TypeFor[*string](),
+		"score":  reflect.TypeFor[int](),
+	}, got.OutputTypes)
+
+	given := TypedPredict[map[string]any, typedStepOut]{
+		Signature: Signature{Inputs: []Field{{Name: "q"}}},
+		LM:        textModel(nil),
+	}
+	got, err = given.ProgramSignature()
+	require.NoError(t, err)
+	require.Nil(t, got.InputTypes, "a map input has no field types")
+
+	var signed []SignatureProgram = []SignatureProgram{predict, &predict, cot, &cot, typed}
+	require.Len(t, signed, 5)
+}
+
+func TestProgramSignatureReportsInvalidProgrammes(t *testing.T) {
+	_, err := Predict{Signature: Signature{Outputs: []Field{{Name: "a"}}}}.ProgramSignature()
+	require.EqualError(t, err, "signature requires at least one input field")
+
+	_, err = ChainOfThought{Signature: Signature{Inputs: []Field{{Name: "q"}}, Outputs: []Field{{Name: "a b"}}}}.
+		ProgramSignature()
+	require.EqualError(t, err, `output field "a b" cannot contain whitespace`)
+
+	_, err = TypedPredict[typedStepIn, string]{LM: textModel(nil)}.ProgramSignature()
+	require.ErrorContains(t, err, "string must be a struct")
 }

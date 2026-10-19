@@ -258,8 +258,10 @@ bridge. The config contains a JSON-safe `program`, `trainset`, optional
 `appendEvent`/`saveState`/`loadState` callbacks provide optimizer events and
 resumable persistence. The callback receives a normalized object of type
 `CompileModelRequest` and may return text, `{ text, usage, finishReason?, model? }`,
-or a Promise of either. A `finishReason` of `length` marks a truncated reply: the
-example scores zero and no repair is requested. Requests are tagged with `task`, `reflector`, `judge`, or `repair`; an
+or a Promise of either. A `finishReason` of `length` marks a truncated reply and
+`content_filter` a refused one: the example scores zero and no repair is requested.
+Task and repair requests carry a `response_format` (`{ name, schema, strict }`); the
+OpenAI and Claude model helpers enforce it when `strict` is true. Requests are tagged with `task`, `reflector`, `judge`, or `repair`; an
 `llmJudge` metric uses the `judge` role. The resolved value is
 `{ candidate, state }`, including candidate scores and the optimization usage
 ledger.
@@ -302,10 +304,12 @@ config is `{ program: { kind?: "predict" | "chainOfThought", signature,
 instruction?, demos?, maxParseRetries?, reasoningField? }, inputs }`.
 Chain-of-thought normalization adds the reasoning output and instruction before
 building the prompt. The async `model` callback receives `{ request_id, kind,
-role, prompt, attempt }` and returns either a raw string or
+role, prompt, attempt, response_format? }` and returns either a raw string or
 `{ text, usage: { prompt_tokens, completion_tokens, total_tokens }, finishReason?, model? }`.
-The returned value is `{ prediction, usage }`. A `finishReason` of `length` fails
-the prediction as truncated without a repair request. If the callback rejects or returns
+The returned value is `{ prediction, usage }`. A `finishReason` of `length` or
+`content_filter` fails the prediction without a repair request. `response_format`
+holds the signature's JSON schema; a model with structured output should enforce it
+when `strict` is true. If the callback rejects or returns
 invalid data, the wrapper cancels the module-owned job and rethrows the model
 error. Parse failures request repair until `maxParseRetries` is exhausted.
 

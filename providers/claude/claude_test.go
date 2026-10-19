@@ -131,6 +131,7 @@ func TestGenerateFinishReasons(t *testing.T) {
 		{stopReason: "max_tokens", text: `{"cut`, want: gepa.FinishLength},
 		{stopReason: "tool_use", text: "calling", want: gepa.FinishToolCalls},
 		{stopReason: "refusal", text: "declined", want: gepa.FinishContentFilter},
+		{stopReason: "refusal", text: "", want: gepa.FinishContentFilter},
 		{stopReason: "model_context_window_exceeded", text: `{"cut`, want: gepa.FinishLength},
 		{stopReason: "pause_turn", text: "paused", want: ""},
 		{stopReason: "", text: "ok", want: ""},
@@ -145,7 +146,7 @@ func TestGenerateFinishReasons(t *testing.T) {
 
 			got, err := testModel(t, server.URL).Generate(context.Background(), "prompt")
 
-			require.NoError(t, err, "a reply cut at the token limit is returned, not rejected")
+			require.NoError(t, err, "a reply cut at the token limit or refused is returned, not rejected")
 			require.Equal(t, tt.want, got.FinishReason)
 			require.Equal(t, tt.text, got.Text)
 		})
@@ -340,4 +341,33 @@ func TestPredictSendsTheSchemaThroughRetryingLanguageModel(t *testing.T) {
 	require.Len(t, *requests, 1)
 	require.Contains(t, (*requests)[0], `"output_config":{"format":{`)
 	require.Contains(t, (*requests)[0], `"type":"json_schema"`)
+}
+
+const refusalReply = `{
+	"model":"claude-resolved","stop_reason":"refusal",
+	"content":[{"type":"text","text":"I can't help with that."}],
+	"usage":{"input_tokens":5,"output_tokens":3}
+}`
+
+func TestGenerateStructuredReportsARefusal(t *testing.T) {
+	server := messageServer(t, refusalReply)
+	format, err := typedSignature().ResponseFormat()
+	require.NoError(t, err)
+
+	got, err := testModel(t, server.URL).GenerateStructured(context.Background(), "prompt", format)
+
+	require.NoError(t, err, "a refusal is a reply, not a failed call")
+	require.Equal(t, "I can't help with that.", got.Text)
+	require.Equal(t, gepa.FinishContentFilter, got.FinishReason)
+}
+
+func TestPredictDoesNotRepairARefusal(t *testing.T) {
+	server, requests := recordingServer(t, refusalReply)
+	program := gepa.Predict{Signature: typedSignature(), LM: testModel(t, server.URL), MaxParseRetries: 2}
+
+	_, err := program.Run(context.Background(), gepa.Prediction{"question": "q"})
+
+	require.ErrorIs(t, err, gepa.ErrContentFiltered)
+	require.ErrorContains(t, err, "I can't help with that.")
+	require.Len(t, *requests, 1, "a refusal ends the call instead of being sent for repair")
 }

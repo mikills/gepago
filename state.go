@@ -8,6 +8,7 @@ import (
 	"maps"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -118,7 +119,8 @@ func (s State) store(key string, typ reflect.Type, value any, fresh bool) {
 //
 // A value stored as another type, such as a model's JSON output, is converted to T strictly:
 // unknown fields, fields that match only by case, missing fields not tagged omitempty or
-// omitzero, and nulls in non-nullable positions are errors rather than zero values. Types
+// omitzero, nulls in non-nullable positions, arrays with too few or too many elements, and
+// non-zero numbers too small for a float type are errors rather than zero values. Types
 // with their own UnmarshalJSON or UnmarshalText are decoded as they define.
 //
 // If T or *T has a Validate() error method, Get calls it on every value it returns (except a
@@ -254,11 +256,23 @@ func checkJSONShape(typ reflect.Type, value any, path string) error {
 			return checkJSONObject(typ, object, path)
 		}
 	case reflect.Slice, reflect.Array:
-		items, _ := value.([]any)
+		items, isArray := value.([]any)
+		if isArray && typ.Kind() == reflect.Array && len(items) != typ.Len() {
+			return fmt.Errorf("%s has %d elements, want %d", describeJSONPath(path), len(items), typ.Len())
+		}
 		for i, item := range items {
 			if err := checkJSONShape(typ.Elem(), item, fmt.Sprintf("%s[%d]", path, i)); err != nil {
 				return err
 			}
+		}
+	case reflect.Float32, reflect.Float64:
+		if number, ok := value.(json.Number); ok && underflows(number, typ.Bits()) {
+			return fmt.Errorf(
+				"%s: number %s is too small for %s and would decode as 0",
+				describeJSONPath(path),
+				number,
+				typ,
+			)
 		}
 	case reflect.Map:
 		object, _ := value.(map[string]any)
@@ -293,6 +307,24 @@ func checkJSONObject(typ reflect.Type, object map[string]any, path string) error
 		}
 	}
 	return nil
+}
+
+// underflows reports whether a non-zero JSON number rounds to zero at the given float size,
+// which encoding/json accepts silently.
+func underflows(number json.Number, bits int) bool {
+	parsed, err := strconv.ParseFloat(number.String(), bits)
+	if err != nil || parsed != 0 {
+		return false
+	}
+	mantissa, _, _ := strings.Cut(strings.ToLower(number.String()), "e")
+	return strings.Trim(mantissa, "-+0.") != ""
+}
+
+func describeJSONPath(path string) string {
+	if path == "" {
+		return "value"
+	}
+	return fmt.Sprintf("field %q", path)
 }
 
 func joinJSONPath(path, key string) string {

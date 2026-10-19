@@ -105,6 +105,11 @@ function openAIResponse(response: WireObject): ChatResponse {
   const raw = apiResponsePart(choice?.message);
   if (!choice || !choice.message)
     throw new Error("OpenAI chat completion returned no choices");
+  const content = typeof raw.content === "string" ? raw.content : "";
+  // a structured-output refusal arrives in its own field; report it as a content-filtered
+  // reply, as the Go provider does.
+  const refusal =
+    !content && typeof raw.refusal === "string" ? raw.refusal.trim() : "";
   const calls = array(raw.tool_calls).map((call, index) => ({
     id: String(call.id ?? `call-${index + 1}`),
     name: String(apiResponsePart(call.function).name ?? ""),
@@ -114,12 +119,12 @@ function openAIResponse(response: WireObject): ChatResponse {
         : JSON.stringify(apiResponsePart(call.function).arguments ?? {}),
   }));
   return {
-    message: responseMessage(
-      typeof raw.content === "string" ? raw.content : "",
-      calls,
-    ),
+    message: responseMessage(refusal || content, calls),
     usage: usageFrom(response.usage),
-    ...finishReasonField(choice.finish_reason, calls.length > 0),
+    ...finishReasonField(
+      refusal ? "content_filter" : choice.finish_reason,
+      calls.length > 0,
+    ),
   };
 }
 function openAIRequest(
@@ -171,7 +176,11 @@ export function createOpenAIChat(input: HTTPProviderOptions): AgentChat {
 }
 export function createOpenAIModel(options: HTTPProviderOptions): ModelFunction {
   const normalized = providerOptions(options, "OpenAI");
-  return modelCallbackFromChat(createOpenAIChat(normalized), normalized.model);
+  return modelCallbackFromChat(
+    createOpenAIChat(normalized),
+    normalized.model,
+    true,
+  );
 }
 export function createOpenAIProvider(
   options: HTTPProviderOptions,
@@ -246,6 +255,11 @@ function anthropicRequest(
       description: tool.description,
       input_schema: tool.parameters ?? { type: "object" },
     }));
+  // Claude's structured output has no non-strict mode, so only a strict format is sent.
+  if (request.response_format?.strict)
+    body.output_config = {
+      format: { type: "json_schema", schema: request.response_format.schema },
+    };
   return body;
 }
 function anthropicResponse(response: WireObject): ChatResponse {
@@ -304,7 +318,11 @@ export function createClaudeChat(input: ClaudeOptions): AgentChat {
 }
 export function createClaudeModel(options: ClaudeOptions): ModelFunction {
   const normalized = providerOptions(options, "Claude");
-  return modelCallbackFromChat(createClaudeChat(options), normalized.model);
+  return modelCallbackFromChat(
+    createClaudeChat(options),
+    normalized.model,
+    true,
+  );
 }
 export function createClaudeProvider(
   options: ClaudeOptions,

@@ -688,13 +688,25 @@ function normalizeChainOfThoughtProgram(
     program.reasoningField === undefined || program.reasoningField === ""
       ? "reasoning"
       : program.reasoningField;
+  // as in cot.go: the reasoning field comes first, so a model that writes fields in schema
+  // order reasons before it answers, and it is a string when the other outputs are typed.
+  const typed = signature.outputs.some(
+    (field) =>
+      field.type !== undefined ||
+      field.schema !== undefined ||
+      field.optional === true,
+  );
   const outputs = signature.outputs.some(
     (field) => field.name === reasoningField,
   )
     ? signature.outputs
     : [
+        {
+          name: reasoningField,
+          description: "brief reasoning for the answer",
+          ...(typed ? { type: "string" } : {}),
+        },
         ...signature.outputs,
-        { name: reasoningField, description: "brief reasoning for the answer" },
       ];
   const instruction = String(
     program.instruction ?? signature.description ?? "",

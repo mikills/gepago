@@ -246,7 +246,11 @@ func TestPredictJobProtocol(t *testing.T) {
 	}
 	if !repairEnvelope.OK || repairEnvelope.Value.Status != "pending" ||
 		repairEnvelope.Value.HostRequest.Attempt != 2 ||
-		!strings.Contains(repairEnvelope.Value.HostRequest.Prompt, "Invalid output:\n```\nnot json\n```") {
+		!strings.Contains(
+			repairEnvelope.Value.HostRequest.Prompt,
+			"Your previous reply was not a valid JSON object for this signature:\n```\nnot json\n```",
+		) ||
+		!strings.Contains(repairEnvelope.Value.HostRequest.Prompt, "\"text\": \"great\"") {
 		t.Fatalf("unexpected repair request: %+v", repairEnvelope)
 	}
 	if !strings.Contains(invokeJSON("predict.resume", mustJSON(t, map[string]any{
@@ -466,5 +470,93 @@ func TestPredictResumeChecksOutputsAsPredictDoes(t *testing.T) {
 	}))
 	if !strings.Contains(notObject, "parse prediction: result must be a JSON object") {
 		t.Fatalf("a null reply was not rejected: %s", notObject)
+	}
+}
+
+func TestPredictHostRequestsCarryTheResponseFormat(t *testing.T) {
+	signature := gepa.Signature{
+		Name:    "sentiment",
+		Inputs:  []gepa.Field{{Name: "text"}},
+		Outputs: []gepa.Field{{Name: "label", Type: "string"}},
+	}
+	format, err := signature.ResponseFormat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := map[string]any{
+		"program": map[string]any{"signature": signature, "maxParseRetries": 1},
+		"inputs":  map[string]any{"text": "great"},
+	}
+	type hostRequest struct {
+		RequestID      string              `json:"request_id"`
+		ResponseFormat *hostResponseFormat `json:"response_format"`
+	}
+	var started struct {
+		Value struct {
+			JobID       string      `json:"job_id"`
+			HostRequest hostRequest `json:"host_request"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal([]byte(invokeJSON("predict.start", mustJSON(t, start))), &started); err != nil {
+		t.Fatal(err)
+	}
+	want := hostResponseFormat{Name: "sentiment", Schema: format.Schema, Strict: true}
+	if got := started.Value.HostRequest.ResponseFormat; got == nil || got.Name != want.Name ||
+		string(got.Schema) != string(want.Schema) || !got.Strict {
+		t.Fatalf("start host request response_format = %+v, want %+v", got, want)
+	}
+
+	var repair struct {
+		Value struct {
+			HostRequest hostRequest `json:"host_request"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal([]byte(invokeJSON("predict.resume", mustJSON(t, map[string]any{
+		"job_id": started.Value.JobID, "request_id": started.Value.HostRequest.RequestID,
+		"result": map[string]any{"text": `{"label":1}`},
+	}))), &repair); err != nil {
+		t.Fatal(err)
+	}
+	if got := repair.Value.HostRequest.ResponseFormat; got == nil || string(got.Schema) != string(want.Schema) {
+		t.Fatalf("repair host request response_format = %+v, want %+v", got, want)
+	}
+}
+
+func TestPredictResumeStopsOnRefusedReply(t *testing.T) {
+	start := map[string]any{
+		"program": map[string]any{
+			"signature": gepa.Signature{
+				Name:    "sentiment",
+				Inputs:  []gepa.Field{{Name: "text"}},
+				Outputs: []gepa.Field{{Name: "label"}},
+			},
+			"maxParseRetries": 2,
+		},
+		"inputs": map[string]any{"text": "great"},
+	}
+	var envelope struct {
+		Value struct {
+			JobID       string `json:"job_id"`
+			HostRequest struct {
+				RequestID string `json:"request_id"`
+			} `json:"host_request"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal([]byte(invokeJSON("predict.start", mustJSON(t, start))), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	refused := invokeJSON("predict.resume", mustJSON(t, map[string]any{
+		"job_id": envelope.Value.JobID, "request_id": envelope.Value.HostRequest.RequestID,
+		"result": map[string]any{"text": "I can't help with that.", "finishReason": "content_filter"},
+	}))
+	if !strings.Contains(refused, "refused under a content policy") ||
+		!strings.Contains(refused, `I can't help with that.`) || strings.Contains(refused, `"status":"pending"`) {
+		t.Fatalf("refused reply was not rejected without repair: %s", refused)
+	}
+	if stale := invokeJSON("predict.resume", mustJSON(t, map[string]any{
+		"job_id": envelope.Value.JobID, "request_id": envelope.Value.HostRequest.RequestID,
+		"result": map[string]any{"text": `{}`},
+	})); !strings.Contains(stale, "unknown or stale") {
+		t.Fatalf("refused job was kept: %s", stale)
 	}
 }

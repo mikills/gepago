@@ -166,6 +166,7 @@ func TestGenerateFinishReasons(t *testing.T) {
 		{reason: "length", content: "", want: gepa.FinishLength},
 		{reason: "length", content: `{"cut`, want: gepa.FinishLength},
 		{reason: "content_filter", content: "withheld", want: gepa.FinishContentFilter},
+		{reason: "content_filter", content: "", want: gepa.FinishContentFilter},
 		{reason: "tool_calls", content: "calling", want: gepa.FinishToolCalls},
 		{reason: "function_call", content: "calling", want: gepa.FinishToolCalls},
 		{reason: "something_new", content: "ok", want: ""},
@@ -181,7 +182,7 @@ func TestGenerateFinishReasons(t *testing.T) {
 
 			got, err := testModel(t, server.URL).Generate(context.Background(), "prompt")
 
-			require.NoError(t, err, "a reply cut at the token limit is returned, not rejected")
+			require.NoError(t, err, "a reply cut at the token limit or by a content filter is returned, not rejected")
 			require.Equal(t, tt.want, got.FinishReason)
 			require.Equal(t, tt.content, got.Text)
 		})
@@ -345,21 +346,35 @@ func TestGenerateStructuredRejectsAnInvalidSchema(t *testing.T) {
 	require.Empty(t, *requests)
 }
 
+const refusalReply = `{
+	"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"m",
+	"choices":[{"index":0,"message":{"role":"assistant","content":null,"refusal":"I can't help with that."},
+		"finish_reason":"stop"}],
+	"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}
+}`
+
 func TestGenerateStructuredReportsARefusal(t *testing.T) {
-	server := completionServer(t, `{
-		"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"m",
-		"choices":[{"index":0,"message":{"role":"assistant","content":null,"refusal":"I can't help with that."},
-			"finish_reason":"stop"}],
-		"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}
-	}`)
+	server := completionServer(t, refusalReply)
 	format, err := typedSignature().ResponseFormat()
 	require.NoError(t, err)
 
 	got, err := testModel(t, server.URL).GenerateStructured(context.Background(), "prompt", format)
 
-	require.EqualError(t, err, "openai reflection completion: model refused: I can't help with that.")
+	require.NoError(t, err, "a refusal is a reply, not a failed call")
+	require.Equal(t, "I can't help with that.", got.Text)
 	require.Equal(t, gepa.FinishContentFilter, got.FinishReason)
 	require.Equal(t, 8, got.Usage.TotalTokens)
+}
+
+func TestPredictDoesNotRepairARefusal(t *testing.T) {
+	server, requests := recordingServer(t, refusalReply)
+	program := gepa.Predict{Signature: typedSignature(), LM: testModel(t, server.URL), MaxParseRetries: 2}
+
+	_, err := program.Run(context.Background(), gepa.Prediction{"question": "q"})
+
+	require.ErrorIs(t, err, gepa.ErrContentFiltered)
+	require.ErrorContains(t, err, "I can't help with that.")
+	require.Len(t, *requests, 1, "a refusal ends the call instead of being sent for repair")
 }
 
 func TestPredictSendsTheSchemaThroughRetryingLanguageModel(t *testing.T) {

@@ -314,3 +314,44 @@ func TestKeyGetFollowsEncodingJSONEmbeddingConflicts(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, got.Amount)
 }
+
+func TestKeyGetRefusesArraysOfTheWrongLength(t *testing.T) {
+	state := NewState(Prediction{"short": []any{1}, "nested": []any{[]any{1, 2}, []any{3}}})
+
+	_, err := Key[[2]int]{Name: "short"}.Get(state)
+	require.EqualError(t, err, `state key "short": decode as [2]int: value has 1 elements, want 2`)
+
+	_, err = Key[[][2]int]{Name: "nested"}.Get(state)
+	require.EqualError(t, err, `state key "nested": decode as [][2]int: field "[1]" has 1 elements, want 2`)
+}
+
+func TestKeyGetRefusesNumbersThatUnderflow(t *testing.T) {
+	state := NewState(Prediction{
+		"tiny":  json.Number("1e-50"),
+		"zero":  json.Number("-0.0e9"),
+		"small": json.Number("1e-45"),
+	})
+
+	_, err := Key[float32]{Name: "tiny"}.Get(state)
+	require.EqualError(
+		t,
+		err,
+		`state key "tiny": decode as float32: value: number 1e-50 is too small for float32 and would decode as 0`,
+	)
+	_, err = Key[[]float64]{Name: "tinier"}.Get(NewState(Prediction{"tinier": []any{json.Number("-1e-400")}}))
+	require.EqualError(
+		t,
+		err,
+		`state key "tinier": decode as []float64: field "[0]": number -1e-400 is too small for float64 and would decode as 0`,
+	)
+
+	zero, err := Key[float32]{Name: "zero"}.Get(state)
+	require.NoError(t, err)
+	require.Zero(t, zero)
+	small, err := Key[float32]{Name: "small"}.Get(state)
+	require.NoError(t, err)
+	require.NotZero(t, small)
+	tiny, err := Key[float64]{Name: "tiny"}.Get(state)
+	require.NoError(t, err, "1e-50 fits a float64")
+	require.NotZero(t, tiny)
+}

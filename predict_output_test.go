@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -123,18 +124,70 @@ func TestPredictRepairPromptCarriesTheSchema(t *testing.T) {
 	schema, err := program.Signature.JSONSchema()
 	require.NoError(t, err)
 
-	prompt := program.RepairPrompt(`{"answer": 4}`, errors.New("output \"answer\" is not a valid string"))
+	prompt := program.RepairPrompt("", `{"answer": 4}`, errors.New("output \"answer\" is not a valid string"))
 
 	require.Contains(t, prompt, "Return only a valid JSON object with these output fields: answer, confidence.")
 	require.Contains(t, prompt, schemaInstruction(schema))
 	require.Contains(t, prompt, "Error: output \"answer\" is not a valid string")
-	require.Contains(t, prompt, "Invalid output:\n```\n{\"answer\": 4}\n```")
+	require.Contains(
+		t,
+		prompt,
+		"Your previous reply was not a valid JSON object for this signature:\n```\n{\"answer\": 4}\n```",
+	)
+	require.True(t, strings.HasPrefix(prompt, "Your previous reply"), "an empty original prompt is left out")
 
 	untyped := Predict{Signature: Signature{Inputs: []Field{{Name: "q"}}, Outputs: []Field{{Name: "a"}}}}
-	require.Contains(t, untyped.RepairPrompt("x", errors.New("bad")), `"additionalProperties": false`)
+	require.Contains(t, untyped.RepairPrompt("Answer q.", "x", errors.New("bad")), `"additionalProperties": false`)
 
 	invalid := Predict{Signature: Signature{Inputs: []Field{{Name: "q"}}, Outputs: []Field{{Name: "a", Type: "?"}}}}
-	require.NotContains(t, invalid.RepairPrompt("x", errors.New("bad")), "JSON schema")
+	require.NotContains(t, invalid.RepairPrompt("Answer q.", "x", errors.New("bad")), "JSON schema")
+}
+
+func TestPredictRepairPromptRepeatsTheRequest(t *testing.T) {
+	program := Predict{Signature: typedQASignature(), Instruction: "Answer the question."}
+	original, err := program.BuildPrompt(program.SeedCandidate(), Prediction{"question": "2+2?"})
+	require.NoError(t, err)
+	schema, err := program.Signature.JSONSchema()
+	require.NoError(t, err)
+
+	prompt := program.RepairPrompt(original, `{"answer": "4"}`, errors.New(`output "confidence" is missing`))
+
+	require.True(t, strings.HasPrefix(prompt, original), "the repair model sees the task, instruction and inputs")
+	require.Equal(t, 1, strings.Count(prompt, schemaInstruction(schema)), "the schema is not repeated")
+	require.Contains(t, prompt, "Answer the request above again, using its inputs.")
+}
+
+// TestPredictRepairAnswersFromTheInputs uses a model that can only fill a missing field from
+// the inputs in its prompt, so the repair works only if the repair prompt carries them.
+func TestPredictRepairAnswersFromTheInputs(t *testing.T) {
+	var prompts []string
+	lm := textModel(func(_ context.Context, prompt string) (string, error) {
+		prompts = append(prompts, prompt)
+		if len(prompts) == 1 {
+			return `{"amount": 10}`, nil
+		}
+		deadline := regexp.MustCompile(`by (\d{4}-\d{2}-\d{2})`).FindStringSubmatch(prompt)
+		if deadline == nil {
+			return `{"amount": 10, "deadline": null}`, nil
+		}
+		return `{"amount": 10, "deadline": "` + deadline[1] + `"}`, nil
+	})
+	program := Predict{
+		Signature: Signature{
+			Name:    "extract",
+			Inputs:  []Field{{Name: "document"}},
+			Outputs: []Field{{Name: "amount", Type: "int"}, {Name: "deadline", Type: "string"}},
+		},
+		LM:              lm,
+		MaxParseRetries: 1,
+	}
+
+	got, err := program.Run(context.Background(), Prediction{"document": "pay 10 by 2031-12-31"})
+
+	require.NoError(t, err)
+	require.Equal(t, "2031-12-31", got["deadline"])
+	require.Len(t, prompts, 2)
+	require.Contains(t, prompts[1], "2031-12-31", "the repair call sees the inputs")
 }
 
 func TestPredictRepairsAnInvalidOutput(t *testing.T) {
@@ -243,8 +296,9 @@ func TestChainOfThoughtTypesItsReasoningFieldForTypedSignatures(t *testing.T) {
 	require.Equal(
 		t,
 		Field{Name: "why", Description: "brief reasoning for the answer", Type: "string"},
-		typed.Signature.Outputs[2],
+		typed.Signature.Outputs[0],
 	)
+	require.Equal(t, []string{"why", "answer", "confidence"}, typed.Signature.OutputNames(), "reasoning comes first")
 	format, err := typed.Signature.ResponseFormat()
 	require.NoError(t, err)
 	require.True(t, format.Strict, "the reasoning field keeps a typed signature strict")
@@ -255,9 +309,50 @@ func TestChainOfThoughtTypesItsReasoningFieldForTypedSignatures(t *testing.T) {
 	require.Equal(
 		t,
 		Field{Name: "reasoning", Description: "brief reasoning for the answer"},
-		untyped.Signature.Outputs[1],
+		untyped.Signature.Outputs[0],
 	)
 	prompt, err := untyped.BuildPrompt(untyped.SeedCandidate(), Prediction{"q": "?"})
 	require.NoError(t, err)
-	require.False(t, strings.Contains(prompt, "JSON schema"), "an untyped chain of thought keeps its prompt")
+	require.False(t, strings.Contains(prompt, "JSON schema"), "an untyped chain of thought has no schema in its prompt")
+	require.Contains(t, prompt, "Return only a JSON object with these output fields: reasoning, a.")
+}
+
+func TestPredictTypeChecksAtTheEdges(t *testing.T) {
+	tests := []struct {
+		typ, value string
+		valid      bool
+	}{
+		{"uint", "-1", false},
+		{"int8", "300", false},
+		{"int64", "9223372036854775808", false},
+		{"uint64", "18446744073709551616", false},
+		{"uint64", "18446744073709551615", true},
+		{"float32", "1e39", false},
+		{"float64", "1e400", false},
+		{"float32", "1e-50", false},
+		{"float32", "1e-45", true},
+		{"int", "1.0", false},
+		{"int", "1e2", false},
+		{"string", "5", false},
+		{"bool", `"true"`, false},
+		{"slice", `{}`, false},
+		{"map", `[]`, false},
+		{"uint8", "255", true},
+		{"float64", "-0", true},
+		{"string", `""`, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.typ+" "+tt.value, func(t *testing.T) {
+			signature := Signature{Name: "s", Inputs: []Field{{Name: "q"}}, Outputs: []Field{{Name: "v", Type: tt.typ}}}
+
+			_, err := Predict{Signature: signature}.ParseOutput(`{"v":` + tt.value + `}`)
+
+			if tt.valid {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorIs(t, err, ErrInvalidOutput)
+			require.ErrorContains(t, err, `output "v" is not a valid `+tt.typ)
+		})
+	}
 }

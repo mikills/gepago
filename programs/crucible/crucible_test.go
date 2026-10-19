@@ -734,6 +734,21 @@ func TestJudgesRejectTruncatedReplies(t *testing.T) {
 	assert.Equal(t, usage, pairwise.Usage)
 }
 
+func TestJudgesRejectRefusedReplies(t *testing.T) {
+	judge := gepa.GeneratorFunc(func(context.Context, string) (gepa.Generation, error) {
+		return gepa.Generation{Text: "I can't grade that.", FinishReason: gepa.FinishContentFilter}, nil
+	})
+	evalCase := EvalCase{ID: "case", Rubric: "Be correct"}
+
+	score, err := RubricJudgeEvaluator{LM: judge}.Evaluate(context.Background(), EvalInput{Case: evalCase})
+	require.ErrorIs(t, err, gepa.ErrContentFiltered)
+	assert.Zero(t, score.Score)
+
+	pairwise, err := PairwiseJudgeEvaluator{LM: judge}.Compare(context.Background(), PairwiseInput{Case: evalCase})
+	require.ErrorIs(t, err, gepa.ErrContentFiltered)
+	assert.Empty(t, pairwise.Winner)
+}
+
 func TestRawModelSubjectReportsUsageOfFailedCall(t *testing.T) {
 	cause := fmt.Errorf("model failed after billing")
 	usage := gepa.Usage{PromptTokens: 4, CompletionTokens: 2, TotalTokens: 6}
