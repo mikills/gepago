@@ -10,7 +10,8 @@ import (
 
 // LLMJudgeMetric uses a language model and rubric to score semantic prediction quality. It
 // records the usage of every judge call, repair calls and failed calls included, into the
-// context's UsageCollector.
+// context's UsageCollector. A judge reply cut at the token limit fails with
+// ErrOutputTruncated rather than being scored or repaired.
 type LLMJudgeMetric struct {
 	LM         Generator
 	Rubric     string
@@ -38,19 +39,17 @@ func (m LLMJudgeMetric) Score(ctx context.Context, expected Prediction, actual P
 	if err != nil {
 		return MetricResult{}, err
 	}
-	generation, err := m.LM.Generate(ctx, prompt)
-	RecordUsage(ctx, generation.Usage)
+	raw, err := m.generate(ctx, prompt)
 	if err != nil {
 		return MetricResult{}, err
 	}
-	judge, err := parseJudgeResponse(generation.Text)
+	judge, err := parseJudgeResponse(raw)
 	if err != nil && m.ParseRetry {
-		repaired, repairErr := m.LM.Generate(ctx, judgeRepairPrompt(generation.Text, err))
-		RecordUsage(ctx, repaired.Usage)
+		repaired, repairErr := m.generate(ctx, judgeRepairPrompt(raw, err))
 		if repairErr != nil {
 			return MetricResult{}, repairErr
 		}
-		judge, err = parseJudgeResponse(repaired.Text)
+		judge, err = parseJudgeResponse(repaired)
 	}
 	if err != nil {
 		return MetricResult{}, err
@@ -60,6 +59,19 @@ func (m LLMJudgeMetric) Score(ctx context.Context, expected Prediction, actual P
 		Feedback: judge.Feedback,
 		Details:  judge.Details,
 	}, nil
+}
+
+// generate makes one judge call, records its usage and rejects a truncated reply.
+func (m LLMJudgeMetric) generate(ctx context.Context, prompt string) (string, error) {
+	generation, err := m.LM.Generate(ctx, prompt)
+	RecordUsage(ctx, generation.Usage)
+	if err != nil {
+		return "", err
+	}
+	if generation.FinishReason == FinishLength {
+		return "", fmt.Errorf("%w: judge reply", ErrOutputTruncated)
+	}
+	return generation.Text, nil
 }
 
 func (m LLMJudgeMetric) prompt(expected Prediction, actual Prediction, maxScore float64) (string, error) {

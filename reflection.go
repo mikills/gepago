@@ -27,8 +27,9 @@ type LessonAwareProposer interface {
 }
 
 // ReflectiveProposer asks a language model to improve candidate components from feedback records.
-// LastUsage reports the usage of every model call in the most recent Propose, failed calls
-// included.
+// LastUsage and LastModelCalls report the usage and number of model calls of the most recent
+// Propose, failed calls included. A reply cut at the token limit fails with ErrOutputTruncated
+// rather than becoming a candidate.
 type ReflectiveProposer struct {
 	LM              Generator
 	Objective       string
@@ -39,6 +40,7 @@ type ReflectiveProposer struct {
 	lessons         []string
 	last            []ProposalMetadata
 	lastUsage       Usage
+	lastCalls       int
 }
 
 // Propose returns a candidate patch for the requested components.
@@ -49,6 +51,7 @@ func (p *ReflectiveProposer) Propose(
 	components []string,
 ) (Candidate, error) {
 	p.lastUsage = Usage{}
+	p.lastCalls = 0
 	if p.LM == nil {
 		return nil, errors.New("reflection language model is required")
 	}
@@ -60,9 +63,13 @@ func (p *ReflectiveProposer) Propose(
 			return nil, err
 		}
 		generation, err := p.LM.Generate(ctx, prompt)
+		p.lastCalls++
 		p.lastUsage = p.lastUsage.Add(generation.Usage)
 		if err != nil {
 			return nil, err
+		}
+		if generation.FinishReason == FinishLength {
+			return nil, fmt.Errorf("%w: reflection reply for %q", ErrOutputTruncated, component)
 		}
 		raw := generation.Text
 		parsed := ParseComponentReplacement(raw, component)
@@ -82,6 +89,11 @@ func (p *ReflectiveProposer) Propose(
 // LastUsage returns the usage of the most recent Propose call.
 func (p *ReflectiveProposer) LastUsage() Usage {
 	return p.lastUsage
+}
+
+// LastModelCalls returns the number of model calls the most recent Propose made.
+func (p *ReflectiveProposer) LastModelCalls() int {
+	return p.lastCalls
 }
 
 // LastProposalMetadata returns metadata for the most recent proposal call.
@@ -195,13 +207,15 @@ func ExtractFencedText(raw string) string {
 	return strings.TrimSpace(rest[:end])
 }
 
-// LLMMergeProposer asks a language model to merge two candidate records. LastUsage reports
-// the usage of the most recent ProposeMerge call, failed calls included.
+// LLMMergeProposer asks a language model to merge two candidate records. LastUsage and
+// LastModelCalls report the usage and number of model calls of the most recent ProposeMerge,
+// failed calls included. A reply cut at the token limit fails with ErrOutputTruncated.
 type LLMMergeProposer struct {
 	LM        Generator
 	Objective string
 	last      []ProposalMetadata
 	lastUsage Usage
+	lastCalls int
 }
 
 // ProposeMerge returns a patch combining two parent candidates.
@@ -212,6 +226,7 @@ func (p *LLMMergeProposer) ProposeMerge(
 	components []string,
 ) (Candidate, error) {
 	p.lastUsage = Usage{}
+	p.lastCalls = 0
 	if p.LM == nil {
 		return nil, errors.New("merge language model is required")
 	}
@@ -236,9 +251,13 @@ func (p *LLMMergeProposer) ProposeMerge(
 		strings.Join(components, ", "),
 	)
 	generation, err := p.LM.Generate(ctx, prompt)
+	p.lastCalls = 1
 	p.lastUsage = generation.Usage
 	if err != nil {
 		return nil, err
+	}
+	if generation.FinishReason == FinishLength {
+		return nil, fmt.Errorf("%w: merge reply", ErrOutputTruncated)
 	}
 	raw := generation.Text
 	parsed := ExtractFencedText(raw)
@@ -253,6 +272,11 @@ func (p *LLMMergeProposer) ProposeMerge(
 // LastUsage returns the usage of the most recent ProposeMerge call.
 func (p *LLMMergeProposer) LastUsage() Usage {
 	return p.lastUsage
+}
+
+// LastModelCalls returns the number of model calls the most recent ProposeMerge made.
+func (p *LLMMergeProposer) LastModelCalls() int {
+	return p.lastCalls
 }
 
 // LastProposalMetadata returns metadata for the most recent merge call.

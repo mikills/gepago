@@ -7,10 +7,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	gepa "github.com/mikills/gepago"
-	"github.com/openai/openai-go/v3/option"
+	"github.com/mikills/gepago/internal/providertest"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,7 +30,7 @@ func completionServer(t *testing.T, body string) *httptest.Server {
 
 func testModel(t *testing.T, baseURL string) *LanguageModel {
 	t.Helper()
-	lm, err := newLanguageModel(Config{BaseURL: baseURL, Model: "requested-model"}, option.WithMaxRetries(0))
+	lm, err := NewLanguageModel(Config{BaseURL: baseURL, Model: "requested-model"})
 	require.NoError(t, err)
 	return lm
 }
@@ -165,7 +166,8 @@ func TestGenerateFinishReasons(t *testing.T) {
 		{reason: "content_filter", content: "withheld", want: gepa.FinishContentFilter},
 		{reason: "tool_calls", content: "calling", want: gepa.FinishToolCalls},
 		{reason: "function_call", content: "calling", want: gepa.FinishToolCalls},
-		{reason: "something_new", content: "ok", want: gepa.FinishStop},
+		{reason: "something_new", content: "ok", want: ""},
+		{reason: "", content: "ok", want: ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.reason+"/"+tt.content, func(t *testing.T) {
@@ -185,58 +187,42 @@ func TestGenerateFinishReasons(t *testing.T) {
 }
 
 func TestGenerateClassifiesErrors(t *testing.T) {
-	for _, tt := range []struct {
-		status int
-		want   gepa.ErrorKind
-	}{
-		{400, gepa.Permanent},
-		{401, gepa.Permanent},
-		{403, gepa.Permanent},
-		{404, gepa.Permanent},
-		{422, gepa.Permanent},
-		{429, gepa.Transient},
-		{500, gepa.Transient},
-		{502, gepa.Transient},
-		{503, gepa.Transient},
-	} {
-		t.Run(fmt.Sprint(tt.status), func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.Header().Set("content-type", "application/json")
-				w.WriteHeader(tt.status)
-				_, _ = w.Write([]byte(`{"error":{"message":"failed","type":"error"}}`))
-			}))
-			defer server.Close()
-
-			got, err := testModel(t, server.URL).Generate(context.Background(), "prompt")
-
-			require.Error(t, err)
-			require.Equal(t, tt.want, gepa.ErrorKindOf(err))
-			require.ErrorContains(t, err, "openai reflection completion")
-			require.Equal(t, gepa.Generation{}, got)
-		})
+	generate := func(ctx context.Context, baseURL string, client *http.Client) error {
+		lm, err := NewLanguageModel(Config{BaseURL: baseURL, Model: "m", Client: client})
+		require.NoError(t, err)
+		generation, err := lm.Generate(ctx, "prompt")
+		require.Equal(t, gepa.Generation{}, generation)
+		return err
 	}
-
-	t.Run("network error", func(t *testing.T) {
-		server := httptest.NewServer(http.NotFoundHandler())
-		url := server.URL
-		server.Close()
-
-		_, err := testModel(t, url).Generate(context.Background(), "prompt")
-
-		require.Error(t, err)
-		require.True(t, gepa.IsTransient(err), "err = %v", err)
+	t.Run("status", func(t *testing.T) {
+		providertest.RunStatusCases(t, `{"error":{"message":"failed","type":"error"}}`, generate)
 	})
-
-	t.Run("cancelled context", func(t *testing.T) {
-		server := completionServer(t, `{}`)
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-
-		_, err := testModel(t, server.URL).Generate(ctx, "prompt")
-
-		require.Same(t, context.Canceled, err)
-		require.Empty(t, gepa.ErrorKindOf(err))
+	t.Run("transport", func(t *testing.T) {
+		providertest.RunTransportCases(t, generate)
 	})
+	t.Run("errors name the provider", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, `{"error":{"message":"bad"}}`, http.StatusBadRequest)
+		}))
+		defer server.Close()
+		require.ErrorContains(t, generate(context.Background(), server.URL, nil), "openai reflection completion")
+	})
+}
+
+func TestRetryingLanguageModelIsTheOnlyRetryLayer(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Retry-After-Ms", "1")
+		http.Error(w, `{"error":{"message":"overloaded"}}`, http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	retrying := &gepa.RetryingLanguageModel{LM: testModel(t, server.URL), MaxAttempts: 2}
+
+	_, err := retrying.Generate(context.Background(), "prompt")
+
+	require.True(t, gepa.IsTransient(err), "err = %v", err)
+	require.Equal(t, int32(2), requests.Load())
 }
 
 func TestLanguageModelIsSafeForConcurrentUse(t *testing.T) {

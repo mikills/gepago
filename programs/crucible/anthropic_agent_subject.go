@@ -127,10 +127,28 @@ type anthropicResponse struct {
 	Model      string                  `json:"model"`
 	Content    []anthropicContentBlock `json:"content"`
 	StopReason string                  `json:"stop_reason"`
-	Usage      struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
-	} `json:"usage"`
+	Usage      anthropicUsage          `json:"usage"`
+}
+
+type anthropicUsage struct {
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+}
+
+// gepaUsage maps Anthropic usage as the claude provider does: input_tokens excludes the
+// cached part, so PromptTokens adds cache reads and writes back. Anthropic does not report
+// reasoning tokens apart from output_tokens.
+func (u anthropicUsage) gepaUsage() gepa.Usage {
+	prompt := u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
+	return gepa.Usage{
+		PromptTokens:        prompt,
+		CompletionTokens:    u.OutputTokens,
+		TotalTokens:         prompt + u.OutputTokens,
+		CachedInputTokens:   u.CacheReadInputTokens,
+		CacheCreationTokens: u.CacheCreationInputTokens,
+	}
 }
 
 func anthropicMaxTokens(maxTokens *int) int {
@@ -209,14 +227,9 @@ func decodeAnthropicResponse(data []byte) (agents.ChatResponse, error) {
 	for _, block := range response.Content {
 		applyAnthropicBlock(&message, block)
 	}
-	usage := gepa.Usage{
-		PromptTokens:     response.Usage.InputTokens,
-		CompletionTokens: response.Usage.OutputTokens,
-		TotalTokens:      response.Usage.InputTokens + response.Usage.OutputTokens,
-	}
 	return agents.ChatResponse{
 		Message:       message,
-		Usage:         usage,
+		Usage:         response.Usage.gepaUsage(),
 		FinishReason:  anthropicFinishReason(response.StopReason),
 		ResolvedModel: response.Model,
 	}, nil
@@ -236,15 +249,19 @@ func applyAnthropicBlock(message *agents.Message, block anthropicContentBlock) {
 	}
 }
 
+// anthropicFinishReason maps a stop reason; a missing or unknown one maps to the empty
+// FinishReason.
 func anthropicFinishReason(reason string) agents.FinishReason {
 	switch reason {
+	case "end_turn", "stop_sequence":
+		return agents.FinishStop
 	case "tool_use":
 		return agents.FinishToolCalls
-	case "max_tokens":
+	case "max_tokens", "model_context_window_exceeded":
 		return agents.FinishLength
 	case "refusal":
 		return agents.FinishContentFilter
 	default:
-		return agents.FinishStop
+		return ""
 	}
 }

@@ -303,6 +303,9 @@ func decodeWASMModelResult(value js.Value) (compileModelResult, error) {
 		return compileModelResult{}, errors.New("model result.text must be a string")
 	}
 	result := compileModelResult{Text: text.String()}
+	if err := decodeWASMModelResultExtras(value, &result); err != nil {
+		return compileModelResult{}, err
+	}
 	usage := value.Get("usage")
 	if usage.IsUndefined() || usage.IsNull() {
 		return result, nil
@@ -321,6 +324,27 @@ func decodeWASMModelResult(value js.Value) (compileModelResult, error) {
 		return compileModelResult{}, err
 	}
 	return result, nil
+}
+
+// decodeWASMModelResultExtras reads the optional finishReason and model of a host result.
+func decodeWASMModelResultExtras(value js.Value, result *compileModelResult) error {
+	if reason := value.Get("finishReason"); !reason.IsUndefined() && !reason.IsNull() {
+		if reason.Type() != js.TypeString {
+			return errors.New("model result.finishReason must be a string")
+		}
+		parsed, err := parseHostFinishReason(reason.String())
+		if err != nil {
+			return fmt.Errorf("model result.%w", err)
+		}
+		result.FinishReason = parsed
+	}
+	if model := value.Get("model"); !model.IsUndefined() && !model.IsNull() {
+		if model.Type() != js.TypeString {
+			return errors.New("model result.model must be a string")
+		}
+		result.Model = model.String()
+	}
+	return nil
 }
 
 func validateCompileUsage(usage gepa.Usage) error {

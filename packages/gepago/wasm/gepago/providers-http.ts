@@ -173,14 +173,32 @@ export function responseMessage(
   if (toolCalls.length > 0) message.tool_calls = toolCalls;
   return message;
 }
+const contentFilterReasons = [
+  "content_filter",
+  "refusal",
+  "SAFETY",
+  "RECITATION",
+  "BLOCKLIST",
+  "PROHIBITED_CONTENT",
+  "SPII",
+  "IMAGE_SAFETY",
+];
 export function finishReason(
   value: unknown,
   hasTools = false,
 ): ChatResponse["finish_reason"] {
   if (hasTools || value === "tool_use" || value === "function_call")
     return "tool_calls";
-  if (["length", "max_tokens", "MAX_TOKENS"].includes(String(value)))
+  if (
+    [
+      "length",
+      "max_tokens",
+      "MAX_TOKENS",
+      "model_context_window_exceeded",
+    ].includes(String(value))
+  )
     return "length";
+  if (contentFilterReasons.includes(String(value))) return "content_filter";
   return "stop";
 }
 export function modelCallbackFromChat(
@@ -204,7 +222,11 @@ export function modelCallbackFromChat(
         { role: "user", content: prompt },
       ],
     });
-    return { text: response.message.content ?? "", usage: response.usage };
+    return {
+      text: response.message.content ?? "",
+      usage: response.usage,
+      finishReason: response.finish_reason,
+    };
   };
 }
 export function providerCallbacks(

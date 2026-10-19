@@ -18,11 +18,12 @@ const (
 )
 
 // WithErrorKind wraps err with kind. The wrapped error keeps err's message and matches err
-// through errors.Is and errors.As. A nil err returns nil. When err already carries a kind,
-// the outer kind wins.
+// through errors.Is and errors.As. A nil err returns nil, and an empty kind returns err
+// unchanged so it keeps any kind it already has. When err already carries a kind, the outer
+// kind wins.
 func WithErrorKind(err error, kind ErrorKind) error {
-	if err == nil {
-		return nil
+	if err == nil || kind == "" {
+		return err
 	}
 	return &kindError{kind: kind, err: err}
 }

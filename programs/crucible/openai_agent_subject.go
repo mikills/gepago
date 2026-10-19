@@ -246,7 +246,31 @@ type openAIChatResponse struct {
 		Message      openAIMessage `json:"message"`
 		FinishReason string        `json:"finish_reason"`
 	} `json:"choices"`
-	Usage gepa.Usage `json:"usage"`
+	Usage openAIChatUsage `json:"usage"`
+}
+
+type openAIChatUsage struct {
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	TotalTokens         int `json:"total_tokens"`
+	PromptTokensDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+	CompletionTokensDetails struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details"`
+}
+
+// gepaUsage maps chat completion usage as the openai provider does. OpenAI reports no cache
+// writes, so CacheCreationTokens stays zero.
+func (u openAIChatUsage) gepaUsage() gepa.Usage {
+	return gepa.Usage{
+		PromptTokens:      u.PromptTokens,
+		CompletionTokens:  u.CompletionTokens,
+		TotalTokens:       u.TotalTokens,
+		ReasoningTokens:   u.CompletionTokensDetails.ReasoningTokens,
+		CachedInputTokens: u.PromptTokensDetails.CachedTokens,
+	}
 }
 
 type openAIResponsesRequest struct {
@@ -280,9 +304,15 @@ type openAIResponsesResponse struct {
 	Model  string                      `json:"model"`
 	Output []openAIResponsesOutputItem `json:"output"`
 	Usage  struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
-		TotalTokens  int `json:"total_tokens"`
+		InputTokens        int `json:"input_tokens"`
+		OutputTokens       int `json:"output_tokens"`
+		TotalTokens        int `json:"total_tokens"`
+		InputTokensDetails struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"input_tokens_details"`
+		OutputTokensDetails struct {
+			ReasoningTokens int `json:"reasoning_tokens"`
+		} `json:"output_tokens_details"`
 	} `json:"usage"`
 	IncompleteDetails struct {
 		Reason string `json:"reason"`
@@ -432,7 +462,7 @@ func decodeOpenAIChatResponse(data []byte) (agents.ChatResponse, error) {
 			Content:   choice.Message.Content,
 			ToolCalls: agentsToolCalls(choice.Message.ToolCalls),
 		},
-		Usage:         response.Usage,
+		Usage:         response.Usage.gepaUsage(),
 		FinishReason:  finishReason(choice.FinishReason),
 		ResolvedModel: response.Model,
 	}, nil
@@ -451,9 +481,11 @@ func decodeOpenAIResponsesResponse(data []byte) (agents.ChatResponse, error) {
 		applyOpenAIResponsesOutput(&message, item)
 	}
 	usage := gepa.Usage{
-		PromptTokens:     response.Usage.InputTokens,
-		CompletionTokens: response.Usage.OutputTokens,
-		TotalTokens:      response.Usage.TotalTokens,
+		PromptTokens:      response.Usage.InputTokens,
+		CompletionTokens:  response.Usage.OutputTokens,
+		TotalTokens:       response.Usage.TotalTokens,
+		ReasoningTokens:   response.Usage.OutputTokensDetails.ReasoningTokens,
+		CachedInputTokens: response.Usage.InputTokensDetails.CachedTokens,
 	}
 	if usage.TotalTokens == 0 {
 		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
@@ -507,8 +539,12 @@ func agentsToolCalls(calls []openAIToolCall) []agents.ToolCall {
 	return out
 }
 
+// finishReason maps a chat completion finish reason; a missing or unknown one maps to the
+// empty FinishReason.
 func finishReason(reason string) agents.FinishReason {
 	switch reason {
+	case "stop":
+		return agents.FinishStop
 	case toolCallsKey:
 		return agents.FinishToolCalls
 	case "length":
@@ -516,7 +552,7 @@ func finishReason(reason string) agents.FinishReason {
 	case "content_filter":
 		return agents.FinishContentFilter
 	default:
-		return agents.FinishStop
+		return ""
 	}
 }
 

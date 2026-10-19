@@ -7,10 +7,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 
-	"github.com/anthropics/anthropic-sdk-go/option"
 	gepa "github.com/mikills/gepago"
+	"github.com/mikills/gepago/internal/providertest"
 	"github.com/stretchr/testify/require"
 )
 
@@ -27,10 +28,7 @@ func messageServer(t *testing.T, body string) *httptest.Server {
 
 func testModel(t *testing.T, baseURL string) *LanguageModel {
 	t.Helper()
-	lm, err := newLanguageModel(
-		Config{APIKey: "test-key", BaseURL: baseURL, Model: "claude-requested", MaxTokens: 64},
-		option.WithMaxRetries(0),
-	)
+	lm, err := NewLanguageModel(Config{APIKey: "test-key", BaseURL: baseURL, Model: "claude-requested", MaxTokens: 64})
 	require.NoError(t, err)
 	return lm
 }
@@ -131,6 +129,9 @@ func TestGenerateFinishReasons(t *testing.T) {
 		{stopReason: "max_tokens", text: `{"cut`, want: gepa.FinishLength},
 		{stopReason: "tool_use", text: "calling", want: gepa.FinishToolCalls},
 		{stopReason: "refusal", text: "declined", want: gepa.FinishContentFilter},
+		{stopReason: "model_context_window_exceeded", text: `{"cut`, want: gepa.FinishLength},
+		{stopReason: "pause_turn", text: "paused", want: ""},
+		{stopReason: "", text: "ok", want: ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.stopReason+"/"+tt.text, func(t *testing.T) {
@@ -149,60 +150,71 @@ func TestGenerateFinishReasons(t *testing.T) {
 	}
 }
 
-func TestGenerateClassifiesErrors(t *testing.T) {
-	for _, tt := range []struct {
-		status int
-		want   gepa.ErrorKind
-	}{
-		{400, gepa.Permanent},
-		{401, gepa.Permanent},
-		{403, gepa.Permanent},
-		{404, gepa.Permanent},
-		{422, gepa.Permanent},
-		{429, gepa.Transient},
-		{500, gepa.Transient},
-		{502, gepa.Transient},
-		{503, gepa.Transient},
-		{529, gepa.Transient},
-	} {
-		t.Run(fmt.Sprint(tt.status), func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.Header().Set("content-type", "application/json")
-				w.WriteHeader(tt.status)
-				_, _ = w.Write([]byte(`{"type":"error","error":{"type":"api_error","message":"failed"}}`))
-			}))
-			defer server.Close()
-
-			got, err := testModel(t, server.URL).Generate(context.Background(), "prompt")
-
-			require.Error(t, err)
-			require.Equal(t, tt.want, gepa.ErrorKindOf(err))
-			require.ErrorContains(t, err, "claude reflection completion")
-			require.Equal(t, gepa.Generation{}, got)
-		})
+func TestContextWindowTruncationFailsPredict(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"m","stop_reason":"model_context_window_exceeded",
+			"content":[{"type":"text","text":"{\"answer\": \"the reply was cut"}],
+			"usage":{"input_tokens":199000,"output_tokens":1000}}`))
+	}))
+	defer server.Close()
+	program := gepa.Predict{
+		Signature: gepa.Signature{
+			Name:    "qa",
+			Inputs:  []gepa.Field{{Name: "q"}},
+			Outputs: []gepa.Field{{Name: "answer"}},
+		},
+		LM:              testModel(t, server.URL),
+		MaxParseRetries: 1,
 	}
 
-	t.Run("network error", func(t *testing.T) {
-		server := httptest.NewServer(http.NotFoundHandler())
-		url := server.URL
-		server.Close()
+	_, err := program.Run(context.Background(), gepa.Prediction{"q": "?"})
 
-		_, err := testModel(t, url).Generate(context.Background(), "prompt")
+	require.ErrorIs(t, err, gepa.ErrOutputTruncated)
+	require.Equal(t, int32(1), requests.Load(), "a truncated reply must not be sent for repair")
+}
 
-		require.Error(t, err)
-		require.True(t, gepa.IsTransient(err), "err = %v", err)
+func TestGenerateClassifiesErrors(t *testing.T) {
+	generate := func(ctx context.Context, baseURL string, client *http.Client) error {
+		lm, err := NewLanguageModel(Config{APIKey: "test-key", BaseURL: baseURL, Model: "m", Client: client})
+		require.NoError(t, err)
+		generation, err := lm.Generate(ctx, "prompt")
+		require.Equal(t, gepa.Generation{}, generation)
+		return err
+	}
+	t.Run("status", func(t *testing.T) {
+		providertest.RunStatusCases(t, `{"type":"error","error":{"type":"api_error","message":"failed"}}`, generate)
 	})
-
-	t.Run("cancelled context", func(t *testing.T) {
-		server := messageServer(t, `{}`)
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-
-		_, err := testModel(t, server.URL).Generate(ctx, "prompt")
-
-		require.Same(t, context.Canceled, err)
-		require.Empty(t, gepa.ErrorKindOf(err))
+	t.Run("transport", func(t *testing.T) {
+		providertest.RunTransportCases(t, generate)
 	})
+	t.Run("errors name the provider", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, `{"type":"error","error":{"type":"invalid_request_error"}}`, http.StatusBadRequest)
+		}))
+		defer server.Close()
+		require.ErrorContains(t, generate(context.Background(), server.URL, nil), "claude reflection completion")
+	})
+}
+
+func TestRetryingLanguageModelIsTheOnlyRetryLayer(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("content-type", "application/json")
+		w.Header().Set("retry-after-ms", "1")
+		w.WriteHeader(529)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"overloaded_error","message":"x"}}`))
+	}))
+	defer server.Close()
+	retrying := &gepa.RetryingLanguageModel{LM: testModel(t, server.URL), MaxAttempts: 2}
+
+	_, err := retrying.Generate(context.Background(), "prompt")
+
+	require.True(t, gepa.IsTransient(err), "err = %v", err)
+	require.Equal(t, int32(2), requests.Load())
 }
 
 func TestLanguageModelIsSafeForConcurrentUse(t *testing.T) {

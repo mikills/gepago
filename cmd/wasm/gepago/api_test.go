@@ -337,3 +337,63 @@ func mustJSON(t *testing.T, value any) string {
 	}
 	return string(encoded)
 }
+
+func TestPredictResumeStopsOnTruncatedReply(t *testing.T) {
+	start := map[string]any{
+		"program": map[string]any{
+			"signature": gepa.Signature{
+				Name:    "sentiment",
+				Inputs:  []gepa.Field{{Name: "text"}},
+				Outputs: []gepa.Field{{Name: "label"}},
+			},
+			"maxParseRetries": 2,
+		},
+		"inputs": map[string]any{"text": "great"},
+	}
+	begin := func() (string, string) {
+		var envelope struct {
+			Value struct {
+				JobID       string `json:"job_id"`
+				HostRequest struct {
+					RequestID string `json:"request_id"`
+				} `json:"host_request"`
+			} `json:"value"`
+		}
+		if err := json.Unmarshal([]byte(invokeJSON("predict.start", mustJSON(t, start))), &envelope); err != nil {
+			t.Fatal(err)
+		}
+		return envelope.Value.JobID, envelope.Value.HostRequest.RequestID
+	}
+
+	jobID, requestID := begin()
+	truncated := invokeJSON("predict.resume", mustJSON(t, map[string]any{
+		"job_id": jobID, "request_id": requestID,
+		"result": map[string]any{"text": `{"label":"pos`, "finishReason": "length", "model": "m"},
+	}))
+	if !strings.Contains(truncated, "truncated") || strings.Contains(truncated, `"status":"pending"`) {
+		t.Fatalf("truncated reply was not rejected without repair: %s", truncated)
+	}
+	if stale := invokeJSON("predict.resume", mustJSON(t, map[string]any{
+		"job_id": jobID, "request_id": requestID, "result": map[string]any{"text": `{}`},
+	})); !strings.Contains(stale, "unknown or stale") {
+		t.Fatalf("truncated job was kept: %s", stale)
+	}
+
+	jobID, requestID = begin()
+	complete := invokeJSON("predict.resume", mustJSON(t, map[string]any{
+		"job_id": jobID, "request_id": requestID,
+		"result": map[string]any{"text": `{"label":"positive"}`, "finishReason": "stop", "model": "m"},
+	}))
+	if !strings.Contains(complete, `"status":"complete"`) {
+		t.Fatalf("stopped reply was not accepted: %s", complete)
+	}
+
+	jobID, requestID = begin()
+	invalid := invokeJSON("predict.resume", mustJSON(t, map[string]any{
+		"job_id": jobID, "request_id": requestID,
+		"result": map[string]any{"text": `{"label":"positive"}`, "finishReason": "end_turn"},
+	}))
+	if !strings.Contains(invalid, `finishReason \"end_turn\" must be one of`) {
+		t.Fatalf("unknown finish reason was accepted: %s", invalid)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	gepa "github.com/mikills/gepago"
@@ -20,6 +21,8 @@ type Config struct {
 	Headers     map[string]string
 	MaxTokens   int
 	Temperature *float64
+	// Client is the HTTP client requests go through; nil uses the SDK default.
+	Client *http.Client
 }
 
 // Validate checks the provider configuration.
@@ -42,16 +45,18 @@ type LanguageModel struct {
 	temperature *float64
 }
 
-// NewLanguageModel constructs an OpenAI or OpenAI-compatible language model.
+// NewLanguageModel constructs an OpenAI or OpenAI-compatible language model. The SDK's own
+// retries are disabled, so every Generate call makes one request; wrap the model in a
+// gepa.RetryingLanguageModel to retry transient failures.
 func NewLanguageModel(config Config) (*LanguageModel, error) {
-	return newLanguageModel(config)
-}
-
-func newLanguageModel(config Config, extra ...option.RequestOption) (*LanguageModel, error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
-	opts := make([]option.RequestOption, 0, len(config.Headers)+2+len(extra))
+	opts := make([]option.RequestOption, 0, len(config.Headers)+4)
+	opts = append(opts, option.WithMaxRetries(0))
+	if config.Client != nil {
+		opts = append(opts, option.WithHTTPClient(config.Client))
+	}
 	if strings.TrimSpace(config.APIKey) != "" {
 		opts = append(opts, option.WithAPIKey(config.APIKey))
 	}
@@ -61,7 +66,6 @@ func newLanguageModel(config Config, extra ...option.RequestOption) (*LanguageMo
 	for key, value := range config.Headers {
 		opts = append(opts, option.WithHeader(key, value))
 	}
-	opts = append(opts, extra...)
 	maxTokens := config.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = 512
@@ -75,10 +79,11 @@ func newLanguageModel(config Config, extra ...option.RequestOption) (*LanguageMo
 }
 
 // Generate sends a prompt and returns the model's reply with its usage, resolved model and
-// finish reason. HTTP failures are classified: 429 and 5xx are transient, other 4xx permanent,
-// and dropped connections transient; a cancelled or expired ctx returns ctx.Err() unwrapped.
-// A reply that fails after the API reported usage returns that usage with the error. An empty
-// reply is an error unless it stopped at the token limit.
+// finish reason. Failures are classified: 429, 5xx, dropped connections and network
+// timeouts are transient; other 4xx and TLS, host or URL misconfiguration are permanent; a
+// cancelled or expired ctx returns ctx.Err() unwrapped. A reply that fails after the API
+// reported usage returns that usage with the error. An empty reply is an error unless it
+// stopped at the token limit.
 func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Generation, error) {
 	params := openai.ChatCompletionNewParams{
 		Model: openai.ChatModel(m.model),
@@ -131,8 +136,12 @@ func openAIUsage(usage openai.CompletionUsage) gepa.Usage {
 	}
 }
 
+// openAIFinishReason maps a chat completion finish reason; a missing or unknown one maps to
+// the empty FinishReason.
 func openAIFinishReason(reason string) gepa.FinishReason {
 	switch reason {
+	case "stop":
+		return gepa.FinishStop
 	case "length":
 		return gepa.FinishLength
 	case "tool_calls", "function_call":
@@ -140,6 +149,6 @@ func openAIFinishReason(reason string) gepa.FinishReason {
 	case "content_filter":
 		return gepa.FinishContentFilter
 	default:
-		return gepa.FinishStop
+		return ""
 	}
 }

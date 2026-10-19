@@ -44,16 +44,18 @@ type LanguageModel struct {
 	maxTokens int
 }
 
-// NewLanguageModel constructs a Claude language model.
+// NewLanguageModel constructs a Claude language model. The SDK's own retries are disabled, so
+// every Generate call makes one request; wrap the model in a gepa.RetryingLanguageModel to
+// retry transient failures.
 func NewLanguageModel(config Config) (*LanguageModel, error) {
-	return newLanguageModel(config)
-}
-
-func newLanguageModel(config Config, extra ...option.RequestOption) (*LanguageModel, error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
-	opts := []option.RequestOption{option.WithoutEnvironmentDefaults(), option.WithAPIKey(config.APIKey)}
+	opts := []option.RequestOption{
+		option.WithoutEnvironmentDefaults(),
+		option.WithAPIKey(config.APIKey),
+		option.WithMaxRetries(0),
+	}
 	if strings.TrimSpace(config.BaseURL) != "" {
 		opts = append(opts, option.WithBaseURL(config.BaseURL))
 	}
@@ -65,7 +67,6 @@ func newLanguageModel(config Config, extra ...option.RequestOption) (*LanguageMo
 	for key, value := range headers {
 		opts = append(opts, option.WithHeader(key, value))
 	}
-	opts = append(opts, extra...)
 	maxTokens := config.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = 512
@@ -79,11 +80,11 @@ func newLanguageModel(config Config, extra ...option.RequestOption) (*LanguageMo
 }
 
 // Generate sends a prompt and returns the model's reply with its usage, resolved model and
-// finish reason. HTTP failures are classified: 429 and 5xx (529 overloaded included) are
-// transient, other 4xx permanent, and dropped connections transient; a cancelled or expired
-// ctx returns ctx.Err() unwrapped. A reply that fails after the API reported usage returns
-// that usage with the error. A reply with no text is an error unless it stopped at the token
-// limit.
+// finish reason. Failures are classified: 429, 5xx (529 overloaded included), dropped
+// connections and network timeouts are transient; other 4xx and TLS, host or URL
+// misconfiguration are permanent; a cancelled or expired ctx returns ctx.Err() unwrapped. A
+// reply that fails after the API reported usage returns that usage with the error. A reply
+// with no text is an error unless it stopped at the token limit.
 func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Generation, error) {
 	message, err := m.client.Messages.New(ctx, anthropic.MessageNewParams{
 		Model:     anthropic.Model(m.model),
@@ -133,16 +134,20 @@ func claudeUsage(usage anthropic.Usage) gepa.Usage {
 	}
 }
 
+// claudeFinishReason maps a stop reason; a missing or unknown one, such as pause_turn, maps to
+// the empty FinishReason.
 func claudeFinishReason(reason anthropic.StopReason) gepa.FinishReason {
 	switch reason {
-	case anthropic.StopReasonMaxTokens:
+	case anthropic.StopReasonEndTurn, anthropic.StopReasonStopSequence:
+		return gepa.FinishStop
+	case anthropic.StopReasonMaxTokens, "model_context_window_exceeded":
 		return gepa.FinishLength
 	case anthropic.StopReasonToolUse:
 		return gepa.FinishToolCalls
 	case anthropic.StopReasonRefusal:
 		return gepa.FinishContentFilter
 	default:
-		return gepa.FinishStop
+		return ""
 	}
 }
 

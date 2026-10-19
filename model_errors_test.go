@@ -58,6 +58,12 @@ func TestWithErrorKind(t *testing.T) {
 		require.EqualError(t, TransientError(errors.New("rate limited")), "rate limited")
 	})
 
+	t.Run("empty kind keeps the error and its kind", func(t *testing.T) {
+		cause := TransientError(errors.New("rate limited"))
+		require.Same(t, cause, WithErrorKind(cause, ""))
+		require.True(t, IsTransient(WithErrorKind(cause, "")))
+	})
+
 	t.Run("nil error stays nil", func(t *testing.T) {
 		require.NoError(t, WithErrorKind(nil, Transient))
 		require.NoError(t, PermanentError(nil))

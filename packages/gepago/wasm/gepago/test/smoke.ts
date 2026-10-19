@@ -233,6 +233,39 @@ test("loads generated Go WASM and exposes deterministic APIs", async () => {
       /model failed/,
     );
 
+    const truncatedRequests: PredictHostRequest[] = [];
+    await assert.rejects(
+      gepago.predict(
+        {
+          program: { signature, maxParseRetries: 2 },
+          inputs: request.inputs,
+        },
+        async (hostRequest: PredictHostRequest): Promise<PredictModelResult> => {
+          truncatedRequests.push(hostRequest);
+          return {
+            text: '{"label":"pos',
+            finishReason: "length",
+            model: "host-model",
+            usage: {
+              prompt_tokens: 4,
+              completion_tokens: 8,
+              total_tokens: 12,
+              reasoning_tokens: 3,
+            },
+          };
+        },
+      ),
+      /truncated/,
+    );
+    assert.equal(truncatedRequests.length, 1, "a truncated reply is not repaired");
+    await assert.rejects(
+      gepago.predict(predictConfig, async () => ({
+        text: '{"label":"positive"}',
+        finishReason: "end_turn" as never,
+      })),
+      /finishReason must be one of/,
+    );
+
     const compileConfig = {
       program: { signature, instruction: "Classify the text." },
       trainset: [
@@ -267,6 +300,23 @@ test("loads generated Go WASM and exposes deterministic APIs", async () => {
     );
     assert.equal(compiled.state.ledger.total_tokens, 0);
     assert.equal(compileRequests.length, 1);
+
+    const truncatedCompileRoles: string[] = [];
+    const truncatedCompiled = await gepago.compile(
+      { ...compileConfig, program: { ...compileConfig.program, maxParseRetries: 1 } },
+      async (hostRequest: CompileModelRequest) => {
+        truncatedCompileRoles.push(hostRequest.role);
+        return {
+          text: '{"label":"positive"}',
+          finishReason: "length",
+          model: "host-model",
+          usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 },
+        };
+      },
+    );
+    assert.deepEqual(truncatedCompileRoles, ["task"]);
+    assert.equal(truncatedCompiled.state.candidates[0].validation_score, 0);
+    assert.equal(truncatedCompiled.state.ledger.total_tokens, 5);
     const compiledPrediction = await gepago.runCompiled(
       compileConfig.program,
       compiled.candidate,

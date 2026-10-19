@@ -14,8 +14,13 @@ export type Prediction = Record<string, JSONValue>;
 export type Candidate = Record<string, string>;
 
 export type MessageRole = "system" | "user" | "assistant" | "tool";
-export type FinishReason = "stop" | "length" | "tool_calls";
-export type StopReason = "complete" | "length" | "max_turns" | "tool_error";
+export type FinishReason = "stop" | "length" | "tool_calls" | "content_filter";
+export type StopReason =
+  | "complete"
+  | "length"
+  | "max_turns"
+  | "tool_error"
+  | "content_filter";
 
 export interface ToolCall {
   id: string;
@@ -485,6 +490,10 @@ export interface CompileModelRequest {
 export interface CompileModelResult {
   text: string;
   usage?: Usage;
+  /** Why the model stopped; "length" marks a truncated reply that is not repaired. */
+  finishReason?: FinishReason;
+  /** The model the provider resolved the request to. */
+  model?: string;
 }
 
 export type CompileModelOutput = string | CompileModelResult;
@@ -504,6 +513,12 @@ export interface Usage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  /** Part of completion_tokens spent on hidden reasoning. */
+  reasoning_tokens?: number;
+  /** Part of prompt_tokens read from a prompt cache. */
+  cached_input_tokens?: number;
+  /** Part of prompt_tokens written to a prompt cache. */
+  cache_creation_tokens?: number;
 }
 
 export type PredictModelUsage = Usage;
@@ -511,6 +526,10 @@ export type PredictModelUsage = Usage;
 export interface PredictModelResult {
   text: string;
   usage?: PredictModelUsage;
+  /** Why the model stopped; "length" fails the prediction without a repair request. */
+  finishReason?: FinishReason;
+  /** The model the provider resolved the request to. */
+  model?: string;
 }
 
 export interface PredictResult {

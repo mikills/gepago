@@ -23,10 +23,27 @@ type compileModelRequest struct {
 	Attempt int    `json:"attempt,omitempty"`
 }
 
-// compileModelResult is the normalized result returned by a host model.
+// compileModelResult is the normalized result returned by a host model. FinishReason and
+// Model are optional: hosts that report them let Predict detect a truncated reply.
 type compileModelResult struct {
-	Text  string
-	Usage gepa.Usage
+	Text         string
+	Usage        gepa.Usage
+	FinishReason gepa.FinishReason
+	Model        string
+}
+
+// parseHostFinishReason validates the optional finish reason a host model reports. Empty
+// means the host did not report one.
+func parseHostFinishReason(value string) (gepa.FinishReason, error) {
+	switch reason := gepa.FinishReason(value); reason {
+	case "", gepa.FinishStop, gepa.FinishLength, gepa.FinishToolCalls, gepa.FinishContentFilter:
+		return reason, nil
+	default:
+		return "", fmt.Errorf(
+			"finishReason %q must be one of stop, length, tool_calls or content_filter",
+			value,
+		)
+	}
 }
 
 // compileModelInvoker is the small host boundary used by the common compile
@@ -88,7 +105,12 @@ func (m *compileLanguageModel) Generate(ctx context.Context, prompt string) (gep
 		// the host already spent the tokens, so report them with the cancellation.
 		return gepa.Generation{Usage: result.Usage}, err
 	}
-	return gepa.Generation{Text: result.Text, Usage: result.Usage}, nil
+	return gepa.Generation{
+		Text:         result.Text,
+		Usage:        result.Usage,
+		Model:        result.Model,
+		FinishReason: result.FinishReason,
+	}, nil
 }
 
 // compileWireConfig is the JSON-only compile protocol. It intentionally does

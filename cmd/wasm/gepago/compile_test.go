@@ -354,3 +354,66 @@ func TestCompileLanguageModelRequiresInvoker(t *testing.T) {
 		t.Fatalf("Generate() error = %v, want host error", err)
 	}
 }
+
+func TestParseHostFinishReason(t *testing.T) {
+	for _, value := range []string{"", "stop", "length", "tool_calls", "content_filter"} {
+		got, err := parseHostFinishReason(value)
+		if err != nil || string(got) != value {
+			t.Fatalf("parseHostFinishReason(%q) = %q, %v", value, got, err)
+		}
+	}
+	if _, err := parseHostFinishReason("MAX_TOKENS"); err == nil {
+		t.Fatal("parseHostFinishReason accepted a provider-native reason")
+	}
+}
+
+func TestCompileTreatsTruncatedHostRepliesAsInvalidOutput(t *testing.T) {
+	var roles []string
+	invoker := compileModelInvokerFunc(
+		func(_ context.Context, request compileModelRequest) (compileModelResult, error) {
+			roles = append(roles, request.Role)
+			return compileModelResult{
+				Text:         `{"label":"positive"}`,
+				Usage:        gepa.Usage{TotalTokens: 4},
+				FinishReason: gepa.FinishLength,
+				Model:        "host-model",
+			}, nil
+		},
+	)
+	model := newCompileLanguageModel(invoker, "task")
+	got, err := model.Generate(context.Background(), "prompt")
+	if err != nil || got.FinishReason != gepa.FinishLength || got.Model != "host-model" {
+		t.Fatalf("Generate() = %+v, %v; want the host finish reason and model", got, err)
+	}
+
+	payload := map[string]any{
+		"program": map[string]any{
+			"signature": map[string]any{
+				"inputs":  []map[string]any{{"name": "text"}},
+				"outputs": []map[string]any{{"name": "label"}},
+			},
+			"maxParseRetries": 1,
+		},
+		"trainset": []map[string]any{{
+			"id": "one", "input": map[string]any{"text": "great"}, "expected": map[string]any{"label": "positive"},
+		}},
+		"metric":         map[string]any{"kind": "exactMatch", "fields": []string{"label"}},
+		"maxMetricCalls": 1,
+	}
+	roles = nil
+
+	value, err := runCompileOperation(context.Background(), mustJSON(t, payload), invoker)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roles) != 1 || roles[0] != "task" {
+		t.Fatalf("roles = %v, want one task call and no repair", roles)
+	}
+	if score := value.State.Candidates[0].ValidationScore; score != 0 {
+		t.Fatalf("seed score = %v, want 0 for a truncated reply", score)
+	}
+	if value.State.Ledger.TotalTokens != 4 {
+		t.Fatalf("ledger = %+v, want the truncated call's usage", value.State.Ledger)
+	}
+}

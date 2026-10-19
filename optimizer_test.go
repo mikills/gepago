@@ -444,3 +444,50 @@ func TestDefaultReflectiveDatasetBuilder(t *testing.T) {
 		}
 	})
 }
+
+// v07ReflectionFingerprint is the config fingerprint v0.7 computed for
+// fingerprintConfig with a LanguageModelFunc reflection model.
+const v07ReflectionFingerprint = "7d2d6d4fdd857cce2f48b15e1a5177d6701702edeb71c1e9e123f770e48f1b9d"
+
+func fingerprintConfig(reflection Generator) OptimizationConfig {
+	return OptimizationConfig{
+		SeedCandidate: Candidate{"instruction": "Classify sentiment."},
+		Trainset: []Example{
+			NewIOExample("one", Prediction{"text": "great"}, Prediction{"label": "positive"}),
+		},
+		Evaluator: EvaluatorFunc(func(context.Context, Candidate, []Example, bool) (EvaluationResult, error) {
+			return EvaluationResult{}, nil
+		}),
+		DatasetBuilder: ReflectiveDatasetBuilderFunc(DefaultReflectiveDatasetBuilder),
+		ReflectionLM:   reflection,
+		Objective:      "classify",
+		MaxMetricCalls: 4,
+		MinibatchSize:  1,
+		Seed:           7,
+	}
+}
+
+func TestConfigFingerprintOfAdaptedLegacyModel(t *testing.T) {
+	fingerprint := func(reflection Generator) string {
+		optimizer, err := NewOptimizer(fingerprintConfig(reflection))
+		if err != nil {
+			t.Fatalf("NewOptimizer() error = %v", err)
+		}
+		return optimizer.configFingerprint(optimizer.validationSet())
+	}
+	legacy := AdaptLanguageModel(LanguageModelFunc(func(context.Context, string) (string, error) { return "", nil }))
+
+	if got := fingerprint(legacy); got != v07ReflectionFingerprint {
+		t.Fatalf("adapted LanguageModelFunc fingerprint = %s, want the v0.7 value %s", got, v07ReflectionFingerprint)
+	}
+	if got := fingerprint(AdaptLanguageModel(&legacyModel{})); got == v07ReflectionFingerprint {
+		t.Fatal("swapping one legacy model type for another left the fingerprint unchanged")
+	}
+	native := GeneratorFunc(func(context.Context, string) (Generation, error) { return Generation{}, nil })
+	if got := fingerprint(native); got == v07ReflectionFingerprint {
+		t.Fatal("a native generator hashed like a legacy model")
+	}
+	if got := optimizationTypeName(legacy); got != "gepa.LanguageModelFunc" {
+		t.Fatalf("optimizationTypeName(adapted) = %q", got)
+	}
+}

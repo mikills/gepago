@@ -3,9 +3,11 @@ package google
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,6 +15,7 @@ import (
 
 	gepa "github.com/mikills/gepago"
 	"github.com/mikills/gepago/agents"
+	"github.com/mikills/gepago/internal/providertest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -218,7 +221,8 @@ func TestGenerateFinishReasons(t *testing.T) {
 		{reason: "SAFETY", text: "partial", want: gepa.FinishContentFilter},
 		{reason: "RECITATION", text: "partial", want: gepa.FinishContentFilter},
 		{reason: "PROHIBITED_CONTENT", text: "partial", want: gepa.FinishContentFilter},
-		{reason: "OTHER", text: "ok", want: gepa.FinishStop},
+		{reason: "OTHER", text: "ok", want: ""},
+		{reason: "", text: "ok", want: ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.reason+"/"+tt.text, func(t *testing.T) {
@@ -237,70 +241,26 @@ func TestGenerateFinishReasons(t *testing.T) {
 }
 
 func TestGenerateClassifiesErrors(t *testing.T) {
-	for _, tt := range []struct {
-		status int
-		want   gepa.ErrorKind
-	}{
-		{400, gepa.Permanent},
-		{401, gepa.Permanent},
-		{403, gepa.Permanent},
-		{404, gepa.Permanent},
-		{422, gepa.Permanent},
-		{429, gepa.Transient},
-		{500, gepa.Transient},
-		{502, gepa.Transient},
-		{503, gepa.Transient},
-	} {
-		t.Run(fmt.Sprint(tt.status), func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				http.Error(w, `{"error":{"message":"failed"}}`, tt.status)
-			}))
-			defer server.Close()
-
-			got, err := testModel(t, server.URL).Generate(context.Background(), "prompt")
-
-			require.Error(t, err)
-			assert.Equal(t, tt.want, gepa.ErrorKindOf(err))
-			assert.ErrorContains(t, err, fmt.Sprintf("google generateContent status %d", tt.status))
-			assert.Equal(t, gepa.Generation{}, got)
-		})
+	generate := func(ctx context.Context, baseURL string, client *http.Client) error {
+		lm, err := NewLanguageModel(Config{APIKey: "secret", BaseURL: baseURL, Model: "m", Client: client})
+		require.NoError(t, err)
+		generation, err := lm.Generate(ctx, "prompt")
+		assert.Equal(t, gepa.Generation{}, generation)
+		return err
 	}
-
-	t.Run("network error", func(t *testing.T) {
-		server := httptest.NewServer(http.NotFoundHandler())
-		url := server.URL
-		server.Close()
-
-		_, err := testModel(t, url).Generate(context.Background(), "prompt")
-
-		require.Error(t, err)
-		assert.True(t, gepa.IsTransient(err), "err = %v", err)
+	t.Run("status", func(t *testing.T) {
+		providertest.RunStatusCases(t, `{"error":{"message":"failed"}}`, generate)
 	})
-
-	t.Run("dropped response body", func(t *testing.T) {
+	t.Run("transport", func(t *testing.T) {
+		providertest.RunTransportCases(t, generate)
+	})
+	t.Run("errors name the status", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Length", "100")
-			_, _ = w.Write([]byte(`{"candidates":`))
+			http.Error(w, `{"error":{"message":"failed"}}`, http.StatusBadRequest)
 		}))
 		defer server.Close()
-
-		_, err := testModel(t, server.URL).Generate(context.Background(), "prompt")
-
-		require.ErrorContains(t, err, "read response")
-		assert.True(t, gepa.IsTransient(err), "err = %v", err)
+		assert.ErrorContains(t, generate(context.Background(), server.URL, nil), "google generateContent status 400")
 	})
-
-	t.Run("cancelled context", func(t *testing.T) {
-		server := googleServer(t, `{}`)
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-
-		_, err := testModel(t, server.URL).Generate(ctx, "prompt")
-
-		require.Same(t, context.Canceled, err)
-		assert.Empty(t, gepa.ErrorKindOf(err))
-	})
-
 	t.Run("chat client classifies too", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			http.Error(w, "slow down", http.StatusTooManyRequests)
@@ -314,6 +274,50 @@ func TestGenerateClassifiesErrors(t *testing.T) {
 		})
 
 		assert.True(t, gepa.IsTransient(err), "err = %v", err)
+	})
+}
+
+func TestErrorsRedactTheAPIKey(t *testing.T) {
+	const key = "SECRET-KEY-123"
+	tlsServer := httptest.NewTLSServer(http.NotFoundHandler())
+	defer tlsServer.Close()
+	echoServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "API key "+r.URL.Query().Get("key")+" not valid", http.StatusBadRequest)
+	}))
+	defer echoServer.Close()
+
+	for name, base := range map[string]string{
+		"tls failure":        tlsServer.URL,
+		"unsupported scheme": "ftp://example.invalid",
+		"body echoes key":    echoServer.URL,
+	} {
+		t.Run(name, func(t *testing.T) {
+			lm, err := NewLanguageModel(Config{APIKey: key, BaseURL: base, Model: "m"})
+			require.NoError(t, err)
+
+			_, err = lm.Generate(context.Background(), "p")
+
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), key)
+			assert.Contains(t, err.Error(), "REDACTED")
+			assert.True(t, gepa.IsPermanent(err), "redaction keeps the kind: %v", err)
+			var urlErr *url.Error
+			if errors.As(err, &urlErr) {
+				assert.NotContains(t, urlErr.URL, key)
+				assert.NotContains(t, urlErr.Error(), key)
+			}
+		})
+	}
+
+	t.Run("context errors stay bare", func(t *testing.T) {
+		lm, err := NewLanguageModel(Config{APIKey: key, BaseURL: echoServer.URL, Model: "m"})
+		require.NoError(t, err)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err = lm.Generate(ctx, "p")
+
+		assert.Same(t, context.Canceled, err)
 	})
 }
 

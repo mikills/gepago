@@ -203,25 +203,68 @@ func containsString(values []string, want string) bool {
 	return false
 }
 
-func TestHostProposerClearsUsageOfFailedProposal(t *testing.T) {
-	fail := false
+func TestHostProposerUsageAndCalls(t *testing.T) {
+	response := `{"patch":{"instruction":"better"},"usage":{"prompt_tokens":3,"total_tokens":3}}`
+	var callbackErr error
 	proposer := &hostProposer{callback: func(context.Context, string) (string, error) {
-		if fail {
-			return "", errors.New("host proposer failed")
-		}
-		return `{"patch":{"instruction":"better"},"usage":{"prompt_tokens":3,"total_tokens":3}}`, nil
+		return response, callbackErr
 	}}
-	if _, err := proposer.Propose(context.Background(), gepa.Candidate{"instruction": "x"}, nil, nil); err != nil {
+	propose := func() error {
+		_, err := proposer.Propose(context.Background(), gepa.Candidate{"instruction": "x"}, nil, nil)
+		return err
+	}
+
+	if err := propose(); err != nil {
 		t.Fatalf("Propose() error = %v", err)
 	}
 	if got := proposer.LastUsage(); got != (gepa.Usage{PromptTokens: 3, TotalTokens: 3}) {
 		t.Fatalf("LastUsage() = %+v", got)
 	}
-	fail = true
-	if _, err := proposer.Propose(context.Background(), gepa.Candidate{"instruction": "x"}, nil, nil); err == nil {
+	if got := proposer.LastModelCalls(); got != 1 {
+		t.Fatalf("LastModelCalls() = %d, want 1", got)
+	}
+
+	// an unusable response still reports the tokens the host spent on it.
+	response = `{"patch":{" ":"better"},"usage":{"prompt_tokens":500,"completion_tokens":40,"total_tokens":540}}`
+	if err := propose(); err == nil {
+		t.Fatal("Propose() accepted an empty component name")
+	}
+	if got := proposer.LastUsage(); got != (gepa.Usage{PromptTokens: 500, CompletionTokens: 40, TotalTokens: 540}) {
+		t.Fatalf("LastUsage() after an invalid response = %+v", got)
+	}
+	if got := proposer.LastProposalMetadata(); len(got) != 0 {
+		t.Fatalf("LastProposalMetadata() after an invalid response = %+v", got)
+	}
+
+	for _, invalid := range []string{
+		`{"patch":{"instruction":"x"},"usage":{"prompt_tokens":-1}}`,
+		`{"patch":{"instruction":"x"},"usage":"many"}`,
+	} {
+		response = invalid
+		if err := propose(); err == nil {
+			t.Fatalf("Propose() accepted invalid usage %s", invalid)
+		}
+		if got := proposer.LastUsage(); got != (gepa.Usage{}) {
+			t.Fatalf("LastUsage() after invalid usage %s = %+v, want zero", invalid, got)
+		}
+	}
+
+	callbackErr = errors.New("host proposer failed")
+	if err := propose(); err == nil {
 		t.Fatal("Propose() error = nil")
 	}
 	if got := proposer.LastUsage(); got != (gepa.Usage{}) {
-		t.Fatalf("LastUsage() after a failed proposal = %+v, want zero", got)
+		t.Fatalf("LastUsage() after a failed callback = %+v, want zero", got)
+	}
+	if got := proposer.LastModelCalls(); got != 1 {
+		t.Fatalf("LastModelCalls() after a failed callback = %d, want 1", got)
+	}
+
+	missing := &hostProposer{}
+	if _, err := missing.Propose(context.Background(), gepa.Candidate{}, nil, nil); err == nil {
+		t.Fatal("Propose() without a callback succeeded")
+	}
+	if got := missing.LastModelCalls(); got != 0 {
+		t.Fatalf("LastModelCalls() without a callback = %d, want 0", got)
 	}
 }

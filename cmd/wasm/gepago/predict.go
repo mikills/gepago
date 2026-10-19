@@ -66,8 +66,10 @@ type predictStartRequest struct {
 }
 
 type predictModelResult struct {
-	Text  *string     `json:"text"`
-	Usage *gepa.Usage `json:"usage"`
+	Text         *string     `json:"text"`
+	Usage        *gepa.Usage `json:"usage"`
+	FinishReason *string     `json:"finishReason"`
+	Model        *string     `json:"model"`
 }
 
 type predictResumeRequest struct {
@@ -203,6 +205,11 @@ func validatePredictResumeRequest(request predictResumeRequest) error {
 	if request.Result.Text == nil {
 		return errors.New("predict.resume payload: result.text is required")
 	}
+	if request.Result.FinishReason != nil {
+		if _, err := parseHostFinishReason(*request.Result.FinishReason); err != nil {
+			return fmt.Errorf("predict.resume payload: result.%w", err)
+		}
+	}
 	if request.Result.Usage == nil {
 		return nil
 	}
@@ -216,6 +223,11 @@ func transitionPredictResume(request predictResumeRequest) (any, error) {
 		return nil, err
 	}
 	addPredictUsage(job, request.Result.Usage)
+	if request.Result.FinishReason != nil && gepa.FinishReason(*request.Result.FinishReason) == gepa.FinishLength {
+		// as in gepa.Predict, a reply cut at the token limit is not sent for repair.
+		delete(predictState.jobs, request.JobID)
+		return nil, fmt.Errorf("predict job %q: %w", request.JobID, gepa.ErrOutputTruncated)
+	}
 
 	raw := *request.Result.Text
 	prediction, parseErr := parsePredictResult(raw)

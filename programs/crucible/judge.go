@@ -34,7 +34,7 @@ func (e RubricJudgeEvaluator) Evaluate(ctx context.Context, input EvalInput) (Sc
 	maxScore := positiveMaxScore(e.MaxScore)
 	generation, err := e.LM.Generate(ctx, rubricJudgePrompt(input, rubric, maxScore))
 	usage := generation.Usage
-	if err != nil {
+	if err = judgeReplyError(generation, err); err != nil {
 		return Score{Usage: usage}, err
 	}
 	response, err := parseJudgeResponse(generation.Text)
@@ -80,7 +80,7 @@ func (e PairwiseJudgeEvaluator) Compare(ctx context.Context, input PairwiseInput
 	presented, swapped := pairwisePresentation(input)
 	generation, err := e.LM.Generate(ctx, pairwiseJudgePrompt(presented, rubric))
 	usage := generation.Usage
-	if err != nil {
+	if err = judgeReplyError(generation, err); err != nil {
 		return PairwiseScore{Usage: usage}, err
 	}
 	response, err := parsePairwiseJudgeResponse(generation.Text, presented.SubjectA, presented.SubjectB)
@@ -96,6 +96,18 @@ func (e PairwiseJudgeEvaluator) Compare(ctx context.Context, input PairwiseInput
 	response.Details["presentation_swapped"] = swapped
 	response.Usage = usage
 	return response, nil
+}
+
+// judgeReplyError returns the call's error, or gepa.ErrOutputTruncated for a reply cut at the
+// token limit, which must not be scored.
+func judgeReplyError(generation gepa.Generation, err error) error {
+	if err != nil {
+		return err
+	}
+	if generation.FinishReason == gepa.FinishLength {
+		return fmt.Errorf("%w: judge reply", gepa.ErrOutputTruncated)
+	}
+	return nil
 }
 
 func pairwisePresentation(input PairwiseInput) (PairwiseInput, bool) {

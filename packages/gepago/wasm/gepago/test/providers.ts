@@ -12,7 +12,9 @@ import type {
 } from "@mikills/wasm/gepago";
 import {
   createClaudeChat,
+  createClaudeModel,
   createGoogleChat,
+  createGoogleModel,
   createOpenAIChat,
   createOpenAIModel,
   createPiModel,
@@ -110,10 +112,73 @@ test("OpenAI model callback keeps credentials out of the request payload", async
     completion_tokens: 3,
     total_tokens: 5,
   });
+  assert.equal(result.finishReason, "stop");
   assert.ok(seen);
   assert.equal(seen.init.headers?.authorization, "Bearer secret");
   assert.equal("apiKey" in seen.body, false);
   assert.equal(seen.body.max_tokens, 64);
+});
+
+test("model callbacks report normalised finish reasons", async () => {
+  const cases: Array<{
+    create: (fetch: ProviderFetch) => PredictModel;
+    body: JSONObject;
+    want: PredictModelResult["finishReason"];
+  }> = [
+    {
+      create: (fetch) =>
+        createOpenAIModel({ apiKey: "k", model: "m", fetch }) as PredictModel,
+      body: {
+        choices: [
+          { message: { content: '{"cut' }, finish_reason: "length" },
+        ],
+      },
+      want: "length",
+    },
+    {
+      create: (fetch) =>
+        createOpenAIModel({ apiKey: "k", model: "m", fetch }) as PredictModel,
+      body: {
+        choices: [
+          { message: { content: "x" }, finish_reason: "content_filter" },
+        ],
+      },
+      want: "content_filter",
+    },
+    {
+      create: (fetch) =>
+        createClaudeModel({ apiKey: "k", model: "m", fetch }) as PredictModel,
+      body: {
+        content: [{ type: "text", text: '{"cut' }],
+        stop_reason: "model_context_window_exceeded",
+      },
+      want: "length",
+    },
+    {
+      create: (fetch) =>
+        createClaudeModel({ apiKey: "k", model: "m", fetch }) as PredictModel,
+      body: {
+        content: [{ type: "text", text: "no" }],
+        stop_reason: "refusal",
+      },
+      want: "content_filter",
+    },
+    {
+      create: (fetch) =>
+        createGoogleModel({ apiKey: "k", model: "m", fetch }) as PredictModel,
+      body: {
+        candidates: [
+          { content: { parts: [{ text: "x" }] }, finishReason: "SAFETY" },
+        ],
+      },
+      want: "content_filter",
+    },
+  ];
+  for (const { create, body, want } of cases) {
+    const model = create(fakeFetch(() => jsonResponse(body)));
+    const result = (await model(modelRequest("p"))) as PredictModelResult;
+    assert.equal(result.finishReason, want, JSON.stringify(body));
+  }
 });
 
 test("OpenAI chat maps tool calls and response format", async () => {

@@ -634,6 +634,14 @@ func TestAgentSubjectFinishReasons(t *testing.T) {
 		{"anthropic max tokens", decodeAnthropicResponse, anthropic("max_tokens"), agents.FinishLength},
 		{"anthropic tool use", decodeAnthropicResponse, anthropic("tool_use"), agents.FinishToolCalls},
 		{"anthropic refusal", decodeAnthropicResponse, anthropic("refusal"), agents.FinishContentFilter},
+		{
+			"anthropic context window",
+			decodeAnthropicResponse,
+			anthropic("model_context_window_exceeded"),
+			agents.FinishLength,
+		},
+		{"anthropic unknown", decodeAnthropicResponse, anthropic("pause_turn"), ""},
+		{"chat unknown", decodeOpenAIChatResponse, chat("something_new"), ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -642,6 +650,88 @@ func TestAgentSubjectFinishReasons(t *testing.T) {
 			assert.Equal(t, tt.want, got.FinishReason)
 		})
 	}
+}
+
+func TestAgentSubjectUsageBreakdown(t *testing.T) {
+	tests := []struct {
+		name   string
+		decode func([]byte) (agents.ChatResponse, error)
+		body   string
+		want   gepa.Usage
+	}{
+		{
+			name:   "openai chat",
+			decode: decodeOpenAIChatResponse,
+			body: `{"model":"m","choices":[{"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],
+				"usage":{"prompt_tokens":120,"completion_tokens":40,"total_tokens":160,
+				"prompt_tokens_details":{"cached_tokens":64},"completion_tokens_details":{"reasoning_tokens":25}}}`,
+			want: gepa.Usage{
+				PromptTokens:      120,
+				CompletionTokens:  40,
+				TotalTokens:       160,
+				ReasoningTokens:   25,
+				CachedInputTokens: 64,
+			},
+		},
+		{
+			name:   "openai responses",
+			decode: decodeOpenAIResponsesResponse,
+			body: `{"model":"m","output":[{"type":"message","content":[{"type":"output_text","text":"x"}]}],
+				"usage":{"input_tokens":90,"output_tokens":30,"total_tokens":120,
+				"input_tokens_details":{"cached_tokens":50},"output_tokens_details":{"reasoning_tokens":12}}}`,
+			want: gepa.Usage{
+				PromptTokens:      90,
+				CompletionTokens:  30,
+				TotalTokens:       120,
+				ReasoningTokens:   12,
+				CachedInputTokens: 50,
+			},
+		},
+		{
+			name:   "anthropic",
+			decode: decodeAnthropicResponse,
+			body: `{"model":"m","content":[{"type":"text","text":"x"}],"stop_reason":"end_turn",
+				"usage":{"input_tokens":10,"output_tokens":30,
+				"cache_read_input_tokens":200,"cache_creation_input_tokens":50}}`,
+			// input_tokens excludes the cached part, so PromptTokens adds it back.
+			want: gepa.Usage{
+				PromptTokens:        260,
+				CompletionTokens:    30,
+				TotalTokens:         290,
+				CachedInputTokens:   200,
+				CacheCreationTokens: 50,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.decode([]byte(tt.body))
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got.Usage)
+		})
+	}
+}
+
+func TestJudgesRejectTruncatedReplies(t *testing.T) {
+	usage := gepa.Usage{PromptTokens: 5, CompletionTokens: 64, TotalTokens: 69}
+	judge := gepa.GeneratorFunc(func(context.Context, string) (gepa.Generation, error) {
+		return gepa.Generation{
+			Text:         `{"winner":"a","score_a":1,"score_b":0,"score":1}`,
+			Usage:        usage,
+			FinishReason: gepa.FinishLength,
+		}, nil
+	})
+	evalCase := EvalCase{ID: "case", Rubric: "Be correct"}
+
+	score, err := RubricJudgeEvaluator{LM: judge}.Evaluate(context.Background(), EvalInput{Case: evalCase})
+	require.ErrorIs(t, err, gepa.ErrOutputTruncated)
+	assert.Zero(t, score.Score)
+	assert.Equal(t, usage, score.Usage)
+
+	pairwise, err := PairwiseJudgeEvaluator{LM: judge}.Compare(context.Background(), PairwiseInput{Case: evalCase})
+	require.ErrorIs(t, err, gepa.ErrOutputTruncated)
+	assert.Empty(t, pairwise.Winner)
+	assert.Equal(t, usage, pairwise.Usage)
 }
 
 func TestRawModelSubjectReportsUsageOfFailedCall(t *testing.T) {

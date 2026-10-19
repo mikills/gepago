@@ -365,7 +365,13 @@ func (o *Optimizer) configFingerprint(valset []Example) string {
 	return hex.EncodeToString(digest[:])
 }
 
+// optimizationTypeName names a configured component's type for the config fingerprint. A
+// legacy model wrapped by AdaptLanguageModel is named by the type it wraps, so runs saved
+// before Generator existed still resume and swapping one legacy model for another is caught.
 func optimizationTypeName(value any) string {
+	if adapted, ok := value.(languageModelGenerator); ok {
+		value = adapted.lm
+	}
 	if value == nil {
 		return ""
 	}
@@ -607,16 +613,28 @@ func (o *Optimizer) evaluateMerge(
 	}, true, nil
 }
 
-// recordProposerUsage adds the usage a proposer reports for its latest call to the ledger,
-// after failed calls too. Proposers that do not report usage are skipped.
+// recordProposerUsage adds the model calls and usage a proposer reports for its latest call to
+// the ledger, after failed calls too. Proposers that report neither are skipped, and so is a
+// call that made no model call, such as one rejected before reaching the model.
 func recordProposerUsage(state *OptimizationState, proposer any, span UsageSpan, err error) {
-	reporter, ok := proposer.(UsageReporter)
-	if !ok {
+	usageReporter, reportsUsage := proposer.(UsageReporter)
+	callReporter, reportsCalls := proposer.(ModelCallReporter)
+	if !reportsUsage && !reportsCalls {
 		return
 	}
-	usage := reporter.LastUsage()
+	calls := 1
+	if reportsCalls {
+		calls = callReporter.LastModelCalls()
+	}
+	if calls <= 0 {
+		return
+	}
+	var usage Usage
+	if reportsUsage {
+		usage = usageReporter.LastUsage()
+	}
 	state.Ledger = state.Ledger.AddUsage(usage)
-	state.Ledger.ModelCalls++
+	state.Ledger.ModelCalls += calls
 	state.Spans = append(state.Spans, span.Finish(usage, err))
 }
 

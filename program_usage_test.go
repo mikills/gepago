@@ -181,9 +181,56 @@ func TestReflectiveProposerUsage(t *testing.T) {
 
 	require.ErrorIs(t, err, cause)
 	require.Equal(t, Usage{TotalTokens: 15}, proposer.LastUsage(), "usage of the failed call counts too")
+	require.Equal(t, 2, proposer.LastModelCalls())
 
-	_, err = (&ReflectiveProposer{}).Propose(context.Background(), Candidate{}, ReflectiveDataset{}, []string{"a"})
+	proposer.LM = nil
+	_, err = proposer.Propose(context.Background(), Candidate{}, ReflectiveDataset{}, []string{"a"})
 	require.EqualError(t, err, "reflection language model is required")
+	require.Equal(t, Usage{}, proposer.LastUsage())
+	require.Zero(t, proposer.LastModelCalls())
+}
+
+func TestReflectiveProposerRejectsTruncatedReply(t *testing.T) {
+	lm := &replyGenerator{replies: []Generation{
+		{Text: "```\nClassify the text as posi", Usage: Usage{TotalTokens: 12}, FinishReason: FinishLength},
+	}}
+	proposer := &ReflectiveProposer{LM: lm}
+
+	patch, err := proposer.Propose(context.Background(), Candidate{"a": "x"}, ReflectiveDataset{}, []string{"a"})
+
+	require.Nil(t, patch)
+	require.ErrorIs(t, err, ErrOutputTruncated)
+	require.ErrorContains(t, err, `reflection reply for "a"`)
+	require.Equal(t, Usage{TotalTokens: 12}, proposer.LastUsage())
+	require.Equal(t, 1, proposer.LastModelCalls())
+}
+
+func TestLLMJudgeMetricRejectsTruncatedReply(t *testing.T) {
+	lm := &replyGenerator{replies: []Generation{
+		{Text: `{"score": 1, "feedback": "looks right but`, Usage: Usage{TotalTokens: 6}, FinishReason: FinishLength},
+		{Text: `{"score": 1, "feedback": "repaired"}`},
+	}}
+	ctx, collector := WithUsageCollector(context.Background())
+
+	result, err := LLMJudgeMetric{LM: lm, ParseRetry: true}.Score(ctx, Prediction{}, Prediction{})
+
+	require.ErrorIs(t, err, ErrOutputTruncated)
+	require.ErrorContains(t, err, "judge reply")
+	require.Zero(t, result.Score)
+	require.Len(t, lm.prompts, 1, "a truncated judge reply must not be repaired")
+	require.Equal(t, Usage{TotalTokens: 6}, collector.Usage())
+}
+
+func TestLLMJudgeMetricRejectsTruncatedRepairReply(t *testing.T) {
+	lm := &replyGenerator{replies: []Generation{
+		{Text: "not json"},
+		{Text: `{"score": 1`, FinishReason: FinishLength},
+	}}
+
+	_, err := LLMJudgeMetric{LM: lm, ParseRetry: true}.Score(context.Background(), Prediction{}, Prediction{})
+
+	require.ErrorIs(t, err, ErrOutputTruncated)
+	require.Len(t, lm.prompts, 2)
 }
 
 func TestLLMMergeProposerUsage(t *testing.T) {
@@ -199,7 +246,18 @@ func TestLLMMergeProposerUsage(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, Candidate{"a": "merged"}, patch)
 		require.Equal(t, Usage{TotalTokens: 9}, proposer.LastUsage())
+		require.Equal(t, 1, proposer.LastModelCalls())
 		require.Len(t, proposer.LastProposalMetadata(), 1)
+	})
+
+	t.Run("truncated merge reply", func(t *testing.T) {
+		lm := &replyGenerator{replies: []Generation{{Text: `{"a": "mer`, FinishReason: FinishLength}}}
+		proposer := &LLMMergeProposer{LM: lm}
+
+		_, err := proposer.ProposeMerge(context.Background(), left, right, []string{"a"})
+
+		require.ErrorIs(t, err, ErrOutputTruncated)
+		require.Equal(t, 1, proposer.LastModelCalls())
 	})
 
 	t.Run("failed merge keeps usage", func(t *testing.T) {
@@ -213,13 +271,14 @@ func TestLLMMergeProposerUsage(t *testing.T) {
 		require.Equal(t, Usage{TotalTokens: 4}, proposer.LastUsage())
 	})
 
-	t.Run("missing model resets usage", func(t *testing.T) {
-		proposer := &LLMMergeProposer{lastUsage: Usage{TotalTokens: 1}}
+	t.Run("missing model resets usage and calls", func(t *testing.T) {
+		proposer := &LLMMergeProposer{lastUsage: Usage{TotalTokens: 1}, lastCalls: 1}
 
 		_, err := proposer.ProposeMerge(context.Background(), left, right, []string{"a"})
 
 		require.EqualError(t, err, "merge language model is required")
 		require.Equal(t, Usage{}, proposer.LastUsage())
+		require.Zero(t, proposer.LastModelCalls())
 	})
 }
 
@@ -257,17 +316,63 @@ func TestOptimizerRecordsProposerUsageOnFailure(t *testing.T) {
 	require.Equal(t, cause.Error(), last.Err)
 }
 
+func TestOptimizerSkipsProposalThatMadeNoModelCall(t *testing.T) {
+	evaluator := EvaluatorFunc(
+		func(_ context.Context, _ Candidate, examples []Example, _ bool) (EvaluationResult, error) {
+			items := make([]EvaluationItem, 0, len(examples))
+			for _, example := range examples {
+				items = append(items, EvaluationItem{ExampleID: example.ID})
+			}
+			return EvaluationResult{Items: items}, nil
+		},
+	)
+	optimizer, err := NewOptimizer(OptimizationConfig{
+		SeedCandidate:  Candidate{"prompt": "start"},
+		Trainset:       []Example{{ID: "one"}},
+		Evaluator:      evaluator,
+		DatasetBuilder: ReflectiveDatasetBuilderFunc(DefaultReflectiveDatasetBuilder),
+		Proposer:       &ReflectiveProposer{},
+		MaxMetricCalls: 4,
+		MinibatchSize:  1,
+	})
+	require.NoError(t, err)
+
+	state, err := optimizer.Run(context.Background())
+
+	require.EqualError(t, err, "reflection language model is required")
+	require.Zero(t, state.Ledger.ModelCalls)
+	for _, span := range state.Spans {
+		require.NotEqual(t, "proposer", span.Name)
+	}
+}
+
+// usageOnlyProposer reports usage but not how many calls it made.
+type usageOnlyProposer struct{ usage Usage }
+
+func (p usageOnlyProposer) LastUsage() Usage { return p.usage }
+
 func TestRecordProposerUsage(t *testing.T) {
 	state := &OptimizationState{RunID: "run"}
 	span := NewUsageSpan("run", "", "llm.merge", "merge proposer")
 
 	recordProposerUsage(state, ProposerFunc(nil), span, nil)
-	require.Empty(t, state.Spans, "proposers without usage are skipped")
+	require.Empty(t, state.Spans, "proposers that report nothing are skipped")
 
-	recordProposerUsage(state, &LLMMergeProposer{lastUsage: Usage{TotalTokens: 3, CachedInputTokens: 1}}, span, nil)
+	recordProposerUsage(state, &LLMMergeProposer{lastUsage: Usage{TotalTokens: 5}}, span, nil)
+	require.Empty(t, state.Spans, "a call that made no model call is skipped")
+
+	merge := &LLMMergeProposer{lastUsage: Usage{TotalTokens: 3, CachedInputTokens: 1}, lastCalls: 1}
+	recordProposerUsage(state, merge, span, nil)
 	require.Equal(t, 1, state.Ledger.ModelCalls)
 	require.Equal(t, 3, state.Ledger.TotalTokens)
 	require.Equal(t, 1, state.Ledger.CachedInputTokens)
 	require.Len(t, state.Spans, 1)
 	require.Equal(t, UsageSpanKind("llm.merge"), state.Spans[0].Kind)
+
+	recordProposerUsage(state, &ReflectiveProposer{lastCalls: 3, lastUsage: Usage{TotalTokens: 9}}, span, nil)
+	require.Equal(t, 4, state.Ledger.ModelCalls, "every model call of a proposal counts")
+
+	recordProposerUsage(state, usageOnlyProposer{usage: Usage{TotalTokens: 1}}, span, nil)
+	require.Equal(t, 5, state.Ledger.ModelCalls, "a proposer that does not count calls counts as one")
+	require.Equal(t, 13, state.Ledger.TotalTokens)
 }

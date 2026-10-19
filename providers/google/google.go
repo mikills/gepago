@@ -62,10 +62,10 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 }
 
 // Generate sends a prompt and returns the model's reply with its usage, resolved model and
-// finish reason. Failures are classified as ChatClient.Chat classifies them, and a cancelled
-// or expired ctx returns its error unwrapped. A reply that fails after the API reported usage
-// returns that usage with the error. An empty reply is an error unless it stopped at the token
-// limit.
+// finish reason. Failures are classified, and the API key redacted, as ChatClient.Chat does;
+// a cancelled or expired ctx returns its error unwrapped. A reply that fails after the API
+// reported usage returns that usage with the error. An empty reply is an error unless it
+// stopped at the token limit.
 func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Generation, error) {
 	resp, err := m.client.Chat(ctx, agents.ChatRequest{
 		Model:       m.client.model,
@@ -131,10 +131,16 @@ func NewChatClient(config Config) (*ChatClient, error) {
 }
 
 // Chat sends one Gemini generateContent request and returns a provider-neutral agent response.
-// HTTP failures are classified: 429 and 5xx are transient, other 4xx permanent, and dropped
-// connections transient; a cancelled or expired ctx returns ctx.Err() unwrapped. A response
-// without candidates still returns its usage with the error.
+// Failures are classified: 429, 5xx, dropped connections and network timeouts are transient;
+// other 4xx and TLS, host or URL misconfiguration are permanent; a cancelled or expired ctx
+// returns ctx.Err() unwrapped. The API key, which travels in the request URL, is redacted
+// from every error. A response without candidates still returns its usage with the error.
 func (c *ChatClient) Chat(ctx context.Context, req agents.ChatRequest) (agents.ChatResponse, error) {
+	resp, err := c.chat(ctx, req)
+	return resp, c.redact(err)
+}
+
+func (c *ChatClient) chat(ctx context.Context, req agents.ChatRequest) (agents.ChatResponse, error) {
 	toolNames := googleToolNameMap(req.Tools)
 	payload := googleGenerateRequest{
 		SystemInstruction: googleSystemInstruction(req.Messages),
@@ -163,12 +169,12 @@ func googleRequestModel(defaultModel string, requestModel string) string {
 func (c *ChatClient) post(ctx context.Context, model string, data []byte) ([]byte, error) {
 	requestURL, err := url.Parse(c.baseURL + "/v1beta/models/" + url.PathEscape(model) + ":generateContent")
 	if err != nil {
-		return nil, err
+		return nil, gepa.PermanentError(err)
 	}
 	addGoogleAPIKey(requestURL, c.apiKey)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL.String(), bytes.NewReader(data))
 	if err != nil {
-		return nil, err
+		return nil, gepa.PermanentError(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	for key, value := range c.headers {
@@ -181,10 +187,7 @@ func (c *ChatClient) post(ctx context.Context, model string, data []byte) ([]byt
 	defer resp.Body.Close()
 	var response bytes.Buffer
 	if _, err := response.ReadFrom(resp.Body); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
-		}
-		return nil, gepa.TransientError(fmt.Errorf("google generateContent read response: %w", err))
+		return nil, providererr.Classify(ctx, 0, fmt.Errorf("google generateContent read response: %w", err))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, providererr.Classify(ctx, resp.StatusCode, fmt.Errorf(
@@ -195,6 +198,36 @@ func (c *ChatClient) post(ctx context.Context, model string, data []byte) ([]byt
 	}
 	return response.Bytes(), nil
 }
+
+// redact removes the API key from err's text and from the URL of any url.Error in its chain,
+// keeping the chain intact for errors.Is and errors.As.
+func (c *ChatClient) redact(err error) error {
+	if err == nil || strings.TrimSpace(c.apiKey) == "" {
+		return err
+	}
+	replacer := strings.NewReplacer(c.apiKey, redactedAPIKey, url.QueryEscape(c.apiKey), redactedAPIKey)
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		urlErr.URL = replacer.Replace(urlErr.URL)
+	}
+	text := replacer.Replace(err.Error())
+	if text == err.Error() {
+		return err
+	}
+	return &redactedError{err: err, text: text}
+}
+
+const redactedAPIKey = "REDACTED"
+
+// redactedError replaces an error's text while keeping it as the wrapped error.
+type redactedError struct {
+	err  error
+	text string
+}
+
+func (e *redactedError) Error() string { return e.text }
+
+func (e *redactedError) Unwrap() error { return e.err }
 
 func addGoogleAPIKey(requestURL *url.URL, apiKey string) {
 	if strings.TrimSpace(apiKey) == "" {
@@ -497,11 +530,14 @@ func googleFinishReason(reason string, message agents.Message) agents.FinishReas
 		return agents.FinishToolCalls
 	}
 	switch strings.ToUpper(reason) {
+	case "STOP":
+		return agents.FinishStop
 	case "MAX_TOKENS":
 		return agents.FinishLength
 	case "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY":
 		return agents.FinishContentFilter
 	default:
-		return agents.FinishStop
+		// a missing or unknown reason, such as OTHER, is reported as unknown.
+		return ""
 	}
 }

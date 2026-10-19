@@ -227,20 +227,6 @@ err = gepa.WriteHTMLReport("report.html", state, gepa.HTMLReportOptions{})
 
 The report is a single HTML file you can open in a browser.
 
-## Role-based model routing
-
-Use `ModelRouter` when a programme should spend stronger models on planning, reflection, or judging while using cheaper models for constrained task execution.
-
-```go
-router := gepa.ModelRouter{Default: taskLM}.
-    With(gepa.RoleReflector, strongLM).
-    With(gepa.RoleJudge, strongLM).
-    With(gepa.RoleImplementer, cheapLM)
-
-proposer := gepa.ReflectiveProposer{LM: router.For(gepa.RoleReflector)}
-judge := gepa.LLMJudgeMetric{LM: router.For(gepa.RoleJudge), Rubric: "..."}
-```
-
 ## Reflection traces
 
 GEPA reflection does not require an agent runtime. Simple prompt or programme optimisation can use scores plus ordinary LLM call metadata:

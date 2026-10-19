@@ -259,10 +259,26 @@ function assertPrediction(value: unknown, name: string): WireObject {
   return value as WireObject;
 }
 
+const optionalUsageFields = [
+  "reasoning_tokens",
+  "cached_input_tokens",
+  "cache_creation_tokens",
+];
+
 function assertUsage(value: unknown, name: string): Usage {
   const usage = assertPlainObject(value, name);
   for (const field of ["prompt_tokens", "completion_tokens", "total_tokens"]) {
     if (!Number.isSafeInteger(usage[field]) || (usage[field] as number) < 0) {
+      throw new TypeError(
+        `${name}.${field} must be a non-negative safe integer`,
+      );
+    }
+  }
+  for (const field of optionalUsageFields) {
+    if (
+      usage[field] !== undefined &&
+      (!Number.isSafeInteger(usage[field]) || (usage[field] as number) < 0)
+    ) {
       throw new TypeError(
         `${name}.${field} must be a non-negative safe integer`,
       );
@@ -273,12 +289,18 @@ function assertUsage(value: unknown, name: string): Usage {
 }
 
 const agentRoles = new Set(["system", "user", "assistant", "tool"]);
-const agentFinishReasons = new Set(["stop", "length", "tool_calls"]);
+const agentFinishReasons = new Set([
+  "stop",
+  "length",
+  "tool_calls",
+  "content_filter",
+]);
 const agentStopReasons = new Set([
   "complete",
   "length",
   "max_turns",
   "tool_error",
+  "content_filter",
 ]);
 
 function assertAgentMessage(value: unknown, name: string): Message {
@@ -1142,17 +1164,36 @@ function parseCompileModelRequest(encoded: unknown): CompileModelRequest {
 function normalizeCompileModelResult(
   value: unknown,
 ): CompileModelOutput | CompileModelResult {
+  return normalizeHostModelResult(value, "compile model result");
+}
+
+// normalizeHostModelResult validates a host model's reply and keeps only the fields the WASM
+// module reads: text, plus optional usage, finishReason and model.
+function normalizeHostModelResult(
+  value: unknown,
+  name: string,
+): PredictModelResult {
   if (typeof value === "string") return { text: value };
-  const result = assertPlainObject(value, "compile model result");
+  const result = assertPlainObject(value, name);
   if (!Object.hasOwn(result, "text"))
-    throw new TypeError("compile model result.text is required");
-  assertString(result.text, "compile model result.text");
-  if (result.usage !== undefined)
-    assertUsage(result.usage, "compile model result.usage");
-  assertJSONValue(result, "compile model result");
-  return result.usage === undefined || result.usage === null
-    ? { text: result.text as string }
-    : { text: result.text as string, usage: result.usage as Usage };
+    throw new TypeError(`${name}.text is required`);
+  assertString(result.text, `${name}.text`);
+  if (result.usage !== undefined) assertUsage(result.usage, `${name}.usage`);
+  if (
+    result.finishReason !== undefined &&
+    !agentFinishReasons.has(result.finishReason as string)
+  )
+    throw new TypeError(
+      `${name}.finishReason must be one of stop, length, tool_calls or content_filter`,
+    );
+  if (result.model !== undefined) assertString(result.model, `${name}.model`);
+  assertJSONValue(result, name);
+  const normalized: PredictModelResult = { text: result.text as string };
+  if (result.usage !== undefined) normalized.usage = result.usage as Usage;
+  if (result.finishReason !== undefined)
+    normalized.finishReason = result.finishReason as FinishReason;
+  if (result.model !== undefined) normalized.model = result.model as string;
+  return normalized;
 }
 
 function assertCompileResult(value: unknown): CompileResult {
@@ -1366,17 +1407,7 @@ function assertPredictComplete(value: unknown): PredictResult {
 }
 
 function normalizeModelResult(value: unknown): PredictModelResult {
-  if (typeof value === "string") return { text: value };
-  const result = assertPlainObject(value, "predict model result");
-  if (!Object.hasOwn(result, "text"))
-    throw new TypeError("predict model result.text is required");
-  assertString(result.text, "predict model result.text");
-  if (result.usage !== undefined)
-    assertUsage(result.usage, "predict model result.usage");
-  assertJSONValue(result, "predict model result");
-  return result.usage === undefined || result.usage === null
-    ? { text: result.text as string }
-    : { text: result.text as string, usage: result.usage as Usage };
+  return normalizeHostModelResult(value, "predict model result");
 }
 
 function assertDemos(value: unknown): asserts value is Demo[] {

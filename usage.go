@@ -15,6 +15,14 @@ type UsageReporter interface {
 	LastUsage() Usage
 }
 
+// ModelCallReporter reports how many model calls an object's most recent call made, failed
+// calls included. The optimiser reads it from a Proposer or MergeProposer to count
+// UsageLedger.ModelCalls; a proposer that reports usage but not calls counts as one call per
+// proposal, and one that reports zero calls is not counted.
+type ModelCallReporter interface {
+	LastModelCalls() int
+}
+
 type usageCollectorKey struct{}
 
 // UsageCollector sums the usage that model calls record into a context. It is safe for
