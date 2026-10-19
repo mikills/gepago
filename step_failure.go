@@ -14,6 +14,31 @@ func failStep(node *stepNode, values map[string]any, err error) *StepError {
 	return stepErr
 }
 
+// failure returns err as the failure of the step p wraps. With a fallback step, the StepError
+// the pipeline gives p holds the fallback's reads as well, so every failure of the wrapped step
+// gets a StepError of its own, with only its own reads and details.
+func (p *policyStep) failure(s State, err error) error {
+	if p.fallback == nil {
+		return err
+	}
+	return &namedStepError{step: failStep(p.child, s.values, err)}
+}
+
+// namedStepError holds the StepError of a step that the enclosing StepError already names, as
+// the step a WithPolicy wraps, and prints only that step's error, so the message names the
+// step once.
+type namedStepError struct {
+	step *StepError
+}
+
+func (e *namedStepError) Error() string {
+	return e.step.Err.Error()
+}
+
+func (e *namedStepError) Unwrap() error {
+	return e.step
+}
+
 // stepReads returns copies of the values of node's declared reads found in values, or nil when
 // there are none.
 func stepReads(node *stepNode, values map[string]any) map[string]any {

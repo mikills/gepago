@@ -170,7 +170,7 @@ func (p *policyStep) runCandidate(ctx context.Context, candidate Candidate, s St
 			return nil
 		}
 		if ctx.Err() != nil {
-			return err
+			return p.failure(s, err)
 		}
 		if attempt >= attempts || !retryIf(err) {
 			if attempt > 1 {
@@ -179,7 +179,7 @@ func (p *policyStep) runCandidate(ctx context.Context, candidate Candidate, s St
 			break
 		}
 		if !sleepContext(ctx, p.backoff(attempt)) {
-			return errors.Join(err, ctx.Err())
+			return p.failure(s, errors.Join(err, ctx.Err()))
 		}
 	}
 	return p.onError(ctx, candidate, s, err)
@@ -222,9 +222,7 @@ func (p *policyStep) onError(ctx context.Context, candidate Candidate, s State, 
 	case errorActionFallback:
 		result, fallbackErr := runChild(ctx, candidate, p.child.name, p.fallback, s.values)
 		if fallbackErr != nil {
-			// the failed step gets a StepError of its own, with its own reads and details, so
-			// they are not confused with the fallback step's.
-			return &fallbackError{primary: failStep(p.child, s.values, err), fallback: fallbackErr, named: true}
+			return &fallbackError{primary: p.failure(s, err), fallback: fallbackErr}
 		}
 		result.commitTo(s, p.fallback)
 		return nil
@@ -246,20 +244,14 @@ func DefaultValue[T any](k Key[T], value T) KeyDefault {
 
 // fallbackError keeps both errors of a step that failed, fell back and failed again. The
 // fallback's error comes first in Unwrap, so when it has a kind, that kind is the kind of
-// the whole. named marks a primary StepError for a step that the enclosing StepError already
-// names, as with a WithPolicy fallback, so Error prints only the error inside it.
+// the whole.
 type fallbackError struct {
 	primary  error
 	fallback error
-	named    bool
 }
 
 func (e *fallbackError) Error() string {
-	primary := e.primary
-	if stepErr, ok := primary.(*StepError); ok && e.named {
-		primary = stepErr.Err
-	}
-	return fmt.Sprintf("%v; fallback failed: %v", primary, e.fallback)
+	return fmt.Sprintf("%v; fallback failed: %v", e.primary, e.fallback)
 }
 
 func (e *fallbackError) Unwrap() []error {

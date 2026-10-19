@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -154,6 +155,111 @@ func TestReflectionRecordNamesAPolicyStepWhoseFallbackFailed(t *testing.T) {
 	require.Equal(t, "classify", sideInfo["step"])
 	require.Equal(t, map[string]any{"amount": 125000}, sideInfo["reads"])
 	require.Equal(t, map[string]any{"output": Prediction{"label": nil}}, sideInfo["details"])
+}
+
+var labelKey = Key[string]{Name: "label"}
+
+// nullLabelStep is step "classify", which reads amount and writes label from a reply that lm
+// gives, and fails with ErrInvalidOutput when the reply's label is null.
+func nullLabelStep(lm LanguageModelFunc) ComponentStep {
+	return NewProgramStep("classify", Predict{
+		Signature: Signature{Name: "classify", Inputs: []Field{{Name: "amount"}}, Outputs: []Field{{Name: "label"}}},
+		LM:        textModel(lm),
+	}, refs(amountKey.Ref()), refs(labelKey.Ref()))
+}
+
+// backupLabelStep is a fallback for nullLabelStep that reads the document, which classify does
+// not read.
+func backupLabelStep() Step {
+	return NewStep("backup", refs(docKey.Ref()), refs(labelKey.Ref()), func(_ context.Context, s State) error {
+		labelKey.Set(s, "backup")
+		return nil
+	})
+}
+
+const nullLabelError = `pipeline step "classify": invalid programme output: signature "classify": output "label" is null`
+
+func TestPolicyStepStoppedBeforeItsFallbackKeepsItsOwnReads(t *testing.T) {
+	started := make(chan struct{})
+	classify := nullLabelStep(func(ctx context.Context, _ string) (string, error) {
+		close(started)
+		<-ctx.Done()
+		return `{"label": null}`, nil
+	})
+	sibling := NewStep("sibling", nil, refs(decisionKey.Ref()), func(context.Context, State) error {
+		<-started
+		return errors.New("sibling failed")
+	})
+	policy := WithPolicy(classify, StepPolicy{OnError: OnErrorFallback(backupLabelStep())})
+	pipeline := fpBuild(t, PipelineSpec{
+		Inputs: refs(docKey.Ref()),
+		Steps:  []Step{amountStep(), Parallel("par", policy, sibling)},
+	})
+	evaluator := ProgramEvaluator{Program: pipeline, Metric: ExactMatchMetric{Fields: []string{"label"}}}
+	examples := []Example{NewIOExample("1", Prediction{"document": "cash"}, Prediction{"label": "large"})}
+	candidate := pipeline.SeedCandidate()
+
+	eval, err := evaluator.Evaluate(context.Background(), candidate, examples, false)
+	require.NoError(t, err)
+	component := "par.classify.instruction"
+	dataset := DefaultReflectiveDatasetBuilder(candidate, eval, []string{component})
+
+	require.Len(t, dataset[component], 1)
+	sideInfo, ok := dataset[component][0]["side_info"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "classify", sideInfo["step"])
+	require.Equal(t, map[string]any{"amount": 125000}, sideInfo["reads"])
+	require.Equal(t, map[string]any{"output": Prediction{"label": nil}}, sideInfo["details"])
+	require.Equal(
+		t,
+		`pipeline step "par": pipeline step "sibling": sibling failed`+"\n"+nullLabelError,
+		sideInfo["feedback"],
+	)
+}
+
+func TestPolicyStepStoppedInBackoffKeepsItsOwnReads(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	classify := nullLabelStep(func(context.Context, string) (string, error) { return `{"label": null}`, nil })
+	policy := WithPolicy(classify, StepPolicy{
+		Retry: RetryPolicy{
+			MaxAttempts: 2,
+			RetryIf:     func(error) bool { return true },
+			Backoff: func(int) time.Duration {
+				cancel()
+				return time.Hour
+			},
+		},
+		OnError: OnErrorFallback(backupLabelStep()),
+	})
+	pipeline := fpBuild(t, PipelineSpec{Inputs: refs(docKey.Ref()), Steps: []Step{amountStep(), policy}})
+
+	_, err := pipeline.Run(ctx, NewState(Prediction{"document": "cash"}))
+
+	require.EqualError(t, err, nullLabelError+"\ncontext canceled")
+	require.ErrorIs(t, err, context.Canceled)
+	var outer *StepError
+	require.ErrorAs(t, err, &outer)
+	require.Equal(t, map[string]any{"amount": 125000, "document": "cash"}, outer.Reads)
+	failed := invalidOutputStep(err)
+	require.NotSame(t, outer, failed)
+	require.Equal(t, "classify", failed.Step)
+	require.Equal(t, map[string]any{"amount": 125000}, failed.Reads)
+	require.Equal(t, map[string]any{"output": Prediction{"label": nil}}, failed.Details)
+}
+
+func TestPolicyStepWithoutFallbackHasOneStepError(t *testing.T) {
+	classify := nullLabelStep(func(context.Context, string) (string, error) { return `{"label": null}`, nil })
+	policy := WithPolicy(classify, StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}})
+	pipeline := fpBuild(t, PipelineSpec{Inputs: refs(docKey.Ref()), Steps: []Step{amountStep(), policy}})
+
+	_, err := pipeline.Run(context.Background(), NewState(Prediction{"document": "cash"}))
+
+	require.EqualError(t, err, nullLabelError)
+	var outer *StepError
+	require.ErrorAs(t, err, &outer)
+	require.Same(t, outer, invalidOutputStep(err))
+	require.Equal(t, map[string]any{"amount": 125000}, outer.Reads)
 }
 
 func TestNestedPolicyFallbackErrorsNameEachStepOnce(t *testing.T) {
