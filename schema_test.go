@@ -701,9 +701,16 @@ func TestJSONSchemaForQuotedFieldsAgreesWithKeyGet(t *testing.T) {
 		{"count", "abc", false},
 		{"count", "1.5", false},
 		{"count", "null", false},
+		{"count", "01", false},
+		{"count", "-01", false},
 		{"ratio", "-1.5e3", true},
 		{"ratio", "half", false},
 		{"ratio", "null", false},
+		{"ratio", "1.", false},
+		{"ratio", "00.5", false},
+		{"ratio", "-Inf", false},
+		{"ratio", "0x1p-2", false},
+		{"ratio", "1_0", false},
 		{"flag", "false", true},
 		{"flag", "yes", false},
 		{"flag", "null", false},
@@ -719,6 +726,65 @@ func TestJSONSchemaForQuotedFieldsAgreesWithKeyGet(t *testing.T) {
 		})
 	}
 	require.False(t, StrictJSONSchema(data), "a pattern is outside the strict subset")
+}
+
+type quotedOptional struct {
+	S  string  `json:"s,string,omitempty"`
+	I  int     `json:"i,string,omitempty"`
+	U  uint8   `json:"u,string,omitempty"`
+	F  float64 `json:"f,string,omitempty"`
+	F3 float32 `json:"f3,string,omitempty"`
+	B  bool    `json:"b,string,omitempty"`
+	P  *int    `json:"p,string,omitempty"`
+	PS *string `json:"ps,string,omitempty"`
+}
+
+// TestJSONSchemaForQuotedFieldsCrossCheck checks, field by field, that Get accepts a quoted
+// value exactly when the schema pattern matches it, apart from numbers that do not fit their
+// type, which only Get can refuse.
+func TestJSONSchemaForQuotedFieldsCrossCheck(t *testing.T) {
+	data, err := JSONSchemaFor[quotedOptional]()
+	require.NoError(t, err)
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	require.NoError(t, json.Unmarshal(data, &schema))
+	pattern := func(field string) *regexp.Regexp {
+		var node struct {
+			AnyOf []struct {
+				Pattern string `json:"pattern"`
+			} `json:"anyOf"`
+		}
+		require.NoError(t, json.Unmarshal(schema.Properties[field], &node))
+		require.NotEmpty(t, node.AnyOf, field)
+		require.NotEmpty(t, node.AnyOf[0].Pattern, field)
+		return regexp.MustCompile(node.AnyOf[0].Pattern)
+	}
+	outOfRange := map[string]bool{"u=256": true, "f=1e-400": true, "f3=1e-50": true}
+	cases := map[string][]string{
+		"s": {`""`, `"a"`, `"é"`, `"\ud800"`, `"\/"`, "\"\x7f\"", "\"a\tb\"", `"\x"`, `"a"b"`, `"`, "\"\xff\"",
+			`null`, `"null"`},
+		"i":  {"0", "-0", "01", "-01", "1.0", "1e2", " 1", "+1", "12", "null", "-", "0x10", "9223372036854775807"},
+		"u":  {"0", "255", "256", "-0", "-1", "00", "null"},
+		"f":  {"1", "1.5", "1.", ".5", "1e5", "-0.0", "1E+2", "NaN", "-Inf", "0x1p-2", "1_0", "1e-400", "null", "0e0"},
+		"f3": {"1e-50", "1e-45", "0.0", "3.4e38"},
+		"b":  {"true", "false", "True", "null", "1"},
+		"p":  {"12", "null", "-0", "012"},
+		"ps": {`"x"`, "null"},
+	}
+	for field, values := range cases {
+		re := pattern(field)
+		for _, value := range values {
+			_, err := Key[quotedOptional]{Name: "k"}.Get(NewState(Prediction{"k": map[string]any{field: value}}))
+			name := field + "=" + value
+			if outOfRange[name] {
+				require.True(t, re.MatchString(value), name)
+				require.Error(t, err, name)
+				continue
+			}
+			require.Equal(t, re.MatchString(value), err == nil, "%s: %v", name, err)
+		}
+	}
 }
 
 type quotedInt struct {
@@ -756,6 +822,12 @@ func TestKeyGetRejectsQuotedDrift(t *testing.T) {
 	require.ErrorContains(t, err, `field "ratio": number 1e-400 is too small for float64`)
 	_, err = Key[quotedFloat]{Name: "k"}.Get(NewState(Prediction{"k": map[string]any{"small": "1", "ratio": "null"}}))
 	require.ErrorContains(t, err, `field "ratio" is the string "null"`)
+	_, err = Key[quotedFloat]{Name: "k"}.Get(NewState(Prediction{"k": map[string]any{"small": "1.", "ratio": nil}}))
+	require.EqualError(
+		t,
+		err,
+		`state key "k": decode as gepa.quotedFloat: field "small" is "1.", which is not a JSON number`,
+	)
 	gotFloat, err := Key[quotedFloat]{
 		Name: "k",
 	}.Get(

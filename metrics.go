@@ -37,7 +37,9 @@ func (fn MetricFunc) Score(ctx context.Context, expected Prediction, actual Pred
 // ExactMatchMetric scores fields by exact equality of their canonical text forms. A string
 // is compared as it is; any other value, typed Go values from TypedPredict or a pipeline
 // included, by its JSON encoding with object keys sorted, unquoted when that encoding is a
-// JSON string. A missing or nil value, a nil pointer included, is null.
+// JSON string. A struct whose fields JSON cannot see, such as one with only unexported fields,
+// is compared by its Go syntax (%#v) instead, since its JSON is always {}. A missing or nil
+// value, a nil pointer included, has no text form and matches only another nil value.
 type ExactMatchMetric struct {
 	Fields          []string
 	CaseInsensitive bool
@@ -53,17 +55,9 @@ func (m ExactMatchMetric) Score(_ context.Context, expected Prediction, actual P
 	matched := 0
 	missing := make([]string, 0)
 	for _, field := range fields {
-		want := metricText(expected[field])
-		got := metricText(actual[field])
-		if m.TrimSpace {
-			want = strings.TrimSpace(want)
-			got = strings.TrimSpace(got)
-		}
-		if m.CaseInsensitive {
-			want = strings.ToLower(want)
-			got = strings.ToLower(got)
-		}
-		if want == got {
+		if matchMetricText(expected[field], actual[field], m.normalise, func(got, want string) bool {
+			return got == want
+		}) {
 			matched++
 		} else {
 			missing = append(missing, field)
@@ -72,8 +66,19 @@ func (m ExactMatchMetric) Score(_ context.Context, expected Prediction, actual P
 	return metricResult(float64(matched)/float64(len(fields)), missing), nil
 }
 
+// normalise applies the TrimSpace and CaseInsensitive options to a canonical text form.
+func (m ExactMatchMetric) normalise(text string) string {
+	if m.TrimSpace {
+		text = strings.TrimSpace(text)
+	}
+	if m.CaseInsensitive {
+		text = strings.ToLower(text)
+	}
+	return text
+}
+
 // ContainsMetric scores fields when the actual value's canonical text form, as described on
-// ExactMatchMetric, contains the expected value's.
+// ExactMatchMetric, contains the expected value's. A nil value matches only another nil value.
 type ContainsMetric struct {
 	Fields          []string
 	CaseInsensitive bool
@@ -88,19 +93,21 @@ func (m ContainsMetric) Score(_ context.Context, expected Prediction, actual Pre
 	matched := 0
 	missing := make([]string, 0)
 	for _, field := range fields {
-		want := metricText(expected[field])
-		got := metricText(actual[field])
-		if m.CaseInsensitive {
-			want = strings.ToLower(want)
-			got = strings.ToLower(got)
-		}
-		if strings.Contains(got, want) {
+		if matchMetricText(expected[field], actual[field], m.normalise, strings.Contains) {
 			matched++
 		} else {
 			missing = append(missing, field)
 		}
 	}
 	return metricResult(float64(matched)/float64(len(fields)), missing), nil
+}
+
+// normalise applies the CaseInsensitive option to a canonical text form.
+func (m ContainsMetric) normalise(text string) string {
+	if m.CaseInsensitive {
+		return strings.ToLower(text)
+	}
+	return text
 }
 
 // NumericMatchMetric scores numeric fields within a tolerance. A value is numeric when it is
@@ -113,7 +120,8 @@ type NumericMatchMetric struct {
 
 // ClassificationMetric scores binary classifications and exposes Pareto-safe objectives. Labels
 // are compared by their canonical text forms, as described on ExactMatchMetric, so a typed
-// label such as a named string type matches its plain string.
+// label such as a named string type matches its plain string. A nil label matches only another
+// nil label, and is null in the result details.
 type ClassificationMetric struct {
 	Field         string
 	PositiveLabel string
@@ -136,29 +144,51 @@ func (m ClassificationMetric) Score(_ context.Context, expected Prediction, actu
 	if negative == "" {
 		negative = "negative"
 	}
-	want := m.normaliseValue(expected[field])
-	got := m.normaliseValue(actual[field])
-	kind := classificationKind(want, got, positive, negative)
+	want, wantOK := m.normaliseValue(expected[field])
+	got, gotOK := m.normaliseValue(actual[field])
+	correct := wantOK == gotOK && want == got
+	kind := boolKind(correct)
+	if wantOK && gotOK {
+		kind = classificationKind(want, got, positive, negative)
+	}
 	result := MetricResult{
-		Score:           boolScore(want == got),
+		Score:           boolScore(correct),
 		ObjectiveScores: classificationObjectiveScores(kind),
 		Details: map[string]any{
 			"field":          field,
-			"expected":       want,
-			"actual":         got,
+			"expected":       detailLabel(want, wantOK),
+			"actual":         detailLabel(got, gotOK),
 			"kind":           kind,
 			"false_positive": kind == "false_positive",
 			"false_negative": kind == "false_negative",
 		},
 	}
-	if want != got {
+	if !correct {
 		result.Feedback = "classification mismatch: " + kind
 	}
 	return result, nil
 }
 
-func (m ClassificationMetric) normaliseValue(value any) string {
-	return m.normalise(metricText(value))
+// normaliseValue returns the normalised label of value, and false when value is nil.
+func (m ClassificationMetric) normaliseValue(value any) (string, bool) {
+	text, ok := metricText(value)
+	return m.normalise(text), ok
+}
+
+// boolKind is the classification kind of a pair that is not two labels.
+func boolKind(correct bool) string {
+	if correct {
+		return "correct"
+	}
+	return "incorrect"
+}
+
+// detailLabel is a label as the result details show it: nil for a nil value.
+func detailLabel(label string, ok bool) any {
+	if !ok {
+		return nil
+	}
+	return label
 }
 
 func (m ClassificationMetric) normalise(value string) string {
@@ -275,30 +305,54 @@ func numericValue(value any) (float64, bool) {
 	}
 }
 
+// matchMetricText reports whether match holds for the normalised canonical text forms of got
+// and want. A nil value has no text form: it matches only another nil value.
+func matchMetricText(want, got any, normalise func(string) string, match func(got, want string) bool) bool {
+	wantText, wantOK := metricText(want)
+	gotText, gotOK := metricText(got)
+	if !wantOK || !gotOK {
+		return wantOK == gotOK
+	}
+	return match(normalise(gotText), normalise(wantText))
+}
+
 // metricText returns the canonical text form the built-in text metrics compare: a string as
 // it is, and any other value its canonical JSON encoding from metricJSON, unquoted when that
-// encoding is a JSON string. A missing or nil value is therefore "null".
-func metricText(value any) string {
+// encoding is a JSON string. It returns false for a value whose encoding is null, such as a
+// missing value or a nil pointer, which has no text form, so that it differs from the string
+// "null".
+func metricText(value any) (string, bool) {
 	if text, ok := value.(string); ok {
-		return text
+		return text, true
 	}
 	encoded := metricJSON(value)
+	if string(encoded) == "null" {
+		return "", false
+	}
 	var text string
 	if encoded[0] == '"' && json.Unmarshal(encoded, &text) == nil {
-		return text
+		return text, true
 	}
-	return string(encoded)
+	return string(encoded), true
 }
 
 // metricJSON returns the canonical JSON encoding of value: pointers followed, object keys
 // sorted whether value is a struct or a map, numbers kept as encoded and HTML left unescaped.
-// A value JSON cannot encode, such as NaN or a channel, is a JSON string of its fmt form.
+// A value JSON cannot encode, such as NaN or a channel, is a JSON string of its fmt form, and a
+// struct whose fields JSON cannot see, which encodes as {} whatever it holds, a JSON string of
+// its Go syntax (%#v).
 func metricJSON(value any) json.RawMessage {
 	encoded, err := encodeMetricJSON(value)
 	if err != nil {
 		// a string always encodes.
 		encoded, _ = encodeMetricJSON(fmt.Sprint(value))
 		return encoded
+	}
+	if string(encoded) == "{}" {
+		if hidden, ok := hiddenStruct(value); ok {
+			encoded, _ = encodeMetricJSON(fmt.Sprintf("%#v", hidden.Interface()))
+			return encoded
+		}
 	}
 	var decoded any
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
@@ -310,6 +364,19 @@ func metricJSON(value any) json.RawMessage {
 	// decoded values are maps, slices, strings, numbers, booleans and nil, which always encode.
 	canonical, _ := encodeMetricJSON(decoded)
 	return canonical
+}
+
+// hiddenStruct returns the struct value points to, following pointers and interfaces, when it
+// has fields but none that JSON can see, such as only unexported fields or fields tagged "-".
+func hiddenStruct(value any) (reflect.Value, bool) {
+	v := reflect.ValueOf(value)
+	for v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface {
+		if v.IsNil() {
+			return reflect.Value{}, false
+		}
+		v = v.Elem()
+	}
+	return v, v.Kind() == reflect.Struct && v.NumField() > 0 && len(jsonFields(v.Type())) == 0
 }
 
 // encodeMetricJSON encodes value as compact JSON without escaping HTML.

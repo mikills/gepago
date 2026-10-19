@@ -222,9 +222,7 @@ func TestMetricTextCanonicalForm(t *testing.T) {
 		want  string
 	}{
 		{"string", " a ", " a "},
-		{"nil", nil, "null"},
-		{"nil pointer", (*string)(nil), "null"},
-		{"nil slice", []string(nil), "null"},
+		{"the string null", "null", "null"},
 		{"pointer to string", pointerTo("r-1"), "r-1"},
 		{"named string", metricLabel("positive"), "positive"},
 		{"time", time.Date(2026, 6, 30, 0, 0, 0, 0, time.UTC), "2026-06-30T00:00:00Z"},
@@ -233,8 +231,16 @@ func TestMetricTextCanonicalForm(t *testing.T) {
 		{"large float", 1e8, "100000000"},
 		{"json number", json.Number("3.50"), "3.50"},
 		{"bool", true, "true"},
+		{"empty slice", []string{}, "[]"},
 		{"slice", []string{"<a>", "b"}, `["<a>","b"]`},
 		{"struct", metricObligation{Deadline: "d", Amount: 1}, `{"amount":1,"deadline":"d"}`},
+		{"empty struct", struct{}{}, "{}"},
+		{"struct with only omitted fields", struct {
+			A string `json:"a,omitempty"`
+		}{}, "{}"},
+		{"struct with hidden fields", metricHidden{v: 1}, "gepa.metricHidden{v:1}"},
+		{"pointer to struct with hidden fields", &metricHidden{v: 2}, "gepa.metricHidden{v:2}"},
+		{"struct with fields tagged -", metricSkipped{V: 3}, "gepa.metricSkipped{V:3}"},
 		{"map", map[string]any{"b": 1, "a": []any{}}, `{"a":[],"b":1}`},
 		{"raw message", json.RawMessage(`{"b": 1, "a": 2}`), `{"a":2,"b":1}`},
 		{"NaN", math.NaN(), "NaN"},
@@ -242,9 +248,132 @@ func TestMetricTextCanonicalForm(t *testing.T) {
 		{"deeper than the decoder allows", deep, strings.Repeat("[", 10001) + `"x"` + strings.Repeat("]", 10001)},
 	}
 	for _, c := range cases {
-		require.Equal(t, c.want, metricText(c.value), c.name)
+		got, ok := metricText(c.value)
+		require.True(t, ok, c.name)
+		require.Equal(t, c.want, got, c.name)
 	}
-	require.True(t, strings.HasPrefix(metricText(make(chan int)), "0x"), "a channel falls back to its fmt form")
+	channel, ok := metricText(make(chan int))
+	require.True(t, ok)
+	require.True(t, strings.HasPrefix(channel, "0x"), "a channel falls back to its fmt form")
+
+	for name, value := range map[string]any{
+		"nil":              nil,
+		"nil pointer":      (*string)(nil),
+		"nil slice":        []string(nil),
+		"nil map":          map[string]any(nil),
+		"null raw message": json.RawMessage("null"),
+	} {
+		got, ok := metricText(value)
+		require.False(t, ok, name)
+		require.Empty(t, got, name)
+	}
+}
+
+type metricHidden struct{ v int }
+
+type metricSkipped struct {
+	V int `json:"-"`
+}
+
+type metricEnum int
+
+func (e metricEnum) String() string { return [...]string{"low", "high"}[e] }
+
+func TestMetricTextPairs(t *testing.T) {
+	big := uint64(1<<53 + 1)
+	text := "r"
+	pairs := []struct {
+		name  string
+		a, b  any
+		equal bool
+	}{
+		{"json number and int", json.Number("3"), 3, true},
+		{"json number and string", json.Number("3"), "3", true},
+		{"whole float and int", 3.0, 3, true},
+		{"json number keeps its literal", json.Number("3.0"), 3.0, false},
+		{"nil and nil", nil, nil, true},
+		{"nil and nil pointer", nil, (*int)(nil), true},
+		{"nil and nil slice", nil, []string(nil), true},
+		{"nil and empty string", nil, "", false},
+		{"nil and the string null", nil, "null", false},
+		{"nil pointer and the string null", (*string)(nil), "null", false},
+		{"nil and <nil>", nil, "<nil>", false},
+		{"string and bytes", "ab", []byte("ab"), false},
+		{"hidden structs that differ", metricHidden{1}, metricHidden{2}, false},
+		{"hidden structs that agree", metricHidden{1}, &metricHidden{1}, true},
+		{"label type", metricLabel("positive"), "positive", true},
+		{"Stringer is not its text", metricEnum(1), "high", false},
+		{"float and its fmt form", 1e20, "1e+20", false},
+		{"slice is not its words", []any{"a b"}, []any{"a", "b"}, false},
+		{"time and RFC 3339", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), "2026-01-01T00:00:00Z", true},
+		{"pointer and string", &text, "r", true},
+		{"bool and string", true, "true", true},
+		{"html", "<a&b>", "<a&b>", true},
+		{"map number kinds", map[string]any{"a": json.Number("1")}, map[string]any{"a": 1.0}, true},
+		{"large uint64 and json number", big, json.Number("9007199254740993"), true},
+		{"NaN and NaN", math.NaN(), math.NaN(), true},
+	}
+	for _, p := range pairs {
+		require.Equal(t, p.equal, matchMetricText(p.a, p.b, strings.TrimSpace, func(got, want string) bool {
+			return got == want
+		}), p.name)
+	}
+}
+
+func TestTextMetricsMatchNilOnlyWithNil(t *testing.T) {
+	ctx := context.Background()
+	for _, tt := range []struct {
+		name            string
+		expected        any
+		actual          any
+		exact, contains float64
+	}{
+		{"omitted output and the string null", "null", nil, 0, 0},
+		{"null output and the string null", "null", (*string)(nil), 0, 0},
+		{"omitted output and an empty string", "", nil, 0, 0},
+		{"null expected and the string null", nil, "null", 0, 0},
+		{"null expected and an empty string", nil, "", 0, 0},
+		{"null expected and a null output", nil, (*string)(nil), 1, 1},
+		{"hidden structs that differ", metricHidden{1}, metricHidden{2}, 0, 0},
+	} {
+		expected := Prediction{"v": tt.expected}
+		actual := Prediction{}
+		if tt.actual != nil {
+			actual["v"] = tt.actual
+		}
+		exact, err := ExactMatchMetric{TrimSpace: true, CaseInsensitive: true}.Score(ctx, expected, actual)
+		require.NoError(t, err)
+		require.Equal(t, tt.exact, exact.Score, "exact: %s", tt.name)
+		contains, err := ContainsMetric{CaseInsensitive: true}.Score(ctx, expected, actual)
+		require.NoError(t, err)
+		require.Equal(t, tt.contains, contains.Score, "contains: %s", tt.name)
+	}
+
+	for _, tt := range []struct {
+		name             string
+		expected, actual any
+		score            float64
+		kind             string
+	}{
+		{"omitted label and the string null", "null", nil, 0, "incorrect"},
+		{"null label and positive", nil, "positive", 0, "incorrect"},
+		{"null labels", nil, (*string)(nil), 1, "correct"},
+	} {
+		result, err := ClassificationMetric{IgnoreCase: true}.Score(
+			ctx,
+			Prediction{"label": tt.expected},
+			Prediction{"label": tt.actual},
+		)
+		require.NoError(t, err)
+		require.Equal(t, tt.score, result.Score, tt.name)
+		require.Equal(t, tt.kind, result.Details["kind"], tt.name)
+		if tt.expected == nil {
+			require.Nil(t, result.Details["expected"], tt.name)
+		}
+		if tt.actual == nil {
+			require.Nil(t, result.Details["actual"], tt.name)
+		}
+	}
 }
 
 func TestLLMJudgeMetricRendersTypedValues(t *testing.T) {

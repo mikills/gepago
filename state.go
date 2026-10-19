@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -310,11 +311,15 @@ func checkJSONObject(typ reflect.Type, object map[string]any, path string) error
 	return nil
 }
 
+// jsonNumber matches the JSON number grammar.
+var jsonNumber = regexp.MustCompile(jsonNumberPattern)
+
 // checkJSONField checks the value of one struct field. A field with the ",string" option holds
 // the JSON encoding of a boolean, number or string inside a string. encoding/json silently
-// decodes the string "null" there as no value, leaving a zero or a nil pointer, and a float in
-// it that underflows as 0, so both are rejected, as an unquoted underflow is; the field's
-// schema pattern rejects "null" too.
+// decodes the string "null" there as no value, leaving a zero or a nil pointer, parses a number
+// there with strconv, which admits text JSON does not, such as "01", "1." or "-Inf", and
+// decodes a float in it that underflows as 0. All three are rejected, as the field's schema
+// pattern rejects the first two and Get rejects an unquoted underflow.
 func checkJSONField(field jsonField, value any, path string) error {
 	text, isString := value.(string)
 	if !isString || !field.quoted || !quotable(field.typ) {
@@ -326,6 +331,14 @@ func checkJSONField(field jsonField, value any, path string) error {
 	typ := field.typ
 	if typ.Kind() == reflect.Pointer {
 		typ = typ.Elem()
+	}
+	switch typ.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64:
+		if !jsonNumber.MatchString(text) {
+			return fmt.Errorf("field %q is %q, which is not a JSON number", path, text)
+		}
 	}
 	return checkJSONShape(typ, json.Number(text), path)
 }

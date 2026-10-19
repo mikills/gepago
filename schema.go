@@ -248,6 +248,9 @@ func (b *schemaBuilder) fieldSchema(field jsonField, path string) (schemaNode, b
 	return node, nullable, nil
 }
 
+// jsonNumberPattern is the JSON number grammar.
+const jsonNumberPattern = `^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$`
+
 // quotedSchema is the schema of a field with the ",string" option: a string that holds the JSON
 // encoding of the value, as encoding/json requires. For a string value that is a JSON string
 // literal: no raw control characters, and only the escapes JSON defines.
@@ -262,7 +265,7 @@ func quotedSchema(typ reflect.Type) schemaNode {
 	case reflect.String:
 		pattern = `^"([^"\\\x00-\x1f]|\\(["\\/bfnrt]|u[0-9a-fA-F]{4}))*"$`
 	case reflect.Float32, reflect.Float64:
-		pattern = `^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$`
+		pattern = jsonNumberPattern
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 		pattern = `^(0|[1-9][0-9]*)$`
 	}
