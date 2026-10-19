@@ -2,6 +2,7 @@ package claude
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -86,7 +87,54 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 // reply that fails after the API reported usage returns that usage with the error. A reply
 // with no text is an error unless it stopped at the token limit.
 func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Generation, error) {
-	message, err := m.client.Messages.New(ctx, anthropic.MessageNewParams{
+	return m.complete(ctx, m.params(prompt))
+}
+
+// GenerateStructured is Generate with a response format, making LanguageModel a
+// gepa.StructuredGenerator. A strict format is sent as Claude's native structured output
+// (output_config.format with a json_schema), so the reply is JSON matching the schema; models
+// without structured output support reject such a request. Claude has no non-strict schema
+// mode and rejects schemas outside the strict subset, so a format that is not strict sends the
+// prompt alone, as Generate does. To keep the prompt-only path for typed signatures too, pass
+// gepa.GeneratorFunc(lm.Generate) instead of lm.
+func (m *LanguageModel) GenerateStructured(
+	ctx context.Context,
+	prompt string,
+	format gepa.ResponseFormat,
+) (gepa.Generation, error) {
+	if !format.Strict {
+		return m.Generate(ctx, prompt)
+	}
+	schema, err := claudeSchema(format.Schema)
+	if err != nil {
+		return gepa.Generation{}, gepa.PermanentError(
+			fmt.Errorf("claude reflection completion: response format schema: %w", err),
+		)
+	}
+	params := m.params(prompt)
+	params.OutputConfig = anthropic.OutputConfigParam{Format: anthropic.JSONOutputFormatParam{Schema: schema}}
+	return m.complete(ctx, params)
+}
+
+// claudeSchema converts a JSON Schema object to the SDK's map form. Each value stays raw JSON,
+// so nested key order, and with it the order of the reply's properties, is kept.
+func claudeSchema(schema json.RawMessage) (map[string]any, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(schema, &fields); err != nil {
+		return nil, err
+	}
+	if fields == nil {
+		return nil, errors.New("schema must be a JSON object")
+	}
+	converted := make(map[string]any, len(fields))
+	for key, value := range fields {
+		converted[key] = value
+	}
+	return converted, nil
+}
+
+func (m *LanguageModel) params(prompt string) anthropic.MessageNewParams {
+	return anthropic.MessageNewParams{
 		Model:     anthropic.Model(m.model),
 		MaxTokens: int64(m.maxTokens),
 		System: []anthropic.TextBlockParam{{
@@ -95,7 +143,11 @@ func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Gener
 		Messages: []anthropic.MessageParam{
 			anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
 		},
-	})
+	}
+}
+
+func (m *LanguageModel) complete(ctx context.Context, params anthropic.MessageNewParams) (gepa.Generation, error) {
+	message, err := m.client.Messages.New(ctx, params)
 	if err != nil {
 		return gepa.Generation{}, classifyError(ctx, err)
 	}

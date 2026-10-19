@@ -152,7 +152,9 @@ export type MetricOptions =
 export interface Field {
   name: string;
   description?: string;
-  required?: boolean;
+  type?: string;
+  schema?: Record<string, unknown>;
+  optional?: boolean;
 }
 
 export interface Signature {

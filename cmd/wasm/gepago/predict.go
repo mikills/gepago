@@ -230,7 +230,7 @@ func transitionPredictResume(request predictResumeRequest) (any, error) {
 	}
 
 	raw := *request.Result.Text
-	prediction, parseErr := parsePredictResult(raw)
+	prediction, parseErr := parsePredictResult(job.signature, raw)
 	return transitionPredictJob(request.JobID, job, raw, prediction, parseErr)
 }
 
@@ -251,7 +251,9 @@ func addPredictUsage(job *predictJob, usage *gepa.Usage) {
 	}
 }
 
-func parsePredictResult(raw string) (gepa.Prediction, error) {
+// parsePredictResult parses and checks a host reply as gepa.Predict does, so a reply with a
+// missing, null or extra output is repaired or rejected here too.
+func parsePredictResult(signature gepa.Signature, raw string) (gepa.Prediction, error) {
 	prediction, err := gepa.ParsePrediction(raw)
 	if err != nil {
 		return nil, err
@@ -259,7 +261,7 @@ func parsePredictResult(raw string) (gepa.Prediction, error) {
 	if prediction == nil {
 		return nil, errors.New("parse prediction: result must be a JSON object")
 	}
-	return prediction, nil
+	return gepa.Predict{Signature: signature}.ParseOutput(raw)
 }
 
 func transitionPredictJob(

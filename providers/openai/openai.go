@@ -2,6 +2,7 @@ package openai
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"github.com/mikills/gepago/internal/providererr"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
+	"github.com/openai/openai-go/v3/shared"
 )
 
 // Config controls OpenAI or OpenAI-compatible model access.
@@ -85,6 +87,47 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 // reported usage returns that usage with the error. An empty reply is an error unless it
 // stopped at the token limit.
 func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Generation, error) {
+	return m.complete(ctx, m.params(prompt))
+}
+
+// GenerateStructured is Generate with a response format, making LanguageModel a
+// gepa.StructuredGenerator. A strict format is sent as a json_schema response_format with
+// strict true, so the reply is JSON matching the schema; a refusal is an error naming it. A
+// format that is not strict is not enforced: the prompt is sent alone, as Generate does, so
+// models and OpenAI-compatible endpoints without structured outputs keep working with untyped
+// signatures. To keep the prompt-only path for typed signatures too, pass
+// gepa.GeneratorFunc(lm.Generate) instead of lm.
+func (m *LanguageModel) GenerateStructured(
+	ctx context.Context,
+	prompt string,
+	format gepa.ResponseFormat,
+) (gepa.Generation, error) {
+	if !format.Strict {
+		return m.Generate(ctx, prompt)
+	}
+	if !json.Valid(format.Schema) {
+		return gepa.Generation{}, gepa.PermanentError(
+			errors.New("openai reflection completion: response format schema is not valid JSON"),
+		)
+	}
+	name := format.Name
+	if name == "" {
+		name = "output"
+	}
+	params := m.params(prompt)
+	params.ResponseFormat = openai.ChatCompletionNewParamsResponseFormatUnion{
+		OfJSONSchema: &shared.ResponseFormatJSONSchemaParam{
+			JSONSchema: shared.ResponseFormatJSONSchemaJSONSchemaParam{
+				Name:   name,
+				Schema: format.Schema,
+				Strict: openai.Bool(true),
+			},
+		},
+	}
+	return m.complete(ctx, params)
+}
+
+func (m *LanguageModel) params(prompt string) openai.ChatCompletionNewParams {
 	params := openai.ChatCompletionNewParams{
 		Model: openai.ChatModel(m.model),
 		Messages: []openai.ChatCompletionMessageParamUnion{
@@ -98,6 +141,10 @@ func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Gener
 	if m.temperature != nil {
 		params.Temperature = openai.Float(*m.temperature)
 	}
+	return params
+}
+
+func (m *LanguageModel) complete(ctx context.Context, params openai.ChatCompletionNewParams) (gepa.Generation, error) {
 	completion, err := m.client.Chat.Completions.New(ctx, params)
 	if err != nil {
 		return gepa.Generation{}, classifyError(ctx, err)
@@ -109,6 +156,10 @@ func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Gener
 	choice := completion.Choices[0]
 	generation.Text = choice.Message.Content
 	generation.FinishReason = openAIFinishReason(choice.FinishReason)
+	if refusal := strings.TrimSpace(choice.Message.Refusal); refusal != "" && strings.TrimSpace(generation.Text) == "" {
+		generation.FinishReason = gepa.FinishContentFilter
+		return generation, fmt.Errorf("openai reflection completion: model refused: %s", refusal)
+	}
 	if strings.TrimSpace(generation.Text) == "" && generation.FinishReason != gepa.FinishLength {
 		return generation, errors.New("openai reflection completion: empty content")
 	}

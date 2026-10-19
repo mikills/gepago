@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -233,4 +235,109 @@ func TestLanguageModelIsSafeForConcurrentUse(t *testing.T) {
 		})
 	}
 	wg.Wait()
+}
+
+// recordingServer answers every request with body and records each request body.
+func recordingServer(t *testing.T, body string) (*httptest.Server, *[]string) {
+	t.Helper()
+	var mu sync.Mutex
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		mu.Lock()
+		requests = append(requests, string(data))
+		mu.Unlock()
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(server.Close)
+	return server, &requests
+}
+
+const structuredReply = `{
+	"model":"claude-resolved","stop_reason":"end_turn",
+	"content":[{"type":"text","text":"{\"answer\":\"4\",\"confidence\":1}"}],
+	"usage":{"input_tokens":5,"output_tokens":3}
+}`
+
+func typedSignature() gepa.Signature {
+	return gepa.Signature{
+		Name:    "qa",
+		Inputs:  []gepa.Field{{Name: "question"}},
+		Outputs: []gepa.Field{{Name: "answer", Type: "string"}, {Name: "confidence", Type: "float64"}},
+	}
+}
+
+func TestGenerateStructuredSendsTheSchemaAsOutputConfig(t *testing.T) {
+	server, requests := recordingServer(t, structuredReply)
+	format, err := typedSignature().ResponseFormat()
+	require.NoError(t, err)
+
+	got, err := testModel(t, server.URL).GenerateStructured(context.Background(), "prompt", format)
+
+	require.NoError(t, err)
+	require.Equal(t, `{"answer":"4","confidence":1}`, got.Text)
+	require.Equal(t, gepa.Usage{PromptTokens: 5, CompletionTokens: 3, TotalTokens: 8}, got.Usage)
+	require.Len(t, *requests, 1)
+	var request struct {
+		OutputConfig struct {
+			Format struct {
+				Type   string          `json:"type"`
+				Schema json.RawMessage `json:"schema"`
+			} `json:"format"`
+		} `json:"output_config"`
+		ToolChoice any `json:"tool_choice"`
+	}
+	require.NoError(t, json.Unmarshal([]byte((*requests)[0]), &request))
+	require.Equal(t, "json_schema", request.OutputConfig.Format.Type)
+	require.JSONEq(t, string(format.Schema), string(request.OutputConfig.Format.Schema))
+	require.Nil(t, request.ToolChoice, "structured output does not force a tool call")
+	require.Less(
+		t,
+		strings.Index((*requests)[0], `"answer"`),
+		strings.Index((*requests)[0], `"confidence"`),
+		"properties keep signature order",
+	)
+}
+
+func TestGenerateStructuredSendsThePromptAloneForANonStrictFormat(t *testing.T) {
+	server, requests := recordingServer(t, structuredReply)
+	format := gepa.ResponseFormat{Name: "qa", Schema: json.RawMessage(`{"type":"object"}`)}
+
+	_, err := testModel(t, server.URL).GenerateStructured(context.Background(), "prompt", format)
+
+	require.NoError(t, err)
+	require.NotContains(t, (*requests)[0], "output_config")
+}
+
+func TestGenerateStructuredRejectsAnInvalidSchema(t *testing.T) {
+	for name, schema := range map[string]string{"not JSON": `{"type":`, "not an object": `null`} {
+		t.Run(name, func(t *testing.T) {
+			server, requests := recordingServer(t, structuredReply)
+			format := gepa.ResponseFormat{Name: "qa", Schema: json.RawMessage(schema), Strict: true}
+
+			_, err := testModel(t, server.URL).GenerateStructured(context.Background(), "prompt", format)
+
+			require.ErrorContains(t, err, "claude reflection completion: response format schema: ")
+			require.True(t, gepa.IsPermanent(err))
+			require.Empty(t, *requests)
+		})
+	}
+}
+
+func TestPredictSendsTheSchemaThroughRetryingLanguageModel(t *testing.T) {
+	server, requests := recordingServer(t, structuredReply)
+	program := gepa.Predict{
+		Signature: typedSignature(),
+		LM:        &gepa.RetryingLanguageModel{LM: testModel(t, server.URL), MaxAttempts: 2},
+	}
+
+	got, err := program.Run(context.Background(), gepa.Prediction{"question": "2+2?"})
+
+	require.NoError(t, err)
+	require.Equal(t, "4", got["answer"])
+	require.Len(t, *requests, 1)
+	require.Contains(t, (*requests)[0], `"output_config":{"format":{`)
+	require.Contains(t, (*requests)[0], `"type":"json_schema"`)
 }

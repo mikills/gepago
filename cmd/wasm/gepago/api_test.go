@@ -399,3 +399,72 @@ func TestPredictResumeStopsOnTruncatedReply(t *testing.T) {
 		t.Fatalf("unknown finish reason was accepted: %s", invalid)
 	}
 }
+
+func TestPredictResumeChecksOutputsAsPredictDoes(t *testing.T) {
+	begin := func(maxParseRetries int) (string, string) {
+		start := map[string]any{
+			"program": map[string]any{
+				"signature": gepa.Signature{
+					Name:    "sentiment",
+					Inputs:  []gepa.Field{{Name: "text"}},
+					Outputs: []gepa.Field{{Name: "label", Type: "string"}},
+				},
+				"maxParseRetries": maxParseRetries,
+			},
+			"inputs": map[string]any{"text": "great"},
+		}
+		var envelope struct {
+			Value struct {
+				JobID       string `json:"job_id"`
+				HostRequest struct {
+					RequestID string `json:"request_id"`
+					Prompt    string `json:"prompt"`
+				} `json:"host_request"`
+			} `json:"value"`
+		}
+		if err := json.Unmarshal([]byte(invokeJSON("predict.start", mustJSON(t, start))), &envelope); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(envelope.Value.HostRequest.Prompt, "The JSON object must match this JSON schema") {
+			t.Fatalf("typed prompt does not carry the schema: %s", envelope.Value.HostRequest.Prompt)
+		}
+		return envelope.Value.JobID, envelope.Value.HostRequest.RequestID
+	}
+
+	jobID, requestID := begin(1)
+	var repair struct {
+		Value struct {
+			Status      string `json:"status"`
+			HostRequest struct {
+				Prompt string `json:"prompt"`
+			} `json:"host_request"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal([]byte(invokeJSON("predict.resume", mustJSON(t, map[string]any{
+		"job_id": jobID, "request_id": requestID,
+		"result": map[string]any{"text": `{"label":"positive","reasoning":"warm words"}`},
+	}))), &repair); err != nil {
+		t.Fatal(err)
+	}
+	if repair.Value.Status != "pending" ||
+		!strings.Contains(repair.Value.HostRequest.Prompt, `field "reasoning" is not an output of the signature`) ||
+		!strings.Contains(repair.Value.HostRequest.Prompt, "The JSON object must match this JSON schema") {
+		t.Fatalf("an extra field was not sent for repair with the schema: %+v", repair)
+	}
+
+	jobID, requestID = begin(0)
+	rejected := invokeJSON("predict.resume", mustJSON(t, map[string]any{
+		"job_id": jobID, "request_id": requestID, "result": map[string]any{"text": `{"label":null}`},
+	}))
+	if !strings.Contains(rejected, `invalid programme output: signature \"sentiment\": output \"label\" is null`) {
+		t.Fatalf("a null output was not rejected: %s", rejected)
+	}
+
+	jobID, requestID = begin(0)
+	notObject := invokeJSON("predict.resume", mustJSON(t, map[string]any{
+		"job_id": jobID, "request_id": requestID, "result": map[string]any{"text": `null`},
+	}))
+	if !strings.Contains(notObject, "parse prediction: result must be a JSON object") {
+		t.Fatalf("a null reply was not rejected: %s", notObject)
+	}
+}

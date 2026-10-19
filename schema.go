@@ -1,0 +1,546 @@
+package gepa
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"reflect"
+	"slices"
+	"strings"
+)
+
+// JSONSchemaFor returns the JSON Schema of the JSON values that Key[T].Get converts to T. It
+// follows the same field rules, so a value valid under the schema decodes without drift:
+//
+//   - a struct is an object with one property per JSON field, as encoding/json finds them
+//     (json tags, embedded structs, "-"), in encoding order, with additionalProperties false;
+//   - every property is listed in required, as strict providers need; a field tagged
+//     omitempty or omitzero, which Get lets the reply omit, is nullable instead;
+//   - a pointer, slice, map or interface admits null, as Get does; other types do not;
+//   - a type with its own UnmarshalJSON or UnmarshalText, an interface, and a struct that
+//     contains itself are unconstrained ({}), since their JSON form is not known;
+//   - []byte is a (base64) string, a map is an object whose additionalProperties hold the
+//     element schema, and a field with the ",string" tag option is a string;
+//   - a field's description tag becomes its property's description.
+//
+// Channels, functions, complex numbers and maps whose keys cannot come from a JSON object key
+// have no JSON form and return an error.
+func JSONSchemaFor[T any]() (json.RawMessage, error) {
+	typ := reflect.TypeFor[T]()
+	node, nullable, err := newSchemaBuilder().typeSchema(typ, "")
+	if err != nil {
+		return nil, fmt.Errorf("json schema for %s: %w", typ, err)
+	}
+	if nullable {
+		node = nullableSchema(node)
+	}
+	return json.Marshal(node)
+}
+
+// schemaNode is a JSON Schema object that keeps its keywords in the order they were added, so
+// properties stay in field order: strict providers generate them in schema order.
+type schemaNode []schemaKeyword
+
+type schemaKeyword struct {
+	key   string
+	value any
+}
+
+// MarshalJSON writes the keywords in order.
+func (n schemaNode) MarshalJSON() ([]byte, error) {
+	var b bytes.Buffer
+	b.WriteByte('{')
+	for i, keyword := range n {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		key, err := json.Marshal(keyword.key)
+		if err != nil {
+			return nil, err
+		}
+		value, err := json.Marshal(keyword.value)
+		if err != nil {
+			return nil, err
+		}
+		b.Write(key)
+		b.WriteByte(':')
+		b.Write(value)
+	}
+	b.WriteByte('}')
+	return b.Bytes(), nil
+}
+
+// with returns a copy of n with keyword added.
+func (n schemaNode) with(key string, value any) schemaNode {
+	return append(slices.Clone(n), schemaKeyword{key: key, value: value})
+}
+
+// constrained reports whether n restricts the values it admits; {} and a node with only
+// annotations admit anything, null included.
+func (n schemaNode) constrained() bool {
+	for _, keyword := range n {
+		if keyword.key != "description" && keyword.key != "title" {
+			return true
+		}
+	}
+	return false
+}
+
+// unconstrainedJSON reports whether a JSON schema object has only annotations, so it admits
+// any value, null included.
+func unconstrainedJSON(schema json.RawMessage) bool {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(schema, &object); err != nil || object == nil {
+		return false
+	}
+	for key := range object {
+		if key != "description" && key != "title" {
+			return false
+		}
+	}
+	return true
+}
+
+func typeNode(name string) schemaNode {
+	return schemaNode{{key: "type", value: name}}
+}
+
+// nullableSchema returns a schema that admits null as well as what node admits. An
+// unconstrained node already admits null and is returned as it is.
+func nullableSchema(node schemaNode) schemaNode {
+	if !node.constrained() {
+		return node
+	}
+	return schemaNode{{key: "anyOf", value: []any{node, typeNode("null")}}}
+}
+
+// schemaBuilder converts Go types to schemas. expanding holds the structs being expanded, so
+// a struct that contains itself becomes unconstrained instead of recursing forever.
+type schemaBuilder struct {
+	expanding map[reflect.Type]bool
+}
+
+func newSchemaBuilder() *schemaBuilder {
+	return &schemaBuilder{expanding: map[reflect.Type]bool{}}
+}
+
+// typeSchema returns the schema of the JSON values that decode into typ, without null, and
+// whether null decodes into typ too. path names the value in errors.
+func (b *schemaBuilder) typeSchema(typ reflect.Type, path string) (schemaNode, bool, error) {
+	if customJSON(typ) {
+		return schemaNode{}, nillable(typ), nil
+	}
+	switch typ.Kind() {
+	case reflect.Bool:
+		return typeNode("boolean"), false, nil
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return typeNode("integer"), false, nil
+	case reflect.Float32, reflect.Float64:
+		return typeNode("number"), false, nil
+	case reflect.String:
+		return typeNode("string"), false, nil
+	case reflect.Interface:
+		return schemaNode{}, true, nil
+	case reflect.Pointer:
+		node, _, err := b.typeSchema(typ.Elem(), path)
+		return node, true, err
+	case reflect.Slice:
+		if typ.Elem().Kind() == reflect.Uint8 && !customJSON(typ.Elem()) {
+			return typeNode("string"), true, nil
+		}
+		items, err := b.elementSchema(typ.Elem(), path+"[]")
+		return typeNode("array").with("items", items), true, err
+	case reflect.Array:
+		items, err := b.elementSchema(typ.Elem(), path+"[]")
+		return typeNode("array").with("items", items), false, err
+	case reflect.Map:
+		if !jsonMapKey(typ.Key()) {
+			return nil, false, fmt.Errorf(
+				"%smap key type %s cannot be decoded from a JSON object key",
+				pathPrefix(path),
+				typ.Key(),
+			)
+		}
+		values, err := b.elementSchema(typ.Elem(), path+"[]")
+		return typeNode("object").with("additionalProperties", values), true, err
+	case reflect.Struct:
+		node, err := b.structSchema(typ, path)
+		return node, false, err
+	}
+	return nil, false, fmt.Errorf("%s%s cannot be decoded from JSON", pathPrefix(path), typ)
+}
+
+// elementSchema returns the schema of a slice, array or map element, null included when the
+// element type admits it.
+func (b *schemaBuilder) elementSchema(typ reflect.Type, path string) (schemaNode, error) {
+	node, nullable, err := b.typeSchema(typ, path)
+	if err != nil {
+		return nil, err
+	}
+	if nullable {
+		node = nullableSchema(node)
+	}
+	return node, nil
+}
+
+func (b *schemaBuilder) structSchema(typ reflect.Type, path string) (schemaNode, error) {
+	if b.expanding[typ] {
+		return schemaNode{}, nil
+	}
+	b.expanding[typ] = true
+	defer delete(b.expanding, typ)
+	fields := jsonFields(typ)
+	names := jsonFieldOrder(fields)
+	properties := make(schemaNode, 0, len(names))
+	for _, name := range names {
+		node, err := b.propertySchema(fields[name], joinJSONPath(path, name))
+		if err != nil {
+			return nil, err
+		}
+		properties = append(properties, schemaKeyword{key: name, value: node})
+	}
+	return schemaNode{
+		{key: "type", value: "object"},
+		{key: "properties", value: properties},
+		{key: "required", value: names},
+		{key: "additionalProperties", value: false},
+	}, nil
+}
+
+// propertySchema returns the schema of one struct field as a property: nullable when the
+// field is optional or its type admits null, and carrying its description.
+func (b *schemaBuilder) propertySchema(field jsonField, path string) (schemaNode, error) {
+	node, nullable, err := b.fieldSchema(field, path)
+	if err != nil {
+		return nil, err
+	}
+	if nullable || field.optional {
+		node = nullableSchema(node)
+	}
+	return node, nil
+}
+
+// fieldSchema returns the schema of a struct field's value without null, with its
+// description, and whether null decodes into it.
+func (b *schemaBuilder) fieldSchema(field jsonField, path string) (schemaNode, bool, error) {
+	node, nullable, err := b.typeSchema(field.typ, path)
+	if err != nil {
+		return nil, false, err
+	}
+	if field.quoted && quotable(field.typ) {
+		node = typeNode("string")
+	}
+	if field.description != "" {
+		node = node.with("description", field.description)
+	}
+	return node, nullable, nil
+}
+
+// quotable reports whether encoding/json applies the ",string" option to a field of typ: a
+// boolean, number or string, or an unnamed pointer to one.
+func quotable(typ reflect.Type) bool {
+	if typ.Name() == "" && typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	switch typ.Kind() {
+	case reflect.Bool, reflect.String,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64:
+		return true
+	}
+	return false
+}
+
+// jsonMapKey reports whether encoding/json decodes object keys into a map key of typ.
+func jsonMapKey(typ reflect.Type) bool {
+	if reflect.PointerTo(typ).Implements(textUnmarshalerType) {
+		return true
+	}
+	switch typ.Kind() {
+	case reflect.String,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return true
+	}
+	return false
+}
+
+// jsonFieldOrder returns the names of fields in encoding order: by the index path of the
+// struct field each resolves to.
+func jsonFieldOrder(fields map[string]jsonField) []string {
+	names := make([]string, 0, len(fields))
+	for name := range fields {
+		names = append(names, name)
+	}
+	slices.SortFunc(names, func(a, b string) int {
+		if order := slices.Compare(fields[a].index, fields[b].index); order != 0 {
+			return order
+		}
+		return strings.Compare(a, b)
+	})
+	return names
+}
+
+func pathPrefix(path string) string {
+	if path == "" {
+		return ""
+	}
+	return fmt.Sprintf("field %q: ", path)
+}
+
+// checkSchemaJSON checks that schema is a JSON object usable as a JSON Schema: valid JSON with
+// type names JSON Schema knows, and well-formed properties, required, items,
+// additionalProperties, enum, anyOf, allOf, oneOf, not and $defs keywords.
+func checkSchemaJSON(schema json.RawMessage) error {
+	node, err := decodeSchema(schema)
+	if err != nil {
+		return err
+	}
+	if _, ok := node.(map[string]any); !ok {
+		return errors.New("must be a JSON object")
+	}
+	return checkSchemaNode(node, "")
+}
+
+var jsonSchemaTypes = map[string]bool{
+	"string": true, "number": true, "integer": true, "boolean": true, "object": true, "array": true, "null": true,
+}
+
+func checkSchemaNode(node any, path string) error {
+	if _, ok := node.(bool); ok {
+		return nil
+	}
+	object, ok := node.(map[string]any)
+	if !ok {
+		return fmt.Errorf("%s must be a schema object or a boolean", schemaPath(path))
+	}
+	for _, key := range slices.Sorted(maps.Keys(object)) {
+		if err := checkSchemaKeyword(key, object[key], joinJSONPath(path, key)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkSchemaKeyword(key string, value any, path string) error {
+	switch key {
+	case "type":
+		return checkSchemaType(value, path)
+	case "properties", "$defs", "definitions":
+		object, ok := value.(map[string]any)
+		if !ok {
+			return fmt.Errorf("%s must be an object of schemas", schemaPath(path))
+		}
+		for _, name := range slices.Sorted(maps.Keys(object)) {
+			if err := checkSchemaNode(object[name], joinJSONPath(path, name)); err != nil {
+				return err
+			}
+		}
+	case "required":
+		items, ok := value.([]any)
+		if !ok {
+			return fmt.Errorf("%s must be an array of strings", schemaPath(path))
+		}
+		for _, item := range items {
+			if _, ok := item.(string); !ok {
+				return fmt.Errorf("%s must be an array of strings", schemaPath(path))
+			}
+		}
+	case "items", "additionalProperties", "not":
+		if items, ok := value.([]any); ok && key == "items" {
+			return checkSchemaList(items, path, false)
+		}
+		return checkSchemaNode(value, path)
+	case "anyOf", "allOf", "oneOf":
+		items, ok := value.([]any)
+		if !ok {
+			return fmt.Errorf("%s must be a non-empty array of schemas", schemaPath(path))
+		}
+		return checkSchemaList(items, path, true)
+	case "enum":
+		if _, ok := value.([]any); !ok {
+			return fmt.Errorf("%s must be an array", schemaPath(path))
+		}
+	}
+	return nil
+}
+
+func checkSchemaType(value any, path string) error {
+	names, ok := value.([]any)
+	if !ok {
+		names = []any{value}
+	}
+	if len(names) == 0 {
+		return fmt.Errorf("%s must name at least one type", schemaPath(path))
+	}
+	for _, name := range names {
+		text, ok := name.(string)
+		if !ok || !jsonSchemaTypes[text] {
+			return fmt.Errorf(
+				"%s %v is not a JSON Schema type; use string, number, integer, boolean, object, array or null",
+				schemaPath(path),
+				jsonText(name),
+			)
+		}
+	}
+	return nil
+}
+
+func checkSchemaList(items []any, path string, nonEmpty bool) error {
+	if nonEmpty && len(items) == 0 {
+		return fmt.Errorf("%s must be a non-empty array of schemas", schemaPath(path))
+	}
+	for i, item := range items {
+		if err := checkSchemaNode(item, fmt.Sprintf("%s[%d]", path, i)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func schemaPath(path string) string {
+	if path == "" {
+		return "schema"
+	}
+	return fmt.Sprintf("%q", path)
+}
+
+func jsonText(value any) string {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Sprint(value)
+	}
+	return string(data)
+}
+
+// strictKeywords are the JSON Schema keywords that both OpenAI and Claude strict modes accept.
+var strictKeywords = map[string]bool{
+	"type": true, "properties": true, "required": true, "additionalProperties": true, "items": true,
+	"anyOf": true, "enum": true, "const": true, "description": true, "title": true,
+}
+
+// StrictJSONSchema reports whether schema stays within the subset of JSON Schema that both
+// OpenAI and Claude enforce in strict mode, so a provider can constrain its reply to it: every
+// schema is an object that names a type (or is an anyOf, enum or const); every object lists
+// all its properties in required and sets additionalProperties to false; every array has
+// items; and no schema uses a keyword other than type, properties, required,
+// additionalProperties, items, anyOf, enum, const, description and title. An unconstrained
+// value ({}), a map, a $ref and a numeric or string limit all fall outside it. Invalid JSON is
+// not strict.
+func StrictJSONSchema(schema json.RawMessage) bool {
+	node, err := decodeSchema(schema)
+	return err == nil && strictSchemaNode(node)
+}
+
+// decodeSchema decodes a schema document; content after the first value is an error.
+func decodeSchema(schema json.RawMessage) (any, error) {
+	var node any
+	if err := json.Unmarshal(schema, &node); err != nil {
+		return nil, fmt.Errorf("not valid JSON: %w", err)
+	}
+	return node, nil
+}
+
+func strictSchemaNode(node any) bool {
+	object, ok := node.(map[string]any)
+	if !ok {
+		return false
+	}
+	for key := range object {
+		if !strictKeywords[key] {
+			return false
+		}
+	}
+	if branches, ok := object["anyOf"]; ok {
+		return strictAnyOf(object, branches)
+	}
+	value, ok := object["type"]
+	if !ok {
+		_, hasEnum := object["enum"]
+		_, hasConst := object["const"]
+		return (hasEnum || hasConst) && !hasAny(object, "properties", "required", "additionalProperties", "items")
+	}
+	types, ok := value.([]any)
+	if !ok {
+		types = []any{value}
+	}
+	isObject, isArray := false, false
+	for _, typeName := range types {
+		switch typeName {
+		case "object":
+			isObject = true
+		case "array":
+			isArray = true
+		}
+	}
+	if isObject != hasAny(object, "properties", "required", "additionalProperties") {
+		return false
+	}
+	if isObject && !strictObject(object) {
+		return false
+	}
+	if isArray != hasAny(object, "items") {
+		return false
+	}
+	return !isArray || strictSchemaNode(object["items"])
+}
+
+func strictAnyOf(object map[string]any, branches any) bool {
+	items, ok := branches.([]any)
+	if !ok || len(items) == 0 {
+		return false
+	}
+	for key := range object {
+		if key != "anyOf" && key != "description" && key != "title" {
+			return false
+		}
+	}
+	for _, item := range items {
+		if !strictSchemaNode(item) {
+			return false
+		}
+	}
+	return true
+}
+
+func strictObject(object map[string]any) bool {
+	if additional, ok := object["additionalProperties"].(bool); !ok || additional {
+		return false
+	}
+	properties, ok := object["properties"].(map[string]any)
+	if !ok {
+		return false
+	}
+	required, ok := object["required"].([]any)
+	if !ok || len(required) != len(properties) {
+		return false
+	}
+	for _, name := range required {
+		text, ok := name.(string)
+		if !ok {
+			return false
+		}
+		if _, ok := properties[text]; !ok {
+			return false
+		}
+	}
+	for _, property := range properties {
+		if !strictSchemaNode(property) {
+			return false
+		}
+	}
+	return true
+}
+
+func hasAny(object map[string]any, keys ...string) bool {
+	for _, key := range keys {
+		if _, ok := object[key]; ok {
+			return true
+		}
+	}
+	return false
+}

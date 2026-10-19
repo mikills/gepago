@@ -221,10 +221,15 @@ func TestCompile(t *testing.T) {
 		if strings.Contains(prompt, "Evaluation records and traces") {
 			return "```\nClassify text as exactly positive or negative. Use negative when wording is ambiguous.\n```", nil
 		}
-		if strings.Contains(strings.ToLower(prompt), "exactly positive or negative") {
-			return "{\"label\":\"positive\",\"reasoning\":\"matched positive wording\"}", nil
+		// only the chain of thought asks for reasoning; Predict rejects fields it did not ask for.
+		reasoning := ""
+		if strings.Contains(prompt, "output fields: label, reasoning.") {
+			reasoning = ",\"reasoning\":\"weak instruction\""
 		}
-		return "{\"label\":\"unknown\",\"reasoning\":\"weak instruction\"}", nil
+		if strings.Contains(strings.ToLower(prompt), "exactly positive or negative") {
+			return "{\"label\":\"positive\"" + reasoning + "}", nil
+		}
+		return "{\"label\":\"unknown\"" + reasoning + "}", nil
 	})
 	signature := Signature{
 		Name:        "sentiment",

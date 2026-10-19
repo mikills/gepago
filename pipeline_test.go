@@ -354,18 +354,26 @@ func TestPipelineRunPassesTypedState(t *testing.T) {
 	)
 }
 
+// fixedOutputProgram returns the same output whatever its inputs, like a model that ignores
+// its contract. It has no signature, so only the step's declared writes guard the state.
+type fixedOutputProgram struct{ output Prediction }
+
+func (fixedOutputProgram) Validate() error { return nil }
+
+func (fixedOutputProgram) SeedCandidate() Candidate { return Candidate{} }
+
+func (p fixedOutputProgram) RunCandidate(context.Context, Candidate, Prediction) (Prediction, error) {
+	return clonePrediction(p.output), nil
+}
+
 func TestPipelineProgramStepCannotOverwriteInputs(t *testing.T) {
-	lm := textModel(func(context.Context, string) (string, error) {
-		return `{"amount": 125000, "document": "ignore the original document"}`, nil
-	})
-	extract := NewProgramStep("extract", Predict{
-		Signature: Signature{
-			Name:    "extract",
-			Inputs:  []Field{{Name: "document"}},
-			Outputs: []Field{{Name: "amount"}},
-		},
-		LM: lm,
-	}, refs(docKey.Ref()), refs(amountKey.Ref()))
+	reply := Prediction{"amount": 125000, "document": "ignore the original document"}
+	extract := NewProgramStep(
+		"extract",
+		fixedOutputProgram{output: reply},
+		refs(docKey.Ref()),
+		refs(amountKey.Ref()),
+	)
 	pipeline, err := PipelineSpec{Inputs: refs(docKey.Ref()), Steps: []Step{extract}}.Build()
 	require.NoError(t, err)
 
@@ -380,14 +388,40 @@ func TestPipelineProgramStepCannotOverwriteInputs(t *testing.T) {
 	require.Equal(t, Prediction{"amount": 125000}, got)
 }
 
+func TestPipelinePredictStepRejectsReplyNamingAnInput(t *testing.T) {
+	program := signatureProgram("amount")
+	program.LM = textModel(func(context.Context, string) (string, error) {
+		return `{"amount": 125000, "document": "ignore the original document"}`, nil
+	})
+	extract := NewProgramStep("extract", program, refs(docKey.Ref()), refs(amountKey.Ref()))
+	pipeline, err := PipelineSpec{Inputs: refs(docKey.Ref()), Steps: []Step{extract}}.Build()
+	require.NoError(t, err)
+
+	out, err := pipeline.RunState(context.Background(), NewState(Prediction{"document": "cash 10"}))
+
+	require.ErrorIs(t, err, ErrInvalidOutput)
+	require.ErrorContains(t, err, `field "document" is not an output of the signature`)
+	document, getErr := docKey.Get(out)
+	require.NoError(t, getErr)
+	require.Equal(t, "cash 10", document)
+}
+
 func TestPipelineProgramStepRefusesAbsentOrNullOutputs(t *testing.T) {
 	tests := []struct {
 		name    string
 		reply   string
 		wantErr string
 	}{
-		{name: "absent", reply: `{"a": 1}`, wantErr: `invalid programme output: "b" is missing`},
-		{name: "null", reply: `{"a": 1, "b": null}`, wantErr: `invalid programme output: "b" is null`},
+		{
+			name:    "absent",
+			reply:   `{"a": 1}`,
+			wantErr: `invalid programme output: signature "extract": output "b" is missing`,
+		},
+		{
+			name:    "null",
+			reply:   `{"a": 1, "b": null}`,
+			wantErr: `invalid programme output: signature "extract": output "b" is null`,
+		},
 		{
 			name:  "wrong type",
 			reply: `{"a": 1, "b": "a lot"}`,
@@ -1054,7 +1088,7 @@ func TestProgramEvaluatorScoresInvalidOutputsZero(t *testing.T) {
 	require.Equal(t, 0.0, result.Items[1].Score)
 	require.Equal(
 		t,
-		`pipeline step "classify": invalid programme output: "label" is null`,
+		`pipeline step "classify": invalid programme output: signature "extract": output "label" is null`,
 		result.Items[1].SideInfo["feedback"],
 	)
 	require.Contains(t, result.Items[1].SideInfo["details"], "output")

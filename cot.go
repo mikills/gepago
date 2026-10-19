@@ -5,7 +5,9 @@ import (
 	"strings"
 )
 
-// ChainOfThought wraps Predict with an added reasoning output field.
+// ChainOfThought wraps Predict with an added reasoning output field. The reasoning field is a
+// required output like any other, so a reply without it fails Predict's output check. When
+// another output sets Type, Schema or Optional, the added reasoning field has Type "string".
 type ChainOfThought struct {
 	Signature       Signature
 	LM              Generator
@@ -77,8 +79,13 @@ func (c ChainOfThought) signatureWithReasoning(reasoningField string) Signature 
 			return signature
 		}
 	}
+	reasoning := Field{Name: reasoningField, Description: "brief reasoning for the answer"}
+	if signature.typed() {
+		// a typed reasoning field keeps an otherwise strict schema strict.
+		reasoning.Type = "string"
+	}
 	outputs := append([]Field(nil), signature.Outputs...)
-	outputs = append(outputs, Field{Name: reasoningField, Description: "brief reasoning for the answer"})
+	outputs = append(outputs, reasoning)
 	signature.Outputs = outputs
 	return signature
 }

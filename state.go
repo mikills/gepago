@@ -302,9 +302,15 @@ func joinJSONPath(path, key string) string {
 	return path + "." + key
 }
 
+// jsonField is one JSON object key of a struct. index is the path of the struct field it
+// resolves to, quoted reports the ",string" tag option, and description holds the field's
+// description tag for JSON Schema.
 type jsonField struct {
-	typ      reflect.Type
-	optional bool
+	typ         reflect.Type
+	optional    bool
+	quoted      bool
+	description string
+	index       []int
 }
 
 type jsonFieldCandidate struct {
@@ -319,6 +325,7 @@ type jsonFieldCandidate struct {
 func jsonFields(typ reflect.Type) map[string]jsonField {
 	candidates := map[string][]jsonFieldCandidate{}
 	visited := map[reflect.Type]bool{}
+	indexes := map[reflect.Type][]int{typ: nil}
 	level := []reflect.Type{typ}
 	for depth := 0; len(level) > 0; depth++ {
 		counts := map[reflect.Type]int{}
@@ -331,7 +338,7 @@ func jsonFields(typ reflect.Type) map[string]jsonField {
 				continue
 			}
 			visited[structType] = true
-			next = append(next, addJSONFieldCandidates(structType, depth, counts[structType], candidates)...)
+			next = append(next, addJSONFieldCandidates(structType, indexes, depth, counts[structType], candidates)...)
 		}
 		level = next
 	}
@@ -346,9 +353,11 @@ func jsonFields(typ reflect.Type) map[string]jsonField {
 
 // addJSONFieldCandidates records the fields of one struct and returns the embedded structs to
 // explore at the next depth. A struct embedded more than once at the same depth adds each
-// field twice, so its fields cancel out as they do in encoding/json.
+// field twice, so its fields cancel out as they do in encoding/json. indexes holds the index
+// path of each struct's first embedding, which is the one explored.
 func addJSONFieldCandidates(
 	structType reflect.Type,
+	indexes map[reflect.Type][]int,
 	depth int,
 	count int,
 	candidates map[string][]jsonFieldCandidate,
@@ -371,7 +380,11 @@ func addJSONFieldCandidates(
 			continue
 		}
 		name, options, _ := strings.Cut(tag, ",")
+		index := append(slices.Clone(indexes[structType]), i)
 		if name == "" && field.Anonymous && inner.Kind() == reflect.Struct {
+			if _, ok := indexes[inner]; !ok {
+				indexes[inner] = index
+			}
 			embedded = append(embedded, inner)
 			continue
 		}
@@ -382,8 +395,11 @@ func addJSONFieldCandidates(
 		opts := strings.Split(options, ",")
 		candidate := jsonFieldCandidate{
 			field: jsonField{
-				typ:      field.Type,
-				optional: slices.Contains(opts, "omitempty") || slices.Contains(opts, "omitzero"),
+				typ:         field.Type,
+				optional:    slices.Contains(opts, "omitempty") || slices.Contains(opts, "omitzero"),
+				quoted:      slices.Contains(opts, "string"),
+				description: field.Tag.Get("description"),
+				index:       index,
 			},
 			depth:  depth,
 			tagged: tagged,

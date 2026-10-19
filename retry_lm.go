@@ -17,6 +17,10 @@ const defaultRetryMaxDelay = 30 * time.Second
 // other half. The returned Generation is the last attempt's, carrying the summed usage of
 // every attempt, failed attempts included. Use it through a pointer; it is safe for concurrent
 // use when LM is.
+//
+// It is a StructuredGenerator whatever LM is: GenerateStructured passes the format to LM when
+// LM is a StructuredGenerator and sends the prompt alone otherwise, so wrapping a model
+// neither hides nor fakes its structured output.
 type RetryingLanguageModel struct {
 	// LM is the wrapped model.
 	LM Generator
@@ -35,6 +39,29 @@ type RetryingLanguageModel struct {
 
 // Generate calls LM, retrying transient failures until MaxAttempts is spent.
 func (m *RetryingLanguageModel) Generate(ctx context.Context, prompt string) (Generation, error) {
+	return m.retry(ctx, func(ctx context.Context) (Generation, error) {
+		return m.LM.Generate(ctx, prompt)
+	})
+}
+
+// GenerateStructured calls LM through GenerateWithFormat, retrying transient failures as
+// Generate does.
+func (m *RetryingLanguageModel) GenerateStructured(
+	ctx context.Context,
+	prompt string,
+	format ResponseFormat,
+) (Generation, error) {
+	return m.retry(ctx, func(ctx context.Context) (Generation, error) {
+		return GenerateWithFormat(ctx, m.LM, prompt, format)
+	})
+}
+
+// retry makes up to MaxAttempts calls, waiting between them, until one succeeds or fails with
+// an error that is not transient.
+func (m *RetryingLanguageModel) retry(
+	ctx context.Context,
+	call func(ctx context.Context) (Generation, error),
+) (Generation, error) {
 	if m == nil || m.LM == nil {
 		return Generation{}, errors.New("retrying language model: wrapped model is required")
 	}
@@ -47,7 +74,7 @@ func (m *RetryingLanguageModel) Generate(ctx context.Context, prompt string) (Ge
 			return generation, err
 		}
 		var err error
-		generation, err = m.LM.Generate(ctx, prompt)
+		generation, err = call(ctx)
 		usage = usage.Add(generation.Usage)
 		generation.Usage = usage
 		if err == nil || attempt >= attempts || !IsTransient(err) {
