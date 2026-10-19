@@ -142,6 +142,10 @@ func (c CompileConfig) Validate() error {
 }
 
 // ProgramEvaluator adapts a prompt programme and Metric to the lower-level Evaluator interface.
+// An example whose run fails with ErrInvalidOutput scores zero instead of failing the
+// evaluation; when a pipeline step produced the output, the item's SideInfo names the step
+// under "step" and holds its StepError.Details under "details" and copies of the values it
+// read under "reads", so DefaultReflectiveDatasetBuilder passes them to reflection.
 type ProgramEvaluator struct {
 	Program Program
 	Metric  Metric
@@ -197,23 +201,22 @@ func (e ProgramEvaluator) Evaluate(
 
 // invalidOutputItem scores an example whose programme output broke its contract as zero, with
 // the error as feedback, so reflection can learn from it instead of optimisation stopping.
+// When a pipeline step produced the output, SideInfo names it under "step" and holds its
+// details under "details" and the values it read under "reads".
 func invalidOutputItem(exampleID string, example IOExample, actual Prediction, err error) EvaluationItem {
-	var details map[string]any
-	var stepErr *StepError
-	if errors.As(err, &stepErr) {
-		details = stepErr.Details
+	sideInfo := map[string]any{
+		"inputs":   example.Inputs,
+		"expected": example.Expected,
+		"actual":   actual,
+		"feedback": err.Error(),
+		"details":  map[string]any(nil),
 	}
-	return EvaluationItem{
-		ExampleID: exampleID,
-		Output:    actual,
-		SideInfo: map[string]any{
-			"inputs":   example.Inputs,
-			"expected": example.Expected,
-			"actual":   actual,
-			"feedback": err.Error(),
-			"details":  details,
-		},
+	if stepErr := invalidOutputStep(err); stepErr != nil {
+		sideInfo["step"] = stepErr.Step
+		sideInfo["details"] = stepErr.Details
+		sideInfo["reads"] = reflectionValues(stepErr.Reads)
 	}
+	return EvaluationItem{ExampleID: exampleID, Output: actual, SideInfo: sideInfo}
 }
 
 func bestCandidateFromState(state OptimizationState) CandidateRecord {

@@ -140,7 +140,7 @@ func runChild(ctx context.Context, candidate Candidate, parent string, child *st
 ) {
 	result, err := runNode(ctx, childCandidate(candidate, child), child, values)
 	if err != nil && child.name != parent {
-		return stepResult{}, newStepError(child.name, err)
+		return stepResult{}, failStep(child, values, err)
 	}
 	return result, err
 }

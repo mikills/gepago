@@ -428,10 +428,14 @@ func isNil(value any) bool {
 // When a step nested in a composite step (Branch, Parallel, Fallback or a policy fallback)
 // fails, the composite's StepError wraps a StepError for the nested step, so the message
 // names each step from the top-level one down and Details holds the innermost diagnostics.
+//
+// Reads holds copies of the values of the step's declared reads that were in state when it
+// ran, for diagnosis and reflection; Error does not print them.
 type StepError struct {
 	Step    string
 	Err     error
 	Details map[string]any
+	Reads   map[string]any
 }
 
 func (e *StepError) Error() string {
@@ -563,7 +567,7 @@ func (p Pipeline) execute(ctx context.Context, candidate Candidate, inputs Predi
 	state := State{values: values}
 	for _, node := range p.steps {
 		if err := p.runStep(ctx, candidate, node, state); err != nil {
-			return state, run, newStepError(node.name, err)
+			return state, run, failStep(node, state.values, err)
 		}
 	}
 	return state, run, nil

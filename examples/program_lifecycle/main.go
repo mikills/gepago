@@ -54,7 +54,7 @@ func main() {
 		panic(err)
 	}
 
-	artifact := gepa.NewProgramArtifact("sentiment-lifecycle-example", compiled.Candidate)
+	artifact := compiled.Artifact("sentiment-lifecycle-example")
 	if err := gepa.SaveProgramArtifact(*artifactPath, artifact); err != nil {
 		panic(err)
 	}
