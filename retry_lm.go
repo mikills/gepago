@@ -45,6 +45,7 @@ func (m *RetryingLanguageModel) Generate(ctx context.Context, prompt string) (Ge
 	attempts := max(m.MaxAttempts, 1)
 	var generation Generation
 	var usage Usage
+	var admission retryAdmission
 	for attempt := 1; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			generation.Usage = usage
@@ -60,7 +61,7 @@ func (m *RetryingLanguageModel) Generate(ctx context.Context, prompt string) (Ge
 		if !sleepContext(ctx, m.backoff(attempt)) {
 			return generation, ctx.Err()
 		}
-		if err := admitRetry(ctx, usage); err != nil {
+		if err := admission.next(ctx, usage); err != nil {
 			return generation, err
 		}
 	}

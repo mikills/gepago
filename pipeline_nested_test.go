@@ -168,6 +168,93 @@ func TestOnErrorFallbackCandidateDoesNotCollide(t *testing.T) {
 	})
 }
 
+// labelProgram seeds its own label as its instruction, records the candidate it ran with under
+// that label, and writes the label under out or fails with err.
+type labelProgram struct {
+	seen  *sync.Map
+	label string
+	out   string
+	err   error
+}
+
+func (labelProgram) Validate() error { return nil }
+
+func (p labelProgram) SeedCandidate() Candidate { return Candidate{InstructionComponent: p.label} }
+
+func (p labelProgram) RunCandidate(_ context.Context, candidate Candidate, _ Prediction) (Prediction, error) {
+	p.seen.Store(p.label, CloneCandidate(candidate))
+	if p.err != nil {
+		return nil, p.err
+	}
+	return Prediction{p.out: p.label}, nil
+}
+
+func TestCandidateKeysReachTheirLeaves(t *testing.T) {
+	seen := &sync.Map{}
+	leaf := func(name, out string, fail bool) Step {
+		var err error
+		if fail {
+			err = errRateLimited
+		}
+		program := labelProgram{seen: seen, label: name, out: out, err: err}
+		return NewProgramStep(name, program, refs(docKey.Ref()), refs(Key[string]{Name: out}.Ref()))
+	}
+	always := func(State) (string, error) { return "x", nil }
+	inner, err := PipelineSpec{
+		Inputs: refs(docKey.Ref()),
+		Steps: []Step{
+			WithCache(WithPolicy(leaf("i1", "k1", true), StepPolicy{OnError: OnErrorFallback(leaf("i2", "k1", false))}), nil),
+			Parallel(
+				"ip",
+				WithPolicy(leaf("i3", "k3", false), StepPolicy{}),
+				Branch("ib", always, map[string]Step{"x": WithCache(leaf("i4", "k4", false), nil)}),
+			),
+		},
+	}.Build()
+	require.NoError(t, err)
+	nested := NewProgramStep(
+		"nest",
+		inner,
+		refs(docKey.Ref()),
+		refs(Key[string]{Name: "k1"}.Ref(), Key[string]{Name: "k3"}.Ref(), Key[string]{Name: "k4"}.Ref()),
+	)
+	pipeline, err := PipelineSpec{
+		Inputs: refs(docKey.Ref()),
+		Steps: []Step{
+			leaf("plain", "p", false),
+			WithPolicy(leaf("pol", "q", true), StepPolicy{OnError: OnErrorFallback(
+				Parallel("fbp", WithPolicy(leaf("fb1", "q", false), StepPolicy{})),
+			)}),
+			WithPolicy(Parallel(
+				"wp",
+				WithCache(leaf("w1", "r", false), nil),
+				Fallback("wf", leaf("w2", "s", true), WithPolicy(leaf("w3", "s", true), StepPolicy{
+					OnError: OnErrorFallback(leaf("w4", "s", false)),
+				})),
+			), StepPolicy{}),
+			WithCache(nested, nil),
+		},
+	}.Build()
+	require.NoError(t, err)
+
+	seed := pipeline.SeedCandidate()
+	require.Len(t, seed, 11)
+	trained := Candidate{}
+	for key := range seed {
+		trained[key] = "T:" + key
+	}
+	for _, candidate := range []Candidate{trained, seed} {
+		seen.Clear()
+		_, err = pipeline.RunCandidate(context.Background(), candidate, Prediction{"document": "d"})
+		require.NoError(t, err)
+		for key, label := range seed {
+			got, ok := seen.Load(label)
+			require.True(t, ok, "leaf %s did not run", label)
+			require.Equal(t, Candidate{InstructionComponent: candidate[key]}, got, "key %s", key)
+		}
+	}
+}
+
 func TestCheckCandidateKeysNamesBothOwners(t *testing.T) {
 	seen := &sync.Map{}
 	first := scopedStep(seen, "extract", "a", nil)
@@ -457,11 +544,9 @@ func TestNestedStepPanicBecomesAStepError(t *testing.T) {
 			wantErr: `pipeline step "route": step panicked: no route`,
 		},
 		{
-			name: "inside a cache key",
-			step: WithCache(writeAmount("cached", 1), func(State) (string, error) {
-				panic("no key")
-			}),
-			wantErr: `pipeline step "cached": step panicked: no key`,
+			name:    "inside a cached step",
+			step:    WithCache(boom, nil),
+			wantErr: `pipeline step "boom": step panicked: kaboom`,
 		},
 	}
 	for _, tt := range tests {

@@ -66,9 +66,10 @@ var (
 // same types as the failed step and may read other keys. Its name must be unique in the
 // pipeline, and its components are scoped beside the failed step's, as "<step>.<component>"
 // or "<outer>.<step>.<component>" inside a composite step, so they never collide with the
-// failed step's own. It runs as part of the failed step: its tokens count against that step's
-// PerStepTokens limit. When step fails too, the error keeps both errors for errors.Is and
-// errors.As.
+// failed step's own. Its budget is its own, not the failed step's: it is limited by
+// PerStepTokens[<step>] if set and by the run limits, so it can stand in for a step that
+// failed on its own PerStepTokens limit. When step fails too, the error keeps both errors for
+// errors.Is and errors.As.
 //
 // Unlike Fallback, which falls back only on a non-permanent error, OnErrorFallback falls back
 // on any error left after the policy's retries.
@@ -219,10 +220,6 @@ func (p *policyStep) onError(ctx context.Context, candidate Candidate, s State, 
 		}
 		return nil
 	case errorActionFallback:
-		// the fallback runs as part of this step: its tokens count against the step's
-		// PerStepTokens limit, which BudgetFrom inside the fallback reports.
-		ctx, _, release := usageFrameFrom(ctx).enterStep(ctx, p.child.name)
-		defer release()
 		result, fallbackErr := runChild(ctx, candidate, p.child.name, p.fallback, s.values)
 		if fallbackErr != nil {
 			return &fallbackError{primary: err, fallback: fallbackErr}

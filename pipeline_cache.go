@@ -3,6 +3,7 @@ package gepa
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"slices"
 	"time"
 )
@@ -20,8 +21,8 @@ import (
 // cached. Concurrent runs and nested pipelines have caches of their own.
 //
 // The cache never makes a working step fail: when the key cannot be built, because key returns
-// an error or tries to read or write a key outside step's reads, or because JSON cannot encode
-// a read value such as NaN, step runs uncached.
+// an error, panics or tries to read or write a key outside step's reads, or because JSON cannot
+// encode a read value such as NaN, step runs uncached. A panic in step itself still fails it.
 //
 // The returned step has step's name, reads and writes, and in a pipeline step keeps its
 // candidate keys. It is a ComponentStep when step is one; like WithPolicy, its own
@@ -77,9 +78,14 @@ func (c *cacheStep) runCandidate(ctx context.Context, candidate Candidate, s Sta
 	return nil
 }
 
-func (c *cacheStep) cacheKey(view State) (string, error) {
-	var key string
-	var err error
+// cacheKey builds the key for the reads in view. A panic while building it, in key or in a
+// value's JSON encoding, is a key that cannot be built.
+func (c *cacheStep) cacheKey(view State) (key string, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			key, err = "", fmt.Errorf("cache key panicked: %v", recovered)
+		}
+	}()
 	if c.key == nil {
 		var data []byte
 		data, err = json.Marshal(view.Prediction())

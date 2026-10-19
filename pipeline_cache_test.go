@@ -137,6 +137,11 @@ func TestWithCacheRunsUncachedWhenTheKeyCannotBeBuilt(t *testing.T) {
 			key:   func(State) (string, error) { return "", errors.New("no key") },
 		},
 		{
+			name:  "key panics",
+			reads: refs(docKey.Ref()),
+			key:   func(State) (string, error) { panic("no key") },
+		},
+		{
 			name:  "key reads an undeclared key",
 			reads: refs(docKey.Ref()),
 			key: func(s State) (string, error) {
