@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -278,4 +279,38 @@ func TestDeepCopyHandlesCycles(t *testing.T) {
 	require.Equal(t, reflect.ValueOf(copied).Pointer(), reflect.ValueOf(self).Pointer())
 	require.NotEqual(t, reflect.ValueOf(original).Pointer(), reflect.ValueOf(copied).Pointer())
 	require.Equal(t, "loop", self["name"])
+}
+
+type embeddedNameA struct {
+	Name string
+}
+
+type embeddedNameB struct {
+	Name string
+}
+
+type ambiguousNames struct {
+	embeddedNameA
+	embeddedNameB
+	Amount int `json:"amount"`
+}
+
+func TestKeyGetFollowsEncodingJSONEmbeddingConflicts(t *testing.T) {
+	key := Key[ambiguousNames]{Name: "value"}
+	input := map[string]any{"Name": "x", "amount": 1}
+
+	decoder := json.NewDecoder(strings.NewReader(`{"Name": "x", "amount": 1}`))
+	decoder.DisallowUnknownFields()
+	require.EqualError(t, decoder.Decode(&ambiguousNames{}), `json: unknown field "Name"`)
+
+	_, err := key.Get(NewState(Prediction{"value": input}))
+	require.EqualError(
+		t,
+		err,
+		`state key "value": decode as gepa.ambiguousNames: field "Name" is not in gepa.ambiguousNames`,
+	)
+
+	got, err := key.Get(NewState(Prediction{"value": map[string]any{"amount": 1}}))
+	require.NoError(t, err)
+	require.Equal(t, 1, got.Amount)
 }

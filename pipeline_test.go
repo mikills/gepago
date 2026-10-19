@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -211,6 +212,15 @@ func TestPipelineSpecBuildErrors(t *testing.T) {
 			wantErr: `merge rule for "notes" matches no step write`,
 		},
 		{
+			name: "merge rule for a single writer",
+			spec: PipelineSpec{
+				Inputs: docInput,
+				Steps:  []Step{amountStep()},
+				Merges: []MergeRule{MergeWith(amountKey, func(a, b int) (int, error) { return a + b, nil })},
+			},
+			wantErr: `merge rule for "amount" is unused: only step "parse" writes it`,
+		},
+		{
 			name: "merge type differs",
 			spec: PipelineSpec{
 				Inputs: docInput,
@@ -284,7 +294,9 @@ func TestPipelineSpecBuildErrors(t *testing.T) {
 			spec: PipelineSpec{
 				Inputs: docInput,
 				Steps:  []Step{amountStep()},
-				Merges: []MergeRule{{Key: KeyRef{Name: "amount"}, Merge: func(_, next any) (any, error) { return next, nil }}},
+				Merges: []MergeRule{
+					{Key: KeyRef{Name: "amount"}, Merge: func(_, next any) (any, error) { return next, nil }},
+				},
 			},
 			wantErr: `merge rule for "amount" key type is required; use MergeWith or Key.Ref`,
 		},
@@ -330,7 +342,16 @@ func TestPipelineRunPassesTypedState(t *testing.T) {
 	decision, err := decisionKey.Get(out)
 	require.NoError(t, err)
 	require.Equal(t, "needs_review", decision)
+	require.Equal(t, Prediction{"amount": 125000, "decision": "needs_review"}, out.Prediction())
 	require.Equal(t, Prediction{"document": "Bond obligation for 125,000."}, inputs.Prediction())
+
+	full, err := pipeline.RunState(context.Background(), inputs)
+	require.NoError(t, err)
+	require.Equal(
+		t,
+		Prediction{"document": "Bond obligation for 125,000.", "amount": 125000, "decision": "needs_review"},
+		full.Prediction(),
+	)
 }
 
 func TestPipelineProgramStepCannotOverwriteInputs(t *testing.T) {
@@ -348,7 +369,7 @@ func TestPipelineProgramStepCannotOverwriteInputs(t *testing.T) {
 	pipeline, err := PipelineSpec{Inputs: refs(docKey.Ref()), Steps: []Step{extract}}.Build()
 	require.NoError(t, err)
 
-	out, err := pipeline.Run(context.Background(), NewState(Prediction{"document": "cash 10"}))
+	out, err := pipeline.RunState(context.Background(), NewState(Prediction{"document": "cash 10"}))
 	require.NoError(t, err)
 	document, err := docKey.Get(out)
 	require.NoError(t, err)
@@ -435,6 +456,19 @@ func TestPipelineEnforcesDeclaredKeysAtRunTime(t *testing.T) {
 				return nil
 			}),
 			wantErr: `pipeline step "drift": state key "amount" is declared as int but set as string`,
+		},
+		{
+			name: "write rejected by Validate",
+			step: NewStep(
+				"invalid",
+				nil,
+				refs(Key[validatedObligation]{Name: "obligation"}.Ref()),
+				func(_ context.Context, s State) error {
+					Key[validatedObligation]{Name: "obligation"}.Set(s, validatedObligation{Amount: 1})
+					return nil
+				},
+			),
+			wantErr: `pipeline step "invalid": state key "obligation": currency is required`,
 		},
 		{
 			name: "read own write before setting it",
@@ -884,7 +918,10 @@ func TestPipelineIsolatesStoredValues(t *testing.T) {
 
 		callerTags := []string{"original"}
 		callerMeta := map[string]any{"record_id": "r-1"}
-		out, err := pipeline.Run(context.Background(), NewState(Prediction{"tags": callerTags, "meta": callerMeta}))
+		out, err := pipeline.RunState(
+			context.Background(),
+			NewState(Prediction{"tags": callerTags, "meta": callerMeta}),
+		)
 		require.NoError(t, err)
 
 		require.Equal(t, []string{"original"}, callerTags)
@@ -1047,4 +1084,34 @@ func TestProgramEvaluatorReturnsUsageWithError(t *testing.T) {
 	result, err := evaluator.Evaluate(context.Background(), pipeline.SeedCandidate(), examples, false)
 	require.EqualError(t, err, `evaluate example "2": run candidate: pipeline step "plan": response truncated`)
 	require.Equal(t, Usage{PromptTokens: 3, CompletionTokens: 30, TotalTokens: 33}, result.Usage)
+}
+
+var countedValidations atomic.Int32
+
+type countedValue struct {
+	Amount int `json:"amount"`
+}
+
+func (countedValue) Validate() error {
+	countedValidations.Add(1)
+	return nil
+}
+
+func TestPipelineConvertsModelOutputOnce(t *testing.T) {
+	value := Key[countedValue]{Name: "value"}
+	program := signatureProgram("value")
+	program.LM = LanguageModelFunc(func(context.Context, string) (string, error) {
+		return `{"value": {"amount": 3}}`, nil
+	})
+	pipeline, err := PipelineSpec{
+		Inputs: refs(docKey.Ref()),
+		Steps:  []Step{NewProgramStep("extract", program, refs(docKey.Ref()), refs(value.Ref()))},
+	}.Build()
+	require.NoError(t, err)
+	countedValidations.Store(0)
+
+	got, err := pipeline.RunCandidate(context.Background(), nil, Prediction{"document": "cash 10"})
+	require.NoError(t, err)
+	require.Equal(t, Prediction{"value": countedValue{Amount: 3}}, got)
+	require.Equal(t, int32(1), countedValidations.Load())
 }

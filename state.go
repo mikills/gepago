@@ -85,8 +85,9 @@ func (s State) lookup(key string) (any, error) {
 }
 
 // store writes value under key. Inside a step, typ is the type the value was written as and
-// must match the declared type.
-func (s State) store(key string, typ reflect.Type, value any) {
+// must match the declared type; a value the caller still holds (fresh false) is copied and
+// validated first, so commit can take pending values as they are.
+func (s State) store(key string, typ reflect.Type, value any, fresh bool) {
 	scope := s.scope
 	if scope == nil {
 		if s.values == nil {
@@ -102,6 +103,13 @@ func (s State) store(key string, typ reflect.Type, value any) {
 	case typ != declared:
 		scope.fail(fmt.Errorf("state key %q is declared as %s but set as %s", key, declared, typ))
 	default:
+		if !fresh {
+			value = deepCopy(value)
+			if err := validateStateValue(value); err != nil {
+				scope.fail(fmt.Errorf("state key %q: %w", key, err))
+				return
+			}
+		}
 		scope.pending[key] = value
 	}
 }
@@ -140,10 +148,11 @@ func (k Key[T]) Get(s State) (T, error) {
 	return decodeStateValue[T](k.Name, raw)
 }
 
-// Set stores v under k. Inside a step, writing a key the step did not declare, or writing it
-// as a type other than the declared one, fails the step.
+// Set stores a copy of v under k. Inside a step, writing a key the step did not declare,
+// writing it as a type other than the declared one, or writing a value its Validate method
+// rejects fails the step.
 func (k Key[T]) Set(s State, v T) {
-	s.store(k.Name, reflect.TypeFor[T](), v)
+	s.store(k.Name, reflect.TypeFor[T](), v, false)
 }
 
 func decodeStateValue[T any](key string, raw any) (T, error) {
@@ -298,55 +307,117 @@ type jsonField struct {
 	optional bool
 }
 
-// jsonFields lists the JSON object keys encoding/json decodes into typ. Embedded structs are
-// flattened, with outer fields taking precedence.
+type jsonFieldCandidate struct {
+	field  jsonField
+	depth  int
+	tagged bool
+}
+
+// jsonFields lists the JSON object keys encoding/json decodes into typ, following its rules
+// for embedded structs: the shallowest field wins, a tagged field wins a tie at the same
+// depth, and fields that still tie cancel out and are not decoded at all.
 func jsonFields(typ reflect.Type) map[string]jsonField {
-	fields := map[string]jsonField{}
-	addJSONFields(typ, fields, map[reflect.Type]bool{})
+	candidates := map[string][]jsonFieldCandidate{}
+	visited := map[reflect.Type]bool{}
+	level := []reflect.Type{typ}
+	for depth := 0; len(level) > 0; depth++ {
+		counts := map[reflect.Type]int{}
+		for _, structType := range level {
+			counts[structType]++
+		}
+		var next []reflect.Type
+		for _, structType := range level {
+			if visited[structType] {
+				continue
+			}
+			visited[structType] = true
+			next = append(next, addJSONFieldCandidates(structType, depth, counts[structType], candidates)...)
+		}
+		level = next
+	}
+	fields := make(map[string]jsonField, len(candidates))
+	for name, found := range candidates {
+		if field, ok := dominantJSONField(found); ok {
+			fields[name] = field
+		}
+	}
 	return fields
 }
 
-func addJSONFields(typ reflect.Type, fields map[string]jsonField, seen map[reflect.Type]bool) {
-	if seen[typ] {
-		return
-	}
-	seen[typ] = true
+// addJSONFieldCandidates records the fields of one struct and returns the embedded structs to
+// explore at the next depth. A struct embedded more than once at the same depth adds each
+// field twice, so its fields cancel out as they do in encoding/json.
+func addJSONFieldCandidates(
+	structType reflect.Type,
+	depth int,
+	count int,
+	candidates map[string][]jsonFieldCandidate,
+) []reflect.Type {
 	var embedded []reflect.Type
-	for i := range typ.NumField() {
-		field := typ.Field(i)
+	for i := range structType.NumField() {
+		field := structType.Field(i)
+		inner := field.Type
+		if inner.Kind() == reflect.Pointer {
+			inner = inner.Elem()
+		}
+		if field.Anonymous && !field.IsExported() && inner.Kind() != reflect.Struct {
+			continue
+		}
+		if !field.Anonymous && !field.IsExported() {
+			continue
+		}
 		tag := field.Tag.Get("json")
 		if tag == "-" {
 			continue
 		}
 		name, options, _ := strings.Cut(tag, ",")
-		if field.Anonymous && name == "" {
-			inner := field.Type
-			if inner.Kind() == reflect.Pointer {
-				inner = inner.Elem()
-			}
-			if inner.Kind() == reflect.Struct {
-				embedded = append(embedded, inner)
-				continue
-			}
-		}
-		if !field.IsExported() {
+		if name == "" && field.Anonymous && inner.Kind() == reflect.Struct {
+			embedded = append(embedded, inner)
 			continue
 		}
-		if name == "" {
+		tagged := name != ""
+		if !tagged {
 			name = field.Name
 		}
-		if _, exists := fields[name]; exists {
+		opts := strings.Split(options, ",")
+		candidate := jsonFieldCandidate{
+			field: jsonField{
+				typ:      field.Type,
+				optional: slices.Contains(opts, "omitempty") || slices.Contains(opts, "omitzero"),
+			},
+			depth:  depth,
+			tagged: tagged,
+		}
+		candidates[name] = append(candidates[name], candidate)
+		if count > 1 {
+			candidates[name] = append(candidates[name], candidate)
+		}
+	}
+	return embedded
+}
+
+func dominantJSONField(found []jsonFieldCandidate) (jsonField, bool) {
+	depth := found[0].depth
+	for _, candidate := range found {
+		depth = min(depth, candidate.depth)
+	}
+	var shallowest, tagged []jsonFieldCandidate
+	for _, candidate := range found {
+		if candidate.depth != depth {
 			continue
 		}
-		opts := strings.Split(options, ",")
-		fields[name] = jsonField{
-			typ:      field.Type,
-			optional: slices.Contains(opts, "omitempty") || slices.Contains(opts, "omitzero"),
+		shallowest = append(shallowest, candidate)
+		if candidate.tagged {
+			tagged = append(tagged, candidate)
 		}
 	}
-	for _, inner := range embedded {
-		addJSONFields(inner, fields, seen)
+	switch {
+	case len(shallowest) == 1:
+		return shallowest[0].field, true
+	case len(tagged) == 1:
+		return tagged[0].field, true
 	}
+	return jsonField{}, false
 }
 
 type stateValueValidator interface{ Validate() error }

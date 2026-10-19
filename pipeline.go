@@ -179,7 +179,7 @@ func (s programStep) RunCandidate(ctx context.Context, candidate Candidate, stat
 		if err != nil {
 			return WithStepDetails(err, map[string]any{"output": clonePrediction(outputs)})
 		}
-		state.store(key.Name, key.Type, value)
+		state.store(key.Name, key.Type, value, true)
 	}
 	return nil
 }
@@ -259,8 +259,9 @@ type builtStep struct {
 // keySource records the type of an available key and where it comes from; an empty step
 // means a pipeline input.
 type keySource struct {
-	typ  reflect.Type
-	step string
+	typ     reflect.Type
+	step    string
+	writers int
 }
 
 func (s keySource) describe(key string) string {
@@ -287,11 +288,17 @@ func (s PipelineSpec) Build() (Pipeline, error) {
 		case rule.Key.Name == "":
 			return Pipeline{}, fmt.Errorf("merge rule %d key is required", i)
 		case rule.Key.Type == nil:
-			return Pipeline{}, fmt.Errorf("merge rule for %q key type is required; use MergeWith or Key.Ref", rule.Key.Name)
+			return Pipeline{}, fmt.Errorf(
+				"merge rule for %q key type is required; use MergeWith or Key.Ref",
+				rule.Key.Name,
+			)
 		case rule.Merge == nil:
 			return Pipeline{}, fmt.Errorf("merge rule for %q requires a merge function", rule.Key.Name)
 		case inputs[rule.Key.Name] != nil:
-			return Pipeline{}, fmt.Errorf("merge rule for %q targets a pipeline input, which is read-only", rule.Key.Name)
+			return Pipeline{}, fmt.Errorf(
+				"merge rule for %q targets a pipeline input, which is read-only",
+				rule.Key.Name,
+			)
 		case merges[rule.Key.Name] != nil:
 			return Pipeline{}, fmt.Errorf("merge rule for %q is duplicated", rule.Key.Name)
 		}
@@ -322,6 +329,13 @@ func (s PipelineSpec) Build() (Pipeline, error) {
 				rule.Key.Name,
 				rule.Key.Type,
 				source.describe(rule.Key.Name),
+			)
+		}
+		if source.writers < 2 {
+			return Pipeline{}, fmt.Errorf(
+				"merge rule for %q is unused: only step %q writes it",
+				rule.Key.Name,
+				source.step,
 			)
 		}
 	}
@@ -395,7 +409,7 @@ func buildStep(
 		}
 		source, ok := sources[key.Name]
 		if !ok {
-			sources[key.Name] = keySource{typ: key.Type, step: name}
+			sources[key.Name] = keySource{typ: key.Type, step: name, writers: 1}
 			continue
 		}
 		if source.typ != key.Type {
@@ -415,6 +429,8 @@ func buildStep(
 				key.Name,
 			)
 		}
+		source.writers++
+		sources[key.Name] = source
 	}
 	return builtStep{step: step, name: name, reads: readTypes, writes: writeNames, write: writeTypes}, nil
 }
@@ -522,10 +538,19 @@ func (p Pipeline) SeedCandidate() Candidate {
 	return candidate
 }
 
-// Run executes the pipeline with its seed candidate and returns the full state, inputs
-// included. When a step fails it returns the state accumulated so far together with a
-// *StepError.
+// Run executes the pipeline with its seed candidate and returns the values the steps wrote,
+// without the inputs, as RunCandidate does. When a step fails it returns the values written
+// so far together with a *StepError.
 func (p Pipeline) Run(ctx context.Context, inputs State) (State, error) {
+	state, err := p.RunState(ctx, inputs)
+	if state.values == nil {
+		return State{}, err
+	}
+	return State{values: p.written(state)}, err
+}
+
+// RunState is Run, but returns the full state, inputs included.
+func (p Pipeline) RunState(ctx context.Context, inputs State) (State, error) {
 	return p.run(ctx, p.SeedCandidate(), inputs.Prediction())
 }
 
@@ -537,13 +562,17 @@ func (p Pipeline) RunCandidate(ctx context.Context, candidate Candidate, inputs 
 	if state.values == nil {
 		return nil, err
 	}
+	return p.written(state), err
+}
+
+func (p Pipeline) written(state State) Prediction {
 	written := Prediction{}
 	for key, value := range state.values {
 		if p.inputTypes[key] == nil {
 			written[key] = value
 		}
 	}
-	return written, err
+	return written
 }
 
 // LastUsage sums the most recent usage reported by each step.
@@ -609,9 +638,10 @@ func (p Pipeline) checkUndeclaredInputs(inputs Prediction) error {
 	)
 }
 
-// runStep gives the step a view limited to its declared keys and commits copies of its
-// writes, converted to their declared types, only when it succeeds, so a failed step leaves
-// the state as the previous step left it. A panic in the step or its merges becomes an error.
+// runStep gives the step a view limited to its declared keys and commits its writes only when
+// it succeeds, so a failed step leaves the state as the previous step left it. Pending writes
+// are already copies of the declared type; only merge results are converted here. A panic in
+// the step or its merges becomes an error.
 func (p Pipeline) runStep(ctx context.Context, candidate Candidate, step builtStep, state State) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -646,13 +676,11 @@ func (p Pipeline) runStep(ctx context.Context, candidate Candidate, step builtSt
 			if err != nil {
 				return fmt.Errorf("merge state key %q: %w", key, err)
 			}
-			next = merged
+			if next, err = convertStateValue(key, step.write[key], merged); err != nil {
+				return err
+			}
 		}
-		value, err := convertStateValue(key, step.write[key], next)
-		if err != nil {
-			return err
-		}
-		committed[key] = value
+		committed[key] = next
 	}
 	maps.Copy(state.values, committed)
 	return nil

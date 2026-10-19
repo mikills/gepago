@@ -148,7 +148,7 @@ At run time each step only sees the keys it declared. Its writes must have the d
 
 `Key.Get` converts model output into `T` strictly: unknown fields, fields that match only by case, missing fields not tagged `omitempty` and nulls in non-nullable positions are errors, not zero values. If `T` has a `Validate() error` method, `Get` calls it too.
 
-`Run` returns the full state; `RunCandidate`, which `Compile` uses, returns only the values the steps wrote. A failed run returns what was accumulated before the failing step together with a `*StepError` naming it. A step can attach diagnostics with `WithStepDetails`, a panicking step's stack is kept under `Details["stack"]`, and usage from a failed model call is still recorded.
+`Run` and `RunCandidate`, which `Compile` uses, return only the values the steps wrote; `RunState` also returns the inputs. A failed run returns what was accumulated before the failing step together with a `*StepError` naming it. A step can attach diagnostics with `WithStepDetails`, a panicking step's stack is kept under `Details["stack"]`, and usage from a failed model call is still recorded.
 
 This mirrors the GEPA paper's compound-system formulation `Φ = (M, C, X, Y)`: the `Pipeline` is `Φ`, each step is a language module `Mᵢ`, each wrapped `Predict` carries the prompt and local input/output schema `(πᵢ, Xᵢ, Yᵢ)`, and the ordered steps are the control flow `C`.
 

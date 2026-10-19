@@ -175,13 +175,15 @@ func (e ProgramEvaluator) Evaluate(
 			continue
 		}
 		if err != nil {
-			return EvaluationResult{Usage: usage}, fmt.Errorf("evaluate example %q: run candidate: %w", example.ID, err)
+			err = fmt.Errorf("evaluate example %q: run candidate: %w", example.ID, err)
+			return EvaluationResult{Usage: usage}, err
 		}
 		metricCtx, metricCollector := WithUsageCollector(ctx)
 		metricResult, err := e.Metric.Score(metricCtx, ioExample.Expected, actual)
 		usage = usage.Add(metricCollector.Usage())
 		if err != nil {
-			return EvaluationResult{Usage: usage}, fmt.Errorf("evaluate example %q: score prediction: %w", example.ID, err)
+			err = fmt.Errorf("evaluate example %q: score prediction: %w", example.ID, err)
+			return EvaluationResult{Usage: usage}, err
 		}
 		items = append(items, EvaluationItem{
 			ExampleID:       example.ID,
