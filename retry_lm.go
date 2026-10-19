@@ -24,7 +24,12 @@ const defaultRetryMaxDelay = 30 * time.Second
 type RetryingLanguageModel struct {
 	// LM is the wrapped model.
 	LM Generator
-	// MaxAttempts is the total number of attempts; zero or less means one.
+	// MaxAttempts is the total number of attempts; zero or less means one. Inside a pipeline
+	// run every attempt after the first is a model call of its own, admitted against the run's
+	// RunBudget like the first (see AdmitModelCall). A failed attempt's tokens count against
+	// the run's token limits as soon as it returns; when the budget refuses the next attempt,
+	// the call ends at once with the Budget error, without waiting. The caller still records
+	// the summed usage once.
 	MaxAttempts int
 	// Delay is the base wait before the second attempt; zero or less retries without waiting.
 	Delay time.Duration
@@ -68,6 +73,8 @@ func (m *RetryingLanguageModel) retry(
 	attempts := max(m.MaxAttempts, 1)
 	var generation Generation
 	var usage Usage
+	ctx, admission := beginRetryAdmission(ctx)
+	defer admission.finish(&usage)
 	for attempt := 1; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			generation.Usage = usage
@@ -80,8 +87,14 @@ func (m *RetryingLanguageModel) retry(
 		if err == nil || attempt >= attempts || !IsTransient(err) {
 			return generation, err
 		}
+		if err := admission.report(usage); err != nil {
+			return generation, err
+		}
 		if !sleepContext(ctx, m.backoff(attempt)) {
 			return generation, ctx.Err()
+		}
+		if err := admission.next(); err != nil {
+			return generation, err
 		}
 	}
 }

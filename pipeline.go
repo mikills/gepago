@@ -221,35 +221,34 @@ func MergeWith[T any](k Key[T], merge func(prev, next T) (T, error)) MergeRule {
 	}}
 }
 
-// PipelineSpec declares a Pipeline: its read-only inputs, its ordered steps, and merge rules
-// for keys written by more than one step. A run fails when its inputs hold a key that is not
-// declared in Inputs, unless AllowExtraInputs is set, in which case such keys are dropped.
+// PipelineSpec declares a Pipeline: its read-only inputs, its ordered steps, merge rules for
+// keys written by more than one step, defaults for the writes of steps that skip on error,
+// and the budget of each run. A run fails when its inputs hold a key that is not declared in
+// Inputs, unless AllowExtraInputs is set, in which case such keys are dropped.
 type PipelineSpec struct {
-	Inputs           []KeyRef
-	Steps            []Step
-	Merges           []MergeRule
+	Inputs   []KeyRef
+	Steps    []Step
+	Merges   []MergeRule
+	Defaults []KeyDefault
+	// Budget limits every run of the pipeline; the zero value sets no limits.
+	Budget           RunBudget
 	AllowExtraInputs bool
 }
 
 // Pipeline is a validated, immutable sequence of steps created by PipelineSpec.Build. It
 // implements Program, so Compile can optimise the components of its ComponentSteps.
 //
-// A Pipeline is safe for concurrent runs: each run has its own State. Steps shared between
-// concurrent runs must themselves be safe for concurrent use.
+// A Pipeline is safe for concurrent runs: each run has its own State, budget and step cache.
+// Steps shared between concurrent runs, or run side by side by Parallel, must themselves be
+// safe for concurrent use.
 type Pipeline struct {
 	inputs           []KeyRef
 	inputTypes       map[string]reflect.Type
 	allowExtraInputs bool
-	steps            []builtStep
+	steps            []*stepNode
 	merges           map[string]func(prev, next any) (any, error)
-}
-
-type builtStep struct {
-	step   Step
-	name   string
-	reads  map[string]reflect.Type
-	writes []string
-	write  map[string]reflect.Type
+	defaults         map[string]any
+	budget           RunBudget
 }
 
 // keySource records the type of an available key and where it comes from; an empty step
@@ -270,6 +269,12 @@ func (s keySource) describe(key string) string {
 // Build checks the state contract once and returns a runnable Pipeline. Every key a step
 // reads must be a pipeline input or written by an earlier step with the same type, pipeline
 // inputs are read-only, and a key written by more than one step needs a MergeRule.
+//
+// Steps nested in WithPolicy, WithCache, Branch, Parallel and Fallback are checked by the same
+// rules against the keys available before the top-level step that contains them, and every
+// step name, nested ones included, must be unique. Each write of a step whose policy skips on
+// error needs a default in Defaults or a later step that writes it, and no step may read such
+// a key between the skippable step and its next writer unless it has a default.
 func (s PipelineSpec) Build() (Pipeline, error) {
 	if len(s.Steps) == 0 {
 		return Pipeline{}, errors.New("pipeline requires at least one step")
@@ -278,62 +283,46 @@ func (s PipelineSpec) Build() (Pipeline, error) {
 	if err != nil {
 		return Pipeline{}, fmt.Errorf("pipeline inputs: %w", err)
 	}
-	merges := map[string]func(prev, next any) (any, error){}
-	for i, rule := range s.Merges {
-		switch {
-		case rule.Key.Name == "":
-			return Pipeline{}, fmt.Errorf("merge rule %d key is required", i)
-		case rule.Key.Type == nil:
-			return Pipeline{}, fmt.Errorf(
-				"merge rule for %q key type is required; use MergeWith or Key.Ref",
-				rule.Key.Name,
-			)
-		case rule.Merge == nil:
-			return Pipeline{}, fmt.Errorf("merge rule for %q requires a merge function", rule.Key.Name)
-		case inputs[rule.Key.Name] != nil:
-			return Pipeline{}, fmt.Errorf(
-				"merge rule for %q targets a pipeline input, which is read-only",
-				rule.Key.Name,
-			)
-		case merges[rule.Key.Name] != nil:
-			return Pipeline{}, fmt.Errorf("merge rule for %q is duplicated", rule.Key.Name)
-		}
-		merges[rule.Key.Name] = rule.Merge
+	merges, err := buildMerges(s.Merges, inputs)
+	if err != nil {
+		return Pipeline{}, err
 	}
-
-	sources := map[string]keySource{}
-	for name, typ := range inputs {
-		sources[name] = keySource{typ: typ}
+	defaults, err := buildDefaults(s.Defaults, inputs)
+	if err != nil {
+		return Pipeline{}, err
 	}
-	names := map[string]bool{}
-	steps := make([]builtStep, 0, len(s.Steps))
+	if err := s.Budget.validate(); err != nil {
+		return Pipeline{}, err
+	}
+	builder := newPipelineBuilder(inputs, merges, defaults)
+	steps := make([]*stepNode, 0, len(s.Steps))
 	for i, step := range s.Steps {
-		built, err := buildStep(step, i, names, inputs, sources, merges)
-		if err != nil {
+		node := newStepNode(step)
+		builder.index = i
+		if err := builder.checkStep(node, topLevelPosition(i)); err != nil {
 			return Pipeline{}, err
 		}
-		steps = append(steps, built)
+		builder.register(node)
+		steps = append(steps, node)
 	}
-	for _, rule := range s.Merges {
-		source, ok := sources[rule.Key.Name]
-		if !ok {
-			return Pipeline{}, fmt.Errorf("merge rule for %q matches no step write", rule.Key.Name)
-		}
-		if source.typ != rule.Key.Type {
-			return Pipeline{}, fmt.Errorf(
-				"merge rule for %q has type %s, but %s",
-				rule.Key.Name,
-				rule.Key.Type,
-				source.describe(rule.Key.Name),
-			)
-		}
-		if source.writers < 2 {
-			return Pipeline{}, fmt.Errorf(
-				"merge rule for %q is unused: only step %q writes it",
-				rule.Key.Name,
-				source.step,
-			)
-		}
+	if err := builder.checkMerges(s.Merges); err != nil {
+		return Pipeline{}, err
+	}
+	if err := checkCandidateKeys(steps); err != nil {
+		return Pipeline{}, err
+	}
+	if err := builder.checkSkips(steps); err != nil {
+		return Pipeline{}, err
+	}
+	if err := builder.checkDefaults(); err != nil {
+		return Pipeline{}, err
+	}
+	if err := builder.checkBudget(s.Budget); err != nil {
+		return Pipeline{}, err
+	}
+	defaultValues := make(map[string]any, len(defaults))
+	for name, def := range defaults {
+		defaultValues[name] = def.Value
 	}
 	return Pipeline{
 		inputs:           slices.Clone(s.Inputs),
@@ -341,107 +330,9 @@ func (s PipelineSpec) Build() (Pipeline, error) {
 		allowExtraInputs: s.AllowExtraInputs,
 		steps:            steps,
 		merges:           merges,
+		defaults:         defaultValues,
+		budget:           s.Budget.clone(),
 	}, nil
-}
-
-func buildStep(
-	step Step,
-	index int,
-	names map[string]bool,
-	inputs map[string]reflect.Type,
-	sources map[string]keySource,
-	merges map[string]func(prev, next any) (any, error),
-) (builtStep, error) {
-	if isNil(step) {
-		return builtStep{}, fmt.Errorf("pipeline step %d is nil", index)
-	}
-	name := strings.TrimSpace(step.Name())
-	if err := validateStepName(name, index, names); err != nil {
-		return builtStep{}, err
-	}
-	if validator, ok := step.(interface{ Validate() error }); ok {
-		if err := validator.Validate(); err != nil {
-			return builtStep{}, fmt.Errorf("pipeline step %q: %w", name, err)
-		}
-	}
-	reads := slices.Clone(step.Reads())
-	readTypes, err := stateKeyTypes(reads)
-	if err != nil {
-		return builtStep{}, fmt.Errorf("pipeline step %q reads: %w", name, err)
-	}
-	writes := slices.Clone(step.Writes())
-	writeTypes, err := stateKeyTypes(writes)
-	if err != nil {
-		return builtStep{}, fmt.Errorf("pipeline step %q writes: %w", name, err)
-	}
-	for _, key := range reads {
-		source, ok := sources[key.Name]
-		if !ok {
-			return builtStep{}, fmt.Errorf(
-				"pipeline step %q reads %q, which is not a pipeline input or written by an earlier step",
-				name,
-				key.Name,
-			)
-		}
-		if source.typ != key.Type {
-			return builtStep{}, fmt.Errorf(
-				"pipeline step %q reads %q as %s, but %s",
-				name,
-				key.Name,
-				key.Type,
-				source.describe(key.Name),
-			)
-		}
-	}
-	writeNames := make([]string, 0, len(writes))
-	for _, key := range writes {
-		writeNames = append(writeNames, key.Name)
-		if inputs[key.Name] != nil {
-			return builtStep{}, fmt.Errorf(
-				"pipeline step %q writes pipeline input %q, which is read-only",
-				name,
-				key.Name,
-			)
-		}
-		source, ok := sources[key.Name]
-		if !ok {
-			sources[key.Name] = keySource{typ: key.Type, step: name, writers: 1}
-			continue
-		}
-		if source.typ != key.Type {
-			return builtStep{}, fmt.Errorf(
-				"pipeline step %q writes %q as %s, but %s",
-				name,
-				key.Name,
-				key.Type,
-				source.describe(key.Name),
-			)
-		}
-		if merges[key.Name] == nil {
-			return builtStep{}, fmt.Errorf(
-				"pipeline steps %q and %q both write %q; declare a MergeRule to combine them",
-				source.step,
-				name,
-				key.Name,
-			)
-		}
-		source.writers++
-		sources[key.Name] = source
-	}
-	return builtStep{step: step, name: name, reads: readTypes, writes: writeNames, write: writeTypes}, nil
-}
-
-func validateStepName(name string, index int, seen map[string]bool) error {
-	switch {
-	case name == "":
-		return fmt.Errorf("pipeline step %d name is required", index)
-	case strings.Contains(name, "."):
-		return fmt.Errorf("pipeline step %q name cannot contain '.'", name)
-	case seen[name]:
-		return fmt.Errorf("pipeline step %q is duplicated", name)
-	}
-	seen[name] = true
-	return nil
 }
 
 func stateKeyTypes(keys []KeyRef) (map[string]reflect.Type, error) {
@@ -475,6 +366,10 @@ func isNil(value any) bool {
 // StepError reports which pipeline step failed. Pipeline runs return it together with the
 // state accumulated by the steps before it. Details holds diagnostics the step attached with
 // WithStepDetails; a step that panicked has the stack under "stack".
+//
+// When a step nested in a composite step (Branch, Parallel, Fallback or a policy fallback)
+// fails, the composite's StepError wraps a StepError for the nested step, so the message
+// names each step from the top-level one down and Details holds the innermost diagnostics.
 type StepError struct {
 	Step    string
 	Err     error
@@ -487,6 +382,17 @@ func (e *StepError) Error() string {
 
 func (e *StepError) Unwrap() error {
 	return e.Err
+}
+
+// newStepError wraps err as the failure of the named step, copying any details attached with
+// WithStepDetails.
+func newStepError(step string, err error) *StepError {
+	stepErr := &StepError{Step: step, Err: err}
+	var detailed *stepDetailsError
+	if errors.As(err, &detailed) {
+		stepErr.Details = detailed.details
+	}
+	return stepErr
 }
 
 // WithStepDetails attaches diagnostics to a step's error. When the step fails with it, the
@@ -519,19 +425,13 @@ func (p Pipeline) Validate() error {
 	return nil
 }
 
-// SeedCandidate returns the components of every ComponentStep under step-scoped names.
+// SeedCandidate returns the components of every ComponentStep under step-scoped names. A
+// component of a nested step is scoped by each enclosing step, as "<outer>.<inner>.<component>".
+// WithPolicy and WithCache add no scope of their own, and an OnErrorFallback step is scoped
+// beside the step it stands in for. Build rejects a pipeline in which two components would
+// share a key.
 func (p Pipeline) SeedCandidate() Candidate {
-	candidate := Candidate{}
-	for _, step := range p.steps {
-		componentStep, ok := step.step.(ComponentStep)
-		if !ok {
-			continue
-		}
-		for component, value := range componentStep.SeedCandidate() {
-			candidate[StepComponentName(step.name, component)] = value
-		}
-	}
-	return candidate
+	return seedChildren(p.steps...)
 }
 
 // Run executes the pipeline with its seed candidate and returns the values the steps wrote,
@@ -572,38 +472,43 @@ func (p Pipeline) written(state State) Prediction {
 }
 
 func (p Pipeline) run(ctx context.Context, candidate Candidate, inputs Prediction) (State, error) {
+	state, _, err := p.execute(ctx, candidate, inputs)
+	return state, err
+}
+
+// execute runs the pipeline and also returns the run's shared record, which holds the outcome
+// of every step execution.
+func (p Pipeline) execute(ctx context.Context, candidate Candidate, inputs Prediction) (State, *pipelineRun, error) {
 	if err := p.Validate(); err != nil {
-		return State{}, err
+		return State{}, nil, err
 	}
 	if !p.allowExtraInputs {
 		if err := p.checkUndeclaredInputs(inputs); err != nil {
-			return State{}, err
+			return State{}, nil, err
 		}
 	}
 	values := Prediction{}
 	for _, key := range p.inputs {
 		value, ok := inputs[key.Name]
 		if !ok {
-			return State{}, fmt.Errorf("pipeline input %q is missing", key.Name)
+			return State{}, nil, fmt.Errorf("pipeline input %q is missing", key.Name)
 		}
 		converted, err := convertStateValue(key.Name, key.Type, value)
 		if err != nil {
-			return State{}, fmt.Errorf("invalid pipeline input: %w", err)
+			return State{}, nil, fmt.Errorf("invalid pipeline input: %w", err)
 		}
 		values[key.Name] = converted
 	}
+	run := newPipelineRun(p.defaults)
+	ctx, release := startRunBudget(context.WithValue(ctx, pipelineRunKey{}, run), p.budget)
+	defer release()
 	state := State{values: values}
-	for _, step := range p.steps {
-		if err := p.runStep(ctx, candidate, step, state); err != nil {
-			stepErr := &StepError{Step: step.name, Err: err}
-			var detailed *stepDetailsError
-			if errors.As(err, &detailed) {
-				stepErr.Details = detailed.details
-			}
-			return state, stepErr
+	for _, node := range p.steps {
+		if err := p.runStep(ctx, candidate, node, state); err != nil {
+			return state, run, newStepError(node.name, err)
 		}
 	}
-	return state, nil
+	return state, run, nil
 }
 
 func (p Pipeline) checkUndeclaredInputs(inputs Prediction) error {
@@ -623,11 +528,16 @@ func (p Pipeline) checkUndeclaredInputs(inputs Prediction) error {
 	)
 }
 
-// runStep gives the step a view limited to its declared keys and commits its writes only when
-// it succeeds, so a failed step leaves the state as the previous step left it. Pending writes
-// are already copies of the declared type; only merge results are converted here. A panic in
-// the step or its merges becomes an error.
-func (p Pipeline) runStep(ctx context.Context, candidate Candidate, step builtStep, state State) (err error) {
+// runStep runs a top-level step on a view limited to its declared keys and commits its writes
+// only when it succeeds, so a failed step leaves the state as the previous step left it.
+// Pending writes are already copies of the declared type; only merge results are converted
+// here. A key left unwritten by a skipped step keeps any value it already had. A panic in the
+// step or its merges becomes an error.
+func (p Pipeline) runStep(ctx context.Context, candidate Candidate, node *stepNode, state State) (err error) {
+	result, err := runNode(ctx, childCandidate(candidate, node), node, state.values)
+	if err != nil {
+		return err
+	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = WithStepDetails(
@@ -636,32 +546,18 @@ func (p Pipeline) runStep(ctx context.Context, candidate Candidate, step builtSt
 			)
 		}
 	}()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	scope := &stepScope{reads: step.reads, writes: step.write, pending: map[string]any{}}
-	view := State{values: state.values, scope: scope}
-	var runErr error
-	if componentStep, ok := step.step.(ComponentStep); ok {
-		runErr = componentStep.RunCandidate(ctx, stepCandidate(candidate, step.name), view)
-	} else {
-		runErr = step.step.Run(ctx, view)
-	}
-	if err := errors.Join(runErr, scope.err); err != nil {
-		return err
-	}
-	committed := make(map[string]any, len(step.writes))
-	for _, key := range step.writes {
-		next, ok := scope.pending[key]
+	committed := make(map[string]any, len(result.writes))
+	for _, key := range node.writeNames {
+		next, ok := result.writes[key]
 		if !ok {
-			return fmt.Errorf("step did not write declared state key %q", key)
+			continue
 		}
 		if prev, exists := state.values[key]; exists {
 			merged, err := p.merges[key](deepCopy(prev), next)
 			if err != nil {
 				return fmt.Errorf("merge state key %q: %w", key, err)
 			}
-			if next, err = convertStateValue(key, step.write[key], merged); err != nil {
+			if next, err = convertStateValue(key, node.writeTypes[key], merged); err != nil {
 				return err
 			}
 		}

@@ -63,6 +63,9 @@ func (p *ReflectiveProposer) Propose(
 		if err != nil {
 			return nil, err
 		}
+		if err := AdmitModelCall(ctx); err != nil {
+			return nil, err
+		}
 		generation, err := p.LM.Generate(ctx, prompt)
 		p.lastCalls++
 		p.lastUsage = p.lastUsage.Add(generation.Usage)
@@ -252,6 +255,9 @@ func (p *LLMMergeProposer) ProposeMerge(
 		rightJSON,
 		strings.Join(components, ", "),
 	)
+	if err := AdmitModelCall(ctx); err != nil {
+		return nil, err
+	}
 	generation, err := p.LM.Generate(ctx, prompt)
 	p.lastCalls = 1
 	p.lastUsage = generation.Usage

@@ -189,6 +189,9 @@ func (p Predict) run(
 
 // generate makes one model call, records its usage and rejects a truncated or refused reply.
 func (p Predict) generate(ctx context.Context, lm Generator, prompt string, format ResponseFormat) (string, error) {
+	if err := AdmitModelCall(ctx); err != nil {
+		return "", err
+	}
 	generation, err := GenerateWithFormat(ctx, lm, prompt, format)
 	RecordUsage(ctx, generation.Usage)
 	if err != nil {

@@ -39,13 +39,25 @@ func WithUsageCollector(ctx context.Context) (context.Context, *UsageCollector) 
 	return context.WithValue(ctx, usageCollectorKey{}, collector), collector
 }
 
-// RecordUsage adds usage to the collector carried by ctx, if there is one. Predict,
-// LLMJudgeMetric and other model consumers call it once for every model call, failed calls
-// included; a custom Program or Metric that calls a Generator directly should do the same so
-// its usage reaches CompiledProgram.RunWithUsage and ProgramEvaluator.
+// RecordUsage adds usage to the collector carried by ctx, if there is one, and counts it
+// against the RunBudget of the pipeline run in ctx. Predict, LLMJudgeMetric and other model
+// consumers call it once for every model call, failed calls included; a custom Program or
+// Metric that calls a Generator directly should do the same so its usage reaches
+// CompiledProgram.RunWithUsage, ProgramEvaluator and the run budget.
 func RecordUsage(ctx context.Context, usage Usage) {
 	collector, _ := ctx.Value(usageCollectorKey{}).(*UsageCollector)
 	collector.Add(usage)
+	usageFrameFrom(ctx).add(usage)
+}
+
+// AdmitModelCall reserves one model call against the RunBudget of the pipeline run in ctx,
+// and the budgets of any pipelines around it. When a budget refuses the call it returns a
+// Budget error (see IsBudget) naming the limit and reserves nothing. Outside a pipeline run it
+// always admits. Predict, LLMJudgeMetric and the reflection proposers call it before every
+// model call; a custom Program or Metric that calls a Generator directly should do the same,
+// and must not make the call when it returns an error.
+func AdmitModelCall(ctx context.Context) error {
+	return usageFrameFrom(ctx).admit()
 }
 
 // Add adds usage to the collector. A nil collector ignores it.
