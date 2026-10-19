@@ -178,8 +178,8 @@ type ProgramEvaluator struct {
 // the values each item carries for reflection pass through all of them, whether or not traces
 // are recorded, so reflection prompts never show what a pipeline redacts: its Output and each
 // SideInfo entry are redacted as an event's details are, the example's inputs and expected
-// values first converted to their keys' types where they convert, SideInfo's "details" as an
-// event's details, and the values of its PipelineTraces by key. Then the text of every value
+// values first converted to their keys' types where they convert, SideInfo's "reads" by key,
+// SideInfo's "details" as an event's details, and the values of its PipelineTraces by key. Then the text of every value
 // the Redactors change, among those and those the example's runs were given, wrote, tried to
 // write or attached to their errors, is removed from every string in them (see Redactor). The
 // Redactors are those of the Pipelines the programme's structure shows, found before any

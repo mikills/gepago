@@ -1,6 +1,7 @@
 package gepa
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -48,6 +49,10 @@ type StepTrace struct {
 	Writes    map[string]any `json:"writes,omitempty"`
 	Cached    bool           `json:"cached,omitempty"`
 	Skipped   bool           `json:"skipped,omitempty"`
+	// ToolCalls holds the tool calls the execution made, as StepFinishedEvent reported them,
+	// with each Output compacted as encoding/json writes it, or stored as a JSON string when it
+	// is not JSON.
+	ToolCalls []ToolCallRecord `json:"tool_calls,omitempty"`
 	// Steps holds the executions nested in this one, such as the arm of a Branch or the steps
 	// of a Parallel, in the order they started.
 	Steps []StepTrace `json:"steps,omitempty"`
@@ -141,6 +146,7 @@ func (r *RecordingObserver) StepFinished(_ context.Context, event StepFinishedEv
 	step.trace.Writes = traceValues(event.Writes)
 	step.trace.Cached = event.Cached
 	step.trace.Skipped = event.Skipped
+	step.trace.ToolCalls = traceToolCalls(event.ToolCalls)
 }
 
 // RunFinished records the end of a run. Once a trace's top-level run has finished, the
@@ -204,6 +210,7 @@ func (r *recordedStep) snapshot() StepTrace {
 	trace.Details = copyValues(trace.Details)
 	trace.Reads = copyValues(trace.Reads)
 	trace.Writes = copyValues(trace.Writes)
+	trace.ToolCalls = cloneRecords(trace.ToolCalls)
 	for _, step := range r.steps {
 		trace.Steps = append(trace.Steps, step.snapshot())
 	}
@@ -211,6 +218,31 @@ func (r *recordedStep) snapshot() StepTrace {
 		trace.Runs = append(trace.Runs, run.snapshot())
 	}
 	return trace
+}
+
+// traceToolCalls returns copies of records as a trace stores them, so that they survive a JSON
+// round trip unchanged: each Output compacted as encoding/json writes it, or a JSON string of its
+// text when it is not JSON, and empty slices nil. It returns nil when there are none.
+func traceToolCalls(records []ToolCallRecord) []ToolCallRecord {
+	records = cloneRecords(records)
+	for i := range records {
+		record := &records[i]
+		if len(record.Output) == 0 {
+			record.Output = nil
+		} else {
+			var compact, escaped bytes.Buffer
+			if json.Compact(&compact, record.Output) == nil {
+				json.HTMLEscape(&escaped, compact.Bytes())
+				record.Output = escaped.Bytes()
+			} else {
+				record.Output, _ = json.Marshal(string(record.Output))
+			}
+		}
+		if len(record.Provenance) == 0 {
+			record.Provenance = nil
+		}
+	}
+	return records
 }
 
 // traceValues returns values in their JSON form, or nil when there are none.

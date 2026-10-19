@@ -35,15 +35,17 @@ type stepCacheKey struct {
 // stepOutcome records one execution of a step, top-level or nested: each retry attempt, each
 // cache hit and each skip on error is an execution of its own. Attempt counts the step's
 // executions in the run from one. Usage is what the execution's model calls recorded, nested
-// steps included. Err is the step's own error, before any enclosing step wraps it.
+// steps included. Err is the step's own error, before any enclosing step wraps it. ToolCalls
+// holds the tool calls the execution made itself, not those of the executions nested in it.
 type stepOutcome struct {
-	Step     string
-	Attempt  int
-	Duration time.Duration
-	Usage    Usage
-	Cached   bool
-	Skipped  bool
-	Err      error
+	Step      string
+	Attempt   int
+	Duration  time.Duration
+	Usage     Usage
+	Cached    bool
+	Skipped   bool
+	Err       error
+	ToolCalls []ToolCallRecord
 }
 
 func newPipelineRun(defaults map[string]any, optional map[string]map[string]bool) *pipelineRun {
@@ -388,9 +390,9 @@ func runNode(
 }
 
 // beginExecution starts one execution of node over values, the state its view reads: it
-// numbers the attempt, reports the start to the run's observers, opens a usage frame and
-// returns a function that records the outcome when the execution ends, given the values the
-// step wrote or tried to write.
+// numbers the attempt, reports the start to the run's observers, opens a usage frame, which also
+// collects the execution's tool calls, and returns a function that records the outcome when the
+// execution ends, given the values the step wrote or tried to write.
 func beginExecution(ctx context.Context, node *stepNode, values map[string]any) (
 	context.Context,
 	func(stepResult, error, []stateWrite),
@@ -404,14 +406,16 @@ func beginExecution(ctx context.Context, node *stepNode, values map[string]any) 
 	return ctx, func(result stepResult, err error, attempted []stateWrite) {
 		release()
 		outcome := stepOutcome{
-			Step:     node.name,
-			Attempt:  attempt,
-			Duration: time.Since(start),
-			Usage:    frame.total(),
-			Err:      err,
+			Step:      node.name,
+			Attempt:   attempt,
+			Duration:  time.Since(start),
+			Usage:     frame.total(),
+			Err:       err,
+			ToolCalls: frame.toolCallRecords(),
 		}
 		run.record(outcome)
 		capture.offerStep(attempted, err)
+		capture.offerToolCalls(outcome.ToolCalls)
 		observed.finish(outcome, result, attempted)
 	}
 }

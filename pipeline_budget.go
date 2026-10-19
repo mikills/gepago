@@ -133,14 +133,16 @@ type budgetClockKey struct{}
 // empty, and enforces their limits. Frames chain from the innermost running step out through
 // its enclosing steps and runs, including the runs of pipelines that run this one as a step.
 // returned lists the retried calls made with this frame's context that have returned with
-// pending tokens their callers have yet to record.
+// pending tokens their callers have yet to record, and toolCalls the tool calls a step
+// execution made itself.
 type usageFrame struct {
-	parent   *usageFrame
-	budget   *runBudget
-	step     string
-	cancel   context.CancelCauseFunc
-	usage    Usage
-	returned []returnedCall
+	parent    *usageFrame
+	budget    *runBudget
+	step      string
+	cancel    context.CancelCauseFunc
+	usage     Usage
+	returned  []returnedCall
+	toolCalls []ToolCallRecord
 }
 
 // returnedCall is a retried call that has returned: the tokens of the usage it returned, which
@@ -450,6 +452,31 @@ func (f *usageFrame) checkLocked() error {
 		}
 	}
 	return nil
+}
+
+// recordToolCall keeps a copy of record in the innermost step frame of f and its parents, the
+// execution that made the call. Outside a step it keeps nothing.
+func (f *usageFrame) recordToolCall(record ToolCallRecord) {
+	for f != nil && f.step == "" {
+		f = f.parent
+	}
+	if f == nil {
+		return
+	}
+	f.budget.mu.Lock()
+	defer f.budget.mu.Unlock()
+	f.toolCalls = append(f.toolCalls, cloneRecord(record))
+}
+
+// toolCallRecords returns copies of the tool calls the step execution of f made itself, in the
+// order they finished.
+func (f *usageFrame) toolCallRecords() []ToolCallRecord {
+	if f == nil {
+		return nil
+	}
+	f.budget.mu.Lock()
+	defer f.budget.mu.Unlock()
+	return cloneRecords(f.toolCalls)
 }
 
 // total returns the usage recorded against f.

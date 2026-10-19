@@ -1,0 +1,767 @@
+package gepa
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+// requireTraceRoundTrip checks that trace survives a JSON round trip unchanged and returns its
+// JSON.
+func requireTraceRoundTrip(t *testing.T, trace PipelineTrace) string {
+	t.Helper()
+	data, err := json.Marshal(trace)
+	require.NoError(t, err)
+	var decoded PipelineTrace
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	require.Equal(t, trace, decoded)
+	return string(data)
+}
+
+func TestStepFinishedReportsTheExecutionsToolCalls(t *testing.T) {
+	calls := &atomic.Int32{}
+	registry, err := NewToolRegistry(lookupTool(calls))
+	require.NoError(t, err)
+	lm := newScriptedChat(
+		toolCallReply("call-1", "lookup_order", `{"order_id":"A-1"}`, Usage{TotalTokens: 10}),
+		textReply(`{"summary":"shipped with DHL"}`, Usage{TotalTokens: 20}),
+	)
+	explain := Predict{
+		Signature: Signature{
+			Name:    "explain",
+			Inputs:  []Field{{Name: "status"}},
+			Outputs: []Field{{Name: "summary", Type: "string"}},
+		},
+		LM:    lm,
+		Tools: []string{"lookup_order"},
+	}
+	recorder := &RecordingObserver{}
+	log := &eventLog{}
+	pipeline, err := PipelineSpec{
+		Inputs: refs(orderIDKey.Ref()),
+		Steps: []Step{
+			ToolStep("lookup", "lookup_order", refs(orderIDKey.Ref()), refs(statusKey.Ref())),
+			NewProgramStep("explain", explain, refs(statusKey.Ref()), refs(summaryKey.Ref())),
+		},
+		Tools:      registry,
+		ToolPolicy: ToolPolicy{Cache: true},
+		Observers:  []PipelineObserver{recorder, log},
+	}.Build()
+	require.NoError(t, err)
+
+	_, err = pipeline.Run(context.Background(), NewState(Prediction{"order_id": "A-1"}))
+
+	require.NoError(t, err)
+	require.EqualValues(t, 1, calls.Load(), "the Predict's identical call is answered from the cache")
+	require.Equal(t, []string{
+		"start run",
+		"start lookup#1 in run",
+		"finish lookup#1",
+		"start explain#1 in run",
+		"finish explain#1",
+		"finish run",
+	}, log.Lines())
+
+	lookup := log.finishedStep(t, "lookup", 1)
+	require.Len(t, lookup.ToolCalls, 1)
+	invoked := lookup.ToolCalls[0]
+	require.Equal(t, "lookup", invoked.Step)
+	require.Equal(t, "lookup_order", invoked.Name)
+	require.JSONEq(t, `{"order_id":"A-1"}`, invoked.Arguments)
+	require.JSONEq(t, `{"status":"shipped","carrier":"DHL"}`, string(invoked.Output))
+	require.False(t, invoked.Cached)
+	require.Empty(t, invoked.Err)
+
+	answer := log.finishedStep(t, "explain", 1)
+	require.Len(t, answer.ToolCalls, 1)
+	cached := answer.ToolCalls[0]
+	require.Equal(t, "explain", cached.Step)
+	require.Equal(t, "call-1", cached.CallID)
+	require.True(t, cached.Cached)
+	require.Equal(t, Usage{}, cached.Usage, "a cached call spends nothing")
+	require.JSONEq(t, `{"status":"shipped","carrier":"DHL"}`, string(cached.Output))
+	require.Equal(t, 30, answer.Usage.TotalTokens)
+
+	trace := recorder.Traces()[0]
+	require.Len(t, trace.Steps, 2)
+	require.Equal(t, []string{"lookup_order"}, toolCallNames(trace.Steps[0].ToolCalls))
+	require.False(t, trace.Steps[0].ToolCalls[0].Cached)
+	require.True(t, trace.Steps[1].ToolCalls[0].Cached)
+	requireTraceRoundTrip(t, trace)
+
+	report, err := HTMLRunReport(trace, HTMLReportOptions{})
+	require.NoError(t, err)
+	require.Contains(t, report, "Tool calls (1)")
+	require.Contains(t, report, "lookup_order")
+	require.Contains(t, report, "&#34;order_id&#34;: &#34;A-1&#34;")
+	require.Contains(t, report, `<span class="badge">cached</span>`)
+}
+
+func TestStepFinishedToolCallsBelongToTheExecutionThatMadeThem(t *testing.T) {
+	registry, err := NewToolRegistry(rememberTool(nil))
+	require.NoError(t, err)
+	failing := errors.New("first attempt failed")
+	var attempts atomic.Int32
+	retried := NewStep("retried", nil, nil, func(ctx context.Context, _ State) error {
+		if _, err := remember(ctx, "k", "v"); err != nil {
+			return err
+		}
+		if attempts.Add(1) == 1 {
+			return TransientError(failing)
+		}
+		return nil
+	})
+	log := &eventLog{}
+	recorder := &RecordingObserver{}
+	pipeline, err := PipelineSpec{
+		Steps: []Step{
+			Parallel("fan", rememberStep("left", "a", "1", nil), rememberStep("right", "b", "2", nil)),
+			WithPolicy(retried, StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}}),
+		},
+		Tools:     registry,
+		Observers: []PipelineObserver{log, recorder},
+	}.Build()
+	require.NoError(t, err)
+
+	_, err = pipeline.Run(context.Background(), NewState(nil))
+
+	require.NoError(t, err)
+	require.Empty(t, log.finishedStep(t, "fan", 1).ToolCalls, "the calls of nested executions are in their own events")
+	require.Equal(t, []string{"remember"}, toolCallNames(log.finishedStep(t, "left", 1).ToolCalls))
+	require.Equal(t, []string{"remember"}, toolCallNames(log.finishedStep(t, "right", 1).ToolCalls))
+	require.Len(t, log.finishedStep(t, "retried", 1).ToolCalls, 1, "a failed attempt reports its calls")
+	require.Len(t, log.finishedStep(t, "retried", 2).ToolCalls, 1)
+	trace := recorder.Traces()[0]
+	require.Empty(t, trace.Steps[0].ToolCalls)
+	require.Len(t, trace.Steps[0].Steps[0].ToolCalls, 1)
+	requireTraceRoundTrip(t, trace)
+}
+
+func toolCallNames(records []ToolCallRecord) []string {
+	names := make([]string, 0, len(records))
+	for _, record := range records {
+		names = append(names, record.Name)
+	}
+	return names
+}
+
+func TestRedactorHidesToolCalls(t *testing.T) {
+	const (
+		secretOrder   = "ORDER-SECRET-91"
+		missingOrder  = "ORDER-MISSING-17"
+		secretCarrier = "Carrier Confidential"
+	)
+	lookup := NewTool("lookup", "Look up an order", func(_ context.Context, args lookupArgs) (orderStatus, error) {
+		if args.OrderID == missingOrder {
+			return orderStatus{}, fmt.Errorf("order %s not found", args.OrderID)
+		}
+		return orderStatus{Status: "delivered", Carrier: secretCarrier}, nil
+	})
+	registry, err := NewToolRegistry(lookup)
+	require.NoError(t, err)
+	question := Key[string]{Name: "question"}
+	run := func(t *testing.T, order string) (*eventLog, PipelineTrace, error) {
+		t.Helper()
+		lm := newScriptedChat(
+			toolCallReply("1", "lookup", `{"order_id":"`+order+`"}`, Usage{}),
+			textReply(`{"summary":"done"}`, Usage{}),
+		)
+		predict := Predict{
+			Signature: Signature{
+				Name:    "answer",
+				Inputs:  []Field{{Name: "question"}},
+				Outputs: []Field{{Name: "summary", Type: "string"}},
+			},
+			LM:    lm,
+			Tools: []string{"lookup"},
+		}
+		recorder := &RecordingObserver{}
+		log := &eventLog{}
+		pipeline, err := PipelineSpec{
+			Inputs:    refs(question.Ref()),
+			Steps:     []Step{NewProgramStep("answer", predict, refs(question.Ref()), refs(summaryKey.Ref()))},
+			Tools:     registry,
+			Observers: []PipelineObserver{recorder, log},
+			Redactor:  hideKey("tool:lookup", "[hidden]"),
+		}.Build()
+		require.NoError(t, err)
+		_, err = pipeline.Run(context.Background(), NewState(Prediction{"question": "where is my order?"}))
+		return log, recorder.Traces()[0], err
+	}
+	requireHidden := func(t *testing.T, log *eventLog, trace PipelineTrace, secrets ...string) {
+		t.Helper()
+		data := requireTraceRoundTrip(t, trace)
+		report, err := HTMLRunReport(trace, HTMLReportOptions{})
+		require.NoError(t, err)
+		require.Contains(t, report, "[hidden]")
+		for _, secret := range secrets {
+			require.NotContains(t, data, secret)
+			require.NotContains(t, report, secret)
+			require.NotContains(t, fmt.Sprintf("%+v %+v", log.finished, log.runsFinished), secret)
+		}
+	}
+
+	t.Run("arguments and output", func(t *testing.T) {
+		log, trace, err := run(t, secretOrder)
+		require.NoError(t, err)
+
+		call := log.finishedStep(t, "answer", 1).ToolCalls[0]
+		require.Equal(t, "lookup", call.Name)
+		require.Equal(t, "[hidden]", call.Arguments)
+		require.Equal(t, json.RawMessage(`"[hidden]"`), call.Output)
+		require.Equal(t, `"[hidden]"`, call.Text, "a text that is the output's JSON follows the redacted output")
+		requireHidden(t, log, trace, secretOrder, secretCarrier)
+	})
+
+	t.Run("a failed call's arguments are removed from its error", func(t *testing.T) {
+		log, trace, err := run(t, missingOrder)
+		require.ErrorContains(t, err, missingOrder, "the caller's error is not redacted")
+
+		event := log.finishedStep(t, "answer", 1)
+		require.EqualError(t, event.Err, `tool "lookup": order [hidden] not found`)
+		require.Equal(t, `tool "lookup": order [hidden] not found`, event.ToolCalls[0].Err)
+		requireHidden(t, log, trace, missingOrder)
+	})
+
+	t.Run("a ToolStep's output in its details", func(t *testing.T) {
+		raw := NewToolFunc(
+			Tool{Name: "lookup", Description: "lookup", Parameters: json.RawMessage(`{"type":"object"}`)},
+			func(context.Context, ToolCall) (ToolResult, error) {
+				return ToolResult{Output: json.RawMessage(`{"carrier":"` + secretCarrier + `"}`)}, nil
+			},
+		)
+		registry, err := NewToolRegistry(raw)
+		require.NoError(t, err)
+		recorder := &RecordingObserver{}
+		log := &eventLog{}
+		pipeline, err := PipelineSpec{
+			Inputs:    refs(orderIDKey.Ref()),
+			Steps:     []Step{ToolStep("lookup", "lookup", refs(orderIDKey.Ref()), refs(statusKey.Ref()))},
+			Tools:     registry,
+			Observers: []PipelineObserver{recorder, log},
+			Redactor:  hideKey("tool:lookup", "[hidden]"),
+		}.Build()
+		require.NoError(t, err)
+
+		_, err = pipeline.Run(context.Background(), NewState(Prediction{"order_id": "A-1"}))
+
+		require.ErrorIs(t, err, ErrInvalidOutput)
+		event := log.finishedStep(t, "lookup", 1)
+		require.Equal(t, json.RawMessage(`"[hidden]"`), event.Details["output"])
+		requireHidden(t, log, recorder.Traces()[0], secretCarrier)
+	})
+}
+
+func TestRedactToolCallsConvertsWhatTheRedactorReturns(t *testing.T) {
+	record := ToolCallRecord{
+		Name:       "lookup",
+		Arguments:  `{"order_id":"A-1"}`,
+		Output:     json.RawMessage(`{"carrier":"DHL","status":"shipped"}`),
+		Text:       "shipped with DHL",
+		Provenance: []Provenance{{Source: "orders.db", Detail: "row A-1"}},
+		Err:        "tool failed for A-1",
+	}
+	tests := []struct {
+		name     string
+		redactor Redactor
+		want     ToolCallRecord
+	}{
+		{
+			name:     "a redactor that changes nothing",
+			redactor: func(_ string, value any) any { return value },
+			want:     record,
+		},
+		{
+			name: "a redactor that masks a field of the JSON",
+			redactor: func(key string, value any) any {
+				if raw, ok := value.(json.RawMessage); ok && key == "tool:lookup" {
+					var output map[string]any
+					if json.Unmarshal(raw, &output) == nil {
+						output["carrier"] = "***"
+						data, _ := json.Marshal(output)
+						return json.RawMessage(data)
+					}
+				}
+				return value
+			},
+			want: ToolCallRecord{
+				Name:       "lookup",
+				Arguments:  `{"order_id":"A-1"}`,
+				Output:     json.RawMessage(`{"carrier":"***","status":"shipped"}`),
+				Text:       "shipped with [redacted]",
+				Provenance: []Provenance{{Source: "orders.db", Detail: "row A-1"}},
+				Err:        "tool failed for A-1",
+			},
+		},
+		{
+			name: "values of other types",
+			redactor: func(key string, value any) any {
+				if key != "tool:lookup" {
+					return value
+				}
+				return map[string]int{"n": 1}
+			},
+			want: ToolCallRecord{
+				Name:       "lookup",
+				Arguments:  `{"n":1}`,
+				Output:     json.RawMessage(`{"n":1}`),
+				Text:       `{"n":1}`,
+				Provenance: []Provenance{{Source: `{"n":1}`}},
+				Err:        "tool failed for [redacted]",
+			},
+		},
+		{
+			name: "values without JSON",
+			redactor: func(key string, value any) any {
+				if key != "tool:lookup" {
+					return value
+				}
+				return func() {}
+			},
+			want: ToolCallRecord{
+				Name:       "lookup",
+				Arguments:  RedactedText,
+				Output:     json.RawMessage(`"[redacted]"`),
+				Text:       RedactedText,
+				Provenance: []Provenance{{Source: RedactedText}},
+				Err:        "tool failed for [redacted]",
+			},
+		},
+		{
+			name: "a redactor that panics",
+			redactor: func(key string, value any) any {
+				if key == "tool:lookup" {
+					panic("boom")
+				}
+				return value
+			},
+			want: ToolCallRecord{
+				Name:       "lookup",
+				Arguments:  RedactionFailed,
+				Output:     json.RawMessage(`"[redaction failed]"`),
+				Text:       RedactionFailed,
+				Provenance: []Provenance{{Source: RedactionFailed}},
+				Err:        "tool failed for [redaction failed]",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			run := &runObservation{trace: &traceObservation{}, redactors: []Redactor{tt.redactor}}
+			got := run.scrubToolCalls(run.redactToolCalls([]ToolCallRecord{record}))
+			require.Equal(t, []ToolCallRecord{tt.want}, got)
+		})
+	}
+
+	t.Run("without redactors", func(t *testing.T) {
+		run := &runObservation{trace: &traceObservation{}}
+		got := run.scrubToolCalls(run.redactToolCalls([]ToolCallRecord{record}))
+		require.Equal(t, []ToolCallRecord{record}, got)
+		got[0].Output[0] = 'x'
+		require.Equal(t, byte('{'), record.Output[0], "the records are copies")
+		require.Nil(t, run.redactToolCalls(nil))
+	})
+}
+
+func TestTraceToolCallsSurviveAJSONRoundTrip(t *testing.T) {
+	records := traceToolCalls([]ToolCallRecord{
+		{Name: "spaced", Output: json.RawMessage(`{ "a" : "<b>" }`), Provenance: []Provenance{}},
+		{Name: "invalid", Output: json.RawMessage(`not json`), Err: "tool output is not valid JSON"},
+		{Name: "empty", Output: json.RawMessage{}},
+	})
+	require.Equal(t, json.RawMessage(`{"a":"\u003cb\u003e"}`), records[0].Output)
+	require.Nil(t, records[0].Provenance)
+	require.Equal(t, json.RawMessage(`"not json"`), records[1].Output)
+	require.Nil(t, records[2].Output)
+	require.Nil(t, traceToolCalls(nil))
+	requireTraceRoundTrip(t, PipelineTrace{Steps: []StepTrace{{Step: "s", ToolCalls: records}}})
+}
+
+func TestReplaceStringsScrubsRawJSON(t *testing.T) {
+	scrub := func(text string) string { return strings.ReplaceAll(text, "secret", "[x]") }
+	got := replaceStrings(map[string]any{
+		"string":  json.RawMessage(`{"a":"secret"}`),
+		"broken":  json.RawMessage(`{"a":secret}`),
+		"nil":     json.RawMessage(nil),
+		"kept":    json.RawMessage(`{"a":1}`),
+		"literal": "secret",
+	}, scrub)
+	require.Equal(t, map[string]any{
+		"string":  json.RawMessage(`{"a":"[x]"}`),
+		"broken":  json.RawMessage(`"{\"a\":[x]}"`),
+		"nil":     json.RawMessage(nil),
+		"kept":    json.RawMessage(`{"a":1}`),
+		"literal": "[x]",
+	}, got)
+}
+
+func TestToolCallUsageIsRecordedOnceInEvents(t *testing.T) {
+	calls := &atomic.Int32{}
+	toolUsage := Usage{PromptTokens: 3, CompletionTokens: 4, TotalTokens: 7}
+	price := NewToolFunc(
+		Tool{Name: "price", Description: "price an order", Parameters: json.RawMessage(`{"type":"object"}`)},
+		func(context.Context, ToolCall) (ToolResult, error) {
+			calls.Add(1)
+			return ToolResult{Output: json.RawMessage(`{"status":"priced"}`), Usage: toolUsage}, nil
+		},
+	)
+	registry, err := NewToolRegistry(price)
+	require.NoError(t, err)
+	lm := newScriptedChat(
+		toolCallReply("1", "price", `{"order_id":"A-1"}`, Usage{TotalTokens: 10}),
+		toolCallReply("2", "price", `{"order_id":"B-2"}`, Usage{TotalTokens: 5}),
+		textReply(`{"summary":"priced"}`, Usage{TotalTokens: 20}),
+	)
+	explain := Predict{
+		Signature: Signature{
+			Name:    "explain",
+			Inputs:  []Field{{Name: "status"}},
+			Outputs: []Field{{Name: "summary", Type: "string"}},
+		},
+		LM:    lm,
+		Tools: []string{"price"},
+	}
+	log := &eventLog{}
+	pipeline, err := PipelineSpec{
+		Inputs: refs(orderIDKey.Ref()),
+		Steps: []Step{
+			ToolStep("lookup", "price", refs(orderIDKey.Ref()), refs(statusKey.Ref())),
+			NewProgramStep("explain", explain, refs(statusKey.Ref()), refs(summaryKey.Ref())),
+		},
+		Tools:      registry,
+		ToolPolicy: ToolPolicy{Cache: true},
+		Observers:  []PipelineObserver{log},
+	}.Build()
+	require.NoError(t, err)
+	ctx, collector := WithUsageCollector(context.Background())
+
+	_, err = pipeline.Run(ctx, NewState(Prediction{"order_id": "A-1"}))
+
+	require.NoError(t, err)
+	require.EqualValues(t, 2, calls.Load())
+	lookup := log.finishedStep(t, "lookup", 1)
+	answer := log.finishedStep(t, "explain", 1)
+	require.Equal(t, toolUsage, lookup.Usage)
+	require.Equal(t, []Usage{toolUsage}, toolCallUsages(lookup.ToolCalls))
+	require.Equal(t, []Usage{{}, toolUsage}, toolCallUsages(answer.ToolCalls), "the cached call spends nothing")
+	require.Equal(t, Usage{TotalTokens: 35}.Add(toolUsage), answer.Usage,
+		"the step's usage holds its chat turns and its one invoked tool call, each once")
+	total := lookup.Usage.Add(answer.Usage)
+	require.Equal(t, collector.Usage(), total)
+	require.Equal(t, collector.Usage(), log.runsFinished[0].Usage)
+	require.Equal(t, 49, total.TotalTokens)
+}
+
+func toolCallUsages(records []ToolCallRecord) []Usage {
+	usages := make([]Usage, 0, len(records))
+	for _, record := range records {
+		usages = append(usages, record.Usage)
+	}
+	return usages
+}
+
+func TestStepErrorReadsNeverLeaveUnredacted(t *testing.T) {
+	const secret = "TOPSECRET-READ-1"
+	secretKey := Key[string]{Name: "secret"}
+	check := NewStep("check", refs(secretKey.Ref()), refs(decisionKey.Ref()), func(context.Context, State) error {
+		return errors.New("check failed")
+	})
+	arms := map[string]Step{"check": check}
+	route := func(State) (string, error) { return "check", nil }
+	for _, step := range []Step{check, Branch("route", route, arms)} {
+		t.Run(step.Name(), func(t *testing.T) {
+			recorder := &RecordingObserver{}
+			log := &eventLog{}
+			pipeline, err := PipelineSpec{
+				Inputs:    refs(secretKey.Ref()),
+				Steps:     []Step{step},
+				Observers: []PipelineObserver{recorder, log},
+				Redactor:  hideKey("secret", "[secret]"),
+			}.Build()
+			require.NoError(t, err)
+
+			_, err = pipeline.Run(context.Background(), NewState(Prediction{"secret": secret}))
+
+			var stepErr *StepError
+			require.ErrorAs(t, err, &stepErr)
+			require.Equal(t, secret, stepErr.Reads["secret"], "the caller's error holds the raw reads")
+			for _, event := range log.finished {
+				require.False(t, errors.As(event.Err, &stepErr), "a StepFinished error does not unwrap to its reads")
+			}
+			require.False(t, errors.As(log.runsFinished[0].Err, &stepErr), "a RunFinished error does not unwrap to its reads")
+			data := requireTraceRoundTrip(t, recorder.Traces()[0])
+			report, err := HTMLRunReport(recorder.Traces()[0], HTMLReportOptions{})
+			require.NoError(t, err)
+			for _, text := range []string{data, report, fmt.Sprintf("%+v %+v", log.finished, log.runsFinished)} {
+				require.NotContains(t, text, secret)
+			}
+		})
+	}
+}
+
+func TestReflectionRedactsTheFailingStepsReads(t *testing.T) {
+	const secret = "TOPSECRET-READ-2"
+	secretKey := Key[string]{Name: "secret"}
+	label := Key[string]{Name: "label"}
+	classify := NewProgramStep("classify", Predict{
+		Signature: Signature{Name: "classify", Inputs: []Field{{Name: "secret"}}, Outputs: []Field{{Name: "label"}}},
+		LM:        textModel(func(context.Context, string) (string, error) { return `{"label": null}`, nil }),
+	}, refs(secretKey.Ref()), refs(label.Ref()))
+	pipeline := fpBuild(t, PipelineSpec{
+		Inputs:   refs(secretKey.Ref()),
+		Steps:    []Step{classify},
+		Redactor: hideKey("secret", "[secret]"),
+	})
+	evaluator := ProgramEvaluator{
+		Program:      pipeline,
+		Metric:       ExactMatchMetric{Fields: []string{"label"}},
+		RecordTraces: true,
+	}
+	examples := []Example{NewIOExample("1", Prediction{"secret": secret}, Prediction{"label": "large"})}
+	candidate := pipeline.SeedCandidate()
+
+	eval, err := evaluator.Evaluate(context.Background(), candidate, examples, true)
+
+	require.NoError(t, err)
+	sideInfo := eval.Items[0].SideInfo
+	require.Equal(t, "classify", sideInfo["step"])
+	require.Equal(t, map[string]any{"secret": "[secret]"}, sideInfo["reads"])
+	require.Equal(t, map[string]any{"output": Prediction{"label": nil}}, sideInfo["details"])
+	component := "classify.instruction"
+	for _, builder := range []ReflectiveDatasetBuilder{
+		ReflectiveDatasetBuilderFunc(DefaultReflectiveDatasetBuilder),
+		TraceDatasetBuilder{},
+	} {
+		dataset := builder.BuildReflectiveDataset(candidate, eval, []string{component})
+		require.NotEmpty(t, dataset[component])
+		data, err := json.Marshal(dataset)
+		require.NoError(t, err)
+		require.NotContains(t, string(data), secret)
+		require.Contains(t, string(data), "[secret]")
+	}
+}
+
+func TestProgramEvaluatorRedactsToolCalls(t *testing.T) {
+	const secretCarrier = "Carrier Confidential"
+	raw := NewToolFunc(
+		Tool{Name: "lookup", Description: "lookup", Parameters: json.RawMessage(`{"type":"object"}`)},
+		func(context.Context, ToolCall) (ToolResult, error) {
+			return ToolResult{Output: json.RawMessage(`{"carrier":"` + secretCarrier + `"}`)}, nil
+		},
+	)
+	registry, err := NewToolRegistry(raw)
+	require.NoError(t, err)
+	pipeline := fpBuild(t, PipelineSpec{
+		Inputs:   refs(orderIDKey.Ref()),
+		Steps:    []Step{ToolStep("lookup", "lookup", refs(orderIDKey.Ref()), refs(statusKey.Ref()))},
+		Tools:    registry,
+		Redactor: hideKey("tool:lookup", "[hidden]"),
+	})
+	for _, record := range []bool{false, true} {
+		t.Run(fmt.Sprintf("record traces %t", record), func(t *testing.T) {
+			evaluator := ProgramEvaluator{
+				Program:      pipeline,
+				Metric:       ExactMatchMetric{Fields: []string{"status"}},
+				RecordTraces: record,
+			}
+			examples := []Example{NewIOExample("1", Prediction{"order_id": "A-1"}, Prediction{"status": "shipped"})}
+
+			eval, err := evaluator.Evaluate(context.Background(), pipeline.SeedCandidate(), examples, true)
+
+			require.NoError(t, err)
+			item := eval.Items[0]
+			require.Equal(t, json.RawMessage(`"[hidden]"`), item.SideInfo["details"].(map[string]any)["output"])
+			data, err := json.Marshal(item)
+			require.NoError(t, err)
+			require.NotContains(t, string(data), secretCarrier)
+			if record {
+				trace := item.Trace.(PipelineTrace)
+				require.Equal(t, "[hidden]", trace.Steps[0].ToolCalls[0].Arguments)
+			}
+		})
+	}
+}
+
+func TestFailingMergeDropsTheStepsToolWrites(t *testing.T) {
+	registry, err := NewToolRegistry(rememberTool(nil))
+	require.NoError(t, err)
+	writeAndRemember := NewStep("second", nil, refs(amountKey.Ref()), func(ctx context.Context, s State) error {
+		if _, err := remember(ctx, "k", "v"); err != nil {
+			return err
+		}
+		amountKey.Set(s, 2)
+		return nil
+	})
+	merge := func(err error) MergeRule {
+		return MergeWith(amountKey, func(prev, next int) (int, error) { return prev + next, err })
+	}
+	tests := []struct {
+		name     string
+		second   Step
+		mergeErr error
+		want     []string
+	}{
+		{
+			name:     "a merge that fails drops the memory writes and cached results",
+			second:   writeAndRemember,
+			mergeErr: errors.New("amounts disagree"),
+			want: []string{
+				"start run",
+				"start first#1 in run",
+				"finish first#1",
+				"start second#1 in run",
+				`finish second#1 err: merge state key "amount": amounts disagree`,
+				`finish run err: pipeline step "second": merge state key "amount": amounts disagree`,
+			},
+		},
+		{
+			name:     "a merge that fails under a policy drops them too",
+			second:   WithPolicy(writeAndRemember, StepPolicy{}),
+			mergeErr: errors.New("amounts disagree"),
+			want: []string{
+				"start run",
+				"start first#1 in run",
+				"finish first#1",
+				"start second#1 in run",
+				"finish second#1",
+				"start second#2 in run",
+				`finish second#2 err: merge state key "amount": amounts disagree`,
+				`finish run err: pipeline step "second": merge state key "amount": amounts disagree`,
+			},
+		},
+		{
+			name:   "a merge that succeeds commits them after the state writes",
+			second: WithPolicy(writeAndRemember, StepPolicy{}),
+			want: []string{
+				"start run",
+				"start first#1 in run",
+				"finish first#1",
+				"start second#1 in run",
+				"finish second#1",
+				"finish run",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			log := &eventLog{}
+			pipeline, err := PipelineSpec{
+				Steps:      []Step{writeAmount("first", 1), tt.second},
+				Merges:     []MergeRule{merge(tt.mergeErr)},
+				Tools:      registry,
+				ToolPolicy: ToolPolicy{Cache: true},
+				Observers:  []PipelineObserver{log},
+			}.Build()
+			require.NoError(t, err)
+			memory := NewToolMemory()
+
+			state, run, err := pipeline.execute(WithToolMemory(context.Background(), memory), nil, Prediction{})
+
+			require.Equal(t, tt.want, log.Lines())
+			require.Len(t, log.finishedStep(t, "second", 1).ToolCalls, 1)
+			got, written := memory.Get("k")
+			if tt.mergeErr != nil {
+				require.Error(t, err)
+				require.False(t, written, "the failed execution's memory write is dropped")
+				require.Empty(t, run.tools.cache, "the failed execution's cached result is dropped")
+				require.Equal(t, 1, state.values["amount"])
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, "v", got)
+			require.Len(t, run.tools.cache, 1)
+			require.Equal(t, 3, state.values["amount"])
+		})
+	}
+}
+
+// contextObserver records, for each event, whether its context reaches the run's tools.
+type contextObserver struct {
+	reached atomic.Int32
+	events  atomic.Int32
+}
+
+func (o *contextObserver) check(ctx context.Context) {
+	o.events.Add(1)
+	if toolEnvFrom(ctx) != nil || ToolMemoryFrom(ctx) != nil || stepStageFrom(ctx) != nil {
+		o.reached.Add(1)
+	}
+}
+
+func (o *contextObserver) RunStarted(ctx context.Context, _ RunStartedEvent)     { o.check(ctx) }
+func (o *contextObserver) StepStarted(ctx context.Context, _ StepStartedEvent)   { o.check(ctx) }
+func (o *contextObserver) StepFinished(ctx context.Context, _ StepFinishedEvent) { o.check(ctx) }
+func (o *contextObserver) RunFinished(ctx context.Context, _ RunFinishedEvent)   { o.check(ctx) }
+
+func TestObserverContextHoldsNoneOfTheRunsTools(t *testing.T) {
+	registry, err := NewToolRegistry(rememberTool(nil))
+	require.NoError(t, err)
+	var stepSaw bool
+	step := NewStep("outer", nil, nil, func(ctx context.Context, _ State) error {
+		stepSaw = toolEnvFrom(ctx) != nil && ToolMemoryFrom(ctx) != nil && stepStageFrom(ctx) != nil
+		_, err := remember(ctx, "k", "v")
+		return err
+	})
+	observer := &contextObserver{}
+	pipeline, err := PipelineSpec{
+		Steps:     []Step{WithPolicy(step, StepPolicy{})},
+		Tools:     registry,
+		Observers: []PipelineObserver{observer},
+	}.Build()
+	require.NoError(t, err)
+
+	_, err = pipeline.Run(WithToolMemory(context.Background(), NewToolMemory()), NewState(nil))
+
+	require.NoError(t, err)
+	require.True(t, stepSaw, "the step itself sees the run's tools")
+	require.EqualValues(t, 4, observer.events.Load())
+	require.Zero(t, observer.reached.Load(), "no observer context carries the run's tools")
+}
+
+// TestPolicyOnlyRunCachesNothing pins what ToolPolicy.Cache and ToolSession.id document: a
+// Predict in a run with a ToolPolicy but no Tools calls through the session of the run around
+// it, so the policy-only run's session, created later, encloses an older one, and its Cache
+// answers nothing.
+func TestPolicyOnlyRunCachesNothing(t *testing.T) {
+	calls := &atomic.Int32{}
+	registry, err := NewToolRegistry(lookupTool(calls))
+	require.NoError(t, err)
+	lm := newScriptedChat(
+		toolCallReply("1", "lookup_order", `{"order_id":"A-1"}`, Usage{}),
+		toolCallReply("2", "lookup_order", `{"order_id":"A-1"}`, Usage{}),
+		textReply(orderAnswer, Usage{}),
+	)
+	predict := Predict{Signature: orderSignature, LM: lm, Tools: []string{"lookup_order"}}
+	var middleSession, outerSession *ToolSession
+	middle, err := PipelineSpec{
+		Steps: []Step{NewStep("answer", nil, nil, func(ctx context.Context, _ State) error {
+			env := toolEnvFrom(ctx)
+			middleSession, outerSession = env.session, env.parent.session
+			_, err := predict.Run(ctx, Prediction{"question": "?"})
+			return err
+		})},
+		ToolPolicy: ToolPolicy{Cache: true},
+	}.Build()
+	require.NoError(t, err)
+	outer, err := toolPipeline(registry, ToolPolicy{}, NewStep("middle", nil, nil, func(ctx context.Context, _ State) error {
+		_, err := middle.Run(ctx, NewState(nil))
+		return err
+	}))
+	require.NoError(t, err)
+
+	_, err = outer.Run(context.Background(), NewState(Prediction{"order_id": "A-1"}))
+
+	require.NoError(t, err)
+	require.EqualValues(t, 2, calls.Load(), "the policy-only run's Cache answers nothing")
+	require.Greater(t, middleSession.id, outerSession.id, "the enclosing session is the newer one")
+	for _, record := range middleSession.Records() {
+		require.False(t, record.Cached)
+	}
+	require.Len(t, middleSession.Records(), 2, "the policy-only run still records the calls")
+}

@@ -33,7 +33,11 @@ type ToolPolicy struct {
 	// cached call invokes nothing, spends no call limit, records no usage and applies no memory
 	// writes; its record is marked Cached and has zero Usage. Calls made at the same moment may
 	// both invoke. In a pipeline run, the results a step caches commit or drop with the step's
-	// memory writes (see PipelineSpec.Tools).
+	// memory writes (see PipelineSpec.Tools). Only the session that makes a call answers it
+	// from its cache, never an enclosing run's, so Cache on a pipeline run without Tools, whose
+	// session makes no calls of its own, caches nothing: the agents and Predicts in its steps
+	// call through sessions of their own or of a run around it, which cache under their own
+	// policies.
 	Cache bool
 }
 
@@ -157,8 +161,11 @@ func ToolMemoryFrom(ctx context.Context) ToolMemory {
 // by their policies too, counts against their limits and is recorded in them as well. Only
 // the session that makes the call answers it from its cache.
 type ToolSession struct {
-	// id orders sessions by creation, so an enclosing session, always created first, has the
-	// lower id; reserve locks sessions in id order.
+	// id numbers sessions in the order they were created. It gives the locks of all sessions
+	// one global order, in which reserve takes them, so two calls never wait on each other.
+	// An enclosing session is not always the older one: a Predict in a pipeline run that has a
+	// ToolPolicy but no Tools calls through the session of the nearest enclosing run with Tools,
+	// so the policy-only run's session, created later, encloses that older one.
 	id      uint64
 	tools   map[string]ToolProvider
 	schemas map[string]Tool
@@ -317,7 +324,7 @@ func (s *ToolSession) Call(ctx context.Context, call ToolCall) (ToolResult, Tool
 		record = withResult(record, result)
 		record.Cached = true
 		record.Usage = Usage{}
-		s.record(record, enclosing)
+		s.record(ctx, record, enclosing)
 		return result, cloneRecord(record), nil
 	}
 	if err := s.reserve(call.Name, enclosing); err != nil {
@@ -338,7 +345,7 @@ func (s *ToolSession) Call(ctx context.Context, call ToolCall) (ToolResult, Tool
 	if err != nil {
 		err = fmt.Errorf("tool %q: %w", call.Name, err)
 		record.Err = err.Error()
-		s.record(record, enclosing)
+		s.record(ctx, record, enclosing)
 		return ToolResult{}, cloneRecord(record), err
 	}
 	applyMemoryWrites(memory, result.MemoryWrites)
@@ -348,7 +355,7 @@ func (s *ToolSession) Call(ctx context.Context, call ToolCall) (ToolResult, Tool
 	case cacheable:
 		s.store(cacheKey, result)
 	}
-	s.record(record, enclosing)
+	s.record(ctx, record, enclosing)
 	return result.clone(), cloneRecord(record), nil
 }
 
@@ -428,7 +435,7 @@ func (s *ToolSession) store(key toolCacheKey, result ToolResult) {
 // and of each enclosing session's, or returns the Budget error of the first limit that refuses
 // it, the session's own first, and counts nothing. It holds every session's lock while it
 // checks and counts, so a concurrent call sees all of the counts or none of them, and takes the
-// locks in id order, enclosing sessions first, so two calls never wait on each other.
+// locks in id order, whichever sessions enclose which, so two calls never wait on each other.
 func (s *ToolSession) reserve(name string, enclosing []*ToolSession) error {
 	sessions := append([]*ToolSession{s}, enclosing...)
 	locked := slices.SortedFunc(slices.Values(sessions), func(a, b *ToolSession) int {
@@ -480,13 +487,15 @@ func (s *ToolSession) limitRefusal(name, run string) error {
 	return nil
 }
 
-// record keeps record in the session and in each enclosing session.
-func (s *ToolSession) record(record ToolCallRecord, enclosing []*ToolSession) {
+// record keeps record in the session, in each enclosing session and in the pipeline step
+// execution that made the call, if any, whose StepFinishedEvent reports it.
+func (s *ToolSession) record(ctx context.Context, record ToolCallRecord, enclosing []*ToolSession) {
 	for _, session := range append([]*ToolSession{s}, enclosing...) {
 		session.mu.Lock()
 		session.records = append(session.records, cloneRecord(record))
 		session.mu.Unlock()
 	}
+	usageFrameFrom(ctx).recordToolCall(record)
 }
 
 func withResult(record ToolCallRecord, result ToolResult) ToolCallRecord {
@@ -501,6 +510,18 @@ func cloneRecord(record ToolCallRecord) ToolCallRecord {
 	record.Output = slices.Clone(record.Output)
 	record.Provenance = slices.Clone(record.Provenance)
 	return record
+}
+
+// cloneRecords returns copies of records, or nil when there are none.
+func cloneRecords(records []ToolCallRecord) []ToolCallRecord {
+	if len(records) == 0 {
+		return nil
+	}
+	out := make([]ToolCallRecord, len(records))
+	for i, record := range records {
+		out[i] = cloneRecord(record)
+	}
+	return out
 }
 
 // currentStep returns the name of the innermost pipeline step running with ctx.

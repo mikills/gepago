@@ -54,10 +54,10 @@ import (
 // the context the caller passed to the trace's top-level run ends, when the MaxDuration of the
 // event's run or of a run around it expires, or once the event's run has finished, but not when
 // a step's timeout, a token or model call limit or a failed Parallel sibling ends the step's
-// own context. It
-// carries neither the run's trace, budget nor usage collection, so an observer's model calls
-// and pipeline runs are independent of the observed run: they spend none of its budget, do not
-// count in its usage, and a pipeline run with ctx starts a trace of its own.
+// own context. It carries neither the run's trace, budget, usage collection, tool session nor
+// tool memory, so an observer's model calls, tool calls and pipeline runs are independent of
+// the observed run: they spend none of its budget or tool call limits, do not count in its
+// usage or tool records, and a pipeline run with ctx starts a trace of its own.
 //
 // The values an event carries pass through PipelineSpec.Redactor; see Redactor. Each observer
 // receives its own copy of them, so changing them changes neither the run nor what other
@@ -128,6 +128,11 @@ type StepFinishedEvent struct {
 	// Skipped reports a step that skipped on error under OnErrorSkip: the step did not run
 	// again, and Writes holds the defaults it committed.
 	Skipped bool
+	// ToolCalls holds the tool calls the execution made, through the run's ToolSession or any
+	// other, such as an agent's, in the order they finished, after redaction (see Redactor). The
+	// calls of the executions nested in it are in their own events. Each call's usage is part of
+	// Usage already, and a call answered from a ToolPolicy cache is marked Cached and has none.
+	ToolCalls []ToolCallRecord
 }
 
 type observeKey struct{}
@@ -158,7 +163,8 @@ func (r *runObservation) observerContext(ctx context.Context) context.Context {
 
 // observerCtx takes its deadline and cancellation from a run's life and its values from a
 // run's context, hiding those that tie it to a pipeline run: its trace, step frame, budget,
-// usage collection, step cache and evaluation capture.
+// usage collection, step cache, evaluation capture, tool session, tool memory and staged tool
+// results.
 type observerCtx struct {
 	context.Context
 	values context.Context
@@ -166,7 +172,8 @@ type observerCtx struct {
 
 func (c observerCtx) Value(key any) any {
 	switch key.(type) {
-	case observeKey, evaluationKey, pipelineRunKey, usageFrameKey, usageCollectorKey, retryAdmissionKey, budgetClockKey:
+	case observeKey, evaluationKey, pipelineRunKey, usageFrameKey, usageCollectorKey, retryAdmissionKey, budgetClockKey,
+		toolEnvKey, toolMemoryKey, stepStageKey:
 		return nil
 	}
 	return c.values.Value(key)
@@ -413,7 +420,8 @@ func observeStep(ctx context.Context, node *stepNode, attempt int, values map[st
 // finish emits StepFinished for the execution that ended with outcome, writing result's
 // writes when it succeeded. When it failed, attempted holds the values the step wrote or tried
 // to write: they leave in no event, but pass through the redactors so that their text is
-// removed from the error.
+// removed from the error. The execution's tool calls are redacted first, so that their text is
+// removed from everything else the event carries.
 func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempted []stateWrite) {
 	if s == nil {
 		return
@@ -437,6 +445,7 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 				run.redact(write.key, write.value)
 			}
 		}
+		toolCalls := run.redactToolCalls(outcome.ToolCalls)
 		event := StepFinishedEvent{
 			Step:     lane.step,
 			Attempt:  outcome.Attempt,
@@ -448,6 +457,7 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 			Cached:   outcome.Cached,
 			Skipped:  outcome.Skipped,
 		}
+		event.ToolCalls = run.scrubToolCalls(toolCalls)
 		event.Err = run.redactError(outcome.Err)
 		event.Span = finishSpan(lane.span, outcome.Duration, outcome.Usage, event.Err)
 		observerCtx := run.observerContext(lane.ctx)
@@ -456,6 +466,7 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 			event.Reads = copyValues(event.Reads)
 			event.Writes = copyValues(event.Writes)
 			event.Details = copyValues(event.Details)
+			event.ToolCalls = cloneRecords(event.ToolCalls)
 			observer.StepFinished(observerCtx, event)
 		})
 	}

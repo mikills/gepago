@@ -35,6 +35,17 @@ import (
 // context.Canceled and context.DeadlineExceeded through errors.Is when the original does, but
 // does not unwrap to the original.
 //
+// The tool calls a step execution made, which StepFinishedEvent carries in ToolCalls, pass
+// through the Redactor under the key "tool:<name>", where <name> is the tool's: first the call's
+// Arguments as a string, then its Output as a json.RawMessage, its Text as a string unless it
+// is the output's JSON, in which case it becomes the redacted output's, and its Provenance as a
+// []Provenance. A result of another type is stored as its JSON encoding, and for Provenance as
+// one entry whose Source holds that text. When the Redactor changes arguments or output that
+// are JSON, the strings their decoded value holds are removed from error messages too. Then the
+// text removed from error messages is also removed from each call's arguments, output, text,
+// error and provenance, and from the text of every json.RawMessage in details, such as the
+// "output" a ToolStep attaches when its tool's output does not fit its writes.
+//
 // A Redactor that panics is recovered: the value is replaced by RedactionFailed and removed
 // from error messages like any other redacted value, so a failing Redactor never lets a value
 // through, and the run continues.
@@ -147,12 +158,14 @@ func (r *runObservation) scrubValues(values map[string]any) map[string]any {
 // evaluationRedaction redacts the values an evaluation item carries for reflection: redactors
 // are those of the pipelines the programme holds or ran, types the types of the keys those
 // pipelines declare, values the values the example's runs were given, wrote or tried to write,
-// and details the details their steps attached to errors.
+// details the details their steps attached to errors, and toolCalls the tool calls their steps
+// made.
 type evaluationRedaction struct {
 	redactors []Redactor
 	types     map[string]reflect.Type
 	values    []stateWrite
 	details   []stateWrite
+	toolCalls []ToolCallRecord
 }
 
 // apply returns item with the values reflection reads passed through the redactors. Its Output
@@ -160,9 +173,10 @@ type evaluationRedaction struct {
 // "inputs" and "expected" entries first converted to their keys' types where they convert, so a
 // Redactor sees them as it sees a run's values, SideInfo's "details" one level further, as an
 // event's details, and the inputs, reads, writes and details of any PipelineTrace in its Trace
-// as an event's. Then the text of every value the redactors change, among those and the
-// values and details of the runs, is removed from every string in them, errors included.
-// Without redactors it returns item unchanged.
+// as an event's, with the tool calls of its steps redacted as an event's are. Then the text of
+// every value the redactors change, among those and the values, details and tool calls of the
+// runs, is removed from every string in them, errors included. Without redactors it returns
+// item unchanged.
 func (e evaluationRedaction) apply(item EvaluationItem) EvaluationItem {
 	if len(e.redactors) == 0 {
 		return item
@@ -174,6 +188,7 @@ func (e evaluationRedaction) apply(item EvaluationItem) EvaluationItem {
 	for _, detail := range e.details {
 		run.redactEntry(detail.key, detail.value)
 	}
+	run.redactToolCalls(e.toolCalls)
 	if output, ok := item.Output.(Prediction); item.Output != nil && (!ok || len(output) > 0) {
 		item.Output = run.redactEntry("output", item.Output)
 	}
@@ -194,7 +209,13 @@ func (e evaluationRedaction) apply(item EvaluationItem) EvaluationItem {
 		item.SideInfo = sideInfo
 	}
 	item.Trace = mapTraces(item.Trace, func(trace PipelineTrace) PipelineTrace {
-		return mapTrace(trace, run.redactValues, run.redactEntries, func(text string) string { return text })
+		return mapTrace(
+			trace,
+			run.redactValues,
+			run.redactEntries,
+			run.redactToolCalls,
+			func(text string) string { return text },
+		)
 	})
 
 	if item.Output != nil {
@@ -204,7 +225,7 @@ func (e evaluationRedaction) apply(item EvaluationItem) EvaluationItem {
 		item.SideInfo = run.scrubValues(item.SideInfo)
 	}
 	item.Trace = mapTraces(item.Trace, func(trace PipelineTrace) PipelineTrace {
-		return mapTrace(trace, run.scrubValues, run.scrubValues, run.trace.scrub)
+		return mapTrace(trace, run.scrubValues, run.scrubValues, run.scrubToolCalls, run.trace.scrub)
 	})
 	return item
 }
@@ -251,11 +272,12 @@ func mapTraces(value any, fn func(PipelineTrace) PipelineTrace) any {
 }
 
 // mapTrace returns a copy of trace, its nested runs included, with values applied to its
-// inputs and to each step's reads and writes, details to each step's details, and text to its
-// errors.
+// inputs and to each step's reads and writes, details to each step's details, tools to each
+// step's tool calls, and text to its errors.
 func mapTrace(
 	trace PipelineTrace,
 	values, details func(map[string]any) map[string]any,
+	tools func([]ToolCallRecord) []ToolCallRecord,
 	text func(string) string,
 ) PipelineTrace {
 	trace.Inputs = values(trace.Inputs)
@@ -268,13 +290,14 @@ func mapTrace(
 		step.Reads = values(step.Reads)
 		step.Writes = values(step.Writes)
 		step.Details = details(step.Details)
+		step.ToolCalls = tools(step.ToolCalls)
 		step.Err = text(step.Err)
-		nested := mapTrace(PipelineTrace{Steps: step.Steps}, values, details, text)
+		nested := mapTrace(PipelineTrace{Steps: step.Steps}, values, details, tools, text)
 		step.Steps = nested.Steps
 		if step.Runs != nil {
 			runs := make([]PipelineTrace, len(step.Runs))
 			for j, run := range step.Runs {
-				runs[j] = mapTrace(run, values, details, text)
+				runs[j] = mapTrace(run, values, details, tools, text)
 			}
 			step.Runs = runs
 		}
@@ -282,6 +305,146 @@ func mapTrace(
 	}
 	trace.Steps = steps
 	return trace
+}
+
+// redactToolCalls returns copies of records as the run's events carry them, each call's
+// arguments, output, text and provenance passed through the redactors under its toolKey, and
+// remembers their text when the redactors change them. A call whose Text is its output's JSON
+// keeps the redacted output's JSON as its Text. The caller holds the trace lock.
+func (r *runObservation) redactToolCalls(records []ToolCallRecord) []ToolCallRecord {
+	records = cloneRecords(records)
+	if len(r.redactors) == 0 {
+		return records
+	}
+	for i := range records {
+		record := &records[i]
+		key := toolKey(record.Name)
+		textIsOutput := record.Text == string(record.Output)
+		record.Arguments = toolText(r.redactTool(key, record.Arguments, []byte(record.Arguments)))
+		if record.Output != nil {
+			record.Output = toolJSON(r.redactTool(key, record.Output, record.Output))
+		}
+		switch {
+		case textIsOutput:
+			record.Text = string(record.Output)
+		case record.Text != "":
+			record.Text = toolText(r.redactTool(key, record.Text, []byte(record.Text)))
+		}
+		if record.Provenance != nil {
+			record.Provenance = toolProvenance(r.redact(key, record.Provenance))
+		}
+	}
+	return records
+}
+
+// redactTool passes value, one field of a tool call, through the redactors under key as redact
+// does. When they change it and data, the field's text, is JSON, the text forms of the JSON's
+// decoded value are remembered too, so that the strings in the arguments or the output are
+// removed from error messages as well as the whole text.
+func (r *runObservation) redactTool(key string, value any, data []byte) any {
+	redacted := r.redact(key, value)
+	if reflect.DeepEqual(value, redacted) {
+		return redacted
+	}
+	var decoded any
+	if json.Unmarshal(data, &decoded) != nil {
+		return redacted
+	}
+	kept := redacted
+	if raw, ok := redacted.(json.RawMessage); ok {
+		kept = nil
+		_ = json.Unmarshal(raw, &kept)
+	}
+	r.trace.remember(decoded, kept)
+	return redacted
+}
+
+// scrubToolCalls returns records with the redacted text removed from their arguments, output,
+// text, error and provenance. It changes records in place.
+func (r *runObservation) scrubToolCalls(records []ToolCallRecord) []ToolCallRecord {
+	if !r.redacting() {
+		return records
+	}
+	for i := range records {
+		record := &records[i]
+		record.Arguments = r.trace.scrub(record.Arguments)
+		record.Output = scrubJSON(record.Output, r.trace.scrub)
+		record.Text = r.trace.scrub(record.Text)
+		record.Err = r.trace.scrub(record.Err)
+		for j := range record.Provenance {
+			record.Provenance[j].Source = r.trace.scrub(record.Provenance[j].Source)
+			record.Provenance[j].Detail = r.trace.scrub(record.Provenance[j].Detail)
+		}
+	}
+	return records
+}
+
+// toolKey is the key a Redactor sees a call of the named tool under.
+func toolKey(name string) string {
+	return "tool:" + name
+}
+
+// toolText returns what a Redactor returned for a text field of a tool call: the string it
+// returned, or else that value's JSON, or RedactedText when it has none.
+func toolText(value any) string {
+	if text, ok := value.(string); ok {
+		return text
+	}
+	if data, ok := safeJSON(value); ok {
+		return string(data)
+	}
+	return RedactedText
+}
+
+// toolJSON returns what a Redactor returned for a tool call's output as JSON: the JSON it
+// returned, or else that value's JSON encoding, or RedactedText's when it has none.
+func toolJSON(value any) json.RawMessage {
+	if raw, ok := value.(json.RawMessage); ok && (raw == nil || json.Valid(raw)) {
+		return raw
+	}
+	if data, ok := safeJSON(value); ok {
+		return data
+	}
+	data, _ := json.Marshal(RedactedText)
+	return data
+}
+
+// toolProvenance returns what a Redactor returned for a tool call's provenance: the provenance
+// it returned, or else one entry whose Source is that value's text, as toolText gives it.
+func toolProvenance(value any) []Provenance {
+	if provenance, ok := value.([]Provenance); ok {
+		return provenance
+	}
+	return []Provenance{{Source: toolText(value)}}
+}
+
+// safeJSON returns value's JSON encoding, and false when it has none or its MarshalJSON method
+// panics.
+func safeJSON(value any) (data []byte, ok bool) {
+	defer func() {
+		if recover() != nil {
+			data, ok = nil, false
+		}
+	}()
+	data, err := json.Marshal(value)
+	return data, err == nil
+}
+
+// scrubJSON returns data with replace applied to its text, as a JSON string when the result is
+// no longer JSON.
+func scrubJSON(data json.RawMessage, replace func(string) string) json.RawMessage {
+	if data == nil {
+		return nil
+	}
+	text := replace(string(data))
+	if text == string(data) {
+		return data
+	}
+	if json.Valid([]byte(text)) {
+		return json.RawMessage(text)
+	}
+	encoded, _ := json.Marshal(text)
+	return encoded
 }
 
 // redactError returns err as the run's events carry it: unchanged when nothing in the trace is
@@ -431,7 +594,8 @@ func walkStrings(v reflect.Value, seen map[uintptr]bool, visit func(string)) {
 }
 
 // replaceStrings returns a copy of value with replace applied to every string it holds that
-// can be set: map keys and unexported struct fields are left as they are.
+// can be set, and to the text of every json.RawMessage, which stays JSON: map keys and
+// unexported struct fields are left as they are.
 func replaceStrings(value any, replace func(string) string) any {
 	if value == nil {
 		return nil
@@ -440,6 +604,9 @@ func replaceStrings(value any, replace func(string) string) any {
 }
 
 func replaceValue(v reflect.Value, replace func(string) string, seen map[copyKey]reflect.Value) reflect.Value {
+	if v.Type() == reflect.TypeFor[json.RawMessage]() {
+		return reflect.ValueOf(scrubJSON(json.RawMessage(slices.Clone(v.Bytes())), replace))
+	}
 	switch v.Kind() {
 	case reflect.String:
 		c := reflect.New(v.Type()).Elem()

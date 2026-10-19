@@ -30,9 +30,9 @@ func WriteHTMLRunReport(path string, trace PipelineTrace, options HTMLReportOpti
 
 // HTMLRunReport renders a self-contained HTML report of one pipeline run, such as a trace from
 // a RecordingObserver: a summary of the run, then every step execution in the order it started
-// with its duration, usage, reads, writes and error, executions nested in a composite step or
-// a nested pipeline shown inside the execution that ran them. Every value and error is
-// escaped.
+// with its duration, usage, reads, writes, tool calls and error, executions nested in a
+// composite step or a nested pipeline shown inside the execution that ran them. Every value and
+// error is escaped.
 func HTMLRunReport(trace PipelineTrace, options HTMLReportOptions) (string, error) {
 	title := strings.TrimSpace(options.Title)
 	if title == "" {
@@ -64,6 +64,16 @@ func countExecutions(steps []StepTrace, view *runReportView) {
 	})
 }
 
+// reportJSON renders a tool call's arguments or output as indented JSON, or as it is when it
+// is not JSON, without escaping HTML, which the template escapes.
+func reportJSON(data []byte) string {
+	var out bytes.Buffer
+	if json.Indent(&out, data, "", "  ") != nil {
+		return string(data)
+	}
+	return out.String()
+}
+
 // reportValues renders values as indented JSON, without escaping HTML, which the template
 // escapes.
 func reportValues(values map[string]any) string {
@@ -79,6 +89,8 @@ func reportValues(values map[string]any) string {
 
 var runReportTemplate = template.Must(template.New("gepa-run-report").Funcs(template.FuncMap{
 	"values": reportValues,
+	"json":   reportJSON,
+	"bytes":  func(text string) []byte { return []byte(text) },
 	"short": func(value string) string {
 		if len(value) <= 8 {
 			return value
@@ -103,6 +115,26 @@ var runReportTemplate = template.Must(template.New("gepa-run-report").Funcs(temp
 {{if .Reads}}<details><summary>Reads</summary><pre>{{values .Reads}}</pre></details>{{end}}
 {{if .Writes}}<details><summary>Writes</summary><pre>{{values .Writes}}</pre></details>{{end}}
 {{if .Details}}<details><summary>Details</summary><pre>{{values .Details}}</pre></details>{{end}}
+{{if .ToolCalls}}<details class="tool-calls"><summary>Tool calls ({{len .ToolCalls}})</summary>
+<ol class="steps">
+{{range .ToolCalls}}
+<li class="step{{if .Err}} failed{{end}}">
+<div class="step-head">
+<strong>{{.Name}}</strong>
+{{if .Cached}}<span class="badge">cached</span>{{end}}
+{{if .Err}}<span class="badge error-badge">failed</span>{{end}}
+<span class="muted">
+{{.Duration}} · {{.Usage.TotalTokens}} tokens ({{.Usage.PromptTokens}} in, {{.Usage.CompletionTokens}} out)
+</span>
+</div>
+<div class="muted">Arguments</div><pre>{{json (bytes .Arguments)}}</pre>
+{{if .Output}}<div class="muted">Output</div><pre>{{json .Output}}</pre>
+{{else if .Text}}<div class="muted">Text</div><pre>{{.Text}}</pre>{{end}}
+{{if .Err}}<pre class="error">{{.Err}}</pre>{{end}}
+</li>
+{{end}}
+</ol>
+</details>{{end}}
 {{if .Steps}}{{template "steps" .Steps}}{{end}}
 {{range .Runs}}
 <div class="nested-run">

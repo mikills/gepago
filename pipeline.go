@@ -316,9 +316,11 @@ type PipelineSpec struct {
 	// policy governs its own run as well, so each call meets every enclosing run's policy. A run
 	// starts its session when Tools is set or ToolPolicy is not the zero value, so a policy
 	// without Tools still governs the calls of the agents and pipelines its steps run; an
-	// empty, non-nil Allow then refuses every one of them. Build rejects a policy that names a
-	// tool Tools does not hold, a step that names a tool the policy does not allow, and a
-	// Predict or TypedPredict step that sets a ToolPolicy of its own.
+	// empty, non-nil Allow then refuses every one of them. Its Cache caches nothing without
+	// Tools, since only the session that makes a call answers it from its cache (see
+	// ToolPolicy.Cache). Build rejects a policy that names a tool Tools does not hold, a step
+	// that names a tool the policy does not allow, and a Predict or TypedPredict step that sets
+	// a ToolPolicy of its own.
 	ToolPolicy ToolPolicy
 	// Observers receive the events of every run, in this order; see PipelineObserver.
 	Observers []PipelineObserver
@@ -488,7 +490,10 @@ func isNil(value any) bool {
 // names each step from the top-level one down and Details holds the innermost diagnostics.
 //
 // Reads holds copies of the values of the step's declared reads that were in state when it
-// ran, for diagnosis and reflection; Error does not print them.
+// ran, for diagnosis and reflection; Error does not print them. A PipelineTrace and its run
+// report keep only the error's message, and under a Redactor pipeline events carry only its
+// redacted message, so Reads never leave in them unredacted; ProgramEvaluator passes them to
+// reflection redacted by key (see Redactor).
 type StepError struct {
 	Step    string
 	Err     error

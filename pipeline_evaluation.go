@@ -18,8 +18,9 @@ const maxProgramDepth = 32
 
 // evaluationCapture collects what ProgramEvaluator needs to redact one evaluated example: the
 // Redactors and key types of the pipelines the programme holds or runs, every value those runs
-// were given, wrote or tried to write, and, when recorder is set, the traces of the top-level
-// runs. known holds the pipelines already accounted for, by their first step.
+// were given, wrote or tried to write, the tool calls their steps made, and, when recorder is
+// set, the traces of the top-level runs. known holds the pipelines already accounted for, by
+// their first step.
 type evaluationCapture struct {
 	recorder  *RecordingObserver
 	mu        sync.Mutex
@@ -28,6 +29,7 @@ type evaluationCapture struct {
 	known     map[*stepNode]bool
 	values    []stateWrite
 	details   []stateWrite
+	toolCalls []ToolCallRecord
 }
 
 // newEvaluationCapture returns a capture holding the Redactors and key types of every Pipeline
@@ -175,6 +177,16 @@ func (c *evaluationCapture) offerStep(writes []stateWrite, err error) {
 	}
 }
 
+// offerToolCalls keeps the tool calls an execution made.
+func (c *evaluationCapture) offerToolCalls(records []ToolCallRecord) {
+	if c == nil || len(records) == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.toolCalls = append(c.toolCalls, cloneRecords(records)...)
+}
+
 // apply returns the evaluation item of the example the capture watched, with the traces it
 // recorded and its reflection values redacted with everything it collected.
 func (c *evaluationCapture) apply(item EvaluationItem) EvaluationItem {
@@ -187,6 +199,7 @@ func (c *evaluationCapture) apply(item EvaluationItem) EvaluationItem {
 		types:     maps.Clone(c.types),
 		values:    slices.Clone(c.values),
 		details:   slices.Clone(c.details),
+		toolCalls: cloneRecords(c.toolCalls),
 	}
 	c.mu.Unlock()
 	return redaction.apply(item)
