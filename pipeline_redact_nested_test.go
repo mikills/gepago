@@ -86,15 +86,16 @@ func TestOuterRedactorReachesNestedObservers(t *testing.T) {
 					`pipeline step "check": bad tenant [hidden] for amount [amount] on [account]`,
 					innerLog.runsFinished[0].Err.Error(),
 				)
-				for _, event := range []any{innerLog.runsStarted, innerLog.stepsStarted, innerLog.finished, innerLog.runsFinished} {
-					text := fmt.Sprintf("%+v", event)
-					require.NotContains(t, text, secret)
-					require.NotContains(t, text, "4242")
-					require.NotContains(t, text, account)
-				}
+				text := stableEventText(innerLog)
+				require.NotContains(t, text, secret)
+				require.NotContains(t, text, fmt.Sprint(amount))
+				require.NotContains(t, text, account)
 				if observed {
 					require.Equal(t, map[string]string{"secret": "[hidden]"}, outerLog.runsStarted[0].RunContext.Attributes)
-					require.NotContains(t, fmt.Sprintf("%+v", outerLog.runsFinished), secret)
+					text := stableEventText(outerLog)
+					require.NotContains(t, text, secret)
+					require.NotContains(t, text, fmt.Sprint(amount))
+					require.NotContains(t, text, account)
 				}
 			})
 		}

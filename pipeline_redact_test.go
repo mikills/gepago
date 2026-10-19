@@ -2,7 +2,6 @@ package gepa
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -473,12 +472,8 @@ func TestRedactorRemovesAFailedStepsWritesFromItsError(t *testing.T) {
 			require.ErrorContains(t, err, secret, "the run's own error is not redacted")
 			require.EqualError(t, log.finishedStep(t, "extract", 1).Err, tt.wantErr)
 			require.EqualError(t, log.runsFinished[0].Err, `pipeline step "extract": `+tt.wantErr)
-			trace := recorder.Traces()[0]
-			data, err := json.Marshal(trace)
-			require.NoError(t, err)
-			require.NotContains(t, string(data), secret)
-			report, err := HTMLRunReport(trace, HTMLReportOptions{})
-			require.NoError(t, err)
+			data, report := stableTraceText(t, recorder.Traces()[0])
+			require.NotContains(t, data, secret)
 			require.NotContains(t, report, secret)
 		})
 	}

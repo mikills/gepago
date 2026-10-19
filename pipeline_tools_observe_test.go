@@ -461,9 +461,8 @@ func TestRedactorHidesNumericToolArguments(t *testing.T) {
 	require.Equal(t, `tool "lookup": account [hidden] is frozen`, event.ToolCalls[0].Err)
 	require.EqualError(t, log.runsFinished[0].Err, `pipeline step "answer": tool "lookup": account [hidden] is frozen`)
 	trace := recorder.Traces()[0]
-	data := requireTraceRoundTrip(t, trace)
-	report, err := HTMLRunReport(trace, HTMLReportOptions{})
-	require.NoError(t, err)
+	requireTraceRoundTrip(t, trace)
+	data, report := stableTraceText(t, trace)
 	require.NotContains(t, data, account)
 	require.NotContains(t, report, account)
 }
@@ -499,7 +498,8 @@ func TestRedactedToolJSONKeepsItsKeys(t *testing.T) {
 		"no entry is lost to a hidden key")
 	step := recorder.Traces()[0].Steps[0]
 	require.Equal(t, map[string]any{"carrier": "[hidden]", "account": "[hidden]"}, step.Details["output"])
-	data := requireTraceRoundTrip(t, recorder.Traces()[0])
+	requireTraceRoundTrip(t, recorder.Traces()[0])
+	data, _ := stableTraceText(t, recorder.Traces()[0])
 	require.NotContains(t, data, "48213977")
 	require.NotContains(t, data, "Secret Co")
 }
@@ -1224,13 +1224,13 @@ func TestRedactorReplacementsNeverEnterText(t *testing.T) {
 			require.ErrorIs(t, err, ErrInvalidOutput)
 			event := log.finishedStep(t, "answer", 1)
 			require.Equal(t, tt.wantNote, event.Details["output"].(Prediction)["note"])
-			data := requireTraceRoundTrip(t, recorder.Traces()[0])
-			report, err := HTMLRunReport(recorder.Traces()[0], HTMLReportOptions{})
-			require.NoError(t, err)
+			requireTraceRoundTrip(t, recorder.Traces()[0])
+			data, report := stableTraceText(t, recorder.Traces()[0])
+			events := stableEventText(log)
 			for _, secret := range tt.hidden {
 				require.NotContains(t, data, secret)
 				require.NotContains(t, report, secret)
-				require.NotContains(t, fmt.Sprintf("%+v", log.finished), secret)
+				require.NotContains(t, events, secret)
 			}
 		})
 	}
