@@ -611,3 +611,29 @@ func TestJSONFieldsIsCachedPerType(t *testing.T) {
 		require.Contains(t, fields, "a")
 	}
 }
+
+func TestMetricTextEndsCyclesInPlainValues(t *testing.T) {
+	cyclic := func(v int) *metricRecursive {
+		node := &metricRecursive{V: v}
+		node.Next = node
+		return node
+	}
+	text, ok := metricText(cyclic(1))
+	require.True(t, ok)
+	require.Equal(t, `{"next":"<cycle>","v":1}`, text)
+
+	equal, err := ExactMatchMetric{}.Score(context.Background(), Prediction{"f": cyclic(1)}, Prediction{"f": cyclic(1)})
+	require.NoError(t, err)
+	require.Equal(t, 1.0, equal.Score, "equal self-referencing values match")
+	differ, err := ExactMatchMetric{}.Score(
+		context.Background(),
+		Prediction{"f": cyclic(1)},
+		Prediction{"f": cyclic(2)},
+	)
+	require.NoError(t, err)
+	require.Zero(t, differ.Score)
+
+	text, ok = metricText(map[string]any{"ratio": math.NaN(), "list": []int{1}})
+	require.True(t, ok)
+	require.Equal(t, "map[list:[1] ratio:NaN]", text, "a value JSON cannot encode still falls back to its fmt form")
+}

@@ -36,10 +36,13 @@ type metricVisit struct {
 // inside such a struct do not.
 type metricWalker struct {
 	path map[metricVisit]bool
+	// thorough walks values whose type cannot hold such a struct too, instead of leaving them
+	// to encoding/json, so that a cycle in one ends at "<cycle>".
+	thorough bool
 }
 
-func newMetricWalker() *metricWalker {
-	return &metricWalker{path: map[metricVisit]bool{}}
+func newMetricWalker(thorough bool) *metricWalker {
+	return &metricWalker{path: map[metricVisit]bool{}, thorough: thorough}
 }
 
 // walk returns the form of v, and whether v holds a struct whose fields JSON cannot see. When
@@ -52,7 +55,7 @@ func (w *metricWalker) walk(v reflect.Value) (any, bool) {
 		if self, ok := selfEncoded(v); ok {
 			return self, false
 		}
-		if !mayHideFields(v.Type()) {
+		if !w.thorough && !mayHideFields(v.Type()) {
 			return v.Interface(), false
 		}
 	}

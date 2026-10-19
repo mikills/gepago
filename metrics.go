@@ -343,8 +343,14 @@ func metricText(value any) (string, bool) {
 // string of its type and fields at any depth, as metricWalker describes. A value JSON cannot
 // encode, such as NaN or a channel, is a JSON string of its fmt form.
 func metricJSON(value any) json.RawMessage {
-	form, _ := newMetricWalker().walk(reflect.ValueOf(value))
+	form, _ := newMetricWalker(false).walk(reflect.ValueOf(value))
 	encoded, err := encodeMetricJSON(form)
+	if err != nil {
+		// encoding/json refuses a cycle in a value the walker left to it; a thorough walk ends
+		// the cycle at "<cycle>" instead.
+		form, _ = newMetricWalker(true).walk(reflect.ValueOf(value))
+		encoded, err = encodeMetricJSON(form)
+	}
 	if err != nil {
 		// a string always encodes.
 		encoded, _ = encodeMetricJSON(fmt.Sprint(value))
