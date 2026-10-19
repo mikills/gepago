@@ -1,0 +1,92 @@
+{
+  "exchanges": [
+    {
+      "path": "/v1beta/models/gemini-2.5-flash:generateContent",
+      "request": {
+        "contents": [{"role": "user"}],
+        "tools": [
+          {
+            "functionDeclarations": [
+              {
+                "name": "lookup_order",
+                "description": "Look up an order",
+                "parametersJsonSchema": {
+                  "type": "object",
+                  "properties": {"order_id": {"type": "string", "description": "The order to look up"}},
+                  "required": ["order_id"],
+                  "additionalProperties": false
+                }
+              }
+            ]
+          }
+        ],
+        "generationConfig": {"maxOutputTokens": 512}
+      },
+      "response": {
+        "candidates": [
+          {
+            "content": {
+              "role": "model",
+              "parts": [{"functionCall": {"name": "lookup_order", "args": {"order_id": "A-1001"}}}]
+            },
+            "finishReason": "STOP",
+            "index": 0
+          }
+        ],
+        "usageMetadata": {
+          "promptTokenCount": 96,
+          "candidatesTokenCount": 18,
+          "totalTokenCount": 140,
+          "thoughtsTokenCount": 26,
+          "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 96}]
+        },
+        "modelVersion": "gemini-2.5-flash",
+        "responseId": "kZ3vaOH2LuGqvdIPq8yQ6Ac"
+      }
+    },
+    {
+      "path": "/v1beta/models/gemini-2.5-flash:generateContent",
+      "request": {
+        "contents": [
+          {"role": "user"},
+          {
+            "role": "model",
+            "parts": [{"functionCall": {"name": "lookup_order", "args": {"order_id": "A-1001"}}}]
+          },
+          {
+            "role": "user",
+            "parts": [
+              {
+                "functionResponse": {
+                  "name": "lookup_order",
+                  "response": {"result": "{\"status\":\"shipped\",\"carrier\":\"DHL\"}"}
+                }
+              }
+            ]
+          }
+        ],
+        "tools": [{"functionDeclarations": [{"name": "lookup_order"}]}]
+      },
+      "response": {
+        "candidates": [
+          {
+            "content": {
+              "role": "model",
+              "parts": [{"text": "{\"status\":\"shipped\",\"summary\":\"Order A-1001 shipped with DHL.\"}"}]
+            },
+            "finishReason": "STOP",
+            "index": 0
+          }
+        ],
+        "usageMetadata": {
+          "promptTokenCount": 152,
+          "candidatesTokenCount": 21,
+          "totalTokenCount": 173,
+          "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 152}]
+        },
+        "modelVersion": "gemini-2.5-flash",
+        "responseId": "lJ3vaKqLDPSovdIP0Iy8wQk"
+      }
+    }
+  ]
+}

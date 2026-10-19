@@ -118,14 +118,15 @@ func searchFilesDefinition() agents.Tool {
 	}
 }
 
-func toolSchema(required string) map[string]any {
-	return map[string]any{
+func toolSchema(required string) json.RawMessage {
+	schema, _ := json.Marshal(map[string]any{
 		"type": "object",
 		"properties": map[string]any{
 			required: map[string]any{"type": "string"},
 		},
 		"required": []string{required},
-	}
+	})
+	return schema
 }
 
 func analyzeFile(_ context.Context, _ *agents.Memory, arguments string) (string, error) {

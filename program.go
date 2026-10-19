@@ -117,6 +117,9 @@ func refusalText(text string) string {
 // other fields. When MaxParseRetries is above zero, a reply that fails to parse or fails the
 // check is sent for repair up to MaxParseRetries times, with the original request, the error
 // and the JSON schema (see RepairPrompt).
+//
+// A Predict with Tools or Middleware chats instead: LM must also be a ChatClient, and the call
+// is a bounded tool loop described on Tools.
 type Predict struct {
 	Signature       Signature
 	LM              Generator
@@ -124,9 +127,43 @@ type Predict struct {
 	Demos           []Demo
 	MaxParseRetries int
 	RepairLM        Generator
+	// Tools names the tools the model may call while it answers. Predict then sends the prompt
+	// as a chat through LM, which must be a ChatClient, with the tools' schemas and the
+	// signature's ResponseFormat when it is strict. It runs the calls of each reply in order,
+	// sends their results back and asks again, until a reply calls no tool; that reply is
+	// checked as any other. Each chat call is admitted with AdmitModelCall and its usage
+	// recorded once with RecordUsage; each tool call goes through the run's ToolSession, so
+	// the ToolPolicy applies and its usage is recorded too. A tool that fails fails the call,
+	// and so does a call to a tool not in Tools (ErrUnknownTool).
+	// A reply that fails the check is repaired, up to MaxParseRetries times, by continuing the
+	// same chat with RepairPrompt's message; RepairLM is not used.
+	//
+	// Inside a pipeline the tools come from PipelineSpec.Tools under PipelineSpec.ToolPolicy,
+	// through the run's ToolSession, and Build checks the names; Build rejects a Predict step
+	// that sets a ToolPolicy or a ToolRegistry other than PipelineSpec.Tools. Outside one they
+	// come from ToolRegistry under ToolPolicy, with a session of their own for each call. A
+	// Predict with a registry of its own that runs inside a pipeline run anyway, in a step's
+	// own code, keeps its own session, and the run's ToolPolicy governs its calls too.
+	Tools []string
+	// MaxToolTurns bounds the replies that call tools: a reply that calls a tool after
+	// MaxToolTurns such replies fails with ErrToolTurnLimit without running the calls. Zero
+	// means 8.
+	MaxToolTurns int
+	// Middleware names chat middleware from the same registry as Tools, outermost first, that
+	// wraps LM for every chat call. Setting it makes Predict chat even without Tools.
+	Middleware []string
+	// ToolRegistry supplies Tools and Middleware outside a pipeline. In a pipeline step it must
+	// be unset or PipelineSpec.Tools.
+	ToolRegistry *ToolRegistry
+	// ToolPolicy governs the tool calls made through ToolRegistry outside a pipeline. It needs
+	// a ToolRegistry, and a pipeline step must leave it unset.
+	ToolPolicy ToolPolicy
 }
 
-// Validate checks that the programme has a valid signature and language model.
+// Validate checks that the programme has a valid signature and language model, and that a
+// ToolPolicy comes with a ToolRegistry. With Tools or Middleware, LM must also be a
+// ChatClient, the names must be unique, MaxToolTurns must not be negative, and when
+// ToolRegistry is set every name must be registered and every tool allowed by ToolPolicy.
 func (p Predict) Validate() error {
 	if err := p.Signature.Validate(); err != nil {
 		return err
@@ -134,7 +171,7 @@ func (p Predict) Validate() error {
 	if p.LM == nil {
 		return errors.New("predict language model is required")
 	}
-	return nil
+	return p.validateChat()
 }
 
 // SeedCandidate returns the initial optimisable instruction and optional demos.
@@ -179,6 +216,9 @@ func (p Predict) run(
 	format, err := p.Signature.ResponseFormat()
 	if err != nil {
 		return nil, err
+	}
+	if p.chats() {
+		return p.runChat(ctx, prompt, format, check)
 	}
 	raw, err := p.generate(ctx, p.LM, prompt, format)
 	if err != nil {

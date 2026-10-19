@@ -23,6 +23,11 @@ type Config struct {
 
 // LanguageModel runs the pi CLI in print mode as a gepa.Generator, one subprocess per call.
 // It keeps no per-call state, so one value is safe for concurrent use.
+//
+// LanguageModel is not a gepa.ChatClient: pi's print mode takes one prompt and prints one
+// reply, and cannot offer caller-defined tools to the model or return its tool calls, so it
+// runs with --no-tools. A gepa.Predict with Tools or Middleware fails Validate with it, and an
+// agents.Agent cannot use it.
 type LanguageModel struct {
 	config Config
 }

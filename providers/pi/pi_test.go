@@ -53,6 +53,22 @@ func TestNewLanguageModelDefaultsCommand(t *testing.T) {
 	require.Equal(t, "pi", lm.config.Command)
 }
 
+func TestLanguageModelCannotCallTools(t *testing.T) {
+	lm, err := NewLanguageModel(Config{})
+	require.NoError(t, err)
+	_, isChat := any(lm).(gepa.ChatClient)
+	require.False(t, isChat, "pi's print mode cannot return tool calls")
+
+	err = gepa.Predict{
+		Signature: gepa.Signature{Inputs: []gepa.Field{{Name: "q"}}, Outputs: []gepa.Field{{Name: "a"}}},
+		LM:        lm,
+		Tools:     []string{"lookup"},
+	}.Validate()
+
+	require.EqualError(t, err, "predict with tools or chat middleware needs a language model that implements "+
+		"ChatClient; *pi.LanguageModel does not")
+}
+
 func TestLanguageModelClassifiesErrors(t *testing.T) {
 	t.Run("non-zero exit is unclassified", func(t *testing.T) {
 		lm, err := NewLanguageModel(Config{Command: fakePi(t, "echo 'rate limited' >&2; exit 3")})

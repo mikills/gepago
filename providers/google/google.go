@@ -13,7 +13,6 @@ import (
 	"strings"
 
 	gepa "github.com/mikills/gepago"
-	"github.com/mikills/gepago/agents"
 	"github.com/mikills/gepago/internal/providererr"
 )
 
@@ -68,16 +67,16 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 // reported usage returns that usage with the error. An empty reply is an error unless it
 // stopped at the token limit or under a content policy.
 func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Generation, error) {
-	resp, err := m.client.Chat(ctx, agents.ChatRequest{
+	resp, err := m.client.Chat(ctx, gepa.ChatRequest{
 		Model:       m.client.model,
 		MaxTokens:   &m.maxTokens,
 		Temperature: m.temperature,
-		Messages: []agents.Message{
+		Messages: []gepa.Message{
 			{
-				Role:    agents.RoleSystem,
+				Role:    gepa.RoleSystem,
 				Content: "You are a precise optimisation assistant. Follow the requested output format exactly.",
 			},
-			{Role: agents.RoleUser, Content: prompt},
+			{Role: gepa.RoleUser, Content: prompt},
 		},
 	})
 	generation := gepa.Generation{
@@ -99,7 +98,28 @@ func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Gener
 	return generation, nil
 }
 
-// ChatClient adapts Google Gemini generateContent to agents.ChatClient.
+// Chat sends one chat request, as ChatClient.Chat does, making LanguageModel a
+// gepa.ChatClient, so a gepa.Predict with tools can use it. A request without MaxTokens or
+// Temperature takes the model's configured values.
+func (m *LanguageModel) Chat(ctx context.Context, req gepa.ChatRequest) (gepa.ChatResponse, error) {
+	if req.MaxTokens == nil {
+		maxTokens := m.maxTokens
+		req.MaxTokens = &maxTokens
+	}
+	if req.Temperature == nil {
+		req.Temperature = m.temperature
+	}
+	return m.client.Chat(ctx, req)
+}
+
+// ChatClient adapts Google Gemini generateContent to gepa.ChatClient. Tool parameters are sent
+// as parametersJsonSchema and a response format as responseJsonSchema, with responseMimeType
+// application/json, whether or not the format is strict: both fields take JSON Schema as gepa
+// produces it. Gemini models before Gemini 3 reject a JSON response type together with
+// function declarations, so a request with tools is sent without its response format; a
+// gepa.Predict still checks the final reply against its signature. A function call's id, when
+// Gemini gives one, becomes the ToolCall's ID and is sent back with its result; otherwise the
+// ID is the function's name.
 type ChatClient struct {
 	apiKey  string
 	baseURL string
@@ -137,12 +157,12 @@ func NewChatClient(config Config) (*ChatClient, error) {
 // other 4xx and TLS, host or URL misconfiguration are permanent; a cancelled or expired ctx
 // returns ctx.Err() unwrapped. The API key, which travels in the request URL, is redacted
 // from every error. A response without candidates still returns its usage with the error.
-func (c *ChatClient) Chat(ctx context.Context, req agents.ChatRequest) (agents.ChatResponse, error) {
+func (c *ChatClient) Chat(ctx context.Context, req gepa.ChatRequest) (gepa.ChatResponse, error) {
 	resp, err := c.chat(ctx, req)
 	return resp, c.redact(err)
 }
 
-func (c *ChatClient) chat(ctx context.Context, req agents.ChatRequest) (agents.ChatResponse, error) {
+func (c *ChatClient) chat(ctx context.Context, req gepa.ChatRequest) (gepa.ChatResponse, error) {
 	toolNames := googleToolNameMap(req.Tools)
 	payload := googleGenerateRequest{
 		SystemInstruction: googleSystemInstruction(req.Messages),
@@ -152,11 +172,11 @@ func (c *ChatClient) chat(ctx context.Context, req agents.ChatRequest) (agents.C
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
-		return agents.ChatResponse{}, err
+		return gepa.ChatResponse{}, err
 	}
 	body, err := c.post(ctx, googleRequestModel(c.model, req.Model), data)
 	if err != nil {
-		return agents.ChatResponse{}, err
+		return gepa.ChatResponse{}, err
 	}
 	return decodeGoogleResponse(body, toolNames)
 }
@@ -260,10 +280,10 @@ type googleGenerateRequest struct {
 }
 
 type googleGenerationConfig struct {
-	Temperature      *float64       `json:"temperature,omitempty"`
-	MaxOutputTokens  *int           `json:"maxOutputTokens,omitempty"`
-	ResponseMIMEType string         `json:"responseMimeType,omitempty"`
-	ResponseSchema   map[string]any `json:"responseSchema,omitempty"`
+	Temperature        *float64        `json:"temperature,omitempty"`
+	MaxOutputTokens    *int            `json:"maxOutputTokens,omitempty"`
+	ResponseMIMEType   string          `json:"responseMimeType,omitempty"`
+	ResponseJSONSchema json.RawMessage `json:"responseJsonSchema,omitempty"`
 }
 
 type googleContent struct {
@@ -278,11 +298,13 @@ type googlePart struct {
 }
 
 type googleFunctionCall struct {
-	Name string         `json:"name"`
-	Args map[string]any `json:"args,omitempty"`
+	ID   string          `json:"id,omitempty"`
+	Name string          `json:"name"`
+	Args json.RawMessage `json:"args,omitempty"`
 }
 
 type googleFunctionResponse struct {
+	ID       string         `json:"id,omitempty"`
 	Name     string         `json:"name"`
 	Response map[string]any `json:"response"`
 }
@@ -292,9 +314,9 @@ type googleTool struct {
 }
 
 type googleFunctionDeclaration struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description,omitempty"`
-	Parameters  map[string]any `json:"parameters,omitempty"`
+	Name                 string          `json:"name"`
+	Description          string          `json:"description,omitempty"`
+	ParametersJSONSchema json.RawMessage `json:"parametersJsonSchema,omitempty"`
 }
 
 type googleGenerateResponse struct {
@@ -334,10 +356,10 @@ func googleUsage(metadata googleUsageMetadata) gepa.Usage {
 	return usage
 }
 
-func googleSystemInstruction(messages []agents.Message) *googleContent {
+func googleSystemInstruction(messages []gepa.Message) *googleContent {
 	parts := make([]googlePart, 0, 1)
 	for _, message := range messages {
-		if message.Role == agents.RoleSystem && strings.TrimSpace(message.Content) != "" {
+		if message.Role == gepa.RoleSystem && strings.TrimSpace(message.Content) != "" {
 			parts = append(parts, googlePart{Text: message.Content})
 		}
 	}
@@ -347,24 +369,33 @@ func googleSystemInstruction(messages []agents.Message) *googleContent {
 	return &googleContent{Parts: parts}
 }
 
-func googleContents(messages []agents.Message) []googleContent {
+// googleContents converts the transcript to contents. The results of consecutive tool
+// messages, such as one reply's parallel calls, travel in one content.
+func googleContents(messages []gepa.Message) []googleContent {
 	out := make([]googleContent, 0, len(messages))
 	for index, message := range messages {
-		if message.Role == agents.RoleSystem {
+		if message.Role == gepa.RoleSystem {
 			continue
 		}
 		content := googleContent{Role: googleRole(message.Role), Parts: googleParts(messages, index, message)}
-		if len(content.Parts) > 0 {
-			out = append(out, content)
+		if len(content.Parts) == 0 {
+			continue
 		}
+		if index > 0 && message.Role == gepa.RoleTool && messages[index-1].Role == gepa.RoleTool && len(out) > 0 {
+			out[len(out)-1].Parts = append(out[len(out)-1].Parts, content.Parts...)
+			continue
+		}
+		out = append(out, content)
 	}
 	return out
 }
 
-func googleParts(messages []agents.Message, index int, message agents.Message) []googlePart {
-	if message.Role == agents.RoleTool {
+func googleParts(messages []gepa.Message, index int, message gepa.Message) []googlePart {
+	if message.Role == gepa.RoleTool {
+		name := googleToolName(messages[:index], message.ToolCallID)
 		return []googlePart{{FunctionResponse: &googleFunctionResponse{
-			Name:     googleToolName(messages[:index], message.ToolCallID),
+			ID:       googleCallID(message.ToolCallID, name),
+			Name:     name,
 			Response: map[string]any{"result": message.Content},
 		}}}
 	}
@@ -378,14 +409,14 @@ func googleParts(messages []agents.Message, index int, message agents.Message) [
 	return parts
 }
 
-func googleRole(role agents.Role) string {
-	if role == agents.RoleAssistant {
+func googleRole(role gepa.Role) string {
+	if role == gepa.RoleAssistant {
 		return "model"
 	}
 	return "user"
 }
 
-func googleToolName(previous []agents.Message, callID string) string {
+func googleToolName(previous []gepa.Message, callID string) string {
 	for index := len(previous) - 1; index >= 0; index-- {
 		for _, call := range previous[index].ToolCalls {
 			if call.ID == callID {
@@ -396,32 +427,45 @@ func googleToolName(previous []agents.Message, callID string) string {
 	return callID
 }
 
-func googleFunctionCallFromAgent(call agents.ToolCall) *googleFunctionCall {
-	args := map[string]any{}
-	if strings.TrimSpace(call.Arguments) != "" {
-		if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
-			args = map[string]any{"arguments": call.Arguments}
-		}
+// googleCallID returns the id to send with a function call or response: the call's ID when
+// Gemini assigned it, and none when the ID is the function name standing in for one.
+func googleCallID(callID string, functionName string) string {
+	if callID == functionName {
+		return ""
 	}
-	return &googleFunctionCall{Name: googleFunctionName(call.Name), Args: args}
+	return callID
 }
 
-func googleTools(tools []agents.Tool) []googleTool {
+func googleFunctionCallFromAgent(call gepa.ToolCall) *googleFunctionCall {
+	name := googleFunctionName(call.Name)
+	args := json.RawMessage(`{}`)
+	if trimmed := strings.TrimSpace(call.Arguments); trimmed != "" {
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(trimmed), &object); err == nil && object != nil {
+			args = json.RawMessage(trimmed)
+		} else {
+			args, _ = json.Marshal(map[string]string{"arguments": call.Arguments})
+		}
+	}
+	return &googleFunctionCall{ID: googleCallID(call.ID, name), Name: name, Args: args}
+}
+
+func googleTools(tools []gepa.Tool) []googleTool {
 	if len(tools) == 0 {
 		return nil
 	}
 	declarations := make([]googleFunctionDeclaration, 0, len(tools))
 	for _, tool := range tools {
 		declarations = append(declarations, googleFunctionDeclaration{
-			Name:        googleFunctionName(tool.Name),
-			Description: tool.Description,
-			Parameters:  tool.Parameters,
+			Name:                 googleFunctionName(tool.Name),
+			Description:          tool.Description,
+			ParametersJSONSchema: tool.InputSchema(),
 		})
 	}
 	return []googleTool{{FunctionDeclarations: declarations}}
 }
 
-func googleToolNameMap(tools []agents.Tool) map[string]string {
+func googleToolNameMap(tools []gepa.Tool) map[string]string {
 	out := make(map[string]string, len(tools))
 	for _, tool := range tools {
 		out[googleFunctionName(tool.Name)] = tool.Name
@@ -483,38 +527,42 @@ func isGoogleFunctionNameRune(r rune) bool {
 		r == '.'
 }
 
-func googleGenerationSettings(req agents.ChatRequest) *googleGenerationConfig {
-	if req.Temperature == nil && req.MaxTokens == nil && req.ResponseFormat == nil {
+func googleGenerationSettings(req gepa.ChatRequest) *googleGenerationConfig {
+	format := req.ResponseFormat
+	if len(req.Tools) > 0 {
+		format = nil
+	}
+	if req.Temperature == nil && req.MaxTokens == nil && format == nil {
 		return nil
 	}
 	config := &googleGenerationConfig{Temperature: req.Temperature, MaxOutputTokens: req.MaxTokens}
-	if req.ResponseFormat != nil {
+	if format != nil {
 		config.ResponseMIMEType = "application/json"
-		config.ResponseSchema = req.ResponseFormat.Schema
+		config.ResponseJSONSchema = req.ResponseFormat.Schema
 	}
 	return config
 }
 
-func decodeGoogleResponse(data []byte, toolNames map[string]string) (agents.ChatResponse, error) {
+func decodeGoogleResponse(data []byte, toolNames map[string]string) (gepa.ChatResponse, error) {
 	var response googleGenerateResponse
 	if err := json.Unmarshal(data, &response); err != nil {
-		return agents.ChatResponse{}, err
+		return gepa.ChatResponse{}, err
 	}
 	usage := googleUsage(response.UsageMetadata)
 	if len(response.Candidates) == 0 {
-		failed := agents.ChatResponse{Usage: usage, ResolvedModel: response.ModelVersion}
+		failed := gepa.ChatResponse{Usage: usage, ResolvedModel: response.ModelVersion}
 		if reason := response.PromptFeedback.BlockReason; reason != "" {
-			failed.FinishReason = agents.FinishContentFilter
+			failed.FinishReason = gepa.FinishContentFilter
 			return failed, fmt.Errorf("google generateContent blocked the prompt: %s", reason)
 		}
 		return failed, errors.New("google generateContent returned no candidates")
 	}
 	candidate := response.Candidates[0]
-	message := agents.Message{Role: agents.RoleAssistant}
+	message := gepa.Message{Role: gepa.RoleAssistant}
 	for _, part := range candidate.Content.Parts {
 		applyGooglePart(&message, part, toolNames)
 	}
-	return agents.ChatResponse{
+	return gepa.ChatResponse{
 		Message:       message,
 		Usage:         usage,
 		FinishReason:  googleFinishReason(candidate.FinishReason, message),
@@ -522,31 +570,38 @@ func decodeGoogleResponse(data []byte, toolNames map[string]string) (agents.Chat
 	}, nil
 }
 
-func applyGooglePart(message *agents.Message, part googlePart, toolNames map[string]string) {
+func applyGooglePart(message *gepa.Message, part googlePart, toolNames map[string]string) {
 	if strings.TrimSpace(part.Text) != "" {
 		message.Content += part.Text
 	}
-	if part.FunctionCall != nil {
-		arguments, _ := json.Marshal(part.FunctionCall.Args)
-		message.ToolCalls = append(message.ToolCalls, agents.ToolCall{
-			ID:        part.FunctionCall.Name,
-			Name:      originalGoogleToolName(part.FunctionCall.Name, toolNames),
-			Arguments: string(arguments),
+	if call := part.FunctionCall; call != nil {
+		arguments := strings.TrimSpace(string(call.Args))
+		if arguments == "" || arguments == "null" {
+			arguments = "{}"
+		}
+		id := call.ID
+		if id == "" {
+			id = call.Name
+		}
+		message.ToolCalls = append(message.ToolCalls, gepa.ToolCall{
+			ID:        id,
+			Name:      originalGoogleToolName(call.Name, toolNames),
+			Arguments: arguments,
 		})
 	}
 }
 
-func googleFinishReason(reason string, message agents.Message) agents.FinishReason {
+func googleFinishReason(reason string, message gepa.Message) gepa.FinishReason {
 	if len(message.ToolCalls) > 0 {
-		return agents.FinishToolCalls
+		return gepa.FinishToolCalls
 	}
 	switch strings.ToUpper(reason) {
 	case "STOP":
-		return agents.FinishStop
+		return gepa.FinishStop
 	case "MAX_TOKENS":
-		return agents.FinishLength
+		return gepa.FinishLength
 	case "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY":
-		return agents.FinishContentFilter
+		return gepa.FinishContentFilter
 	default:
 		// a missing or unknown reason, such as OTHER, is reported as unknown.
 		return ""

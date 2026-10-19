@@ -174,12 +174,181 @@ func stoppedEarly(reason gepa.FinishReason) bool {
 }
 
 func classifyError(ctx context.Context, err error) error {
+	return classifyErrorAs(ctx, "openai reflection completion", err)
+}
+
+func classifyErrorAs(ctx context.Context, operation string, err error) error {
 	status := 0
 	var apiErr *openai.Error
 	if errors.As(err, &apiErr) {
 		status = apiErr.StatusCode
 	}
-	return providererr.Classify(ctx, status, fmt.Errorf("openai reflection completion: %w", err))
+	return providererr.Classify(ctx, status, fmt.Errorf("%s: %w", operation, err))
+}
+
+// Chat sends one chat completion with the request's messages, tools and response format,
+// making LanguageModel a gepa.ChatClient, so a gepa.Predict with tools or an agents.Agent can
+// use it. An empty Model, MaxTokens or Temperature takes the configured value.
+//
+// Each tool is a function whose parameters are the tool's InputSchema, marked strict when the
+// schema stays within the strict subset (see gepa.StrictJSONSchema), so its arguments match
+// the schema. OpenAI enforces strict schemas only without parallel tool calls, so a request
+// with a strict tool also sets parallel_tool_calls to false, and the model calls at most one
+// tool per reply. A response format is sent as a json_schema response_format with the
+// format's Strict flag. Assistant messages carry their tool calls and tool messages their
+// call's id, so a transcript round-trips.
+//
+// Failures are classified as Generate's are, and a refusal is not an error: it becomes the
+// reply text with FinishContentFilter. A reply with no text and no tool call is an error unless
+// it stopped at the token limit or under a content policy. A reply that fails after the API
+// reported usage returns that usage with the error.
+func (m *LanguageModel) Chat(ctx context.Context, req gepa.ChatRequest) (gepa.ChatResponse, error) {
+	params, err := m.chatParams(req)
+	if err != nil {
+		return gepa.ChatResponse{}, gepa.PermanentError(fmt.Errorf("openai chat completion: %w", err))
+	}
+	completion, err := m.client.Chat.Completions.New(ctx, params)
+	if err != nil {
+		return gepa.ChatResponse{}, classifyErrorAs(ctx, "openai chat completion", err)
+	}
+	resp := gepa.ChatResponse{Usage: openAIUsage(completion.Usage), ResolvedModel: completion.Model}
+	if len(completion.Choices) == 0 {
+		return resp, errors.New("openai chat completion: no choices returned")
+	}
+	choice := completion.Choices[0]
+	resp.FinishReason = openAIFinishReason(choice.FinishReason)
+	resp.Message = gepa.Message{Role: gepa.RoleAssistant, Content: choice.Message.Content}
+	for _, call := range choice.Message.ToolCalls {
+		if call.Type != "function" {
+			return resp, fmt.Errorf("openai chat completion: unsupported %q tool call %q", call.Type, call.ID)
+		}
+		resp.Message.ToolCalls = append(resp.Message.ToolCalls, gepa.ToolCall{
+			ID:        call.ID,
+			Name:      call.Function.Name,
+			Arguments: call.Function.Arguments,
+		})
+	}
+	noReply := strings.TrimSpace(resp.Message.Content) == "" && len(resp.Message.ToolCalls) == 0
+	if refusal := strings.TrimSpace(choice.Message.Refusal); refusal != "" && noReply {
+		resp.Message.Content = choice.Message.Refusal
+		resp.FinishReason = gepa.FinishContentFilter
+		return resp, nil
+	}
+	if noReply && !stoppedEarly(resp.FinishReason) {
+		return resp, errors.New("openai chat completion: empty reply")
+	}
+	return resp, nil
+}
+
+func (m *LanguageModel) chatParams(req gepa.ChatRequest) (openai.ChatCompletionNewParams, error) {
+	model := m.model
+	if strings.TrimSpace(req.Model) != "" {
+		model = req.Model
+	}
+	maxTokens := m.maxTokens
+	if req.MaxTokens != nil {
+		maxTokens = *req.MaxTokens
+	}
+	params := openai.ChatCompletionNewParams{
+		Model:               openai.ChatModel(model),
+		MaxCompletionTokens: openai.Int(int64(maxTokens)),
+	}
+	if temperature := req.Temperature; temperature != nil || m.temperature != nil {
+		if temperature == nil {
+			temperature = m.temperature
+		}
+		params.Temperature = openai.Float(*temperature)
+	}
+	for _, message := range req.Messages {
+		converted, err := openAIMessage(message)
+		if err != nil {
+			return params, err
+		}
+		params.Messages = append(params.Messages, converted)
+	}
+	for _, tool := range req.Tools {
+		schema := tool.InputSchema()
+		parameters, err := rawObject(schema)
+		if err != nil {
+			return params, fmt.Errorf("tool %q parameters: %w", tool.Name, err)
+		}
+		function := shared.FunctionDefinitionParam{Name: tool.Name, Parameters: parameters}
+		if tool.Description != "" {
+			function.Description = openai.String(tool.Description)
+		}
+		if gepa.StrictJSONSchema(schema) {
+			function.Strict = openai.Bool(true)
+			// OpenAI enforces a strict schema only when the model makes one call per reply.
+			params.ParallelToolCalls = openai.Bool(false)
+		}
+		params.Tools = append(params.Tools, openai.ChatCompletionFunctionTool(function))
+	}
+	if format := req.ResponseFormat; format != nil {
+		if !json.Valid(format.Schema) {
+			return params, errors.New("response format schema is not valid JSON")
+		}
+		name := format.Name
+		if name == "" {
+			name = "output"
+		}
+		params.ResponseFormat = openai.ChatCompletionNewParamsResponseFormatUnion{
+			OfJSONSchema: &shared.ResponseFormatJSONSchemaParam{
+				JSONSchema: shared.ResponseFormatJSONSchemaJSONSchemaParam{
+					Name:   name,
+					Schema: format.Schema,
+					Strict: openai.Bool(format.Strict),
+				},
+			},
+		}
+	}
+	return params, nil
+}
+
+// openAIMessage converts one transcript message to its chat completion form.
+func openAIMessage(message gepa.Message) (openai.ChatCompletionMessageParamUnion, error) {
+	switch message.Role {
+	case gepa.RoleSystem:
+		return openai.SystemMessage(message.Content), nil
+	case gepa.RoleUser:
+		return openai.UserMessage(message.Content), nil
+	case gepa.RoleTool:
+		return openai.ToolMessage(message.Content, message.ToolCallID), nil
+	case gepa.RoleAssistant:
+		assistant := openai.ChatCompletionAssistantMessageParam{}
+		if message.Content != "" || len(message.ToolCalls) == 0 {
+			assistant.Content.OfString = openai.String(message.Content)
+		}
+		for _, call := range message.ToolCalls {
+			assistant.ToolCalls = append(assistant.ToolCalls, openai.ChatCompletionMessageToolCallUnionParam{
+				OfFunction: &openai.ChatCompletionMessageFunctionToolCallParam{
+					ID: call.ID,
+					Function: openai.ChatCompletionMessageFunctionToolCallFunctionParam{
+						Name:      call.Name,
+						Arguments: call.Arguments,
+					},
+				},
+			})
+		}
+		return openai.ChatCompletionMessageParamUnion{OfAssistant: &assistant}, nil
+	}
+	return openai.ChatCompletionMessageParamUnion{}, fmt.Errorf("message role %q is not supported", message.Role)
+}
+
+// rawObject converts a JSON object to the SDK's map form. Each value stays raw JSON, so nested
+// key order is kept.
+func rawObject(schema json.RawMessage) (map[string]any, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(schema, &fields); err != nil {
+		return nil, err
+	}
+	if fields == nil {
+		return nil, errors.New("schema must be a JSON object")
+	}
+	converted := make(map[string]any, len(fields))
+	for key, value := range fields {
+		converted[key] = value
+	}
+	return converted, nil
 }
 
 // openAIUsage maps chat completion usage. CacheCreationTokens stays zero: OpenAI caches
