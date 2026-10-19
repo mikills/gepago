@@ -22,6 +22,12 @@ const defaultMaxTurns = 10
 // crashing it, and every call is recorded in RunResult.ToolCalls. The memory writes of a
 // registry tool's successful call are stored in the run's Memory; a failed call's are dropped.
 // The tool's usage is added to the run's and recorded with gepa.RecordUsage.
+//
+// Every chat call is admitted with gepa.AdmitModelCall before it is made and its usage, a
+// failed call's included, recorded once with gepa.RecordUsage, so an agent run inside a
+// pipeline step counts against the pipeline's RunBudget, and a usage collector, such as the one
+// CompiledProgram.RunWithUsage uses, sees the run's usage. A refused call ends the run with the
+// Budget error. Code that runs an agent must therefore not record RunResult.Usage itself.
 type Agent struct {
 	Name           string
 	Client         ChatClient
@@ -328,7 +334,14 @@ func (r *agentRun) executeTurn(turn int) (bool, error) {
 	return false, nil
 }
 
+// chat makes one chat call. The call is admitted against the run budget in the run's context
+// first, and its usage, a failed call's included, is recorded once with gepa.RecordUsage, so a
+// pipeline's RunBudget and a usage collector cover the agent's model calls.
 func (r *agentRun) chat(turn int) (ChatResponse, error) {
+	if err := gepa.AdmitModelCall(r.ctx); err != nil {
+		r.finishRun(turn, err)
+		return ChatResponse{}, fmt.Errorf("agent %q chat turn %d: %w", r.agent.Name, turn, err)
+	}
 	chatReq := r.chatRequest(turn)
 	llmSpan := gepa.NewUsageSpan(r.memory.RunID, r.runSpan.ID, gepa.UsageSpanLLMCall, r.agent.Model)
 	llmSpan.Model = r.agent.Model
@@ -344,6 +357,7 @@ func (r *agentRun) chat(turn int) (ChatResponse, error) {
 		},
 	)
 	resp, err := r.client.Chat(r.ctx, chatReq)
+	gepa.RecordUsage(r.ctx, resp.Usage)
 	if resolved := strings.TrimSpace(resp.ResolvedModel); resolved != "" {
 		llmSpan.Model = resolved
 	}

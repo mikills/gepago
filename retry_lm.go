@@ -3,6 +3,7 @@ package gepa
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -20,7 +21,8 @@ const defaultRetryMaxDelay = 30 * time.Second
 //
 // It is a StructuredGenerator whatever LM is: GenerateStructured passes the format to LM when
 // LM is a StructuredGenerator and sends the prompt alone otherwise, so wrapping a model
-// neither hides nor fakes its structured output.
+// neither hides nor fakes its structured output. It is a ChatClient too, so a Predict with
+// tools can use it, but its Chat works only when LM can chat (see Chat).
 type RetryingLanguageModel struct {
 	// LM is the wrapped model.
 	LM Generator
@@ -61,40 +63,93 @@ func (m *RetryingLanguageModel) GenerateStructured(
 	})
 }
 
-// retry makes up to MaxAttempts calls, waiting between them, until one succeeds or fails with
-// an error that is not transient.
+// Chat calls LM's Chat, retrying transient failures as Generate does: with the same backoff,
+// the same admission of each attempt after the first against the run budget, and a returned
+// ChatResponse that is the last attempt's with the summed usage of every attempt. When LM
+// cannot chat, Chat fails at once with a Permanent error, and a Predict with tools or
+// middleware rejects the model in Validate.
+func (m *RetryingLanguageModel) Chat(ctx context.Context, req ChatRequest) (ChatResponse, error) {
+	if m != nil && m.LM != nil && !canChat(m.LM) {
+		return ChatResponse{}, PermanentError(fmt.Errorf("retrying language model: %T cannot chat", m.LM))
+	}
+	return retryCall(ctx, m, chatUsage, func(ctx context.Context) (ChatResponse, error) {
+		return m.LM.(ChatClient).Chat(ctx, req)
+	})
+}
+
+// canChat reports that the wrapped model can chat, so a Predict with tools may use the
+// wrapper. It implements chatCapability.
+func (m *RetryingLanguageModel) canChat() bool {
+	return m != nil && m.LM != nil && canChat(m.LM)
+}
+
+// chatCapability is implemented by a ChatClient that wraps another model and can chat only
+// when the wrapped model can, such as RetryingLanguageModel.
+type chatCapability interface {
+	canChat() bool
+}
+
+// canChat reports whether lm can serve chat calls: it is a ChatClient and, when it wraps
+// another model, that model can chat too.
+func canChat(lm any) bool {
+	if _, ok := lm.(ChatClient); !ok {
+		return false
+	}
+	if wrapper, ok := lm.(chatCapability); ok {
+		return wrapper.canChat()
+	}
+	return true
+}
+
+func generationUsage(generation *Generation) *Usage { return &generation.Usage }
+
+func chatUsage(resp *ChatResponse) *Usage { return &resp.Usage }
+
+// retry makes up to MaxAttempts Generate calls, as retryCall does.
 func (m *RetryingLanguageModel) retry(
 	ctx context.Context,
 	call func(ctx context.Context) (Generation, error),
 ) (Generation, error) {
+	return retryCall(ctx, m, generationUsage, call)
+}
+
+// retryCall makes up to m.MaxAttempts calls, waiting between them, until one succeeds or fails
+// with an error that is not transient. usageOf gives the usage a result carries; the returned
+// result carries the summed usage of every attempt.
+func retryCall[R any](
+	ctx context.Context,
+	m *RetryingLanguageModel,
+	usageOf func(*R) *Usage,
+	call func(ctx context.Context) (R, error),
+) (R, error) {
+	var result R
 	if m == nil || m.LM == nil {
-		return Generation{}, errors.New("retrying language model: wrapped model is required")
+		return result, errors.New("retrying language model: wrapped model is required")
 	}
 	attempts := max(m.MaxAttempts, 1)
-	var generation Generation
 	var usage Usage
 	ctx, admission := beginRetryAdmission(ctx)
 	defer admission.finish(&usage)
 	for attempt := 1; ; attempt++ {
 		if err := ctx.Err(); err != nil {
-			generation.Usage = usage
-			return generation, err
+			*usageOf(&result) = usage
+			return result, err
 		}
 		var err error
-		generation, err = call(ctx)
-		usage = usage.Add(generation.Usage)
-		generation.Usage = usage
+		result, err = call(ctx)
+		usage = usage.Add(*usageOf(&result))
+		*usageOf(&result) = usage
 		if err == nil || attempt >= attempts || !IsTransient(err) {
-			return generation, err
+			return result, err
 		}
 		if err := admission.report(usage); err != nil {
-			return generation, err
+			return result, err
 		}
 		if !sleepContext(ctx, m.backoff(attempt)) {
-			return generation, ctx.Err()
+			return result, ctx.Err()
 		}
 		if err := admission.next(); err != nil {
-			return generation, err
+			return result, err
 		}
 	}
 }

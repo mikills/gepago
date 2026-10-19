@@ -31,10 +31,15 @@ func (p Predict) validateChat() error {
 	if !p.chats() {
 		return nil
 	}
-	if _, ok := p.LM.(ChatClient); !ok {
+	if !canChat(p.LM) {
+		reason := "does not"
+		if _, ok := p.LM.(ChatClient); ok {
+			reason = "wraps a model that does not"
+		}
 		return fmt.Errorf(
-			"predict with tools or chat middleware needs a language model that implements ChatClient; %T does not",
+			"predict with tools or chat middleware needs a language model that implements ChatClient; %T %s",
 			p.LM,
+			reason,
 		)
 	}
 	if p.MaxToolTurns < 0 {
