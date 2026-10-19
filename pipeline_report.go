@@ -32,7 +32,9 @@ func WriteHTMLRunReport(path string, trace PipelineTrace, options HTMLReportOpti
 // a RecordingObserver: a summary of the run, then every step execution in the order it started
 // with its duration, usage, reads, writes, tool calls and error, executions nested in a
 // composite step or a nested pipeline shown inside the execution that ran them. Every value and
-// error is escaped.
+// error is escaped. Values are shown as JSON, indented when it nests no deeper than 32 levels
+// and is no larger than 64 KiB, and compact otherwise, so the report grows linearly with the
+// trace.
 func HTMLRunReport(trace PipelineTrace, options HTMLReportOptions) (string, error) {
 	title := strings.TrimSpace(options.Title)
 	if title == "" {
@@ -64,27 +66,67 @@ func countExecutions(steps []StepTrace, view *runReportView) {
 	})
 }
 
-// reportJSON renders a tool call's arguments or output as indented JSON, or as it is when it
-// is not JSON, without escaping HTML, which the template escapes.
+const (
+	// maxReportIndentDepth is the deepest nesting of JSON the run report indents.
+	maxReportIndentDepth = 32
+	// maxReportIndentBytes is the size of the largest JSON the run report indents.
+	maxReportIndentBytes = 64 << 10
+)
+
+// reportJSON renders a tool call's arguments or output as indented JSON, without escaping
+// HTML, which the template escapes. JSON nested deeper than maxReportIndentDepth or larger than
+// maxReportIndentBytes is rendered compact instead, since indenting it would make the report
+// grow with the square of its depth; text that is not JSON is rendered as it is.
 func reportJSON(data []byte) string {
+	if len(data) <= maxReportIndentBytes && jsonDepth(data) <= maxReportIndentDepth {
+		var out bytes.Buffer
+		if json.Indent(&out, data, "", "  ") == nil {
+			return out.String()
+		}
+	}
 	var out bytes.Buffer
-	if json.Indent(&out, data, "", "  ") != nil {
+	if json.Compact(&out, data) != nil {
 		return string(data)
 	}
 	return out.String()
 }
 
-// reportValues renders values as indented JSON, without escaping HTML, which the template
-// escapes.
+// reportValues renders values as JSON, without escaping HTML, which the template escapes,
+// indented as reportJSON indents it.
 func reportValues(values map[string]any) string {
 	var out bytes.Buffer
 	encoder := json.NewEncoder(&out)
 	encoder.SetEscapeHTML(false)
-	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(values); err != nil {
 		return fmt.Sprintf("%v", values)
 	}
-	return strings.TrimSpace(out.String())
+	return reportJSON(bytes.TrimSpace(out.Bytes()))
+}
+
+// jsonDepth returns how deeply data, JSON text, nests objects and arrays, counting no further
+// than one past maxReportIndentDepth.
+func jsonDepth(data []byte) int {
+	depth, deepest := 0, 0
+	inString, escaped := false, false
+	for _, c := range data {
+		switch {
+		case escaped:
+			escaped = false
+		case inString:
+			escaped = c == '\\'
+			inString = c != '"'
+		case c == '"':
+			inString = true
+		case c == '{' || c == '[':
+			depth++
+			if deepest = max(deepest, depth); deepest > maxReportIndentDepth {
+				return deepest
+			}
+		case c == '}' || c == ']':
+			depth--
+		}
+	}
+	return deepest
 }
 
 var runReportTemplate = template.Must(template.New("gepa-run-report").Funcs(template.FuncMap{
