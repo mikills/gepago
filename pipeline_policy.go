@@ -211,13 +211,18 @@ func (p *policyStep) onError(ctx context.Context, candidate Candidate, s State, 
 	switch p.policy.OnError.kind {
 	case errorActionSkip:
 		run := pipelineRunFrom(ctx)
+		finish := beginStandIn(ctx, skippedOnError, p.child, s.values)
+		defaults := stepResult{writes: map[string]any{}}
 		for _, key := range p.child.writes {
 			if value, ok := run.defaultFor(key.Name); ok {
-				s.store(key.Name, key.Type, deepCopy(value), true)
+				value = deepCopy(value)
+				s.store(key.Name, key.Type, value, true)
+				defaults.writes[key.Name] = value
 			} else {
 				s.skip(key.Name)
 			}
 		}
+		finish(defaults)
 		return nil
 	case errorActionFallback:
 		result, fallbackErr := runChild(ctx, candidate, p.child.name, p.fallback, s.values)

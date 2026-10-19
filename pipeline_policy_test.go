@@ -50,6 +50,9 @@ func outcomeSummary(run *pipelineRun) []string {
 		if outcome.Cached {
 			line += " cached"
 		}
+		if outcome.Skipped {
+			line += " skipped"
+		}
 		if outcome.Err != nil {
 			line += " err: " + outcome.Err.Error()
 		}
@@ -294,7 +297,7 @@ func TestWithPolicySkip(t *testing.T) {
 		got, run, err := pipeline.execute(ctx, nil, Prediction{})
 		require.NoError(t, err)
 		require.Equal(t, Prediction{"amount": 7, "decision": "amount 7"}, pipeline.written(got))
-		require.Equal(t, []string{"extract#1 err: flaky", "decide#1"}, outcomeSummary(run))
+		require.Equal(t, []string{"extract#1 err: flaky", "extract#2 skipped", "decide#1"}, outcomeSummary(run))
 	})
 
 	t.Run("a default merges with an earlier write", func(t *testing.T) {

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
-	"time"
 )
 
 // WithCache returns step with its results cached for the rest of the run. Before step runs,
@@ -56,14 +55,9 @@ func (c *cacheStep) runCandidate(ctx context.Context, candidate Candidate, s Sta
 	key, keyErr := c.cacheKey(readOnlyView(s.values, c.child.readTypes))
 	if keyErr == nil {
 		if result, ok := run.cached(c.child.name, key); ok {
-			start := time.Now()
+			finish := beginStandIn(ctx, cacheHit, c.child, s.values)
 			result.commitTo(s, c.child)
-			run.record(stepOutcome{
-				Step:     c.child.name,
-				Attempt:  run.nextAttempt(c.child.name),
-				Duration: time.Since(start),
-				Cached:   true,
-			})
+			finish(result)
 			return nil
 		}
 	}

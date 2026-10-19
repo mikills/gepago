@@ -281,8 +281,9 @@ func MergeWith[T any](k Key[T], merge func(prev, next T) (T, error)) MergeRule {
 
 // PipelineSpec declares a Pipeline: its read-only inputs, its ordered steps, merge rules for
 // keys written by more than one step, defaults for the writes of steps that skip on error,
-// and the budget of each run. A run fails when its inputs hold a key that is not declared in
-// Inputs, unless AllowExtraInputs is set, in which case such keys are dropped.
+// the budget of each run, and who observes its runs. A run fails when its inputs hold a key
+// that is not declared in Inputs, unless AllowExtraInputs is set, in which case such keys are
+// dropped.
 type PipelineSpec struct {
 	Inputs   []KeyRef
 	Steps    []Step
@@ -291,6 +292,10 @@ type PipelineSpec struct {
 	// Budget limits every run of the pipeline; the zero value sets no limits.
 	Budget           RunBudget
 	AllowExtraInputs bool
+	// Observers receive the events of every run, in this order; see PipelineObserver.
+	Observers []PipelineObserver
+	// Redactor rewrites the values events carry; see Redactor. Nil lets them through.
+	Redactor Redactor
 }
 
 // Pipeline is a validated, immutable sequence of steps created by PipelineSpec.Build. It
@@ -307,6 +312,8 @@ type Pipeline struct {
 	merges           map[string]func(prev, next any) (any, error)
 	defaults         map[string]any
 	budget           RunBudget
+	observers        []PipelineObserver
+	redactor         Redactor
 }
 
 // keySource records the type of an available key and where it comes from; an empty step
@@ -352,6 +359,11 @@ func (s PipelineSpec) Build() (Pipeline, error) {
 	if err := s.Budget.validate(); err != nil {
 		return Pipeline{}, err
 	}
+	for i, observer := range s.Observers {
+		if isNil(observer) {
+			return Pipeline{}, fmt.Errorf("pipeline observer %d is nil", i)
+		}
+	}
 	builder := newPipelineBuilder(inputs, merges, defaults)
 	steps := make([]*stepNode, 0, len(s.Steps))
 	for i, step := range s.Steps {
@@ -390,6 +402,8 @@ func (s PipelineSpec) Build() (Pipeline, error) {
 		merges:           merges,
 		defaults:         defaultValues,
 		budget:           s.Budget.clone(),
+		observers:        slices.Clone(s.Observers),
+		redactor:         s.Redactor,
 	}, nil
 }
 
@@ -560,12 +574,16 @@ func (p Pipeline) execute(ctx context.Context, candidate Candidate, inputs Predi
 	run := newPipelineRun(p.defaults)
 	ctx, release := startRunBudget(context.WithValue(ctx, pipelineRunKey{}, run), p.budget)
 	defer release()
+	ctx, observed := p.observeRun(ctx, values)
 	state := State{values: values}
 	for _, node := range p.steps {
 		if err := p.runStep(ctx, candidate, node, state); err != nil {
-			return state, run, newStepError(node.name, err)
+			stepErr := newStepError(node.name, err)
+			observed.finish(ctx, stepErr)
+			return state, run, stepErr
 		}
 	}
+	observed.finish(ctx, nil)
 	return state, run, nil
 }
 

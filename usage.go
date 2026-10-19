@@ -149,6 +149,10 @@ const (
 	UsageSpanAgentRun UsageSpanKind = "agent.run"
 	UsageSpanLLMCall  UsageSpanKind = "llm.chat"
 	UsageSpanToolCall UsageSpanKind = "tool.call"
+	// UsageSpanPipelineRun is the span of one Pipeline run; see PipelineObserver.
+	UsageSpanPipelineRun UsageSpanKind = "pipeline.run"
+	// UsageSpanPipelineStep is the span of one execution of a pipeline step.
+	UsageSpanPipelineStep UsageSpanKind = "pipeline.step"
 )
 
 // UsageSpan records timing and usage for one measured operation.
