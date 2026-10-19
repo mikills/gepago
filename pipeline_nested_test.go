@@ -2,12 +2,15 @@ package gepa
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"maps"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -61,16 +64,16 @@ func TestNestedStepsScopeTheirCandidates(t *testing.T) {
 	require.NoError(t, err)
 
 	steps := map[string]string{
-		"extract.instruction":          "extract",
-		"extract.estimate.instruction": "estimate",
-		"fan.left.instruction":         "left",
-		"fan.route.arm.instruction":    "arm",
-		"guard.main.instruction":       "main",
-		"guard.spare.instruction":      "spare",
+		"extract.instruction":       "extract",
+		"estimate.instruction":      "estimate",
+		"fan.left.instruction":      "left",
+		"fan.route.arm.instruction": "arm",
+		"guard.main.instruction":    "main",
+		"guard.spare.instruction":   "spare",
 	}
 	seed := pipeline.SeedCandidate()
 	require.ElementsMatch(t, slices.Collect(maps.Keys(steps)), slices.Collect(maps.Keys(seed)))
-	require.Equal(t, "estimate seed", seed["extract.estimate.instruction"])
+	require.Equal(t, "estimate seed", seed["estimate.instruction"])
 
 	trained := Candidate{}
 	for key := range steps {
@@ -90,6 +93,106 @@ func TestNestedStepsScopeTheirCandidates(t *testing.T) {
 		require.True(t, ok, step)
 		require.Equal(t, Candidate{InstructionComponent: "trained " + key}, candidate, step)
 	}
+}
+
+// fixedProgram is a component programme with a chosen seed that records the candidate it ran
+// with under label.
+type fixedProgram struct {
+	seen   *sync.Map
+	label  string
+	seed   Candidate
+	output string
+}
+
+func (fixedProgram) Validate() error { return nil }
+
+func (p fixedProgram) SeedCandidate() Candidate { return CloneCandidate(p.seed) }
+
+func (p fixedProgram) RunCandidate(_ context.Context, candidate Candidate, _ Prediction) (Prediction, error) {
+	p.seen.Store(p.label, CloneCandidate(candidate))
+	return Prediction{p.output: p.label}, nil
+}
+
+func TestOnErrorFallbackCandidateDoesNotCollide(t *testing.T) {
+	seen := &sync.Map{}
+	fact := Key[string]{Name: "fact"}
+	program := func(label string) fixedProgram {
+		return fixedProgram{seen: seen, label: label, seed: Candidate{"instruction": label + " seed"}, output: "fact"}
+	}
+	// the wrapped step runs a nested pipeline whose step has the fallback's name, so its own
+	// components are "summarise.<component>" too.
+	inner, err := PipelineSpec{
+		Inputs: refs(docKey.Ref()),
+		Steps:  []Step{NewProgramStep("summarise", program("inner"), refs(docKey.Ref()), refs(fact.Ref()))},
+	}.Build()
+	require.NoError(t, err)
+	primary := NewProgramStep("extract", inner, refs(docKey.Ref()), refs(fact.Ref()))
+	fallback := NewProgramStep("summarise", program("fallback"), refs(docKey.Ref()), refs(fact.Ref()))
+
+	t.Run("top level", func(t *testing.T) {
+		pipeline, err := PipelineSpec{
+			Inputs: refs(docKey.Ref()),
+			Steps:  []Step{WithPolicy(primary, StepPolicy{OnError: OnErrorFallback(fallback)})},
+		}.Build()
+		require.NoError(t, err)
+		require.Equal(t, Candidate{
+			"extract.summarise.instruction": "inner seed",
+			"summarise.instruction":         "fallback seed",
+		}, pipeline.SeedCandidate())
+
+		_, err = pipeline.RunCandidate(
+			context.Background(),
+			Candidate{"extract.summarise.instruction": "trained", "summarise.instruction": "other"},
+			Prediction{"document": "doc"},
+		)
+		require.NoError(t, err)
+		got, ok := seen.Load("inner")
+		require.True(t, ok)
+		require.Equal(t, Candidate{"instruction": "trained"}, got)
+	})
+
+	t.Run("inside a composite", func(t *testing.T) {
+		pipeline, err := PipelineSpec{
+			Inputs: refs(docKey.Ref()),
+			Steps: []Step{Parallel(
+				"fan",
+				WithPolicy(primary, StepPolicy{OnError: OnErrorFallback(fallback)}),
+				writeNotes("note"),
+			)},
+		}.Build()
+		require.NoError(t, err)
+		require.Equal(t, Candidate{
+			"fan.extract.summarise.instruction": "inner seed",
+			"fan.summarise.instruction":         "fallback seed",
+		}, pipeline.SeedCandidate())
+	})
+}
+
+func TestCheckCandidateKeysNamesBothOwners(t *testing.T) {
+	seen := &sync.Map{}
+	first := scopedStep(seen, "extract", "a", nil)
+	second := scopedStep(seen, "extract", "b", nil)
+
+	// Build refuses the duplicate name first; the check guards the scoping rule itself.
+	err := checkCandidateKeys([]*stepNode{newStepNode(first), newStepNode(Parallel("fan", writeNotes("n"))),
+		newStepNode(WithPolicy(second, StepPolicy{}))})
+	require.EqualError(t, err, `pipeline steps "extract" and "extract" both own candidate key "extract.instruction"`)
+	require.NoError(t, checkCandidateKeys([]*stepNode{newStepNode(first), newStepNode(Parallel("fan", second))}))
+}
+
+func TestWrappersShareTheirParentsCandidateNamespace(t *testing.T) {
+	seen := &sync.Map{}
+	model := scopedStep(seen, "model", "amount", nil)
+	backup := scopedStep(seen, "backup", "amount", nil)
+	policy, ok := WithPolicy(model, StepPolicy{OnError: OnErrorFallback(backup)}).(ComponentStep)
+	require.True(t, ok)
+	require.Equal(t, Candidate{
+		"model.instruction":  "model seed",
+		"backup.instruction": "backup seed",
+	}, policy.SeedCandidate())
+	cached, ok := WithCache(WithPolicy(model, StepPolicy{}), nil).(ComponentStep)
+	require.True(t, ok)
+	require.Equal(t, Candidate{"model.instruction": "model seed"}, cached.SeedCandidate())
 }
 
 func TestCompositesAreComponentStepsOnlyWithComponents(t *testing.T) {
@@ -472,4 +575,63 @@ func TestStepOutcomesRecordEachExecution(t *testing.T) {
 		{Step: "summarise", Attempt: 1, Usage: tenTokens, Err: errRateLimited},
 		{Step: "summarise", Attempt: 2, Usage: tenTokens},
 	}, run.outcomes)
+}
+
+// TestComposedPipelineStress runs a pipeline that nests the control-flow steps, with retries,
+// timeouts, a cache, budgets and a shared flaky model, many times concurrently. It passes when
+// the race detector finds nothing.
+func TestComposedPipelineStress(t *testing.T) {
+	var provider atomic.Int32
+	shared := GeneratorFunc(func(ctx context.Context, _ string) (Generation, error) {
+		n := provider.Add(1)
+		if n%7 == 0 {
+			return Generation{Usage: tenTokens}, TransientError(errors.New("flaky"))
+		}
+		if n%11 == 0 {
+			select {
+			case <-ctx.Done():
+				return Generation{Usage: tenTokens}, ctx.Err()
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+		return Generation{Usage: tenTokens}, nil
+	})
+	var children []Step
+	for i := range 6 {
+		name := fmt.Sprintf("c%d", i)
+		meterKey := Key[int]{Name: name + "m"}
+		lm := GeneratorFunc(func(ctx context.Context, prompt string) (Generation, error) {
+			generation, err := shared.Generate(ctx, prompt)
+			generation.Text = fmt.Sprintf(`{%q: "done"}`, name)
+			return generation, err
+		})
+		meter := NewStep(name+"m", refs(docKey.Ref()), refs(meterKey.Ref()), func(ctx context.Context, s State) error {
+			meterKey.Set(s, BudgetFrom(ctx).Remaining().Tokens%3)
+			return nil
+		})
+		children = append(
+			children,
+			WithPolicy(
+				WithCache(predictStep(name, lm, docKey.Ref(), Key[string]{Name: name}.Ref()), nil),
+				StepPolicy{Timeout: 3 * time.Millisecond, Retry: RetryPolicy{MaxAttempts: 4}},
+			),
+			meter,
+		)
+	}
+	pipeline, err := PipelineSpec{
+		Inputs: refs(docKey.Ref()),
+		Steps:  []Step{WithPolicy(Parallel("fan", children...), StepPolicy{Retry: RetryPolicy{MaxAttempts: 3}})},
+		Budget: RunBudget{MaxModelCalls: 1000, MaxTokens: 100000, PerStepTokens: map[string]int{"fan": 100000}},
+	}.Build()
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Go(func() {
+			for range 10 {
+				_, _ = pipeline.RunCandidate(context.Background(), nil, Prediction{"document": "d"})
+			}
+		})
+	}
+	wg.Wait()
 }

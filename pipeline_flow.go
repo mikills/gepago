@@ -97,7 +97,7 @@ func (b *branchStep) checkChildren() error {
 }
 
 func (b *branchStep) seedCandidate() Candidate {
-	return seedChildren(b.name, slices.Collect(maps.Values(b.arms))...)
+	return seedChildren(slices.Collect(maps.Values(b.arms))...)
 }
 
 func (b *branchStep) Run(ctx context.Context, s State) error {
@@ -197,7 +197,7 @@ func (p *parallelStep) checkChildren() error {
 }
 
 func (p *parallelStep) seedCandidate() Candidate {
-	return seedChildren(p.name, p.steps...)
+	return seedChildren(p.steps...)
 }
 
 func (p *parallelStep) Run(ctx context.Context, s State) error {
@@ -289,7 +289,7 @@ func (f *fallbackStep) checkChildren() error {
 }
 
 func (f *fallbackStep) seedCandidate() Candidate {
-	return seedChildren(f.name, f.primary, f.secondary)
+	return seedChildren(f.primary, f.secondary)
 }
 
 func (f *fallbackStep) Run(ctx context.Context, s State) error {

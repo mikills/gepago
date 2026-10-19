@@ -98,9 +98,17 @@ func asComponentStep(step compositeStep, children ...*stepNode) Step {
 	return step
 }
 
-// seedChildren collects the seed components of children. A wrapped child shares its parent's
-// name and keeps its components unscoped; any other child's are scoped by its name.
-func seedChildren(parent string, children ...*stepNode) Candidate {
+// isWrapper reports whether step is a WithPolicy or WithCache wrapper. A wrapper shares the
+// candidate namespace of the steps around it: its own SeedCandidate and RunCandidate use keys
+// already scoped by the names of the steps it wraps.
+func isWrapper(step Step) bool {
+	composite, ok := step.(compositeStep)
+	return ok && composite.wrapper()
+}
+
+// seedChildren collects the seed components of children in the namespace that holds them. A
+// step's components are scoped by its name; a wrapper's are already scoped.
+func seedChildren(children ...*stepNode) Candidate {
 	candidate := Candidate{}
 	for _, child := range children {
 		componentStep, ok := child.step.(ComponentStep)
@@ -108,7 +116,7 @@ func seedChildren(parent string, children ...*stepNode) Candidate {
 			continue
 		}
 		for component, value := range componentStep.SeedCandidate() {
-			if child.name == parent {
+			if isWrapper(child.step) {
 				candidate[component] = value
 			} else {
 				candidate[StepComponentName(child.name, component)] = value
@@ -116,6 +124,55 @@ func seedChildren(parent string, children ...*stepNode) Candidate {
 		}
 	}
 	return candidate
+}
+
+// childCandidate returns the part of a namespace's candidate that belongs to child: the keys
+// scoped by its name, or all of them for a wrapper, which shares the namespace.
+func childCandidate(candidate Candidate, child *stepNode) Candidate {
+	if isWrapper(child.step) {
+		return candidate
+	}
+	return stepCandidate(candidate, child.name)
+}
+
+// checkCandidateKeys requires every component in the pipeline to have a candidate key of its
+// own. Keys start with the names of the steps that own them, which Build requires to be
+// unique and free of '.', so the composites of this package cannot produce two equal keys;
+// the check keeps that true if scoping changes.
+func checkCandidateKeys(steps []*stepNode) error {
+	owners := map[string]string{}
+	var walk func(node *stepNode, prefix string) error
+	walk = func(node *stepNode, prefix string) error {
+		if composite, ok := node.step.(compositeStep); ok {
+			if !composite.wrapper() {
+				prefix += node.name + "."
+			}
+			for _, child := range composite.children() {
+				if err := walk(child.node, prefix); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		componentStep, ok := node.step.(ComponentStep)
+		if !ok {
+			return nil
+		}
+		for _, component := range slices.Sorted(maps.Keys(componentStep.SeedCandidate())) {
+			key := prefix + StepComponentName(node.name, component)
+			if owner, ok := owners[key]; ok {
+				return fmt.Errorf("pipeline steps %q and %q both own candidate key %q", owner, node.name, key)
+			}
+			owners[key] = node.name
+		}
+		return nil
+	}
+	for _, node := range steps {
+		if err := walk(node, ""); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // unionKeys merges key lists, keeping the first declaration of each name. Build checks every

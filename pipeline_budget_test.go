@@ -2,8 +2,10 @@ package gepa
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -63,7 +65,7 @@ func TestRunBudgetLimitsTripAtTheirBoundary(t *testing.T) {
 			name:      "MaxTokens one below",
 			budget:    RunBudget{MaxTokens: 29},
 			wantCalls: 3,
-			wantErr:   `pipeline step "c": run budget MaxTokens 29 exceeded: 30 tokens recorded`,
+			wantErr:   `pipeline step "c": run budget MaxTokens 29 exceeded: 30 tokens spent`,
 			want:      Prediction{"a": "done", "b": "done"},
 		},
 		{name: "MaxTokens at", budget: RunBudget{MaxTokens: 30}, wantCalls: 3, want: complete},
@@ -73,14 +75,14 @@ func TestRunBudgetLimitsTripAtTheirBoundary(t *testing.T) {
 			budget:    RunBudget{MaxTokens: 29},
 			usage:     Usage{PromptTokens: 4, CompletionTokens: 6},
 			wantCalls: 3,
-			wantErr:   `pipeline step "c": run budget MaxTokens 29 exceeded: 30 tokens recorded`,
+			wantErr:   `pipeline step "c": run budget MaxTokens 29 exceeded: 30 tokens spent`,
 			want:      Prediction{"a": "done", "b": "done"},
 		},
 		{
 			name:      "PerStepTokens one below",
 			budget:    RunBudget{PerStepTokens: map[string]int{"b": 9}},
 			wantCalls: 2,
-			wantErr:   `pipeline step "b": run budget PerStepTokens["b"] 9 exceeded: 10 tokens recorded`,
+			wantErr:   `pipeline step "b": run budget PerStepTokens["b"] 9 exceeded: 10 tokens spent`,
 			want:      Prediction{"a": "done"},
 		},
 		{name: "PerStepTokens at", budget: RunBudget{PerStepTokens: map[string]int{"b": 10}}, wantCalls: 3, want: complete},
@@ -270,7 +272,7 @@ func TestBudgetFromRemaining(t *testing.T) {
 		require.NoError(t, err)
 
 		_, err = pipeline.RunCandidate(context.Background(), nil, Prediction{})
-		require.EqualError(t, err, `pipeline step "probe": run budget PerStepTokens["probe"] 5 exceeded: 20 tokens recorded`)
+		require.EqualError(t, err, `pipeline step "probe": run budget PerStepTokens["probe"] 5 exceeded: 20 tokens spent`)
 		require.Equal(t, 0, got.Tokens)
 		require.Equal(t, 0, got.StepTokens)
 	})
@@ -343,7 +345,7 @@ func TestRunBudgetCoversNestedPipelines(t *testing.T) {
 			name:  "outer step's token limit",
 			outer: RunBudget{PerStepTokens: map[string]int{"inner": 15}},
 			wantErr: `pipeline step "inner": pipeline step "b": run budget PerStepTokens["inner"] 15 exceeded: ` +
-				`20 tokens recorded`,
+				`20 tokens spent`,
 		},
 	}
 	for _, tt := range tests {
@@ -374,26 +376,47 @@ func TestRunBudgetCoversNestedPipelines(t *testing.T) {
 	}
 }
 
-func TestRunBudgetUnderParallel(t *testing.T) {
-	fan := func(calls *atomic.Int32, remaining *[4]BudgetRemaining) Step {
-		steps := make([]Step, 0, 4)
-		for i := range 4 {
-			name := fmt.Sprintf("s%d", i)
-			model := replyStep(name, "document", tenTokens, calls)
-			steps = append(steps, NewStep(name, refs(docKey.Ref()), model.Writes(), func(ctx context.Context, s State) error {
-				remaining[i] = BudgetFrom(ctx).Remaining()
-				return model.Run(ctx, s)
-			}))
-		}
-		return Parallel("fan", steps...)
-	}
+// meteredFan is a Parallel of four model steps that each read BudgetFrom(ctx).Remaining()
+// once every step has read it and before any makes its call, and, when after is set, again
+// once every call has finished.
+type meteredFan struct {
+	calls  atomic.Int32
+	before [4]BudgetRemaining
+	after  [4]BudgetRemaining
+}
 
+func (f *meteredFan) step(after bool) Step {
+	var read, called sync.WaitGroup
+	read.Add(4)
+	called.Add(4)
+	steps := make([]Step, 0, 4)
+	for i := range 4 {
+		name := fmt.Sprintf("s%d", i)
+		model := replyStep(name, "document", tenTokens, &f.calls)
+		steps = append(steps, NewStep(name, refs(docKey.Ref()), model.Writes(), func(ctx context.Context, s State) error {
+			f.before[i] = BudgetFrom(ctx).Remaining()
+			read.Done()
+			read.Wait()
+			if err := model.Run(ctx, s); err != nil {
+				return err
+			}
+			if after {
+				called.Done()
+				called.Wait()
+				f.after[i] = BudgetFrom(ctx).Remaining()
+			}
+			return nil
+		}))
+	}
+	return Parallel("fan", steps...)
+}
+
+func TestRunBudgetUnderParallel(t *testing.T) {
 	t.Run("within budget", func(t *testing.T) {
-		calls := &atomic.Int32{}
-		var remaining [4]BudgetRemaining
+		fan := &meteredFan{}
 		pipeline, err := PipelineSpec{
 			Inputs: refs(docKey.Ref()),
-			Steps:  []Step{fan(calls, &remaining)},
+			Steps:  []Step{fan.step(true)},
 			Budget: RunBudget{MaxModelCalls: 4, MaxTokens: 40, PerStepTokens: map[string]int{"fan": 40}},
 		}.Build()
 		require.NoError(t, err)
@@ -401,18 +424,25 @@ func TestRunBudgetUnderParallel(t *testing.T) {
 		got, run, err := pipeline.execute(context.Background(), nil, Prediction{"document": "cash 10"})
 		require.NoError(t, err)
 		require.Len(t, pipeline.written(got), 4)
-		require.Equal(t, int32(4), calls.Load())
+		require.Equal(t, int32(4), fan.calls.Load())
 		fanOutcome := run.outcomes[len(run.outcomes)-1]
 		require.Equal(t, "fan", fanOutcome.Step)
 		require.Equal(t, Usage{PromptTokens: 16, CompletionTokens: 24, TotalTokens: 40}, fanOutcome.Usage)
+		for i := range 4 {
+			require.Equal(
+				t,
+				BudgetRemaining{Duration: math.MaxInt64, ModelCalls: 4, Tokens: 40, StepTokens: 40},
+				fan.before[i],
+			)
+			require.Equal(t, BudgetRemaining{Duration: math.MaxInt64}, fan.after[i])
+		}
 	})
 
 	t.Run("one call over budget", func(t *testing.T) {
-		calls := &atomic.Int32{}
-		var remaining [4]BudgetRemaining
+		fan := &meteredFan{}
 		pipeline, err := PipelineSpec{
 			Inputs: refs(docKey.Ref()),
-			Steps:  []Step{fan(calls, &remaining)},
+			Steps:  []Step{fan.step(false)},
 			Budget: RunBudget{MaxModelCalls: 3},
 		}.Build()
 		require.NoError(t, err)
@@ -420,8 +450,15 @@ func TestRunBudgetUnderParallel(t *testing.T) {
 		got, err := pipeline.RunCandidate(context.Background(), nil, Prediction{"document": "cash 10"})
 		require.ErrorContains(t, err, "run budget MaxModelCalls 3 exceeded: model call 4 refused")
 		require.True(t, IsBudget(err))
-		require.Equal(t, int32(3), calls.Load())
+		require.Equal(t, int32(3), fan.calls.Load())
 		require.Equal(t, Prediction{}, got)
+		for i := range 4 {
+			require.Equal(
+				t,
+				BudgetRemaining{Duration: math.MaxInt64, ModelCalls: 3, Tokens: math.MaxInt, StepTokens: math.MaxInt},
+				fan.before[i],
+			)
+		}
 	})
 }
 
@@ -436,9 +473,169 @@ func TestAdmitModelCallAfterTheRunBudgetIsSpent(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = pipeline.RunCandidate(context.Background(), nil, Prediction{})
-	require.EqualError(t, err, `pipeline step "spend": run budget MaxTokens 10 exceeded: 20 tokens recorded`)
-	require.EqualError(t, admitErr, "run budget MaxTokens 10 exceeded: 20 tokens recorded")
+	require.EqualError(t, err, `pipeline step "spend": run budget MaxTokens 10 exceeded: 20 tokens spent`)
+	require.EqualError(t, admitErr, "run budget MaxTokens 10 exceeded: 20 tokens spent")
 	require.True(t, IsBudget(admitErr))
+}
+
+// flakyProvider fails transiently failures times, then answers {"a": "done"}; every call costs
+// ten tokens and is counted in calls.
+func flakyProvider(failures int32, calls *atomic.Int32) Generator {
+	return GeneratorFunc(func(context.Context, string) (Generation, error) {
+		if calls.Add(1) <= failures {
+			return Generation{Usage: tenTokens}, TransientError(errors.New("503"))
+		}
+		return Generation{Text: `{"a": "done"}`, Usage: tenTokens}, nil
+	})
+}
+
+func retryingPipeline(t *testing.T, budget RunBudget, calls *atomic.Int32) Pipeline {
+	t.Helper()
+	lm := &RetryingLanguageModel{LM: flakyProvider(2, calls), MaxAttempts: 3}
+	pipeline, err := PipelineSpec{
+		Inputs: refs(docKey.Ref()),
+		Steps:  []Step{predictStep("a", lm, docKey.Ref(), Key[string]{Name: "a"}.Ref())},
+		Budget: budget,
+	}.Build()
+	require.NoError(t, err)
+	return pipeline
+}
+
+func TestRunBudgetCountsEveryRetryAttempt(t *testing.T) {
+	tests := []struct {
+		name       string
+		budget     RunBudget
+		wantCalls  int32
+		wantTokens int
+		wantErr    string
+	}{
+		{
+			name:       "MaxModelCalls one below",
+			budget:     RunBudget{MaxModelCalls: 2},
+			wantCalls:  2,
+			wantTokens: 20,
+			wantErr:    `pipeline step "a": run budget MaxModelCalls 2 exceeded: model call 3 refused`,
+		},
+		{name: "MaxModelCalls at", budget: RunBudget{MaxModelCalls: 3}, wantCalls: 3, wantTokens: 30},
+		{name: "MaxModelCalls one above", budget: RunBudget{MaxModelCalls: 4}, wantCalls: 3, wantTokens: 30},
+		{
+			name:       "MaxTokens below the tokens of the earlier attempts",
+			budget:     RunBudget{MaxTokens: 19},
+			wantCalls:  2,
+			wantTokens: 20,
+			wantErr:    `pipeline step "a": run budget MaxTokens 19 exceeded: 20 tokens spent`,
+		},
+		{
+			name:       "MaxTokens at the tokens of the earlier attempts",
+			budget:     RunBudget{MaxTokens: 20},
+			wantCalls:  3,
+			wantTokens: 30,
+			wantErr:    `pipeline step "a": run budget MaxTokens 20 exceeded: 30 tokens spent`,
+		},
+		{name: "MaxTokens at", budget: RunBudget{MaxTokens: 30}, wantCalls: 3, wantTokens: 30},
+		{name: "MaxTokens one above", budget: RunBudget{MaxTokens: 31}, wantCalls: 3, wantTokens: 30},
+		{
+			name:       "PerStepTokens below the tokens of the earlier attempts",
+			budget:     RunBudget{PerStepTokens: map[string]int{"a": 19}},
+			wantCalls:  2,
+			wantTokens: 20,
+			wantErr:    `pipeline step "a": run budget PerStepTokens["a"] 19 exceeded: 20 tokens spent`,
+		},
+		{name: "PerStepTokens at", budget: RunBudget{PerStepTokens: map[string]int{"a": 30}}, wantCalls: 3, wantTokens: 30},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := &atomic.Int32{}
+			pipeline := retryingPipeline(t, tt.budget, calls)
+			compiled := CompiledProgram{Program: pipeline, Candidate: pipeline.SeedCandidate()}
+
+			got, usage, err := compiled.RunWithUsage(context.Background(), Prediction{"document": "x"})
+
+			require.Equal(t, tt.wantCalls, calls.Load())
+			require.Equal(t, tt.wantTokens, usage.TotalTokens, "each token is recorded once")
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				require.Equal(t, Prediction{"a": "done"}, got)
+				return
+			}
+			require.EqualError(t, err, tt.wantErr)
+			require.True(t, IsBudget(err))
+			require.Equal(t, Prediction{}, got)
+		})
+	}
+}
+
+func TestRetryingModelRespectsMaxModelCalls(t *testing.T) {
+	calls := &atomic.Int32{}
+	pipeline := retryingPipeline(t, RunBudget{MaxModelCalls: 1}, calls)
+
+	_, err := pipeline.RunCandidate(context.Background(), nil, Prediction{"document": "x"})
+	require.EqualError(t, err, `pipeline step "a": run budget MaxModelCalls 1 exceeded: model call 2 refused`)
+	require.Equal(t, int32(1), calls.Load())
+}
+
+func TestRetryingModelStopsAtMaxTokens(t *testing.T) {
+	calls := &atomic.Int32{}
+	pipeline := retryingPipeline(t, RunBudget{MaxTokens: 15}, calls)
+
+	_, err := pipeline.RunCandidate(context.Background(), nil, Prediction{"document": "x"})
+	require.EqualError(t, err, `pipeline step "a": run budget MaxTokens 15 exceeded: 20 tokens spent`)
+	require.Equal(t, int32(2), calls.Load())
+}
+
+func TestPerStepTokensCountOnErrorFallback(t *testing.T) {
+	out := Key[string]{Name: "out"}
+	t.Run("the fallback's tokens count against the failed step", func(t *testing.T) {
+		calls := &atomic.Int32{}
+		failing := NewStep("a", refs(docKey.Ref()), refs(out.Ref()), func(context.Context, State) error {
+			return errFlaky
+		})
+		model := replyStep("out", "document", tenTokens, calls)
+		var remaining BudgetRemaining
+		fallback := NewStep("fallback", refs(docKey.Ref()), refs(out.Ref()), func(ctx context.Context, s State) error {
+			remaining = BudgetFrom(ctx).Remaining()
+			return model.Run(ctx, s)
+		})
+		pipeline, err := PipelineSpec{
+			Inputs: refs(docKey.Ref()),
+			Steps:  []Step{WithPolicy(failing, StepPolicy{OnError: OnErrorFallback(fallback)})},
+			Budget: RunBudget{PerStepTokens: map[string]int{"a": 5}},
+		}.Build()
+		require.NoError(t, err)
+
+		got, err := pipeline.RunCandidate(context.Background(), nil, Prediction{"document": "doc"})
+		require.EqualError(
+			t,
+			err,
+			`pipeline step "a": flaky; fallback failed: pipeline step "fallback": `+
+				`run budget PerStepTokens["a"] 5 exceeded: 10 tokens spent`,
+		)
+		require.True(t, IsBudget(err))
+		require.Equal(t, 5, remaining.StepTokens)
+		require.Equal(t, int32(1), calls.Load())
+		require.Equal(t, Prediction{}, got)
+	})
+
+	t.Run("no fallback once the failed step spent its tokens", func(t *testing.T) {
+		calls := &atomic.Int32{}
+		ran := false
+		fallback := NewStep("fallback", nil, refs(Key[string]{Name: "a"}.Ref()), func(context.Context, State) error {
+			ran = true
+			return nil
+		})
+		pipeline, err := PipelineSpec{
+			Inputs: refs(docKey.Ref()),
+			Steps: []Step{WithPolicy(replyStep("a", "document", tenTokens, calls), StepPolicy{
+				OnError: OnErrorFallback(fallback),
+			})},
+			Budget: RunBudget{PerStepTokens: map[string]int{"a": 5}},
+		}.Build()
+		require.NoError(t, err)
+
+		_, err = pipeline.RunCandidate(context.Background(), nil, Prediction{"document": "doc"})
+		require.ErrorContains(t, err, `fallback failed: pipeline step "fallback": run budget PerStepTokens["a"] 5`)
+		require.False(t, ran)
+	})
 }
 
 func TestRunBudgetStepLimitStaysSpentAcrossRetries(t *testing.T) {
@@ -455,7 +652,7 @@ func TestRunBudgetStepLimitStaysSpentAcrossRetries(t *testing.T) {
 	require.EqualError(
 		t,
 		err,
-		`pipeline step "a": after 2 attempts: run budget PerStepTokens["a"] 5 exceeded: 10 tokens recorded`,
+		`pipeline step "a": after 2 attempts: run budget PerStepTokens["a"] 5 exceeded: 10 tokens spent`,
 	)
 	require.Equal(t, int32(1), calls.Load())
 }

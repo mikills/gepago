@@ -130,25 +130,23 @@ func (r stepResult) commitTo(s State, child *stepNode) {
 }
 
 // runChild runs a step nested in the composite step named parent, on a fresh view over the
-// values the composite sees, and returns its result for the composite to commit. The child's
-// error is wrapped in a StepError naming it, unless the child is the step a WithPolicy or
-// WithCache wrapper wraps, which shares the wrapper's name and candidate scope.
+// values the composite sees, and returns its result for the composite to commit. candidate is
+// the composite's candidate namespace. The child's error is wrapped in a StepError naming it,
+// unless the child is the step a WithPolicy or WithCache wrapper wraps, which shares the
+// wrapper's name.
 func runChild(ctx context.Context, candidate Candidate, parent string, child *stepNode, values map[string]any) (
 	stepResult,
 	error,
 ) {
-	if child.name == parent {
-		return runNode(ctx, candidate, child, values)
-	}
-	result, err := runNode(ctx, stepCandidate(candidate, child.name), child, values)
-	if err != nil {
+	result, err := runNode(ctx, childCandidate(candidate, child), child, values)
+	if err != nil && child.name != parent {
 		return stepResult{}, newStepError(child.name, err)
 	}
-	return result, nil
+	return result, err
 }
 
 // runNode runs one step on a fresh view of values limited to its declared keys and returns its
-// writes when it succeeds. The candidate is already scoped to the step. Each execution of a
+// writes when it succeeds. The candidate is the step's, as childCandidate selects it. Each execution of a
 // step other than a WithPolicy or WithCache wrapper gets its own usage frame and outcome
 // record. A panic becomes an error with the stack in its details. When the step's context
 // ended because a budget ran out or an attempt timed out, that cause replaces the step's

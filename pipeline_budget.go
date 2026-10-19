@@ -13,23 +13,30 @@ import (
 
 // RunBudget limits one Pipeline run. A zero field sets no limit.
 //
-// MaxModelCalls counts the calls AdmitModelCall admits: a run with MaxModelCalls N makes N
-// calls and the next is refused before it reaches the model. MaxTokens and PerStepTokens count
-// the tokens RecordUsage records, as Usage.TotalTokens or, when a provider leaves that zero,
-// PromptTokens plus CompletionTokens; reaching a token limit is allowed, and the run or step
-// fails as soon as recorded tokens exceed it. MaxDuration fails the run once the time since it
-// started reaches the limit.
+// MaxModelCalls counts the provider calls AdmitModelCall admits, each retry of a
+// RetryingLanguageModel included: a run with MaxModelCalls N makes N calls and the next is
+// refused before it reaches the model. MaxTokens and PerStepTokens count every token spent:
+// those RecordUsage records, as Usage.TotalTokens or, when a provider leaves that zero,
+// PromptTokens plus CompletionTokens, and those a retrying model has spent on earlier attempts
+// of a call still in progress. Reaching a token limit is allowed; the run or step fails as soon
+// as spent tokens exceed it, and no call or retry starts after that. MaxDuration fails the run
+// once the time since it started reaches the limit.
 //
 // Exceeding a limit fails with a Budget error (see IsBudget) that names the limit and its
 // value. A run limit ends the run: it cancels the context of every running step, and a step
 // that finishes after that fails with the budget error, its writes dropped. A PerStepTokens
 // limit fails only the steps it names, which a policy or Fallback around them may handle.
+//
+// MaxDuration does not bound a step that ignores its context: the pipeline waits for every
+// step to return rather than abandon a goroutine that still uses the run's state, and only then
+// reports the budget error.
 type RunBudget struct {
 	MaxDuration   time.Duration
 	MaxModelCalls int
 	MaxTokens     int
-	// PerStepTokens limits the tokens recorded while the named step runs, nested steps
-	// included, summed over all its executions in the run. A name may be a nested step's.
+	// PerStepTokens limits the tokens spent while the named step runs, nested steps and the
+	// step's OnErrorFallback included, summed over all its executions in the run. A name may be
+	// a nested step's.
 	PerStepTokens map[string]int
 }
 
@@ -215,33 +222,57 @@ func (f *usageFrame) add(usage Usage) {
 		budget := frame.budget
 		if frame.step == "" {
 			budget.tokens += tokens
-			if limit := budget.limits.MaxTokens; limit > 0 && budget.tokens > limit {
-				budget.fail(BudgetError(
-					fmt.Errorf("run budget MaxTokens %d exceeded: %d tokens recorded", limit, budget.tokens),
-				))
-			}
+			budget.checkTokens(budget.tokens)
 			continue
 		}
 		budget.stepTokens[frame.step] += tokens
-		limit := budget.limits.PerStepTokens[frame.step]
-		if limit <= 0 || budget.stepTokens[frame.step] <= limit {
-			continue
-		}
-		if budget.stepErrs[frame.step] == nil {
-			budget.stepErrs[frame.step] = BudgetError(fmt.Errorf(
-				"run budget PerStepTokens[%q] %d exceeded: %d tokens recorded",
-				frame.step,
-				limit,
-				budget.stepTokens[frame.step],
-			))
-		}
-		frame.cancel(budget.stepErrs[frame.step])
+		frame.checkStepTokens(budget.stepTokens[frame.step])
 	}
 }
 
+// checkTokens fails the run when spent, the tokens it has spent, exceeds MaxTokens, and
+// returns the error that ended the run. The caller holds mu.
+func (b *runBudget) checkTokens(spent int) error {
+	if limit := b.limits.MaxTokens; limit > 0 && spent > limit {
+		return b.fail(BudgetError(fmt.Errorf("run budget MaxTokens %d exceeded: %d tokens spent", limit, spent)))
+	}
+	return nil
+}
+
+// checkStepTokens fails the step of frame f when spent, the tokens the step has spent,
+// exceeds its PerStepTokens limit: it cancels the step's context with the budget error and
+// returns that error. The caller holds mu.
+func (f *usageFrame) checkStepTokens(spent int) error {
+	budget := f.budget
+	limit := budget.limits.PerStepTokens[f.step]
+	if limit <= 0 || spent <= limit {
+		return nil
+	}
+	if budget.stepErrs[f.step] == nil {
+		budget.stepErrs[f.step] = BudgetError(fmt.Errorf(
+			"run budget PerStepTokens[%q] %d exceeded: %d tokens spent",
+			f.step,
+			limit,
+			spent,
+		))
+	}
+	f.cancel(budget.stepErrs[f.step])
+	return budget.stepErrs[f.step]
+}
+
+// admitRetry reserves one more model call for a caller that retries a failed call, such as
+// RetryingLanguageModel, against the budgets of the pipeline run in ctx. spent is the usage the
+// earlier attempts of the call spent, which the caller records once the call ends; the token
+// limits count it, so an attempt does not start once they are exceeded.
+func admitRetry(ctx context.Context, spent Usage) error {
+	return usageFrameFrom(ctx).admit(usageTokens(spent))
+}
+
 // admit reserves one model call against every run around f, or returns the budget error that
-// refuses it without reserving anything.
-func (f *usageFrame) admit() error {
+// refuses it without reserving anything. pending is the number of tokens the caller has spent
+// but not yet recorded: a token limit that recorded and pending tokens together exceed
+// refuses the call and fails as if they had been recorded.
+func (f *usageFrame) admit(pending int) error {
 	if f == nil {
 		return nil
 	}
@@ -253,7 +284,13 @@ func (f *usageFrame) admit() error {
 	for frame := f; frame != nil; frame = frame.parent {
 		budget := frame.budget
 		if frame.step != "" {
+			if err := frame.checkStepTokens(budget.stepTokens[frame.step] + pending); err != nil {
+				return err
+			}
 			continue
+		}
+		if err := budget.checkTokens(budget.tokens + pending); err != nil {
+			return err
 		}
 		if limit := budget.limits.MaxModelCalls; limit > 0 && budget.calls >= limit {
 			return budget.fail(BudgetError(

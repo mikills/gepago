@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strings"
 	"time"
 )
 
@@ -14,8 +13,9 @@ import (
 type StepPolicy struct {
 	// Timeout bounds each attempt; zero means no timeout. An attempt that runs past it fails
 	// with a Transient error that matches context.DeadlineExceeded, and its writes are
-	// dropped. The pipeline waits for a step that ignores its context before reporting the
-	// timeout.
+	// dropped. Timeout does not bound a step that ignores its context: the pipeline waits for
+	// the step to return rather than abandon a goroutine that still uses the run's state, and
+	// only then reports the timeout.
 	Timeout time.Duration
 	Retry   RetryPolicy
 	OnError ErrorAction
@@ -63,9 +63,12 @@ var (
 
 // OnErrorFallback runs step in place of the failed step, on a fresh view of the state as it
 // was before the failed step, and commits its writes. step must write the same keys with the
-// same types as the failed step and may read other keys. It is a nested step: its name must be
-// unique in the pipeline and its components are scoped as "<failed step>.<step>.<component>".
-// When step fails too, the error keeps both errors for errors.Is and errors.As.
+// same types as the failed step and may read other keys. Its name must be unique in the
+// pipeline, and its components are scoped beside the failed step's, as "<step>.<component>"
+// or "<outer>.<step>.<component>" inside a composite step, so they never collide with the
+// failed step's own. It runs as part of the failed step: its tokens count against that step's
+// PerStepTokens limit. When step fails too, the error keeps both errors for errors.Is and
+// errors.As.
 //
 // Unlike Fallback, which falls back only on a non-permanent error, OnErrorFallback falls back
 // on any error left after the policy's retries.
@@ -73,11 +76,13 @@ func OnErrorFallback(step Step) ErrorAction {
 	return ErrorAction{kind: errorActionFallback, fallback: step}
 }
 
-// WithPolicy returns step run under policy. The returned step has step's name, writes and
-// candidate components, so a policy changes neither the pipeline's candidate keys nor how
-// budgets and other steps refer to step; its reads add those of an OnErrorFallback step. It
-// is a ComponentStep when step or the fallback step is one. Build rejects a negative Timeout
-// or MaxAttempts.
+// WithPolicy returns step run under policy. The returned step has step's name and writes, and
+// in a pipeline step keeps its candidate keys, so a policy changes neither the pipeline's
+// candidate keys nor how budgets and other steps refer to step; its reads add those of an
+// OnErrorFallback step. It is a ComponentStep when step or the fallback step is one. Its own
+// SeedCandidate and RunCandidate use keys already scoped by step's name and the fallback
+// step's, because it shares the candidate namespace of the steps around it. Build rejects a
+// negative Timeout or MaxAttempts.
 func WithPolicy(step Step, policy StepPolicy) Step {
 	p := &policyStep{child: newStepNode(step), policy: policy}
 	nodes := []*stepNode{p.child}
@@ -142,7 +147,7 @@ func (p *policyStep) seedCandidate() Candidate {
 	if p.fallback != nil {
 		nodes = append(nodes, p.fallback)
 	}
-	return seedChildren(p.child.name, nodes...)
+	return seedChildren(nodes...)
 }
 
 func (p *policyStep) Run(ctx context.Context, s State) error {
@@ -180,8 +185,7 @@ func (p *policyStep) runCandidate(ctx context.Context, candidate Candidate, s St
 }
 
 // attempt runs the wrapped step once on a fresh view, under the policy's timeout. When the
-// timeout fires, the step's run reports the timeout in place of its own result. The wrapped
-// step does not see the components of the fallback step.
+// timeout fires, the step's run reports the timeout in place of its own result.
 func (p *policyStep) attempt(ctx context.Context, candidate Candidate, values map[string]any, attempt int) (
 	stepResult,
 	error,
@@ -191,15 +195,6 @@ func (p *policyStep) attempt(ctx context.Context, candidate Candidate, values ma
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeoutCause(ctx, p.policy.Timeout, timeout)
 		defer cancel()
-	}
-	if p.fallback != nil && len(candidate) > 0 {
-		own := Candidate{}
-		for component, value := range candidate {
-			if !strings.HasPrefix(component, p.fallback.name+".") {
-				own[component] = value
-			}
-		}
-		candidate = own
 	}
 	return runChild(ctx, candidate, p.child.name, p.child, values)
 }
@@ -224,6 +219,10 @@ func (p *policyStep) onError(ctx context.Context, candidate Candidate, s State, 
 		}
 		return nil
 	case errorActionFallback:
+		// the fallback runs as part of this step: its tokens count against the step's
+		// PerStepTokens limit, which BudgetFrom inside the fallback reports.
+		ctx, _, release := usageFrameFrom(ctx).enterStep(ctx, p.child.name)
+		defer release()
 		result, fallbackErr := runChild(ctx, candidate, p.child.name, p.fallback, s.values)
 		if fallbackErr != nil {
 			return &fallbackError{primary: err, fallback: fallbackErr}

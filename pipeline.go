@@ -308,6 +308,9 @@ func (s PipelineSpec) Build() (Pipeline, error) {
 	if err := builder.checkMerges(s.Merges); err != nil {
 		return Pipeline{}, err
 	}
+	if err := checkCandidateKeys(steps); err != nil {
+		return Pipeline{}, err
+	}
 	if err := builder.checkSkips(steps); err != nil {
 		return Pipeline{}, err
 	}
@@ -423,20 +426,12 @@ func (p Pipeline) Validate() error {
 }
 
 // SeedCandidate returns the components of every ComponentStep under step-scoped names. A
-// component of a nested step is scoped by each enclosing step, as "<outer>.<inner>.<component>";
-// WithPolicy and WithCache add no scope of their own.
+// component of a nested step is scoped by each enclosing step, as "<outer>.<inner>.<component>".
+// WithPolicy and WithCache add no scope of their own, and an OnErrorFallback step is scoped
+// beside the step it stands in for. Build rejects a pipeline in which two components would
+// share a key.
 func (p Pipeline) SeedCandidate() Candidate {
-	candidate := Candidate{}
-	for _, node := range p.steps {
-		componentStep, ok := node.step.(ComponentStep)
-		if !ok {
-			continue
-		}
-		for component, value := range componentStep.SeedCandidate() {
-			candidate[StepComponentName(node.name, component)] = value
-		}
-	}
-	return candidate
+	return seedChildren(p.steps...)
 }
 
 // Run executes the pipeline with its seed candidate and returns the values the steps wrote,
@@ -539,7 +534,7 @@ func (p Pipeline) checkUndeclaredInputs(inputs Prediction) error {
 // here. A key left unwritten by a skipped step keeps any value it already had. A panic in the
 // step or its merges becomes an error.
 func (p Pipeline) runStep(ctx context.Context, candidate Candidate, node *stepNode, state State) (err error) {
-	result, err := runNode(ctx, stepCandidate(candidate, node.name), node, state.values)
+	result, err := runNode(ctx, childCandidate(candidate, node), node, state.values)
 	if err != nil {
 		return err
 	}

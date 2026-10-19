@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -28,30 +29,38 @@ func summariseStep(calls *atomic.Int32, replied func()) ComponentStep {
 	return predictStep("summarise", lm, docKey.Ref(), summaryKey.Ref())
 }
 
-// retriedPair runs a cached summarise step beside a step that fails transiently the first
-// time, once the model has answered, under a policy that retries the pair once. The retry is
-// the second execution of summarise in the run.
-func retriedPair(t *testing.T, key func(State) (string, error)) (Pipeline, *atomic.Int32) {
-	t.Helper()
-	calls := &atomic.Int32{}
-	replied := make(chan struct{})
-	var once sync.Once
-	summarise := WithCache(summariseStep(calls, func() { once.Do(func() { close(replied) }) }), key)
+// retryBeside runs step beside a step that fails transiently once done is closed, under a
+// policy that retries the pair once, so step runs twice in one run.
+func retryBeside(step Step, done <-chan struct{}) Step {
 	attempts := 0
-	flaky := NewStep("flaky", refs(docKey.Ref()), refs(amountKey.Ref()), func(_ context.Context, s State) error {
+	flaky := NewStep("flaky", nil, refs(amountKey.Ref()), func(_ context.Context, s State) error {
 		attempts++
 		if attempts == 1 {
-			<-replied
+			<-done
 			return errRateLimited
 		}
 		amountKey.Set(s, attempts)
 		return nil
 	})
+	return WithPolicy(Parallel("both", step, flaky), StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}})
+}
+
+// closer returns a channel and a function that closes it once.
+func closer() (chan struct{}, func()) {
+	done := make(chan struct{})
+	var once sync.Once
+	return done, func() { once.Do(func() { close(done) }) }
+}
+
+// retriedPair runs a cached summarise step twice in one run with retryBeside; the sibling
+// fails once the model has answered.
+func retriedPair(t *testing.T, key func(State) (string, error)) (Pipeline, *atomic.Int32) {
+	t.Helper()
+	calls := &atomic.Int32{}
+	replied, reply := closer()
 	pipeline, err := PipelineSpec{
 		Inputs: refs(docKey.Ref()),
-		Steps: []Step{WithPolicy(Parallel("both", summarise, flaky), StepPolicy{
-			Retry: RetryPolicy{MaxAttempts: 2},
-		})},
+		Steps:  []Step{retryBeside(WithCache(summariseStep(calls, reply), key), replied)},
 	}.Build()
 	require.NoError(t, err)
 	return pipeline, calls
@@ -108,68 +117,73 @@ func TestWithCacheKey(t *testing.T) {
 		require.Equal(t, int32(1), calls.Load())
 	})
 
+}
+
+func TestWithCacheRunsUncachedWhenTheKeyCannotBeBuilt(t *testing.T) {
+	score := Key[float64]{Name: "score"}
 	hook := Key[func()]{Name: "hook"}
 	tests := []struct {
-		name    string
-		inputs  []KeyRef
-		reads   []KeyRef
-		key     func(State) (string, error)
-		wantErr string
+		name       string
+		reads      []KeyRef
+		key        func(State) (string, error)
+		wantCached bool
 	}{
+		{name: "a buildable key is cached", reads: refs(docKey.Ref()), wantCached: true},
+		{name: "default key of a NaN read", reads: refs(score.Ref())},
+		{name: "default key of a value JSON cannot encode", reads: refs(hook.Ref())},
 		{
-			name:    "key error",
-			key:     func(State) (string, error) { return "", errors.New("no key") },
-			wantErr: `pipeline step "cached": cache key: no key`,
+			name:  "key error",
+			reads: refs(docKey.Ref()),
+			key:   func(State) (string, error) { return "", errors.New("no key") },
 		},
 		{
-			name: "key reads an undeclared key",
+			name:  "key reads an undeclared key",
+			reads: refs(docKey.Ref()),
 			key: func(s State) (string, error) {
 				_, err := amountKey.Get(s)
 				return "", err
 			},
-			wantErr: `pipeline step "cached": cache key: state key "amount" is not a declared read`,
 		},
 		{
-			name: "key writes",
+			name:  "key writes",
+			reads: refs(docKey.Ref()),
 			key: func(s State) (string, error) {
 				docKey.Set(s, "rewritten")
 				return "k", nil
 			},
-			wantErr: `pipeline step "cached": cache key: state key "document" is not a declared write`,
-		},
-		{
-			name:    "default key of a value JSON cannot encode",
-			inputs:  refs(docKey.Ref(), hook.Ref()),
-			reads:   refs(hook.Ref()),
-			wantErr: `pipeline step "cached": cache key: json: unsupported type: func()`,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			inputs, reads := tt.inputs, tt.reads
-			if inputs == nil {
-				inputs, reads = refs(docKey.Ref()), refs(docKey.Ref())
-			}
-			ran := false
-			step := NewStep("cached", reads, refs(amountKey.Ref()), func(_ context.Context, s State) error {
-				ran = true
-				amountKey.Set(s, 1)
+			var runs atomic.Int32
+			ran, finish := closer()
+			step := NewStep("cached", tt.reads, refs(decisionKey.Ref()), func(_ context.Context, s State) error {
+				runs.Add(1)
+				decisionKey.Set(s, "ok")
+				finish()
 				return nil
 			})
 			pipeline, err := PipelineSpec{
-				Inputs:           inputs,
-				Steps:            []Step{WithCache(step, tt.key)},
-				AllowExtraInputs: true,
+				Inputs: refs(docKey.Ref(), score.Ref(), hook.Ref()),
+				Steps:  []Step{retryBeside(WithCache(step, tt.key), ran)},
 			}.Build()
 			require.NoError(t, err)
 
-			_, err = pipeline.RunCandidate(
+			got, run, err := pipeline.execute(
 				context.Background(),
 				nil,
-				Prediction{"document": "cash 10", "hook": func() {}},
+				Prediction{"document": "cash 10", "score": math.NaN(), "hook": func() {}},
 			)
-			require.EqualError(t, err, tt.wantErr)
-			require.False(t, ran)
+
+			require.NoError(t, err)
+			require.Equal(t, Prediction{"decision": "ok", "amount": 2}, pipeline.written(got))
+			if tt.wantCached {
+				require.Equal(t, int32(1), runs.Load())
+				require.Equal(t, []string{"cached#1", "cached#2 cached"}, outcomesOf(run, "cached"))
+				return
+			}
+			require.Equal(t, int32(2), runs.Load())
+			require.Equal(t, []string{"cached#1", "cached#2"}, outcomesOf(run, "cached"))
 		})
 	}
 }
@@ -214,4 +228,20 @@ func TestWithCacheBelongsToOneRun(t *testing.T) {
 func TestWithCacheBuildErrors(t *testing.T) {
 	_, err := PipelineSpec{Steps: []Step{writeAmount("parse", 1), WithCache(nil, nil)}}.Build()
 	require.EqualError(t, err, "pipeline step 1 is nil")
+}
+
+func TestWithCacheDoesNotFailAStepThatReadsNaN(t *testing.T) {
+	score := Key[float64]{Name: "score"}
+	step := NewStep("use", refs(score.Ref()), refs(decisionKey.Ref()), func(_ context.Context, s State) error {
+		decisionKey.Set(s, "ok")
+		return nil
+	})
+	for _, wrapped := range []Step{step, WithCache(step, nil)} {
+		pipeline, err := PipelineSpec{Inputs: refs(score.Ref()), Steps: []Step{wrapped}}.Build()
+		require.NoError(t, err)
+
+		got, err := pipeline.RunCandidate(context.Background(), nil, Prediction{"score": math.NaN()})
+		require.NoError(t, err)
+		require.Equal(t, Prediction{"decision": "ok"}, got)
+	}
 }

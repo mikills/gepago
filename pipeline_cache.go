@@ -3,7 +3,6 @@ package gepa
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"slices"
 	"time"
 )
@@ -20,8 +19,13 @@ import (
 // not repeat the model calls of the parts that already succeeded. Failed executions are not
 // cached. Concurrent runs and nested pipelines have caches of their own.
 //
-// The returned step has step's name, reads, writes and candidate components, and is a
-// ComponentStep when step is one.
+// The cache never makes a working step fail: when the key cannot be built, because key returns
+// an error or tries to read or write a key outside step's reads, or because JSON cannot encode
+// a read value such as NaN, step runs uncached.
+//
+// The returned step has step's name, reads and writes, and in a pipeline step keeps its
+// candidate keys. It is a ComponentStep when step is one; like WithPolicy, its own
+// SeedCandidate and RunCandidate use keys already scoped by step's name.
 func WithCache(step Step, key func(State) (string, error)) Step {
 	c := &cacheStep{child: newStepNode(step), key: key}
 	return asComponentStep(c, c.child)
@@ -40,34 +44,35 @@ func (c *cacheStep) wrapper() bool            { return true }
 func (c *cacheStep) skipsOnError() bool       { return false }
 func (c *cacheStep) children() []childStep    { return []childStep{{node: c.child}} }
 func (c *cacheStep) checkChildren() error     { return nil }
-func (c *cacheStep) seedCandidate() Candidate { return seedChildren(c.child.name, c.child) }
+func (c *cacheStep) seedCandidate() Candidate { return seedChildren(c.child) }
 
 func (c *cacheStep) Run(ctx context.Context, s State) error {
 	return c.runCandidate(ctx, nil, s)
 }
 
 func (c *cacheStep) runCandidate(ctx context.Context, candidate Candidate, s State) error {
-	key, err := c.cacheKey(readOnlyView(s.values, c.child.readTypes))
-	if err != nil {
-		return fmt.Errorf("cache key: %w", err)
-	}
 	run := pipelineRunFrom(ctx)
-	if result, ok := run.cached(c.child.name, key); ok {
-		start := time.Now()
-		result.commitTo(s, c.child)
-		run.record(stepOutcome{
-			Step:     c.child.name,
-			Attempt:  run.nextAttempt(c.child.name),
-			Duration: time.Since(start),
-			Cached:   true,
-		})
-		return nil
+	key, keyErr := c.cacheKey(readOnlyView(s.values, c.child.readTypes))
+	if keyErr == nil {
+		if result, ok := run.cached(c.child.name, key); ok {
+			start := time.Now()
+			result.commitTo(s, c.child)
+			run.record(stepOutcome{
+				Step:     c.child.name,
+				Attempt:  run.nextAttempt(c.child.name),
+				Duration: time.Since(start),
+				Cached:   true,
+			})
+			return nil
+		}
 	}
 	result, err := runChild(ctx, candidate, c.child.name, c.child, s.values)
 	if err != nil {
 		return err
 	}
-	run.storeCached(c.child.name, key, result)
+	if keyErr == nil {
+		run.storeCached(c.child.name, key, result)
+	}
 	result.commitTo(s, c.child)
 	return nil
 }
