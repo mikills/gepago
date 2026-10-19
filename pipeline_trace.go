@@ -272,6 +272,10 @@ func isTraceDatasetBuilder(builder ReflectiveDatasetBuilder) bool {
 // Pipeline scopes candidate keys; an execution owns a component when it has no nested
 // executions and its path followed by '.' starts the component's key. A composite step that
 // failed before running any nested step therefore owns the components of its nested steps.
+// When the pipeline runs inside a programme that scopes its keys further, such as a step of a
+// PipelineProgram, and no execution owns the whole key, the key is tried without its leading
+// segments, one at a time, until some execution owns it; segments are matched whole, so a
+// step "summarise" never owns "xsummarise.instruction".
 //
 // Each step record holds "trace_id", "step", the step's name, "attempt", "reads", "writes" and
 // "usage", and for a failed execution "error" and, when the step attached any, "details". A
@@ -336,12 +340,27 @@ func evaluationTrace(recorder *RecordingObserver) any {
 	return traces
 }
 
-// ownedSteps returns a record for every execution in traces of a step that owns component.
+// ownedSteps returns a record for every execution in traces of a step that owns component. When
+// no execution owns the key, because a programme around the pipeline scoped it further, it
+// tries the key without its leading segments, one at a time.
 func ownedSteps(component string, traces []PipelineTrace) []ReflectiveRecord {
-	records := []ReflectiveRecord{}
+	for key := component; ; {
+		if records := stepsOwning(key, traces); len(records) > 0 {
+			return records
+		}
+		var found bool
+		if _, key, found = strings.Cut(key, "."); !found {
+			return []ReflectiveRecord{}
+		}
+	}
+}
+
+// stepsOwning returns a record for every execution in traces whose path scopes key.
+func stepsOwning(key string, traces []PipelineTrace) []ReflectiveRecord {
+	var records []ReflectiveRecord
 	for _, trace := range traces {
 		walkStepTraces(trace.Steps, "", func(path string, step StepTrace) {
-			if len(step.Steps) == 0 && len(step.Runs) == 0 && strings.HasPrefix(component, path+".") {
+			if len(step.Steps) == 0 && len(step.Runs) == 0 && strings.HasPrefix(key, path+".") {
 				records = append(records, stepRecord(trace.TraceID, step))
 			}
 		})

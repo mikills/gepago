@@ -34,8 +34,7 @@ import (
 //   - A pipeline run by a step, through NewProgramStep or a step that runs it with its
 //     context, joins the run's trace: its RunStarted and RunFinished come between that step's
 //     StepStarted and StepFinished, and its run span's parent is the step's span. Its events
-//     go to its own observers and then to those of every run around it; an observer of both
-//     receives each event once.
+//     go to its own observers and then to those of every run around it.
 //
 // Under Parallel the events of steps that run side by side interleave, but the observer and
 // redactor calls of one trace are serialised: no two of them run at once, and every observer
@@ -44,13 +43,18 @@ import (
 // different traces call a shared observer concurrently, so an observer of a pipeline that runs
 // concurrently must be safe for concurrent use.
 //
-// Observers are called in the order of PipelineSpec.Observers, and an observer listed more than
-// once is called once. An observer that panics is recovered: the run continues, the other
+// Observers are called in the order of PipelineSpec.Observers. An observer of a comparable
+// type, such as a pointer, is called once for each event even when it is listed more than
+// once, or by both a pipeline and a pipeline nested in it. An observer that cannot be compared,
+// such as a struct value with a func, map or slice field, is called once for each listing, so
+// prefer pointer observers. An observer that panics is recovered: the run continues, the other
 // observers still receive the event, and the observer keeps receiving later events.
 //
-// ctx carries the values of the context of the run or step the event belongs to, but not its
-// cancellation, deadline, trace, budget or usage collection, so an observer's model calls and
-// pipeline runs are independent of the observed run: they spend none of its budget, do not
+// ctx carries the values of the context of the run or step the event belongs to, and ends when
+// the context the caller passed to the trace's top-level run ends, but not when a step's
+// timeout, a RunBudget limit or a failed Parallel sibling ends the step's own context. It
+// carries neither the run's trace, budget nor usage collection, so an observer's model calls
+// and pipeline runs are independent of the observed run: they spend none of its budget, do not
 // count in its usage, and a pipeline run with ctx starts a trace of its own.
 //
 // The values an event carries pass through PipelineSpec.Redactor; see Redactor. Each observer
@@ -138,31 +142,69 @@ func observeScopeFrom(ctx context.Context) *observeScope {
 	return scope
 }
 
-// traceSinkKey carries a RecordingObserver that every top-level pipeline run started with the
-// context reports to after its own observers, as ProgramEvaluator uses it to capture traces.
-type traceSinkKey struct{}
+// evaluationKey carries an evaluationCapture, which every top-level pipeline run started with
+// the context reports to; see ProgramEvaluator.
+type evaluationKey struct{}
 
-func withTraceSink(ctx context.Context, recorder *RecordingObserver) context.Context {
-	return context.WithValue(ctx, traceSinkKey{}, recorder)
+// evaluationCapture collects what ProgramEvaluator needs from the top-level pipeline runs of
+// one evaluated example: their Redactors and, when recorder is set, their traces.
+type evaluationCapture struct {
+	recorder  *RecordingObserver
+	mu        sync.Mutex
+	redactors []Redactor
 }
 
-// observerContext returns ctx as observers receive it: with its values, but without its
-// cancellation and without the run it belongs to, so nothing an observer does with it counts
-// against the run.
-func observerContext(ctx context.Context) context.Context {
-	return detachedContext{context.WithoutCancel(ctx)}
+func withEvaluationCapture(ctx context.Context, capture *evaluationCapture) context.Context {
+	return context.WithValue(ctx, evaluationKey{}, capture)
 }
 
-// detachedContext hides the values that tie a context to a pipeline run: its trace, step
-// frame, budget, usage collection and step cache.
-type detachedContext struct{ context.Context }
-
-func (c detachedContext) Value(key any) any {
-	switch key.(type) {
-	case observeKey, traceSinkKey, pipelineRunKey, usageFrameKey, usageCollectorKey, retryAdmissionKey, budgetClockKey:
+// join records a top-level run of p and returns the recorder the run reports to, if any.
+func (c *evaluationCapture) join(p Pipeline) *RecordingObserver {
+	if c == nil {
 		return nil
 	}
-	return c.Context.Value(key)
+	if p.redactor != nil {
+		c.mu.Lock()
+		c.redactors = append(c.redactors, p.redactor)
+		c.mu.Unlock()
+	}
+	return c.recorder
+}
+
+// apply returns the evaluation item of the example the capture watched, with the traces it
+// recorded and its reflection values redacted by the Redactors of the pipelines it ran.
+func (c *evaluationCapture) apply(item EvaluationItem) EvaluationItem {
+	if trace := evaluationTrace(c.recorder); trace != nil {
+		item.Trace = trace
+	}
+	c.mu.Lock()
+	redactors := slices.Clone(c.redactors)
+	c.mu.Unlock()
+	return redactEvaluationItem(item, redactors)
+}
+
+// observerContext returns ctx, a context of the trace's runs, as observers receive it: with
+// its values, but ending only when the context the caller passed to the trace's top-level run
+// ends, and without the run it belongs to, so nothing an observer does with it counts against
+// the run.
+func (t *traceObservation) observerContext(ctx context.Context) context.Context {
+	return observerCtx{Context: t.caller, values: context.WithoutCancel(ctx)}
+}
+
+// observerCtx takes its deadline and cancellation from the caller's context and its values
+// from a run's context, hiding those that tie it to a pipeline run: its trace, step frame,
+// budget, usage collection, step cache and evaluation capture.
+type observerCtx struct {
+	context.Context
+	values context.Context
+}
+
+func (c observerCtx) Value(key any) any {
+	switch key.(type) {
+	case observeKey, evaluationKey, pipelineRunKey, usageFrameKey, usageCollectorKey, retryAdmissionKey, budgetClockKey:
+		return nil
+	}
+	return c.values.Value(key)
 }
 
 // appendObservers appends to list each observer it does not already hold.
@@ -187,10 +229,12 @@ func sameObserver(a, b PipelineObserver) (same bool) {
 }
 
 // traceObservation is shared by the runs of one trace. Its lock serialises their observer and
-// redactor calls and guards the text it removes from errors; see Redactor.
+// redactor calls and guards the text it removes from errors; see Redactor. caller is the
+// context the caller passed to the trace's top-level run.
 type traceObservation struct {
-	id string
-	mu sync.Mutex
+	id     string
+	caller context.Context
+	mu     sync.Mutex
 	redactedText
 }
 
@@ -205,13 +249,17 @@ type runObservation struct {
 }
 
 // observeRun starts observing a run of p over its converted inputs, as part of the trace in ctx
-// if there is one, and emits RunStarted. It returns ctx carrying the run, and nil when nothing
-// observes the run.
-func (p Pipeline) observeRun(ctx context.Context, inputs map[string]any) (context.Context, *runObservation) {
+// if there is one, and emits RunStarted. caller is the context the caller passed to the run.
+// It returns ctx carrying the run, and nil when nothing observes the run.
+func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any) (
+	context.Context,
+	*runObservation,
+) {
 	parent := observeScopeFrom(ctx)
 	var sink *RecordingObserver
 	if parent == nil {
-		sink, _ = ctx.Value(traceSinkKey{}).(*RecordingObserver)
+		capture, _ := ctx.Value(evaluationKey{}).(*evaluationCapture)
+		sink = capture.join(p)
 		if len(p.observers) == 0 && sink == nil {
 			return ctx, nil
 		}
@@ -230,7 +278,7 @@ func (p Pipeline) observeRun(ctx context.Context, inputs map[string]any) (contex
 		if sink != nil {
 			run.observers = appendObservers(run.observers, sink)
 		}
-		run.trace = &traceObservation{id: NewID()}
+		run.trace = &traceObservation{id: NewID(), caller: caller}
 	}
 	run.span = NewUsageSpan(run.trace.id, parentSpan, UsageSpanPipelineRun, "pipeline")
 	ctx = context.WithValue(ctx, observeKey{}, &observeScope{run: run, span: run.span.ID})
@@ -238,7 +286,7 @@ func (p Pipeline) observeRun(ctx context.Context, inputs map[string]any) (contex
 	run.trace.mu.Lock()
 	defer run.trace.mu.Unlock()
 	event := RunStartedEvent{Span: run.span, Inputs: run.redactValues(inputs)}
-	observerCtx := observerContext(ctx)
+	observerCtx := run.trace.observerContext(ctx)
 	run.deliver(func(observer PipelineObserver) {
 		event := event
 		event.Inputs = copyValues(event.Inputs)
@@ -258,7 +306,7 @@ func (r *runObservation) finish(ctx context.Context, err error) {
 	defer r.trace.mu.Unlock()
 	err = r.redactError(err)
 	event := RunFinishedEvent{Span: finishSpan(r.span, duration, usage, err), Duration: duration, Usage: usage, Err: err}
-	observerCtx := observerContext(ctx)
+	observerCtx := r.trace.observerContext(ctx)
 	r.deliver(func(observer PipelineObserver) {
 		observer.RunFinished(observerCtx, event)
 	})
@@ -298,7 +346,7 @@ func observeStep(ctx context.Context, node *stepNode, attempt int, values map[st
 	defer run.trace.mu.Unlock()
 	observed := &stepObservation{run: run, ctx: ctx, span: span, step: node.name, reads: run.redactValues(reads)}
 	event := StepStartedEvent{Span: span, Step: node.name, Attempt: attempt, Reads: observed.reads}
-	observerCtx := observerContext(ctx)
+	observerCtx := run.trace.observerContext(ctx)
 	run.deliver(func(observer PipelineObserver) {
 		event := event
 		event.Reads = copyValues(event.Reads)
@@ -346,7 +394,7 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 	}
 	event.Err = run.redactError(outcome.Err)
 	event.Span = finishSpan(s.span, outcome.Duration, outcome.Usage, event.Err)
-	observerCtx := observerContext(s.ctx)
+	observerCtx := run.trace.observerContext(s.ctx)
 	run.deliver(func(observer PipelineObserver) {
 		event := event
 		event.Reads = copyValues(event.Reads)

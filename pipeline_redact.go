@@ -121,6 +121,26 @@ func (r *runObservation) redactDetails(details map[string]any) map[string]any {
 	return out
 }
 
+// redactEvaluationItem returns item with the values reflection reads, its Output and SideInfo,
+// passed through redactors as an event's details are: a Prediction or map[string]any entry by
+// entry, any other entry under its own name, and the text of every value they changed removed
+// from the strings. Without redactors it returns item unchanged.
+func redactEvaluationItem(item EvaluationItem, redactors []Redactor) EvaluationItem {
+	if len(redactors) == 0 {
+		return item
+	}
+	run := &runObservation{trace: &traceObservation{}, redactors: redactors}
+	if output, ok := item.Output.(Prediction); ok && len(output) > 0 {
+		item.Output = Prediction(run.redactValues(output))
+	} else if item.Output != nil && !ok {
+		item.Output = run.redact("output", item.Output)
+	}
+	if len(item.SideInfo) > 0 {
+		item.SideInfo = run.redactDetails(item.SideInfo)
+	}
+	return item
+}
+
 // redactError returns err as the run's events carry it: unchanged when nothing in the trace is
 // redacted, and otherwise a copy with the redacted text removed from its message. The caller
 // holds the trace lock.

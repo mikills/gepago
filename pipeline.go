@@ -571,10 +571,11 @@ func (p Pipeline) execute(ctx context.Context, candidate Candidate, inputs Predi
 		}
 		values[key.Name] = converted
 	}
+	caller := ctx
 	run := newPipelineRun(p.defaults)
 	ctx, release := startRunBudget(context.WithValue(ctx, pipelineRunKey{}, run), p.budget)
 	defer release()
-	ctx, observed := p.observeRun(ctx, values)
+	ctx, observed := p.observeRun(ctx, caller, values)
 	state := State{values: values}
 	for _, node := range p.steps {
 		if err := p.runStep(ctx, candidate, node, state); err != nil {

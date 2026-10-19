@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -88,6 +89,68 @@ func TestSameObserver(t *testing.T) {
 	_, err = pipeline.Run(context.Background(), NewState(nil))
 	require.NoError(t, err)
 	require.Len(t, log.Lines(), 8)
+}
+
+// hookedObserver is an observer value that cannot be compared, because it has a func field.
+type hookedObserver struct {
+	log  *eventLog
+	hook func()
+}
+
+func (o hookedObserver) RunStarted(ctx context.Context, event RunStartedEvent) {
+	o.hook()
+	o.log.RunStarted(ctx, event)
+}
+
+func (o hookedObserver) StepStarted(ctx context.Context, event StepStartedEvent) {
+	o.hook()
+	o.log.StepStarted(ctx, event)
+}
+
+func (o hookedObserver) StepFinished(ctx context.Context, event StepFinishedEvent) {
+	o.hook()
+	o.log.StepFinished(ctx, event)
+}
+
+func (o hookedObserver) RunFinished(ctx context.Context, event RunFinishedEvent) {
+	o.hook()
+	o.log.RunFinished(ctx, event)
+}
+
+// TestPipelineObserverThatCannotBeComparedIsCalledForEachListing pins the documented
+// behaviour: only comparable observers are de-duplicated.
+func TestPipelineObserverThatCannotBeComparedIsCalledForEachListing(t *testing.T) {
+	log := &eventLog{}
+	observer := hookedObserver{log: log, hook: func() {}}
+	inner, err := PipelineSpec{
+		Inputs:    refs(docKey.Ref()),
+		Steps:     []Step{predictStep("summarise", tenTokenModel(`{"summary": "short"}`), docKey.Ref(), summaryKey.Ref())},
+		Observers: []PipelineObserver{observer},
+	}.Build()
+	require.NoError(t, err)
+	outer, err := PipelineSpec{
+		Inputs:    refs(docKey.Ref()),
+		Steps:     []Step{NewProgramStep("inner", inner, refs(docKey.Ref()), refs(summaryKey.Ref()))},
+		Observers: []PipelineObserver{observer},
+	}.Build()
+	require.NoError(t, err)
+
+	_, err = outer.Run(context.Background(), NewState(Prediction{"document": "cash 10"}))
+	require.NoError(t, err)
+	require.Equal(t, []string{
+		"start run",
+		"start inner#1 in run",
+		"start run in inner#1",
+		"start run in inner#1",
+		"start summarise#1 in run in inner#1",
+		"start summarise#1 in run in inner#1",
+		"finish summarise#1",
+		"finish summarise#1",
+		"finish run in inner#1",
+		"finish run in inner#1",
+		"finish inner#1",
+		"finish run",
+	}, log.Lines())
 }
 
 func TestPipelineObserverMergeFailureFailsTheStep(t *testing.T) {
@@ -229,38 +292,98 @@ func (o *spendingObserver) StepFinished(ctx context.Context, event StepFinishedE
 }
 
 func TestPipelineObserverSpendingIsIndependentOfTheRun(t *testing.T) {
-	spend := NewStep("spend", nil, refs(amountKey.Ref()), func(ctx context.Context, s State) error {
-		RecordUsage(ctx, tenTokens)
-		amountKey.Set(s, 1)
-		return nil
-	})
-	nested, err := PipelineSpec{Steps: []Step{spend}, Budget: RunBudget{MaxTokens: 15}}.Build()
+	spendStep := func(name string) Step {
+		return NewStep(name, nil, refs(Key[int]{Name: name}.Ref()), func(ctx context.Context, s State) error {
+			RecordUsage(ctx, tenTokens)
+			Key[int]{Name: name}.Set(s, 1)
+			return nil
+		})
+	}
+	nested, err := PipelineSpec{Steps: []Step{spendStep("inside")}, Budget: RunBudget{MaxTokens: 15}}.Build()
 	require.NoError(t, err)
 	observer := &spendingObserver{nested: nested}
-	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), ctxValueKey{}, "kept"))
-	defer cancel()
-	stop := NewStep("stop", refs(docKey.Ref()), refs(decisionKey.Ref()), func(context.Context, State) error {
-		cancel()
-		return errors.New("stopped")
-	})
 	pipeline, err := PipelineSpec{
 		Inputs: refs(docKey.Ref()),
 		Steps: []Step{
 			predictStep("summarise", tenTokenModel(`{"summary": "short"}`), docKey.Ref(), summaryKey.Ref()),
-			stop,
+			spendStep("spend"),
 		},
 		Observers: []PipelineObserver{observer},
 		Budget:    RunBudget{MaxTokens: 15},
 	}.Build()
 	require.NoError(t, err)
 
-	ctx, collector := WithUsageCollector(ctx)
+	ctx, collector := WithUsageCollector(context.WithValue(context.Background(), ctxValueKey{}, "kept"))
 	_, err = pipeline.Run(ctx, NewState(Prediction{"document": "cash 10"}))
-	require.EqualError(t, err, `pipeline step "stop": stopped`)
-	require.Equal(t, tenTokens, collector.Usage(), "the observer's usage is not the run's")
-	require.Equal(t, tenTokens, observer.runsFinished[0].Usage)
-	require.Equal(t, []error{nil, nil, nil, nil}, observer.errs, "the run's cancellation does not reach the observer")
+	// had the observer's 10 tokens after summarise counted, summarise would have failed
+	require.ErrorContains(t, err, `pipeline step "spend": run budget MaxTokens 15 exceeded`)
+	require.True(t, IsBudget(err))
+	require.Equal(t, tenTokens.Add(tenTokens), collector.Usage(), "the observer's usage is not the run's")
+	require.Equal(t, tenTokens.Add(tenTokens), observer.runsFinished[0].Usage)
+	require.Equal(t, []error{nil, nil, nil, nil}, observer.errs, "the run's budget does not end the observer's context")
 	require.Equal(t, []any{"kept", "kept"}, observer.values)
+}
+
+// blockingObserver waits in StepStarted until its context ends, and records the error its
+// context reports in each StepFinished.
+type blockingObserver struct {
+	eventLog
+	block    bool
+	finished []error
+}
+
+func (o *blockingObserver) StepStarted(ctx context.Context, event StepStartedEvent) {
+	if o.block {
+		<-ctx.Done()
+	}
+	o.eventLog.StepStarted(ctx, event)
+}
+
+func (o *blockingObserver) StepFinished(ctx context.Context, event StepFinishedEvent) {
+	o.finished = append(o.finished, ctx.Err())
+	o.eventLog.StepFinished(ctx, event)
+}
+
+func TestPipelineObserverContextEndsWithTheCallersContext(t *testing.T) {
+	observer := &blockingObserver{block: true}
+	pipeline, err := PipelineSpec{Steps: []Step{writeAmount("write", 1)}, Observers: []PipelineObserver{observer}}.Build()
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := pipeline.Run(ctx, NewState(nil))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run is still blocked after its context expired")
+	}
+	require.Equal(t, []error{context.DeadlineExceeded}, observer.finished)
+}
+
+func TestPipelineObserverContextOutlivesStepTimeouts(t *testing.T) {
+	observer := &blockingObserver{}
+	slow := NewStep("slow", nil, refs(amountKey.Ref()), func(ctx context.Context, _ State) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	pipeline, err := PipelineSpec{
+		Steps: []Step{
+			WithPolicy(slow, StepPolicy{Timeout: 5 * time.Millisecond, OnError: OnErrorSkip}),
+		},
+		Defaults:  []KeyDefault{DefaultValue(amountKey, 0)},
+		Observers: []PipelineObserver{observer},
+	}.Build()
+	require.NoError(t, err)
+
+	_, err = pipeline.Run(context.Background(), NewState(nil))
+	require.NoError(t, err)
+	require.ErrorIs(t, observer.finishedStep(t, "slow", 1).Err, context.DeadlineExceeded)
+	require.Equal(t, []error{nil, nil}, observer.finished, "a step's timeout does not end the observer's context")
 }
 
 // TestPipelineObserverStress runs many runs of a Parallel of retried, cached steps with

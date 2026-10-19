@@ -168,6 +168,11 @@ type ProgramEvaluator struct {
 // captureTraces are both set and the programme runs a Pipeline, each item's Trace holds the
 // PipelineTrace of the run, as the pipeline's Redactor redacts it, or a []PipelineTrace when
 // the programme ran several; see TraceDatasetBuilder.
+//
+// When the programme runs a Pipeline that has a Redactor, the values each item carries for
+// reflection, its Output and SideInfo, pass through that Redactor as the details of an event
+// do (see Redactor), whether or not traces are recorded, so reflection prompts never show what
+// the pipeline redacts. The Metric still scores the real values.
 func (e ProgramEvaluator) Evaluate(
 	ctx context.Context,
 	candidate Candidate,
@@ -175,7 +180,7 @@ func (e ProgramEvaluator) Evaluate(
 	captureTraces bool,
 ) (EvaluationResult, error) {
 	items := make([]EvaluationItem, 0, len(examples))
-	traces := make([]any, 0, len(examples))
+	captures := make([]*evaluationCapture, 0, len(examples))
 	usage := Usage{}
 	for _, example := range examples {
 		ioExample, ok := example.Input.(IOExample)
@@ -183,14 +188,13 @@ func (e ProgramEvaluator) Evaluate(
 			return EvaluationResult{}, errors.New("program evaluator examples must contain IOExample input")
 		}
 		runCtx, collector := WithUsageCollector(ctx)
-		var recorder *RecordingObserver
+		capture := &evaluationCapture{}
 		if captureTraces && e.RecordTraces {
-			recorder = &RecordingObserver{}
-			runCtx = withTraceSink(runCtx, recorder)
+			capture.recorder = &RecordingObserver{}
 		}
-		actual, err := e.Program.RunCandidate(runCtx, candidate, ioExample.Inputs)
+		actual, err := e.Program.RunCandidate(withEvaluationCapture(runCtx, capture), candidate, ioExample.Inputs)
 		usage = usage.Add(collector.Usage())
-		traces = append(traces, evaluationTrace(recorder))
+		captures = append(captures, capture)
 		if errors.Is(err, ErrInvalidOutput) {
 			items = append(items, invalidOutputItem(example.ID, ioExample, actual, err))
 			continue
@@ -221,10 +225,8 @@ func (e ProgramEvaluator) Evaluate(
 		})
 	}
 	// every example that did not end the evaluation added one item
-	for i := range min(len(items), len(traces)) {
-		if traces[i] != nil {
-			items[i].Trace = traces[i]
-		}
+	for i := range min(len(items), len(captures)) {
+		items[i] = captures[i].apply(items[i])
 	}
 	return EvaluationResult{Items: items, Usage: usage}, nil
 }
