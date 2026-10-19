@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -371,6 +372,40 @@ func TestPipelineObserverContextEndsWithTheRunsMaxDuration(t *testing.T) {
 	deadline, ok := observer.last.Deadline()
 	require.True(t, ok, "the observer's context carries the run's deadline")
 	require.False(t, deadline.IsZero())
+}
+
+// wrappedContext is a context type of its own, which the context package cannot link to its
+// children without a goroutine.
+type wrappedContext struct{ context.Context }
+
+func TestPipelineObserverContextsLeakNoGoroutines(t *testing.T) {
+	inner, err := PipelineSpec{
+		Inputs: refs(docKey.Ref()),
+		Steps:  []Step{lengthStep()},
+		Budget: RunBudget{MaxDuration: time.Hour},
+	}.Build()
+	require.NoError(t, err)
+	outer, err := PipelineSpec{
+		Inputs:    refs(docKey.Ref()),
+		Steps:     []Step{NewProgramStep("inner", inner, refs(docKey.Ref()), refs(amountKey.Ref()))},
+		Observers: []PipelineObserver{&RecordingObserver{}},
+		Budget:    RunBudget{MaxDuration: time.Hour},
+	}.Build()
+	require.NoError(t, err)
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	caller := wrappedContext{parent}
+
+	runtime.GC()
+	before := runtime.NumGoroutine()
+	for range 500 {
+		_, err := outer.Run(caller, NewState(Prediction{"document": "cash 10"}))
+		require.NoError(t, err)
+	}
+	require.Eventually(t, func() bool {
+		runtime.GC()
+		return runtime.NumGoroutine() <= before+2
+	}, 2*time.Second, 20*time.Millisecond)
 }
 
 func TestPipelineObserverContextEndsWithItsRun(t *testing.T) {

@@ -172,11 +172,11 @@ type ProgramEvaluator struct {
 // When the programme runs Pipelines that have Redactors, nested pipelines included, the values
 // each item carries for reflection pass through all of them, whether or not traces are
 // recorded, so reflection prompts never show what a pipeline redacts: its Output and each
-// SideInfo entry are redacted as an event's details are, SideInfo's "details" as an event's
-// details, and the values of its PipelineTraces by key, and then the text of every value the
-// Redactors changed is removed from every string in them (see Redactor). Values a pipeline's
-// own events already redacted pass through the Redactors again, so a Redactor should leave a
-// value it produced unchanged. The Metric still scores the real values.
+// SideInfo entry are redacted as an event's details are, the example's inputs and expected
+// values first converted to their keys' types where they convert, SideInfo's "details" as an
+// event's details, and the values of its PipelineTraces by key. Then the text of every value
+// the Redactors changed, here or in the runs, such as a failed step's writes, is removed from
+// every string in them (see Redactor). The Metric still scores the real values.
 func (e ProgramEvaluator) Evaluate(
 	ctx context.Context,
 	candidate Candidate,

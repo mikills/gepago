@@ -25,9 +25,9 @@ import (
 //
 // Error messages and the strings in details cannot be redacted by key, so every value a
 // Redactor changes, as reflect.DeepEqual compares it, is removed from them instead: from then
-// on in the trace, each of its text forms (each string it holds, and for a value that is not a
-// string its %v, %+v and JSON forms) is replaced by the redacted value when that is a string,
-// and otherwise by RedactedText. The values a failed step wrote, or tried to write but was
+// on in the trace, each of its text forms (each string it holds that the redacted value no
+// longer holds, and for a value that is not a string its %v, %+v and JSON forms) is replaced by
+// the redacted value when that is a string, and otherwise by RedactedText. The values a failed step wrote, or tried to write but was
 // refused, such as a value its type's Validate method rejected, pass through the Redactor for
 // this purpose too, though no event carries them. This is best effort and errs on the side of removing text: a
 // short or common value is removed wherever it appears. An event's Err is then an error with
@@ -38,6 +38,11 @@ import (
 // A Redactor that panics is recovered: the value is replaced by RedactionFailed and removed
 // from error messages like any other redacted value, so a failing Redactor never lets a value
 // through, and the run continues.
+//
+// A Redactor may be given a value it has already redacted: ProgramEvaluator passes the values
+// of recorded traces, which the run's events already redacted, through every Redactor of the
+// evaluated programme again. It should return such a value unchanged, as one that replaces a
+// value with a fixed placeholder does.
 //
 // A pipeline nested in a run passes the values of its events through its own Redactor and then
 // those of every run around it. Redactor calls are serialised with observer calls, so a
@@ -139,28 +144,46 @@ func (r *runObservation) scrubValues(values map[string]any) map[string]any {
 	return values
 }
 
-// redactEvaluationItem returns item with the values reflection reads passed through
-// redactors. Its Output and each SideInfo entry are redacted as an event's details are (see
-// redactEntry), SideInfo's "details" one level further, as an event's details, and the inputs,
-// reads, writes and details of any PipelineTrace in its Trace as an event's. Then the text of
-// every value the redactors changed is removed from every string in them, errors included.
-// Without redactors it returns item unchanged.
-func redactEvaluationItem(item EvaluationItem, redactors []Redactor) EvaluationItem {
-	if len(redactors) == 0 {
+// evaluationRedaction redacts the values an evaluation item carries for reflection: redactors
+// are those of the pipelines the programme ran, types the types of the keys those pipelines
+// declare, and forms the text their runs' redaction removed from errors, failed writes
+// included.
+type evaluationRedaction struct {
+	redactors []Redactor
+	types     map[string]reflect.Type
+	forms     map[string]string
+}
+
+// apply returns item with the values reflection reads passed through the redactors. Its Output
+// and each SideInfo entry are redacted as an event's details are (see redactEntry), with the
+// "inputs" and "expected" entries first converted to their keys' types where they convert, so a
+// Redactor sees them as it sees a run's values, SideInfo's "details" one level further, as an
+// event's details, and the inputs, reads, writes and details of any PipelineTrace in its Trace
+// as an event's. Then the text of every value the redactors changed, here or in the runs, is
+// removed from every string in them, errors included. Without redactors it returns item
+// unchanged.
+func (e evaluationRedaction) apply(item EvaluationItem) EvaluationItem {
+	if len(e.redactors) == 0 && len(e.forms) == 0 {
 		return item
 	}
-	run := &runObservation{trace: &traceObservation{}, redactors: redactors}
+	run := &runObservation{trace: &traceObservation{}, redactors: e.redactors}
+	run.trace.forms = maps.Clone(e.forms)
 	if output, ok := item.Output.(Prediction); item.Output != nil && (!ok || len(output) > 0) {
 		item.Output = run.redactEntry("output", item.Output)
 	}
 	if len(item.SideInfo) > 0 {
 		sideInfo := make(map[string]any, len(item.SideInfo))
 		for name, entry := range item.SideInfo {
-			if details, ok := entry.(map[string]any); ok && name == "details" {
+			details, isMap := entry.(map[string]any)
+			example, isPrediction := entry.(Prediction)
+			switch {
+			case isMap && name == "details":
 				sideInfo[name] = run.redactEntries(details)
-				continue
+			case isPrediction && (name == "inputs" || name == "expected"):
+				sideInfo[name] = run.redactTyped(example, e.types)
+			default:
+				sideInfo[name] = run.redactEntry(name, entry)
 			}
-			sideInfo[name] = run.redactEntry(name, entry)
 		}
 		item.SideInfo = sideInfo
 	}
@@ -178,6 +201,25 @@ func redactEvaluationItem(item EvaluationItem, redactors []Redactor) EvaluationI
 		return mapTrace(trace, run.scrubValues, run.scrubValues, run.trace.scrub)
 	})
 	return item
+}
+
+// redactTyped returns a copy of values with each one converted to its key's type in types
+// when it converts, as a run converts its inputs, and then redacted under its key. A value that
+// does not convert is redacted as it is.
+func (r *runObservation) redactTyped(values Prediction, types map[string]reflect.Type) Prediction {
+	if len(values) == 0 {
+		return values
+	}
+	out := make(Prediction, len(values))
+	for key, value := range values {
+		if typ := types[key]; typ != nil {
+			if converted, err := convertStateValue(key, typ, value); err == nil {
+				value = converted
+			}
+		}
+		out[key] = r.redact(key, value)
+	}
+	return out
 }
 
 // mapTraces applies fn to the traces an evaluation item's Trace holds, keeping its shape.
@@ -279,7 +321,8 @@ type redactedText struct {
 	replacer *strings.Replacer
 }
 
-// remember records the text forms of original, which a redactor turned into redacted.
+// remember records the text forms of original, which a redactor turned into redacted. The
+// forms of a string redacted still holds, such as a field the redactor kept, are not recorded.
 func (t *redactedText) remember(original, redacted any) {
 	replacement := RedactedText
 	if text, ok := redacted.(string); ok {
@@ -288,8 +331,12 @@ func (t *redactedText) remember(original, redacted any) {
 	if t.forms == nil {
 		t.forms = map[string]string{}
 	}
+	kept := map[string]bool{}
+	for _, form := range stringForms(redacted) {
+		kept[form] = true
+	}
 	for _, form := range textForms(original) {
-		if form != "" && form != replacement {
+		if form != "" && form != replacement && !kept[form] {
 			t.forms[form] = replacement
 		}
 	}
@@ -318,14 +365,7 @@ func (t *redactedText) scrub(text string) string {
 // it is, quoted and JSON-encoded, and for a value that is not a string its %v, %+v and JSON
 // forms. A panic in a value's String or MarshalJSON method only drops that form.
 func textForms(value any) []string {
-	var forms []string
-	walkStrings(reflect.ValueOf(value), map[uintptr]bool{}, func(text string) {
-		quoted := strconv.Quote(text)
-		forms = append(forms, text, quoted[1:len(quoted)-1])
-		if data, err := json.Marshal(text); err == nil {
-			forms = append(forms, string(data[1:len(data)-1]))
-		}
-	})
+	forms := stringForms(value)
 	if value == nil || reflect.TypeOf(value).Kind() == reflect.String {
 		return forms
 	}
@@ -336,6 +376,19 @@ func textForms(value any) []string {
 			forms = append(forms, string(data))
 		}
 	}()
+	return forms
+}
+
+// stringForms returns each string value holds, as it is, quoted and JSON-encoded.
+func stringForms(value any) []string {
+	var forms []string
+	walkStrings(reflect.ValueOf(value), map[uintptr]bool{}, func(text string) {
+		quoted := strconv.Quote(text)
+		forms = append(forms, text, quoted[1:len(quoted)-1])
+		if data, err := json.Marshal(text); err == nil {
+			forms = append(forms, string(data[1:len(data)-1]))
+		}
+	})
 	return forms
 }
 

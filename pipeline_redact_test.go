@@ -336,6 +336,17 @@ func TestReplaceStringsCopiesValues(t *testing.T) {
 	require.Nil(t, replaceStrings(nil, replace))
 }
 
+func TestRedactedTextKeepsWhatTheRedactorKept(t *testing.T) {
+	type person struct {
+		Name string
+		SSN  string
+	}
+	var text redactedText
+	text.remember(person{Name: "Bob", SSN: "123-45-6789"}, person{Name: "Bob", SSN: "***"})
+	require.Equal(t, "Bob, ssn [redacted]", text.scrub("Bob, ssn 123-45-6789"))
+	require.Equal(t, RedactedText, text.scrub("{Bob 123-45-6789}"), "the whole value's text is still removed")
+}
+
 func TestTextFormsSurviveValuesThatPanic(t *testing.T) {
 	forms := textForms(panickyJSON{})
 	require.Contains(t, forms, "panicked")

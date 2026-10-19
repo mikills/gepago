@@ -3,6 +3,7 @@ package gepa
 import (
 	"context"
 	"errors"
+	"maps"
 	"reflect"
 	"slices"
 	"sync"
@@ -149,32 +150,64 @@ func observeScopeFrom(ctx context.Context) *observeScope {
 type evaluationKey struct{}
 
 // evaluationCapture collects what ProgramEvaluator needs from the pipeline runs of one
-// evaluated example: the Redactors of every run, nested ones included, and, when recorder is
-// set, the traces of the top-level runs.
+// evaluated example: the Redactors of every run, nested ones included, the types of the keys
+// those pipelines declare, the text the runs' redaction removed from errors, failed writes
+// included, and, when recorder is set, the traces of the top-level runs.
 type evaluationCapture struct {
 	recorder  *RecordingObserver
 	mu        sync.Mutex
 	redactors []Redactor
+	types     map[string]reflect.Type
+	forms     map[string]string
 }
 
 func withEvaluationCapture(ctx context.Context, capture *evaluationCapture) context.Context {
 	return context.WithValue(ctx, evaluationKey{}, capture)
 }
 
-// join records a run of p and returns the recorder a top-level run reports to, if any.
+// join records a run of p and returns the recorder a top-level run reports to, if any. The
+// first pipeline to declare a key gives its type.
 func (c *evaluationCapture) join(p Pipeline, topLevel bool) *RecordingObserver {
 	if c == nil {
 		return nil
 	}
+	c.mu.Lock()
 	if p.redactor != nil {
-		c.mu.Lock()
 		c.redactors = append(c.redactors, p.redactor)
-		c.mu.Unlock()
 	}
+	if c.types == nil {
+		c.types = map[string]reflect.Type{}
+	}
+	for name, typ := range p.inputTypes {
+		if c.types[name] == nil {
+			c.types[name] = typ
+		}
+	}
+	for _, node := range p.steps {
+		for name, typ := range node.writeTypes {
+			if c.types[name] == nil {
+				c.types[name] = typ
+			}
+		}
+	}
+	c.mu.Unlock()
 	if !topLevel {
 		return nil
 	}
 	return c.recorder
+}
+
+// remember keeps the text a run's redaction removed. The caller holds the run's trace lock.
+func (c *evaluationCapture) remember(text *redactedText) {
+	if c == nil || len(text.forms) == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.forms == nil {
+		c.forms = map[string]string{}
+	}
+	maps.Copy(c.forms, text.forms)
 }
 
 // apply returns the evaluation item of the example the capture watched, with the traces it
@@ -184,9 +217,13 @@ func (c *evaluationCapture) apply(item EvaluationItem) EvaluationItem {
 		item.Trace = trace
 	}
 	c.mu.Lock()
-	redactors := slices.Clone(c.redactors)
+	redaction := evaluationRedaction{
+		redactors: slices.Clone(c.redactors),
+		types:     maps.Clone(c.types),
+		forms:     maps.Clone(c.forms),
+	}
 	c.mu.Unlock()
-	return redactEvaluationItem(item, redactors)
+	return redaction.apply(item)
 }
 
 // observerContext returns ctx, a context of the run, as observers receive it: with its values,
@@ -253,6 +290,7 @@ type runObservation struct {
 	start     time.Time
 	life      context.Context
 	endLife   context.CancelFunc
+	capture   *evaluationCapture
 }
 
 // observeRun starts observing a run of p over its converted inputs, as part of the trace in ctx
@@ -265,10 +303,18 @@ func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any)
 	parent := observeScopeFrom(ctx)
 	capture, _ := ctx.Value(evaluationKey{}).(*evaluationCapture)
 	sink := capture.join(p, parent == nil)
-	if parent == nil && len(p.observers) == 0 && sink == nil {
+	// an evaluated run with a Redactor is observed even without observers, so that the text
+	// its redaction removes reaches the evaluation
+	evaluated := capture != nil && p.redactor != nil
+	if parent == nil && len(p.observers) == 0 && sink == nil && !evaluated {
 		return ctx, nil
 	}
-	run := &runObservation{observers: appendObservers(nil, p.observers...), start: time.Now(), life: caller}
+	run := &runObservation{
+		observers: appendObservers(nil, p.observers...),
+		start:     time.Now(),
+		life:      caller,
+		capture:   capture,
+	}
 	if p.redactor != nil {
 		run.redactors = []Redactor{p.redactor}
 	}
@@ -320,6 +366,7 @@ func (r *runObservation) finish(ctx context.Context, err error) {
 	r.deliver(func(observer PipelineObserver) {
 		observer.RunFinished(observerCtx, event)
 	})
+	r.capture.remember(&r.trace.redactedText)
 	r.endLife()
 }
 

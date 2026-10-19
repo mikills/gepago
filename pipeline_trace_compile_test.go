@@ -295,6 +295,98 @@ func TestTraceDatasetBuilderNeverDropsATopLevelStepName(t *testing.T) {
 	require.Equal(t, "other", stepsOf("inner.route.other.instruction")[0]["step"])
 }
 
+// TestProgramEvaluatorRemovesAFailedWriteFromTheFeedback evaluates a pipeline whose step writes
+// a value and then fails quoting it, with and without recorded traces, so the pipeline has no
+// observers in the second case.
+func TestProgramEvaluatorRemovesAFailedWriteFromTheFeedback(t *testing.T) {
+	const secret = "123-45-6789"
+	ssnKey := Key[string]{Name: "ssn"}
+	extract := NewStep("extract", refs(docKey.Ref()), refs(ssnKey.Ref()), func(_ context.Context, s State) error {
+		ssnKey.Set(s, secret)
+		return fmt.Errorf("%w: checksum failed for %s", ErrInvalidOutput, secret)
+	})
+	pipeline, err := PipelineSpec{
+		Inputs:   refs(docKey.Ref()),
+		Steps:    []Step{extract},
+		Redactor: hideKey("ssn", "[ssn]"),
+	}.Build()
+	require.NoError(t, err)
+	examples := []Example{NewIOExample("one", Prediction{"document": "d"}, Prediction{"ssn": "987-65-4321"})}
+	for _, recordTraces := range []bool{false, true} {
+		evaluator := ProgramEvaluator{
+			Program:      pipeline,
+			Metric:       ExactMatchMetric{Fields: []string{"ssn"}},
+			RecordTraces: recordTraces,
+		}
+		result, err := evaluator.Evaluate(context.Background(), pipeline.SeedCandidate(), examples, true)
+		require.NoError(t, err)
+		item := result.Items[0]
+		require.Equal(
+			t,
+			`pipeline step "extract": invalid programme output: checksum failed for [ssn]`,
+			item.SideInfo["feedback"],
+			"RecordTraces %v",
+			recordTraces,
+		)
+		dataset := TraceDatasetBuilder{}.BuildReflectiveDataset(pipeline.SeedCandidate(), result, []string{"x"})
+		require.NotContains(t, fmt.Sprint(dataset), secret, "RecordTraces %v", recordTraces)
+		require.NotContains(t, fmt.Sprint(dataset), "987-65-4321", "RecordTraces %v", recordTraces)
+	}
+}
+
+type profile struct {
+	Name string `json:"name"`
+	SSN  string `json:"ssn"`
+}
+
+// TestProgramEvaluatorConvertsExampleValuesBeforeRedacting checks that a Redactor written for
+// a key's type sees an example's inputs and expected values as that type even when the example
+// gives them in their JSON form, as the run's own events do.
+func TestProgramEvaluatorConvertsExampleValuesBeforeRedacting(t *testing.T) {
+	profileKey := Key[profile]{Name: "profile"}
+	greet := NewStep("greet", refs(profileKey.Ref()), refs(letterKey.Ref()), func(_ context.Context, s State) error {
+		p, err := profileKey.Get(s)
+		if err != nil {
+			return err
+		}
+		letterKey.Set(s, "Dear "+p.Name)
+		return nil
+	})
+	recorder := &RecordingObserver{}
+	pipeline, err := PipelineSpec{
+		Inputs:    refs(profileKey.Ref()),
+		Steps:     []Step{greet},
+		Observers: []PipelineObserver{recorder},
+		Redactor: func(_ string, value any) any {
+			if p, ok := value.(profile); ok {
+				p.SSN = "***"
+				return p
+			}
+			return value
+		},
+	}.Build()
+	require.NoError(t, err)
+	examples := []Example{NewIOExample(
+		"one",
+		Prediction{"profile": map[string]any{"name": "Bob", "ssn": "123-45-6789"}},
+		Prediction{"letter": 42, "profile": "not a profile but 123-45-6789"},
+	)}
+
+	result, err := ProgramEvaluator{Program: pipeline, Metric: ExactMatchMetric{Fields: []string{"letter"}}}.
+		Evaluate(context.Background(), pipeline.SeedCandidate(), examples, false)
+	require.NoError(t, err)
+	require.Equal(t, map[string]any{"profile": map[string]any{"name": "Bob", "ssn": "***"}}, recorder.Traces()[0].Inputs)
+	sideInfo := result.Items[0].SideInfo
+	require.Equal(t, Prediction{"profile": profile{Name: "Bob", SSN: "***"}}, sideInfo["inputs"])
+	require.Equal(
+		t,
+		Prediction{"letter": 42, "profile": "not a profile but " + RedactedText},
+		sideInfo["expected"],
+		"a value that does not convert is kept, and its text scrubbed",
+	)
+	require.NotContains(t, fmt.Sprint(sideInfo), "123-45-6789")
+}
+
 // hideKey returns a Redactor that replaces the value of one key.
 func hideKey(name string, replacement any) Redactor {
 	return func(key string, value any) any {
@@ -363,7 +455,7 @@ func TestRedactEvaluationItemKeepsTheTraceShape(t *testing.T) {
 	}
 	redactors := []Redactor{hideKey("document", "[doc]")}
 	for _, value := range []any{trace, &trace, []PipelineTrace{trace}} {
-		got := redactEvaluationItem(EvaluationItem{Trace: value}, redactors).Trace
+		got := evaluationRedaction{redactors: redactors}.apply(EvaluationItem{Trace: value}).Trace
 		require.IsType(t, value, got)
 		require.NotContains(t, fmt.Sprint(got), "secret doc is bad")
 		traces, _ := pipelineTraces(got)
@@ -375,7 +467,7 @@ func TestRedactEvaluationItemKeepsTheTraceShape(t *testing.T) {
 		require.Equal(t, map[string]any{"note": "about [doc]"}, redacted.Steps[0].Runs[0].Inputs)
 	}
 	require.Equal(t, "secret doc", trace.Inputs["document"], "the original trace is unchanged")
-	require.Equal(t, "not a trace", redactEvaluationItem(EvaluationItem{Trace: "not a trace"}, redactors).Trace)
+	require.Equal(t, "not a trace", evaluationRedaction{redactors: redactors}.apply(EvaluationItem{Trace: "not a trace"}).Trace)
 }
 
 func TestRedactEvaluationItemHandlesOtherOutputs(t *testing.T) {
@@ -386,10 +478,10 @@ func TestRedactEvaluationItemHandlesOtherOutputs(t *testing.T) {
 		return value
 	}}
 	item := EvaluationItem{ExampleID: "one", Output: "raw text", SideInfo: map[string]any{"note": "raw text here"}}
-	got := redactEvaluationItem(item, redactors)
+	got := evaluationRedaction{redactors: redactors}.apply(item)
 	require.Equal(t, "[output]", got.Output)
 	require.Equal(t, map[string]any{"note": "[output] here"}, got.SideInfo)
-	require.Equal(t, item, redactEvaluationItem(item, nil))
+	require.Equal(t, item, evaluationRedaction{}.apply(item))
 	empty := EvaluationItem{Output: Prediction{}}
-	require.Equal(t, empty, redactEvaluationItem(empty, redactors))
+	require.Equal(t, empty, evaluationRedaction{redactors: redactors}.apply(empty))
 }
