@@ -264,9 +264,9 @@ func TestRedactorHidesToolCalls(t *testing.T) {
 				require.Equal(t, json.RawMessage(`"[hidden]"`), event.ToolCalls[0].Output)
 				require.Equal(
 					t,
-					json.RawMessage(`{"active":true,"balance":"[hidden]","carrier":"[hidden]"}`),
+					json.RawMessage(`{"carrier":"[hidden]","balance":"[hidden]","active":true}`),
 					event.Details["output"],
-					"each value is hidden and each key kept",
+					"each value is hidden and each key kept, in order",
 				)
 				requireHidden(t, log, recorder.Traces()[0], "Confidential", "12345.67")
 			})
@@ -413,7 +413,7 @@ func TestReplaceStringsScrubsRawJSON(t *testing.T) {
 	}, scrub)
 	require.Equal(t, map[string]any{
 		"string":  json.RawMessage(`{"a":"[x]"}`),
-		"foreign": json.RawMessage(`{"list":["[x]",1],"n":"[x]","none":null,"ok":true,"secret":"[x]"}`),
+		"foreign": json.RawMessage(`{"secret":"[x]","n":"[x]","ok":true,"none":null,"list":["[x]",1]}`),
 		"broken":  json.RawMessage(`"{\"a\":[x]}"`),
 		"nil":     json.RawMessage(nil),
 		"kept":    json.RawMessage(`{ "a" : 1 }`),
@@ -681,7 +681,7 @@ func TestProgramEvaluatorRedactsToolCalls(t *testing.T) {
 
 			require.NoError(t, err)
 			item := eval.Items[0]
-			require.Equal(t, json.RawMessage(`{"balance":"[hidden]","carrier":"[hidden]"}`),
+			require.Equal(t, json.RawMessage(`{"carrier":"[hidden]","balance":"[hidden]"}`),
 				item.SideInfo["details"].(map[string]any)["output"])
 			if record {
 				trace := item.Trace.(PipelineTrace)
@@ -872,4 +872,447 @@ func TestPolicyOnlyRunCachesNothing(t *testing.T) {
 		require.False(t, record.Cached)
 	}
 	require.Len(t, middleSession.Records(), 2, "the policy-only run still records the calls")
+}
+
+func TestRedactorThatMasksOneArgumentFieldKeepsTheRest(t *testing.T) {
+	const secret = "SECRET-9"
+	asString := func(mask func(map[string]any)) Redactor {
+		return func(key string, value any) any {
+			text, ok := value.(string)
+			var args map[string]any
+			if key != "tool:lookup" || !ok || json.Unmarshal([]byte(text), &args) != nil || args["order_id"] == nil {
+				return value
+			}
+			mask(args)
+			data, _ := json.Marshal(args)
+			return string(data)
+		}
+	}
+	tests := []struct {
+		name     string
+		redactor Redactor
+		wantArgs string
+		wantErr  string
+	}{
+		{
+			name:     "a JSON string with the field masked",
+			redactor: asString(func(args map[string]any) { args["order_id"] = "***" }),
+			wantArgs: `{"order_id":"***","region":"europe"}`,
+			wantErr:  `tool "lookup": order [redacted] not found in europe`,
+		},
+		{
+			name:     "a JSON string without the field",
+			redactor: asString(func(args map[string]any) { delete(args, "order_id") }),
+			wantArgs: `{"region":"europe"}`,
+			wantErr:  `tool "lookup": order [redacted] not found in europe`,
+		},
+		{
+			name: "a map with the field masked",
+			redactor: func(key string, value any) any {
+				if text, ok := value.(string); ok && key == "tool:lookup" && strings.Contains(text, secret) {
+					return map[string]any{"order_id": "***", "region": "europe"}
+				}
+				return value
+			},
+			wantArgs: `{"order_id":"***","region":"europe"}`,
+			wantErr:  `tool "lookup": order [redacted] not found in europe`,
+		},
+		{
+			name: "a placeholder for the whole arguments",
+			redactor: func(key string, value any) any {
+				if text, ok := value.(string); ok && key == "tool:lookup" && strings.Contains(text, secret) {
+					return "[arguments]"
+				}
+				return value
+			},
+			wantArgs: "[arguments]",
+			wantErr:  `tool "lookup": order [arguments] not found in [arguments]`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lookup := NewTool("lookup", "Look up an order", func(_ context.Context, args struct {
+				OrderID string `json:"order_id"`
+				Region  string `json:"region"`
+			}) (orderStatus, error) {
+				return orderStatus{}, fmt.Errorf("order %s not found in %s", args.OrderID, args.Region)
+			})
+			registry, err := NewToolRegistry(lookup)
+			require.NoError(t, err)
+			lm := newScriptedChat(toolCallReply("1", "lookup", `{"order_id":"`+secret+`","region":"europe"}`, Usage{}))
+			question := Key[string]{Name: "question"}
+			predict := Predict{
+				Signature: Signature{
+					Name:    "answer",
+					Inputs:  []Field{{Name: "question"}},
+					Outputs: []Field{{Name: "summary", Type: "string"}},
+				},
+				LM:    lm,
+				Tools: []string{"lookup"},
+			}
+			log := &eventLog{}
+			pipeline, err := PipelineSpec{
+				Inputs:    refs(question.Ref()),
+				Steps:     []Step{NewProgramStep("answer", predict, refs(question.Ref()), refs(summaryKey.Ref()))},
+				Tools:     registry,
+				Observers: []PipelineObserver{log},
+				Redactor:  tt.redactor,
+			}.Build()
+			require.NoError(t, err)
+
+			_, err = pipeline.Run(context.Background(), NewState(Prediction{"question": "where is it?"}))
+
+			require.Error(t, err)
+			event := log.finishedStep(t, "answer", 1)
+			if json.Valid([]byte(tt.wantArgs)) {
+				require.JSONEq(t, tt.wantArgs, event.ToolCalls[0].Arguments, "the arguments are what the Redactor returned")
+			} else {
+				require.Equal(t, tt.wantArgs, event.ToolCalls[0].Arguments, "the arguments are what the Redactor returned")
+			}
+			require.EqualError(t, event.Err, tt.wantErr, "a kept field stays, and a removed one is replaced, but "+
+				"not by what the Redactor put in its place")
+			require.Equal(t, tt.wantErr, event.ToolCalls[0].Err)
+		})
+	}
+}
+
+func TestRedactorHidesEveryValueOfADuplicateKey(t *testing.T) {
+	const output = `{"carrier": "First Secret", "carrier": "Second Secret"}`
+	duplicated := NewToolFunc(
+		Tool{Name: "lookup", Description: "lookup", Parameters: json.RawMessage(`{"type":"object"}`)},
+		func(context.Context, ToolCall) (ToolResult, error) {
+			return ToolResult{Output: json.RawMessage(output)}, nil
+		},
+	)
+	registry, err := NewToolRegistry(duplicated)
+	require.NoError(t, err)
+	requireHidden := func(t *testing.T, log *eventLog, trace PipelineTrace) {
+		t.Helper()
+		data := requireTraceRoundTrip(t, trace)
+		report, err := HTMLRunReport(trace, HTMLReportOptions{})
+		require.NoError(t, err)
+		for _, text := range []string{data, report, fmt.Sprintf("%+v", log.finished)} {
+			require.NotContains(t, text, "First Secret")
+			require.NotContains(t, text, "Second Secret")
+		}
+	}
+
+	t.Run("the first value echoed by the model", func(t *testing.T) {
+		lm := newScriptedChat(
+			toolCallReply("1", "lookup", `{"order_id":"A-1"}`, Usage{}),
+			textReply(`{"summary": null, "note": "carrier is First Secret"}`, Usage{}),
+		)
+		question := Key[string]{Name: "question"}
+		predict := Predict{
+			Signature: Signature{
+				Name:    "answer",
+				Inputs:  []Field{{Name: "question"}},
+				Outputs: []Field{{Name: "summary", Type: "string"}},
+			},
+			LM:    lm,
+			Tools: []string{"lookup"},
+		}
+		recorder := &RecordingObserver{}
+		log := &eventLog{}
+		pipeline, err := PipelineSpec{
+			Inputs:    refs(question.Ref()),
+			Steps:     []Step{NewProgramStep("answer", predict, refs(question.Ref()), refs(summaryKey.Ref()))},
+			Tools:     registry,
+			Observers: []PipelineObserver{recorder, log},
+			Redactor:  hideKey("tool:lookup", "[hidden]"),
+		}.Build()
+		require.NoError(t, err)
+
+		_, err = pipeline.Run(context.Background(), NewState(Prediction{"question": "q"}))
+
+		require.ErrorIs(t, err, ErrInvalidOutput)
+		event := log.finishedStep(t, "answer", 1)
+		require.Equal(t, "carrier is [hidden]", event.Details["output"].(Prediction)["note"])
+		requireHidden(t, log, recorder.Traces()[0])
+	})
+
+	t.Run("both values in a ToolStep's details", func(t *testing.T) {
+		recorder := &RecordingObserver{}
+		log := &eventLog{}
+		pipeline, err := PipelineSpec{
+			Inputs:    refs(orderIDKey.Ref()),
+			Steps:     []Step{ToolStep("lookup", "lookup", refs(orderIDKey.Ref()), refs(statusKey.Ref()))},
+			Tools:     registry,
+			Observers: []PipelineObserver{recorder, log},
+			Redactor:  hideKey("tool:lookup", "[hidden]"),
+		}.Build()
+		require.NoError(t, err)
+
+		_, err = pipeline.Run(context.Background(), NewState(Prediction{"order_id": "A-1"}))
+
+		require.ErrorIs(t, err, ErrInvalidOutput)
+		event := log.finishedStep(t, "lookup", 1)
+		require.Equal(t, json.RawMessage(`{"carrier":"[hidden]","carrier":"[hidden]"}`), event.Details["output"])
+		requireHidden(t, log, recorder.Traces()[0])
+	})
+}
+
+func TestReportJSONIndentsOnlyWithinItsLimits(t *testing.T) {
+	deep := strings.Repeat("[", maxReportIndentDepth+1) + `"x"` + strings.Repeat("]", maxReportIndentDepth+1)
+	large := `["` + strings.Repeat("a", maxReportIndentBytes) + `"]`
+	tests := []struct {
+		name string
+		data string
+		want string
+	}{
+		{name: "shallow and small", data: `{"a":[1, 2]}`, want: "{\n  \"a\": [\n    1,\n    2\n  ]\n}"},
+		{name: "at the depth limit", data: deep[1 : len(deep)-1], want: ""},
+		{name: "deeper than the limit", data: deep, want: deep},
+		{name: "larger than the limit", data: `[ ` + large[1:], want: large},
+		{name: "not JSON", data: "not json", want: "not json"},
+		{name: "a string holding brackets", data: `"[[[{{{"`, want: `"[[[{{{"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := reportJSON([]byte(tt.data))
+			if tt.want == "" {
+				require.Contains(t, got, "\n"+strings.Repeat("  ", maxReportIndentDepth)+`"x"`)
+				return
+			}
+			require.Equal(t, tt.want, got)
+		})
+	}
+	require.Equal(t, `{"deep":`+deep+`}`, reportValues(map[string]any{"deep": json.RawMessage(deep)}))
+	require.Equal(t, "{\n  \"a\": 1\n}", reportValues(map[string]any{"a": 1}))
+}
+
+func TestHTMLRunReportGrowsLinearlyWithJSONDepth(t *testing.T) {
+	reportSize := func(t *testing.T, output string, step Step) int {
+		t.Helper()
+		fetch := NewToolFunc(
+			Tool{Name: "fetch", Description: "fetch", Parameters: json.RawMessage(`{"type":"object"}`)},
+			func(context.Context, ToolCall) (ToolResult, error) {
+				return ToolResult{Output: json.RawMessage(output)}, nil
+			},
+		)
+		registry, err := NewToolRegistry(fetch)
+		require.NoError(t, err)
+		recorder := &RecordingObserver{}
+		pipeline, err := PipelineSpec{
+			Inputs:    refs(orderIDKey.Ref()),
+			Steps:     []Step{step},
+			Tools:     registry,
+			Observers: []PipelineObserver{recorder},
+		}.Build()
+		require.NoError(t, err)
+		_, _ = pipeline.Run(context.Background(), NewState(Prediction{"order_id": "A-1"}))
+		report, err := HTMLRunReport(recorder.Traces()[0], HTMLReportOptions{})
+		require.NoError(t, err)
+		return len(report)
+	}
+	calling := NewStep("fetch", nil, nil, func(ctx context.Context, _ State) error {
+		_, _, err := toolEnvFrom(ctx).session.Call(ctx, ToolCall{ID: "1", Name: "fetch", Arguments: `{}`})
+		return err
+	})
+	failing := ToolStep("fetch", "fetch", refs(orderIDKey.Ref()), refs(statusKey.Ref()))
+	for name, step := range map[string]Step{"a tool call's output": calling, "a step's details": failing} {
+		t.Run(name, func(t *testing.T) {
+			for _, depth := range []int{1000, 9000} {
+				output := strings.Repeat("[", depth) + `"x"` + strings.Repeat("]", depth)
+				size := reportSize(t, output, step)
+				require.Less(t, size, 8*len(output)+64<<10, "depth %d: report of %d bytes", depth, size)
+			}
+		})
+	}
+}
+
+// TestRedactorReplacementsNeverEnterText checks that a value a Redactor removes from a tool's
+// JSON is replaced in error messages and details by RedactedText, never by what the Redactor put
+// in its place, which may name someone else or hold a value hidden under another key.
+func TestRedactorReplacementsNeverEnterText(t *testing.T) {
+	customer := Key[string]{Name: "customer"}
+	editOutput := func(edit func(map[string]any)) Redactor {
+		return func(key string, value any) any {
+			switch key {
+			case "customer":
+				return "[customer]"
+			case "tool:lookup":
+				raw, ok := value.(json.RawMessage)
+				var output map[string]any
+				if !ok || json.Unmarshal(raw, &output) != nil {
+					return value
+				}
+				edit(output)
+				data, _ := json.Marshal(output)
+				return json.RawMessage(data)
+			}
+			return value
+		}
+	}
+	tests := []struct {
+		name     string
+		output   string
+		note     string
+		redactor Redactor
+		wantNote string
+		hidden   []string
+	}{
+		{
+			name:   "an entry dropped from an array",
+			output: `{"contacts": ["Mallory Secret", "Carol Client"]}`,
+			note:   "Mallory Secret did not answer",
+			redactor: editOutput(func(output map[string]any) {
+				var kept []any
+				for _, contact := range output["contacts"].([]any) {
+					if !strings.HasPrefix(contact.(string), "Mallory") {
+						kept = append(kept, contact)
+					}
+				}
+				output["contacts"] = kept
+			}),
+			wantNote: "[redacted] did not answer",
+			hidden:   []string{"Mallory Secret", "Carol Client"},
+		},
+		{
+			name:     "a replacement that holds another hidden value",
+			output:   `{"ssn": "123-45-6789", "status": "ok"}`,
+			note:     "ssn 123-45-6789 checked",
+			redactor: editOutput(func(output map[string]any) { output["ssn"] = "ssn of Carol Client" }),
+			wantNote: "ssn [redacted] checked",
+			hidden:   []string{"123-45-6789", "Carol Client"},
+		},
+		{
+			name:     "a number replaced by another value the output keeps",
+			output:   `{"pin": 4321, "retries": 7}`,
+			note:     "pin 4321 after 7 retries",
+			redactor: editOutput(func(output map[string]any) { output["pin"] = 7 }),
+			wantNote: "pin [redacted] after 7 retries",
+			hidden:   []string{"4321"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tool := NewToolFunc(
+				Tool{Name: "lookup", Description: "lookup", Parameters: json.RawMessage(`{"type":"object"}`)},
+				func(context.Context, ToolCall) (ToolResult, error) {
+					return ToolResult{Output: json.RawMessage(tt.output)}, nil
+				},
+			)
+			registry, err := NewToolRegistry(tool)
+			require.NoError(t, err)
+			lm := newScriptedChat(
+				toolCallReply("1", "lookup", `{"q":"x"}`, Usage{}),
+				textReply(`{"summary": null, "note": "`+tt.note+`"}`, Usage{}),
+			)
+			predict := Predict{
+				Signature: Signature{
+					Name:    "answer",
+					Inputs:  []Field{{Name: "customer"}},
+					Outputs: []Field{{Name: "summary", Type: "string"}},
+				},
+				LM:    lm,
+				Tools: []string{"lookup"},
+			}
+			recorder := &RecordingObserver{}
+			log := &eventLog{}
+			pipeline, err := PipelineSpec{
+				Inputs:    refs(customer.Ref()),
+				Steps:     []Step{NewProgramStep("answer", predict, refs(customer.Ref()), refs(summaryKey.Ref()))},
+				Tools:     registry,
+				Observers: []PipelineObserver{recorder, log},
+				Redactor:  tt.redactor,
+			}.Build()
+			require.NoError(t, err)
+
+			_, err = pipeline.Run(context.Background(), NewState(Prediction{"customer": "Carol Client"}))
+
+			require.ErrorIs(t, err, ErrInvalidOutput)
+			event := log.finishedStep(t, "answer", 1)
+			require.Equal(t, tt.wantNote, event.Details["output"].(Prediction)["note"])
+			data := requireTraceRoundTrip(t, recorder.Traces()[0])
+			report, err := HTMLRunReport(recorder.Traces()[0], HTMLReportOptions{})
+			require.NoError(t, err)
+			for _, secret := range tt.hidden {
+				require.NotContains(t, data, secret)
+				require.NotContains(t, report, secret)
+				require.NotContains(t, fmt.Sprintf("%+v", log.finished), secret)
+			}
+		})
+	}
+}
+
+func TestRedactorHidesMalformedToolArguments(t *testing.T) {
+	const secret = "SECRET-ORDER-5"
+	for name, arguments := range map[string]string{
+		"truncated":      `{"order_id":"` + secret,
+		"trailing comma": `{"order_id":"` + secret + `",}`,
+		"two values":     `{"order_id":"` + secret + `"} {}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			lookup := NewTool("lookup", "Look up an order", func(context.Context, lookupArgs) (orderStatus, error) {
+				return orderStatus{}, nil
+			})
+			registry, err := NewToolRegistry(lookup)
+			require.NoError(t, err)
+			lm := newScriptedChat(toolCallReply("1", "lookup", arguments, Usage{}))
+			question := Key[string]{Name: "question"}
+			predict := Predict{
+				Signature: Signature{
+					Name:    "answer",
+					Inputs:  []Field{{Name: "question"}},
+					Outputs: []Field{{Name: "summary", Type: "string"}},
+				},
+				LM:    lm,
+				Tools: []string{"lookup"},
+			}
+			recorder := &RecordingObserver{}
+			log := &eventLog{}
+			pipeline, err := PipelineSpec{
+				Inputs:    refs(question.Ref()),
+				Steps:     []Step{NewProgramStep("answer", predict, refs(question.Ref()), refs(summaryKey.Ref()))},
+				Tools:     registry,
+				Observers: []PipelineObserver{recorder, log},
+				Redactor:  hideKey("tool:lookup", "[hidden]"),
+			}.Build()
+			require.NoError(t, err)
+
+			_, err = pipeline.Run(context.Background(), NewState(Prediction{"question": "q"}))
+
+			require.ErrorIs(t, err, ErrInvalidToolArguments)
+			event := log.finishedStep(t, "answer", 1)
+			require.Equal(t, "[hidden]", event.ToolCalls[0].Arguments)
+			data := requireTraceRoundTrip(t, recorder.Traces()[0])
+			report, err := HTMLRunReport(recorder.Traces()[0], HTMLReportOptions{})
+			require.NoError(t, err)
+			require.NotContains(t, data, secret)
+			require.NotContains(t, report, secret)
+			require.NotContains(t, fmt.Sprintf("%+v", log.finished), secret)
+		})
+	}
+}
+
+func TestRedactorHidesALargeToolString(t *testing.T) {
+	paragraph := strings.Repeat("confidential paragraph. ", 40_000)
+	tool := NewToolFunc(
+		Tool{Name: "lookup", Description: "lookup", Parameters: json.RawMessage(`{"type":"object"}`)},
+		func(context.Context, ToolCall) (ToolResult, error) {
+			return ToolResult{Output: json.RawMessage(`{"doc": "` + paragraph + `", "n": 1}`)}, nil
+		},
+	)
+	registry, err := NewToolRegistry(tool)
+	require.NoError(t, err)
+	recorder := &RecordingObserver{}
+	log := &eventLog{}
+	pipeline, err := PipelineSpec{
+		Inputs:    refs(orderIDKey.Ref()),
+		Steps:     []Step{ToolStep("lookup", "lookup", refs(orderIDKey.Ref()), refs(statusKey.Ref()))},
+		Tools:     registry,
+		Observers: []PipelineObserver{recorder, log},
+		Redactor:  hideKey("tool:lookup", "[hidden]"),
+	}.Build()
+	require.NoError(t, err)
+
+	_, err = pipeline.Run(context.Background(), NewState(Prediction{"order_id": "A-1"}))
+
+	require.ErrorIs(t, err, ErrInvalidOutput)
+	event := log.finishedStep(t, "lookup", 1)
+	require.Equal(t, json.RawMessage(`{"doc":"[hidden]","n":"[hidden]"}`), event.Details["output"])
+	data := requireTraceRoundTrip(t, recorder.Traces()[0])
+	require.NotContains(t, data, "confidential paragraph")
+	require.Less(t, len(data), 16<<10, "the hidden string leaves no copy in the trace")
 }
