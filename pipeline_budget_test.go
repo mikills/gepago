@@ -989,6 +989,162 @@ func TestRetryPendingTokensSettleOnEveryPath(t *testing.T) {
 	}
 }
 
+func TestRetryCountsAFailedAttemptBeforeItsBackoff(t *testing.T) {
+	t.Run("a sibling's model call is refused", func(t *testing.T) {
+		inBackoff := make(chan struct{})
+		var once sync.Once
+		var aCalls, bCalls atomic.Int32
+		var waited atomic.Bool
+		b := GeneratorFunc(func(context.Context, string) (Generation, error) {
+			bCalls.Add(1)
+			return Generation{Usage: Usage{TotalTokens: 20}}, TransientError(errors.New("503"))
+		})
+		bLM := &RetryingLanguageModel{LM: b, MaxAttempts: 2, Delay: 200 * time.Millisecond, Jitter: func() float64 {
+			waited.Store(true)
+			once.Do(func() { close(inBackoff) })
+			return 0
+		}}
+		aLM := GeneratorFunc(func(context.Context, string) (Generation, error) {
+			aCalls.Add(1)
+			return Generation{Text: `{"a": "done"}`, Usage: Usage{TotalTokens: 1}}, nil
+		})
+		aPredict := predictStep("a", aLM, docKey.Ref(), Key[string]{Name: "a"}.Ref())
+		a := NewStep("a", refs(docKey.Ref()), refs(Key[string]{Name: "a"}.Ref()), func(ctx context.Context, s State) error {
+			select {
+			case <-inBackoff: // B waits to retry, having spent 20 tokens against MaxTokens 15
+			case <-ctx.Done(): // B ended the run instead
+			}
+			return aPredict.Run(ctx, s)
+		})
+		pipeline, err := PipelineSpec{
+			Inputs: refs(docKey.Ref()),
+			Steps:  []Step{Parallel("fan", a, predictStep("b", bLM, docKey.Ref(), Key[string]{Name: "b"}.Ref()))},
+			Budget: RunBudget{MaxTokens: 15},
+		}.Build()
+		require.NoError(t, err)
+
+		_, err = pipeline.RunCandidate(context.Background(), nil, Prediction{"document": "x"})
+
+		// either sibling may report the budget error first; the other's is the same error
+		require.ErrorContains(t, err, "run budget MaxTokens 15 exceeded: 20 tokens spent")
+		require.True(t, IsBudget(err))
+		require.Zero(t, aCalls.Load(), "A's call must not start once 20 tokens are spent")
+		require.Equal(t, int32(1), bCalls.Load())
+		require.False(t, waited.Load(), "B must not wait for a retry the budget refuses")
+	})
+
+	t.Run("a sibling sees them spent", func(t *testing.T) {
+		inBackoff := make(chan struct{})
+		read := make(chan struct{})
+		var once sync.Once
+		var bCalls atomic.Int32
+		b := GeneratorFunc(func(context.Context, string) (Generation, error) {
+			if bCalls.Add(1) == 1 {
+				return Generation{Usage: Usage{TotalTokens: 20}}, TransientError(errors.New("503"))
+			}
+			<-read
+			return Generation{Text: `{"b": "done"}`, Usage: tenTokens}, nil
+		})
+		bLM := &RetryingLanguageModel{LM: b, MaxAttempts: 2, Delay: time.Millisecond, Jitter: func() float64 {
+			once.Do(func() { close(inBackoff) })
+			return 0
+		}}
+		var during, after BudgetRemaining
+		a := NewStep("a", nil, nil, func(ctx context.Context, _ State) error {
+			defer close(read)
+			select {
+			case <-inBackoff:
+				during = BudgetFrom(ctx).Remaining()
+			case <-ctx.Done():
+			}
+			return nil
+		})
+		probe := NewStep("probe", nil, nil, func(ctx context.Context, _ State) error {
+			after = BudgetFrom(ctx).Remaining()
+			return nil
+		})
+		pipeline, err := PipelineSpec{
+			Inputs: refs(docKey.Ref()),
+			Steps:  []Step{Parallel("fan", a, predictStep("b", bLM, docKey.Ref(), Key[string]{Name: "b"}.Ref())), probe},
+			Budget: RunBudget{MaxTokens: 100},
+		}.Build()
+		require.NoError(t, err)
+		compiled := CompiledProgram{Program: pipeline, Candidate: pipeline.SeedCandidate()}
+
+		_, usage, err := compiled.RunWithUsage(context.Background(), Prediction{"document": "x"})
+
+		require.NoError(t, err)
+		require.Equal(t, 80, during.Tokens, "B's failed attempt is spent while B waits")
+		require.Equal(t, 70, after.Tokens)
+		require.Equal(t, 30, usage.TotalTokens)
+	})
+}
+
+func TestRetryStopsWithoutWaitingWhenTheBudgetRefuses(t *testing.T) {
+	tests := []struct {
+		name     string
+		attempts []int
+		budget   RunBudget
+		wantErr  string
+	}{
+		{
+			name:     "run token limit",
+			attempts: []int{3},
+			budget:   RunBudget{MaxTokens: 15},
+			wantErr:  `pipeline step "a": run budget MaxTokens 15 exceeded: 20 tokens spent`,
+		},
+		{
+			name:     "step token limit",
+			attempts: []int{3},
+			budget:   RunBudget{PerStepTokens: map[string]int{"a": 15}},
+			wantErr:  `pipeline step "a": run budget PerStepTokens["a"] 15 exceeded: 20 tokens spent`,
+		},
+		{
+			name:     "model calls",
+			attempts: []int{3},
+			budget:   RunBudget{MaxModelCalls: 1},
+			wantErr:  `pipeline step "a": run budget MaxModelCalls 1 exceeded: model call 2 refused`,
+		},
+		{
+			name:     "nested",
+			attempts: []int{3, 3},
+			budget:   RunBudget{MaxTokens: 15},
+			wantErr:  `pipeline step "a": run budget MaxTokens 15 exceeded: 20 tokens spent`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int32
+			var waited atomic.Bool
+			var lm Generator = GeneratorFunc(func(context.Context, string) (Generation, error) {
+				calls.Add(1)
+				return Generation{Usage: Usage{TotalTokens: 20}}, TransientError(errors.New("503"))
+			})
+			for _, n := range tt.attempts {
+				lm = &RetryingLanguageModel{LM: lm, MaxAttempts: n, Delay: time.Second, MaxDelay: time.Second, Jitter: func() float64 {
+					waited.Store(true)
+					return 0
+				}}
+			}
+			pipeline, err := PipelineSpec{
+				Inputs: refs(docKey.Ref()),
+				Steps:  []Step{predictStep("a", lm, docKey.Ref(), Key[string]{Name: "a"}.Ref())},
+				Budget: tt.budget,
+			}.Build()
+			require.NoError(t, err)
+			compiled := CompiledProgram{Program: pipeline, Candidate: pipeline.SeedCandidate()}
+
+			_, usage, err := compiled.RunWithUsage(context.Background(), Prediction{"document": "x"})
+
+			require.EqualError(t, err, tt.wantErr)
+			require.True(t, IsBudget(err))
+			require.Equal(t, int32(1), calls.Load())
+			require.False(t, waited.Load(), "the retry the budget refuses is not waited for")
+			require.Equal(t, 20, usage.TotalTokens)
+		})
+	}
+}
+
 func TestRefusedRetryRecordsUsageOnce(t *testing.T) {
 	var provider atomic.Int32
 	flaky := GeneratorFunc(func(context.Context, string) (Generation, error) {

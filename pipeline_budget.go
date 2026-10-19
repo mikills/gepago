@@ -17,8 +17,8 @@ import (
 // RetryingLanguageModel included: a run with MaxModelCalls N makes N calls and the next is
 // refused before it reaches the model. MaxTokens and PerStepTokens count every token spent:
 // those RecordUsage records, as Usage.TotalTokens or, when a provider leaves that zero,
-// PromptTokens plus CompletionTokens, and those a retrying model has spent on earlier attempts
-// of a call still in progress. Reaching a token limit is allowed; the run or step fails as soon
+// PromptTokens plus CompletionTokens, and those a retrying model has spent on the failed
+// attempts of a call still in progress, from the moment each attempt returns. Reaching a token limit is allowed; the run or step fails as soon
 // as spent tokens exceed it, and no call or retry starts after that. MaxDuration fails the run
 // once the time since it started reaches the limit.
 //
@@ -300,12 +300,15 @@ func (f *usageFrame) checkStepTokens(spent int) error {
 type retryAdmissionKey struct{}
 
 // retryAdmission admits the attempts after the first of one call of a retrying model, such as
-// RetryingLanguageModel, against the budgets of the pipeline run in its context.
+// RetryingLanguageModel, against the budgets of the pipeline run in its context. The model
+// reports each failed attempt it would retry as soon as the attempt returns, and stops at once
+// when the budget already refuses the retry; once its wait is over it reserves the retry with
+// next.
 //
-// Tokens of failed attempts are pending from the moment the call reports them until its caller
-// records the usage the call returns: the run and its steps count them as spent, for every
-// call's admissions. reported is the number of tokens of the call's attempts already pending.
-// A retrying model called by another with the same usage frame is nested in it: the tokens it
+// Reported tokens are pending until the call's caller records the usage the call returns: the
+// run and its steps count them as spent, for every call's admissions, including during the
+// call's waits. reported is the number of tokens of the call's attempts already pending. A
+// retrying model called by another with the same usage frame is nested in it: the tokens it
 // reports count as reported by every call it is nested in, so the outer call does not report
 // them again, and only the outermost call leaves its pending tokens to settle on return.
 type retryAdmission struct {
@@ -328,9 +331,11 @@ func beginRetryAdmission(ctx context.Context) (context.Context, *retryAdmission)
 	return context.WithValue(ctx, retryAdmissionKey{}, call), call
 }
 
-// next reserves the next attempt of the call. spent is the summed usage of its attempts so far;
-// the tokens of it that are not yet reported become pending.
-func (r *retryAdmission) next(spent Usage) error {
+// report counts the call's failed attempts as spent. spent is the summed usage of its attempts
+// so far; the tokens of it that are not yet reported become pending. It returns the budget
+// error that refuses the next attempt now, failing the limit that is exceeded, so the call ends
+// without waiting to retry.
+func (r *retryAdmission) report(spent Usage) error {
 	f := r.frame
 	if f == nil {
 		return nil
@@ -348,7 +353,12 @@ func (r *retryAdmission) next(spent Usage) error {
 			frame.budget.stepPending[frame.step] += unreported
 		}
 	}
-	return f.admitLocked()
+	return f.refusalLocked()
+}
+
+// next reserves the next attempt of the call, after its wait.
+func (r *retryAdmission) next() error {
+	return r.frame.admit()
 }
 
 // finish ends the call, which returns spent. An outermost call leaves its pending tokens on its
@@ -373,12 +383,21 @@ func (f *usageFrame) admit() error {
 	}
 	f.budget.mu.Lock()
 	defer f.budget.mu.Unlock()
-	return f.admitLocked()
+	if err := f.refusalLocked(); err != nil {
+		return err
+	}
+	for frame := f; frame != nil; frame = frame.parent {
+		if frame.step == "" {
+			frame.budget.calls++
+		}
+	}
+	return nil
 }
 
-// admitLocked is admit for a caller that holds mu. A token limit that the spent tokens,
-// pending ones included, exceed refuses the call.
-func (f *usageFrame) admitLocked() error {
+// refusalLocked returns the budget error that refuses a model call under f now, failing the
+// limit it exceeds: a token limit that the spent tokens, pending ones included, exceed, or a
+// spent MaxModelCalls, besides any error that already stops work under f. The caller holds mu.
+func (f *usageFrame) refusalLocked() error {
 	if err := f.checkLocked(); err != nil {
 		return err
 	}
@@ -397,11 +416,6 @@ func (f *usageFrame) admitLocked() error {
 			return budget.fail(BudgetError(
 				fmt.Errorf("run budget MaxModelCalls %d exceeded: model call %d refused", limit, budget.calls+1),
 			))
-		}
-	}
-	for frame := f; frame != nil; frame = frame.parent {
-		if frame.step == "" {
-			frame.budget.calls++
 		}
 	}
 	return nil
