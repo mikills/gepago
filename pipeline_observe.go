@@ -50,9 +50,11 @@ import (
 // prefer pointer observers. An observer that panics is recovered: the run continues, the other
 // observers still receive the event, and the observer keeps receiving later events.
 //
-// ctx carries the values of the context of the run or step the event belongs to, and ends when
-// the context the caller passed to the trace's top-level run ends, but not when a step's
-// timeout, a RunBudget limit or a failed Parallel sibling ends the step's own context. It
+// ctx carries the values of the context of the run or step the event belongs to. It ends when
+// the context the caller passed to the trace's top-level run ends, when the MaxDuration of the
+// event's run or of a run around it expires, or once the event's run has finished, but not when
+// a step's timeout, a token or model call limit or a failed Parallel sibling ends the step's
+// own context. It
 // carries neither the run's trace, budget nor usage collection, so an observer's model calls
 // and pipeline runs are independent of the observed run: they spend none of its budget, do not
 // count in its usage, and a pipeline run with ctx starts a trace of its own.
@@ -142,12 +144,13 @@ func observeScopeFrom(ctx context.Context) *observeScope {
 	return scope
 }
 
-// evaluationKey carries an evaluationCapture, which every top-level pipeline run started with
-// the context reports to; see ProgramEvaluator.
+// evaluationKey carries an evaluationCapture, which every pipeline run started with the
+// context reports to; see ProgramEvaluator.
 type evaluationKey struct{}
 
-// evaluationCapture collects what ProgramEvaluator needs from the top-level pipeline runs of
-// one evaluated example: their Redactors and, when recorder is set, their traces.
+// evaluationCapture collects what ProgramEvaluator needs from the pipeline runs of one
+// evaluated example: the Redactors of every run, nested ones included, and, when recorder is
+// set, the traces of the top-level runs.
 type evaluationCapture struct {
 	recorder  *RecordingObserver
 	mu        sync.Mutex
@@ -158,8 +161,8 @@ func withEvaluationCapture(ctx context.Context, capture *evaluationCapture) cont
 	return context.WithValue(ctx, evaluationKey{}, capture)
 }
 
-// join records a top-level run of p and returns the recorder the run reports to, if any.
-func (c *evaluationCapture) join(p Pipeline) *RecordingObserver {
+// join records a run of p and returns the recorder a top-level run reports to, if any.
+func (c *evaluationCapture) join(p Pipeline, topLevel bool) *RecordingObserver {
 	if c == nil {
 		return nil
 	}
@@ -167,6 +170,9 @@ func (c *evaluationCapture) join(p Pipeline) *RecordingObserver {
 		c.mu.Lock()
 		c.redactors = append(c.redactors, p.redactor)
 		c.mu.Unlock()
+	}
+	if !topLevel {
+		return nil
 	}
 	return c.recorder
 }
@@ -183,17 +189,16 @@ func (c *evaluationCapture) apply(item EvaluationItem) EvaluationItem {
 	return redactEvaluationItem(item, redactors)
 }
 
-// observerContext returns ctx, a context of the trace's runs, as observers receive it: with
-// its values, but ending only when the context the caller passed to the trace's top-level run
-// ends, and without the run it belongs to, so nothing an observer does with it counts against
-// the run.
-func (t *traceObservation) observerContext(ctx context.Context) context.Context {
-	return observerCtx{Context: t.caller, values: context.WithoutCancel(ctx)}
+// observerContext returns ctx, a context of the run, as observers receive it: with its values,
+// but ending only when the run's life ends (see runObservation), and without the run it
+// belongs to, so nothing an observer does with it counts against the run.
+func (r *runObservation) observerContext(ctx context.Context) context.Context {
+	return observerCtx{Context: r.life, values: context.WithoutCancel(ctx)}
 }
 
-// observerCtx takes its deadline and cancellation from the caller's context and its values
-// from a run's context, hiding those that tie it to a pipeline run: its trace, step frame,
-// budget, usage collection, step cache and evaluation capture.
+// observerCtx takes its deadline and cancellation from a run's life and its values from a
+// run's context, hiding those that tie it to a pipeline run: its trace, step frame, budget,
+// usage collection, step cache and evaluation capture.
 type observerCtx struct {
 	context.Context
 	values context.Context
@@ -229,23 +234,25 @@ func sameObserver(a, b PipelineObserver) (same bool) {
 }
 
 // traceObservation is shared by the runs of one trace. Its lock serialises their observer and
-// redactor calls and guards the text it removes from errors; see Redactor. caller is the
-// context the caller passed to the trace's top-level run.
+// redactor calls and guards the text it removes from errors; see Redactor.
 type traceObservation struct {
-	id     string
-	caller context.Context
-	mu     sync.Mutex
+	id string
+	mu sync.Mutex
 	redactedText
 }
 
 // runObservation reports one run to its observers: its own and those of the runs around it,
-// with its own redactor followed by theirs.
+// with its own redactor followed by theirs. life ends when the context the caller passed to the
+// trace's top-level run ends, when the MaxDuration of the run or a run around it expires, or
+// when endLife ends it once the run has finished.
 type runObservation struct {
 	trace     *traceObservation
 	observers []PipelineObserver
 	redactors []Redactor
 	span      UsageSpan
 	start     time.Time
+	life      context.Context
+	endLife   context.CancelFunc
 }
 
 // observeRun starts observing a run of p over its converted inputs, as part of the trace in ctx
@@ -256,15 +263,12 @@ func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any)
 	*runObservation,
 ) {
 	parent := observeScopeFrom(ctx)
-	var sink *RecordingObserver
-	if parent == nil {
-		capture, _ := ctx.Value(evaluationKey{}).(*evaluationCapture)
-		sink = capture.join(p)
-		if len(p.observers) == 0 && sink == nil {
-			return ctx, nil
-		}
+	capture, _ := ctx.Value(evaluationKey{}).(*evaluationCapture)
+	sink := capture.join(p, parent == nil)
+	if parent == nil && len(p.observers) == 0 && sink == nil {
+		return ctx, nil
 	}
-	run := &runObservation{observers: appendObservers(nil, p.observers...), start: time.Now()}
+	run := &runObservation{observers: appendObservers(nil, p.observers...), start: time.Now(), life: caller}
 	if p.redactor != nil {
 		run.redactors = []Redactor{p.redactor}
 	}
@@ -273,12 +277,18 @@ func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any)
 		run.trace = parent.run.trace
 		run.observers = appendObservers(run.observers, parent.run.observers...)
 		run.redactors = append(run.redactors, parent.run.redactors...)
+		run.life = parent.run.life
 		parentSpan = parent.span
 	} else {
 		if sink != nil {
 			run.observers = appendObservers(run.observers, sink)
 		}
-		run.trace = &traceObservation{id: NewID(), caller: caller}
+		run.trace = &traceObservation{id: NewID()}
+	}
+	if limit := p.budget.MaxDuration; limit > 0 {
+		run.life, run.endLife = context.WithDeadline(run.life, run.start.Add(limit))
+	} else {
+		run.life, run.endLife = context.WithCancel(run.life)
 	}
 	run.span = NewUsageSpan(run.trace.id, parentSpan, UsageSpanPipelineRun, "pipeline")
 	ctx = context.WithValue(ctx, observeKey{}, &observeScope{run: run, span: run.span.ID})
@@ -286,7 +296,7 @@ func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any)
 	run.trace.mu.Lock()
 	defer run.trace.mu.Unlock()
 	event := RunStartedEvent{Span: run.span, Inputs: run.redactValues(inputs)}
-	observerCtx := run.trace.observerContext(ctx)
+	observerCtx := run.observerContext(ctx)
 	run.deliver(func(observer PipelineObserver) {
 		event := event
 		event.Inputs = copyValues(event.Inputs)
@@ -306,10 +316,11 @@ func (r *runObservation) finish(ctx context.Context, err error) {
 	defer r.trace.mu.Unlock()
 	err = r.redactError(err)
 	event := RunFinishedEvent{Span: finishSpan(r.span, duration, usage, err), Duration: duration, Usage: usage, Err: err}
-	observerCtx := r.trace.observerContext(ctx)
+	observerCtx := r.observerContext(ctx)
 	r.deliver(func(observer PipelineObserver) {
 		observer.RunFinished(observerCtx, event)
 	})
+	r.endLife()
 }
 
 // stepObservation reports one execution of a step.
@@ -346,7 +357,7 @@ func observeStep(ctx context.Context, node *stepNode, attempt int, values map[st
 	defer run.trace.mu.Unlock()
 	observed := &stepObservation{run: run, ctx: ctx, span: span, step: node.name, reads: run.redactValues(reads)}
 	event := StepStartedEvent{Span: span, Step: node.name, Attempt: attempt, Reads: observed.reads}
-	observerCtx := run.trace.observerContext(ctx)
+	observerCtx := run.observerContext(ctx)
 	run.deliver(func(observer PipelineObserver) {
 		event := event
 		event.Reads = copyValues(event.Reads)
@@ -394,7 +405,7 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 	}
 	event.Err = run.redactError(outcome.Err)
 	event.Span = finishSpan(s.span, outcome.Duration, outcome.Usage, event.Err)
-	observerCtx := run.trace.observerContext(s.ctx)
+	observerCtx := run.observerContext(s.ctx)
 	run.deliver(func(observer PipelineObserver) {
 		event := event
 		event.Reads = copyValues(event.Reads)

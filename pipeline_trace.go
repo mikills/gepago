@@ -274,8 +274,9 @@ func isTraceDatasetBuilder(builder ReflectiveDatasetBuilder) bool {
 // failed before running any nested step therefore owns the components of its nested steps.
 // When the pipeline runs inside a programme that scopes its keys further, such as a step of a
 // PipelineProgram, and no execution owns the whole key, the key is tried without its leading
-// segments, one at a time, until some execution owns it; segments are matched whole, so a
-// step "summarise" never owns "xsummarise.instruction".
+// segments, one at a time, until some execution owns it. A leading segment that names a
+// top-level step of the traces is never dropped, since the pipeline's own scoping added it,
+// and segments are matched whole, so a step "summarise" never owns "xsummarise.instruction".
 //
 // Each step record holds "trace_id", "step", the step's name, "attempt", "reads", "writes" and
 // "usage", and for a failed execution "error" and, when the step attached any, "details". A
@@ -342,16 +343,24 @@ func evaluationTrace(recorder *RecordingObserver) any {
 
 // ownedSteps returns a record for every execution in traces of a step that owns component. When
 // no execution owns the key, because a programme around the pipeline scoped it further, it
-// tries the key without its leading segments, one at a time.
+// tries the key without its leading segments, one at a time, but never drops the name of a
+// top-level step of the traces, which the pipeline's own scoping added.
 func ownedSteps(component string, traces []PipelineTrace) []ReflectiveRecord {
+	topLevel := map[string]bool{}
+	for _, trace := range traces {
+		for _, step := range trace.Steps {
+			topLevel[step.Step] = true
+		}
+	}
 	for key := component; ; {
 		if records := stepsOwning(key, traces); len(records) > 0 {
 			return records
 		}
-		var found bool
-		if _, key, found = strings.Cut(key, "."); !found {
+		segment, rest, found := strings.Cut(key, ".")
+		if !found || topLevel[segment] {
 			return []ReflectiveRecord{}
 		}
+		key = rest
 	}
 }
 

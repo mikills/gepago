@@ -330,6 +330,7 @@ type blockingObserver struct {
 	eventLog
 	block    bool
 	finished []error
+	last     context.Context
 }
 
 func (o *blockingObserver) StepStarted(ctx context.Context, event StepStartedEvent) {
@@ -341,7 +342,45 @@ func (o *blockingObserver) StepStarted(ctx context.Context, event StepStartedEve
 
 func (o *blockingObserver) StepFinished(ctx context.Context, event StepFinishedEvent) {
 	o.finished = append(o.finished, ctx.Err())
+	o.last = ctx
 	o.eventLog.StepFinished(ctx, event)
+}
+
+func TestPipelineObserverContextEndsWithTheRunsMaxDuration(t *testing.T) {
+	observer := &blockingObserver{block: true}
+	pipeline, err := PipelineSpec{
+		Steps:     []Step{writeAmount("write", 1)},
+		Observers: []PipelineObserver{observer},
+		Budget:    RunBudget{MaxDuration: 100 * time.Millisecond},
+	}.Build()
+	require.NoError(t, err)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := pipeline.Run(context.Background(), NewState(nil))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		require.True(t, IsBudget(err), "%v", err)
+		require.ErrorContains(t, err, "MaxDuration")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run is still blocked after its MaxDuration")
+	}
+	require.Equal(t, []error{context.DeadlineExceeded}, observer.finished)
+	deadline, ok := observer.last.Deadline()
+	require.True(t, ok, "the observer's context carries the run's deadline")
+	require.False(t, deadline.IsZero())
+}
+
+func TestPipelineObserverContextEndsWithItsRun(t *testing.T) {
+	observer := &blockingObserver{}
+	pipeline, err := PipelineSpec{Steps: []Step{writeAmount("write", 1)}, Observers: []PipelineObserver{observer}}.Build()
+	require.NoError(t, err)
+	_, err = pipeline.Run(context.Background(), NewState(nil))
+	require.NoError(t, err)
+	require.Equal(t, []error{nil}, observer.finished)
+	require.ErrorIs(t, observer.last.Err(), context.Canceled, "the context ends once the run has finished")
 }
 
 func TestPipelineObserverContextEndsWithTheCallersContext(t *testing.T) {

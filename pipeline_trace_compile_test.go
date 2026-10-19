@@ -235,13 +235,26 @@ func TestProgramEvaluatorRedactsReflectionValues(t *testing.T) {
 	})
 
 	t.Run("an invalid output", func(t *testing.T) {
-		pipeline := build(tenTokenModel(`{"summary": null, "note": "private words"}`))
-		result, err := ProgramEvaluator{Program: pipeline, Metric: metric}.
-			Evaluate(context.Background(), pipeline.SeedCandidate(), examples, false)
+		ssnKey := Key[int]{Name: "ssn"}
+		pipeline, err := PipelineSpec{
+			Inputs:   refs(docKey.Ref()),
+			Steps:    []Step{predictStep("extract", tenTokenModel(`{"ssn": "123-45-6789"}`), docKey.Ref(), ssnKey.Ref())},
+			Redactor: hideKey("ssn", "[ssn]"),
+		}.Build()
 		require.NoError(t, err)
-		require.Zero(t, result.Items[0].Score)
-		require.Equal(t, Prediction{"summary": "[summary]"}, result.Items[0].SideInfo["expected"])
-		require.NotContains(t, fmt.Sprint(result.Items[0].SideInfo), "the gist")
+		ssnExamples := []Example{NewIOExample("one", Prediction{"document": "d"}, Prediction{"ssn": 987654321})}
+		result, err := ProgramEvaluator{Program: pipeline, Metric: metric}.
+			Evaluate(context.Background(), pipeline.SeedCandidate(), ssnExamples, false)
+		require.NoError(t, err)
+		item := result.Items[0]
+		require.Zero(t, item.Score)
+		details, ok := item.SideInfo["details"].(map[string]any)
+		require.True(t, ok, "the item carries the step's details: %v", item.SideInfo)
+		require.Equal(t, Prediction{"ssn": "[ssn]"}, details["output"])
+		require.Equal(t, Prediction{"ssn": "[ssn]"}, item.SideInfo["expected"])
+		require.NotContains(t, fmt.Sprint(item.SideInfo), "123-45-6789")
+		require.NotContains(t, fmt.Sprint(item.SideInfo), "987654321")
+		require.NotContains(t, fmt.Sprint(item.Output), "123-45-6789")
 	})
 
 	t.Run("a programme without a pipeline", func(t *testing.T) {
@@ -254,6 +267,115 @@ func TestProgramEvaluatorRedactsReflectionValues(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, Prediction{"summary": "private words"}, result.Items[0].Output)
 	})
+}
+
+func TestTraceDatasetBuilderNeverDropsATopLevelStepName(t *testing.T) {
+	// an outer pipeline with a top-level step classify and a step inner that ran a pipeline
+	// whose Branch route took arm other rather than its own classify
+	trace := PipelineTrace{TraceID: "t1", Steps: []StepTrace{
+		{Step: "classify", Attempt: 1},
+		{Step: "inner", Runs: []PipelineTrace{{Steps: []StepTrace{
+			{Step: "route", Steps: []StepTrace{{Step: "other", Attempt: 1}}},
+		}}}},
+	}}
+	eval := EvaluationResult{Items: []EvaluationItem{{ExampleID: "one", Trace: trace}}}
+	components := []string{
+		"inner.route.classify.instruction",
+		"classify.instruction",
+		"wrapper.classify.instruction",
+		"inner.route.other.instruction",
+	}
+	dataset := TraceDatasetBuilder{}.BuildReflectiveDataset(nil, eval, components)
+	stepsOf := func(component string) []ReflectiveRecord {
+		return dataset[component][0]["steps"].([]ReflectiveRecord)
+	}
+	require.Empty(t, stepsOf("inner.route.classify.instruction"), "the outer classify is not the branch arm")
+	require.Len(t, stepsOf("classify.instruction"), 1)
+	require.Len(t, stepsOf("wrapper.classify.instruction"), 1, "a wrapping programme's prefix is dropped")
+	require.Equal(t, "other", stepsOf("inner.route.other.instruction")[0]["step"])
+}
+
+// hideKey returns a Redactor that replaces the value of one key.
+func hideKey(name string, replacement any) Redactor {
+	return func(key string, value any) any {
+		if key == name {
+			return replacement
+		}
+		return value
+	}
+}
+
+// TestProgramEvaluatorRedactsWithNestedPipelineRedactors evaluates an outer pipeline without a
+// Redactor that runs an inner one with a Redactor, and checks the inner Redactor reaches the
+// reflection values and the recorded trace, whether or not traces are captured.
+func TestProgramEvaluatorRedactsWithNestedPipelineRedactors(t *testing.T) {
+	// the model echoes the document into the summary, which the Redactor does not name
+	echo := GeneratorFunc(func(_ context.Context, prompt string) (Generation, error) {
+		return Generation{Text: `{"summary": "about secret doc"}`, Usage: tenTokens}, nil
+	})
+	inner, err := PipelineSpec{
+		Inputs:   refs(docKey.Ref()),
+		Steps:    []Step{predictStep("summarise", echo, docKey.Ref(), summaryKey.Ref())},
+		Redactor: hideKey("document", "[doc]"),
+	}.Build()
+	require.NoError(t, err)
+	outer, err := PipelineSpec{
+		Inputs: refs(docKey.Ref()),
+		Steps:  []Step{NewProgramStep("inner", inner, refs(docKey.Ref()), refs(summaryKey.Ref()))},
+	}.Build()
+	require.NoError(t, err)
+	evaluator := ProgramEvaluator{Program: outer, Metric: ExactMatchMetric{Fields: []string{"summary"}}, RecordTraces: true}
+	examples := []Example{NewIOExample("one", Prediction{"document": "secret doc"}, Prediction{"summary": "short"})}
+
+	for _, captureTraces := range []bool{false, true} {
+		result, err := evaluator.Evaluate(context.Background(), outer.SeedCandidate(), examples, captureTraces)
+		require.NoError(t, err)
+		item := result.Items[0]
+		require.Equal(t, Prediction{"document": "[doc]"}, item.SideInfo["inputs"], "captureTraces %v", captureTraces)
+		require.Equal(t, Prediction{"summary": "about [doc]"}, item.Output, "the output's text is scrubbed")
+		require.NotContains(t, fmt.Sprint(item), "secret doc", "captureTraces %v", captureTraces)
+		if !captureTraces {
+			require.Nil(t, item.Trace)
+			continue
+		}
+		trace, ok := item.Trace.(PipelineTrace)
+		require.True(t, ok)
+		require.Equal(t, map[string]any{"document": "[doc]"}, trace.Inputs, "the outer run's trace is redacted too")
+		require.Equal(t, map[string]any{"summary": "about [doc]"}, trace.Steps[0].Writes)
+		require.Len(t, trace.Steps[0].Runs, 1)
+	}
+}
+
+func TestRedactEvaluationItemKeepsTheTraceShape(t *testing.T) {
+	trace := PipelineTrace{
+		TraceID: "t1",
+		Inputs:  map[string]any{"document": "secret doc"},
+		Err:     "failed on secret doc",
+		Steps: []StepTrace{{
+			SpanID:  "s1",
+			Step:    "secret doc step",
+			Reads:   map[string]any{"document": "secret doc"},
+			Details: map[string]any{"output": map[string]any{"document": "secret doc"}},
+			Err:     "secret doc is bad",
+			Steps:   []StepTrace{{Step: "nested", Reads: map[string]any{"document": "secret doc"}}},
+			Runs:    []PipelineTrace{{Inputs: map[string]any{"note": "about secret doc"}}},
+		}},
+	}
+	redactors := []Redactor{hideKey("document", "[doc]")}
+	for _, value := range []any{trace, &trace, []PipelineTrace{trace}} {
+		got := redactEvaluationItem(EvaluationItem{Trace: value}, redactors).Trace
+		require.IsType(t, value, got)
+		require.NotContains(t, fmt.Sprint(got), "secret doc is bad")
+		traces, _ := pipelineTraces(got)
+		redacted := traces[0]
+		require.Equal(t, "failed on [doc]", redacted.Err)
+		require.Equal(t, "secret doc step", redacted.Steps[0].Step, "step names are not scrubbed")
+		require.Equal(t, map[string]any{"document": "[doc]"}, redacted.Steps[0].Steps[0].Reads)
+		require.Equal(t, map[string]any{"output": map[string]any{"document": "[doc]"}}, redacted.Steps[0].Details)
+		require.Equal(t, map[string]any{"note": "about [doc]"}, redacted.Steps[0].Runs[0].Inputs)
+	}
+	require.Equal(t, "secret doc", trace.Inputs["document"], "the original trace is unchanged")
+	require.Equal(t, "not a trace", redactEvaluationItem(EvaluationItem{Trace: "not a trace"}, redactors).Trace)
 }
 
 func TestRedactEvaluationItemHandlesOtherOutputs(t *testing.T) {

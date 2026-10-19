@@ -169,10 +169,14 @@ type ProgramEvaluator struct {
 // PipelineTrace of the run, as the pipeline's Redactor redacts it, or a []PipelineTrace when
 // the programme ran several; see TraceDatasetBuilder.
 //
-// When the programme runs a Pipeline that has a Redactor, the values each item carries for
-// reflection, its Output and SideInfo, pass through that Redactor as the details of an event
-// do (see Redactor), whether or not traces are recorded, so reflection prompts never show what
-// the pipeline redacts. The Metric still scores the real values.
+// When the programme runs Pipelines that have Redactors, nested pipelines included, the values
+// each item carries for reflection pass through all of them, whether or not traces are
+// recorded, so reflection prompts never show what a pipeline redacts: its Output and each
+// SideInfo entry are redacted as an event's details are, SideInfo's "details" as an event's
+// details, and the values of its PipelineTraces by key, and then the text of every value the
+// Redactors changed is removed from every string in them (see Redactor). Values a pipeline's
+// own events already redacted pass through the Redactors again, so a Redactor should leave a
+// value it produced unchanged. The Metric still scores the real values.
 func (e ProgramEvaluator) Evaluate(
 	ctx context.Context,
 	candidate Candidate,

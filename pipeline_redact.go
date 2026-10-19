@@ -94,51 +94,146 @@ func applyRedactors(redactors []Redactor, key string, value any) (out any) {
 	return value
 }
 
-// redactDetails returns copies of an error's details as the run's events carry them: each
-// detail redacted, by entry for a Prediction or map[string]any, and the redacted text removed
-// from every string in it. The caller holds the trace lock.
-func (r *runObservation) redactDetails(details map[string]any) map[string]any {
+// redactEntry returns a copy of the detail named name as events carry it: a Prediction or
+// map[string]any entry by entry under each entry's key, and any other value under name. The
+// caller holds the trace lock.
+func (r *runObservation) redactEntry(name string, detail any) any {
+	switch entries := detail.(type) {
+	case Prediction:
+		return Prediction(r.redactValues(entries))
+	case map[string]any:
+		return r.redactValues(entries)
+	}
+	return r.redact(name, detail)
+}
+
+// redactEntries returns copies of details, each redacted by redactEntry, or nil when there are
+// none. The caller holds the trace lock.
+func (r *runObservation) redactEntries(details map[string]any) map[string]any {
 	if len(details) == 0 {
 		return nil
 	}
 	out := make(map[string]any, len(details))
 	for name, detail := range details {
-		switch entries := detail.(type) {
-		case Prediction:
-			out[name] = Prediction(r.redactValues(entries))
-		case map[string]any:
-			out[name] = r.redactValues(entries)
-		default:
-			out[name] = r.redact(name, detail)
-		}
-	}
-	if !r.redacting() {
-		return out
-	}
-	for name, detail := range out {
-		out[name] = replaceStrings(detail, r.trace.scrub)
+		out[name] = r.redactEntry(name, detail)
 	}
 	return out
 }
 
-// redactEvaluationItem returns item with the values reflection reads, its Output and SideInfo,
-// passed through redactors as an event's details are: a Prediction or map[string]any entry by
-// entry, any other entry under its own name, and the text of every value they changed removed
-// from the strings. Without redactors it returns item unchanged.
+// redactDetails returns copies of an error's details as the run's events carry them: each
+// detail redacted by redactEntry, and the redacted text removed from every string in them. The
+// caller holds the trace lock.
+func (r *runObservation) redactDetails(details map[string]any) map[string]any {
+	out := r.redactEntries(details)
+	if r.redacting() {
+		out = r.scrubValues(out)
+	}
+	return out
+}
+
+// scrubValues returns values with the redacted text removed from every string in them.
+func (r *runObservation) scrubValues(values map[string]any) map[string]any {
+	for name, value := range values {
+		values[name] = replaceStrings(value, r.trace.scrub)
+	}
+	return values
+}
+
+// redactEvaluationItem returns item with the values reflection reads passed through
+// redactors. Its Output and each SideInfo entry are redacted as an event's details are (see
+// redactEntry), SideInfo's "details" one level further, as an event's details, and the inputs,
+// reads, writes and details of any PipelineTrace in its Trace as an event's. Then the text of
+// every value the redactors changed is removed from every string in them, errors included.
+// Without redactors it returns item unchanged.
 func redactEvaluationItem(item EvaluationItem, redactors []Redactor) EvaluationItem {
 	if len(redactors) == 0 {
 		return item
 	}
 	run := &runObservation{trace: &traceObservation{}, redactors: redactors}
-	if output, ok := item.Output.(Prediction); ok && len(output) > 0 {
-		item.Output = Prediction(run.redactValues(output))
-	} else if item.Output != nil && !ok {
-		item.Output = run.redact("output", item.Output)
+	if output, ok := item.Output.(Prediction); item.Output != nil && (!ok || len(output) > 0) {
+		item.Output = run.redactEntry("output", item.Output)
 	}
 	if len(item.SideInfo) > 0 {
-		item.SideInfo = run.redactDetails(item.SideInfo)
+		sideInfo := make(map[string]any, len(item.SideInfo))
+		for name, entry := range item.SideInfo {
+			if details, ok := entry.(map[string]any); ok && name == "details" {
+				sideInfo[name] = run.redactEntries(details)
+				continue
+			}
+			sideInfo[name] = run.redactEntry(name, entry)
+		}
+		item.SideInfo = sideInfo
 	}
+	item.Trace = mapTraces(item.Trace, func(trace PipelineTrace) PipelineTrace {
+		return mapTrace(trace, run.redactValues, run.redactEntries, func(text string) string { return text })
+	})
+
+	if item.Output != nil {
+		item.Output = replaceStrings(item.Output, run.trace.scrub)
+	}
+	if item.SideInfo != nil {
+		item.SideInfo = run.scrubValues(item.SideInfo)
+	}
+	item.Trace = mapTraces(item.Trace, func(trace PipelineTrace) PipelineTrace {
+		return mapTrace(trace, run.scrubValues, run.scrubValues, run.trace.scrub)
+	})
 	return item
+}
+
+// mapTraces applies fn to the traces an evaluation item's Trace holds, keeping its shape.
+func mapTraces(value any, fn func(PipelineTrace) PipelineTrace) any {
+	switch trace := value.(type) {
+	case PipelineTrace:
+		return fn(trace)
+	case *PipelineTrace:
+		if trace != nil {
+			mapped := fn(*trace)
+			return &mapped
+		}
+	case []PipelineTrace:
+		if trace != nil {
+			mapped := make([]PipelineTrace, len(trace))
+			for i, run := range trace {
+				mapped[i] = fn(run)
+			}
+			return mapped
+		}
+	}
+	return value
+}
+
+// mapTrace returns a copy of trace, its nested runs included, with values applied to its
+// inputs and to each step's reads and writes, details to each step's details, and text to its
+// errors.
+func mapTrace(
+	trace PipelineTrace,
+	values, details func(map[string]any) map[string]any,
+	text func(string) string,
+) PipelineTrace {
+	trace.Inputs = values(trace.Inputs)
+	trace.Err = text(trace.Err)
+	if trace.Steps == nil {
+		return trace
+	}
+	steps := make([]StepTrace, len(trace.Steps))
+	for i, step := range trace.Steps {
+		step.Reads = values(step.Reads)
+		step.Writes = values(step.Writes)
+		step.Details = details(step.Details)
+		step.Err = text(step.Err)
+		nested := mapTrace(PipelineTrace{Steps: step.Steps}, values, details, text)
+		step.Steps = nested.Steps
+		if step.Runs != nil {
+			runs := make([]PipelineTrace, len(step.Runs))
+			for j, run := range step.Runs {
+				runs[j] = mapTrace(run, values, details, text)
+			}
+			step.Runs = runs
+		}
+		steps[i] = step
+	}
+	trace.Steps = steps
+	return trace
 }
 
 // redactError returns err as the run's events carry it: unchanged when nothing in the trace is
