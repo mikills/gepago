@@ -72,8 +72,18 @@ uses named steps whose nested programs are `predict` or `chainOfThought`:
 ],"returnAll":true}
 ```
 
-Pipeline candidates are scoped (`extract.instruction`, `decide.instruction`,
-etc.) and are passed to the existing `gepa.PipelineProgram` during Compile.
+Compile runs a pipeline program as a typed `gepa.Pipeline`. Each step reads its
+`inputKeys`, or its signature's inputs when it lists none, and writes its
+signature's outputs under its `outputPrefix`. A key takes the Go type of the
+`Field.Type` that first declares it (the first step's output that writes it, or,
+for a pipeline input, the input field of the first step that reads it), and
+`any` when that field sets no type, so a typed pipeline input must convert to
+its type. An absent or null optional output holds its type's zero value. A key
+written by several steps keeps the latest value; a step that writes a pipeline
+input, or steps that write one key as different types, fail validation. The
+result is the last step's outputs, or with `returnAll` the inputs overlaid with
+every step's outputs. Pipeline candidates are scoped (`extract.instruction`,
+`decide.instruction`, etc.).
 
 Supported metrics are `exactMatch`, `contains`, `numericMatch`,
 `classification`, and `llmJudge`. `acceptance` is `strict` (the default) or

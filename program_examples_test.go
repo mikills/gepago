@@ -75,8 +75,13 @@ func ExampleChainOfThought() {
 	// Output: 42
 }
 
-func ExamplePipelineProgram() {
+func ExampleNewProgramStep() {
 	ctx := context.Background()
+	document := gepa.Key[string]{Name: "document"}
+	amount := gepa.Key[int]{Name: "amount"}
+	deadline := gepa.Key[string]{Name: "deadline"}
+	decision := gepa.Key[string]{Name: "decision"}
+	reason := gepa.Key[string]{Name: "reason"}
 	extractLM := gepa.GeneratorFunc(func(context.Context, string) (gepa.Generation, error) {
 		return gepa.Generation{Text: `{"amount":125000,"deadline":"2026-06-30"}`}, nil
 	})
@@ -89,40 +94,39 @@ func ExamplePipelineProgram() {
 		return gepa.Generation{Text: `{"decision":"approve","reason":"Amount is within policy."}`}, nil
 	})
 
-	program := gepa.PipelineProgram{Steps: []gepa.PipelineStep{
-		{
-			Name: "extract",
-			Program: gepa.Predict{
-				Signature: gepa.Signature{
-					Name:    "extract_obligation",
-					Inputs:  []gepa.Field{{Name: "document"}},
-					Outputs: []gepa.Field{{Name: "amount"}, {Name: "deadline"}},
-				},
-				Instruction: "Extract the obligation amount and deadline.",
-				LM:          extractLM,
-			},
+	extract := gepa.NewProgramStep("extract", gepa.Predict{
+		Signature: gepa.Signature{
+			Name:    "extract_obligation",
+			Inputs:  []gepa.Field{{Name: "document"}},
+			Outputs: []gepa.Field{{Name: "amount", Type: "int"}, {Name: "deadline", Type: "string"}},
 		},
-		{
-			Name: "decide",
-			Program: gepa.Predict{
-				Signature: gepa.Signature{
-					Name:    "underwriting_decision",
-					Inputs:  []gepa.Field{{Name: "amount"}, {Name: "deadline"}},
-					Outputs: []gepa.Field{{Name: "decision"}, {Name: "reason"}},
-				},
-				Instruction: "Decide whether this obligation can be approved automatically.",
-				LM:          decideLM,
-			},
-			InputKeys: []string{"amount", "deadline"},
+		Instruction: "Extract the obligation amount and deadline.",
+		LM:          extractLM,
+	}, []gepa.KeyRef{document.Ref()}, []gepa.KeyRef{amount.Ref(), deadline.Ref()})
+	decide := gepa.NewProgramStep("decide", gepa.Predict{
+		Signature: gepa.Signature{
+			Name:    "underwriting_decision",
+			Inputs:  []gepa.Field{{Name: "amount"}, {Name: "deadline"}},
+			Outputs: []gepa.Field{{Name: "decision"}, {Name: "reason"}},
 		},
-	}}
+		Instruction: "Decide whether this obligation can be approved automatically.",
+		LM:          decideLM,
+	}, []gepa.KeyRef{amount.Ref(), deadline.Ref()}, []gepa.KeyRef{decision.Ref(), reason.Ref()})
 
-	prediction, err := program.Run(ctx, gepa.Prediction{"document": "Bond obligation for 125,000 due 30 June 2026."})
+	pipeline, err := gepa.PipelineSpec{
+		Inputs: []gepa.KeyRef{document.Ref()},
+		Steps:  []gepa.Step{extract, decide},
+	}.Build()
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println(prediction["decision"])
-	fmt.Println(prediction["reason"])
+	inputs := gepa.NewState(gepa.Prediction{"document": "Bond obligation for 125,000 due 30 June 2026."})
+	out, err := pipeline.Run(ctx, inputs)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(out.Prediction()["decision"])
+	fmt.Println(out.Prediction()["reason"])
 	// Output:
 	// needs_review
 	// Amount exceeds the automatic approval threshold.

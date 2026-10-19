@@ -309,11 +309,12 @@ func isTraceDatasetBuilder(builder ReflectiveDatasetBuilder) bool {
 // Pipeline scopes candidate keys; an execution owns a component when it has no nested
 // executions and its path followed by '.' starts the component's key. A composite step that
 // failed before running any nested step therefore owns the components of its nested steps.
-// When the pipeline runs inside a programme that scopes its keys further, such as a step of a
-// PipelineProgram, and no execution owns the whole key, the key is tried without its leading
-// segments, one at a time, until some execution owns it. A leading segment that names a
-// top-level step of the traces is never dropped, since the pipeline's own scoping added it,
-// and segments are matched whole, so a step "summarise" never owns "xsummarise.instruction".
+// When the pipeline runs inside a programme that scopes its keys further, such as a custom
+// Program that runs it under a name, and no execution owns the whole key, the key is tried
+// without its leading segments, one at a time, until some execution owns it. A leading
+// segment that names a top-level step of the traces is never dropped, since the pipeline's own
+// scoping added it, and segments are matched whole, so a step "summarise" never owns
+// "xsummarise.instruction".
 //
 // Each step record holds "trace_id", "step", the step's name, "attempt", "reads", "writes" and
 // "usage", and for a failed execution "error" and, when the step attached any, "details". A

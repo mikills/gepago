@@ -13,9 +13,9 @@ import (
 )
 
 // TestNewEvaluationCaptureFindsThePipelinesOfAProgramme checks that the capture finds the
-// Redactors and key types of the pipelines a programme's structure shows, nested ones, those
-// inside composite steps and policy fallbacks and those of PipelineProgram steps included,
-// each once, and not those of a pipeline reached only through another kind of Program.
+// Redactors and key types of the pipelines a programme's structure shows, nested ones and
+// those inside composite steps and policy fallbacks included, each once, and not those of a
+// pipeline reached only through another kind of Program.
 func TestNewEvaluationCaptureFindsThePipelinesOfAProgramme(t *testing.T) {
 	scoreKey := Key[float64]{Name: "score"}
 	redacting := func(name string, steps ...Step) Pipeline {
@@ -49,13 +49,22 @@ func TestNewEvaluationCaptureFindsThePipelinesOfAProgramme(t *testing.T) {
 		Redactor: hideKey("outer", "[outer]"),
 	}.Build()
 	require.NoError(t, err)
-	program := &PipelineProgram{Steps: []PipelineStep{
-		{Name: "outer", Program: &outer},
-		{Name: "listed", Program: listed},
-		{Name: "again", Program: outer},
-	}}
+	keepNext := func(key KeyRef) MergeRule {
+		return MergeRule{Key: key, Merge: func(_, next any) (any, error) { return next, nil }}
+	}
+	outerWrites := refs(amountKey.Ref(), letterKey.Ref(), summaryKey.Ref())
+	program, err := PipelineSpec{
+		Inputs: refs(docKey.Ref()),
+		Steps: []Step{
+			NewProgramStep("outer", &outer, refs(docKey.Ref()), outerWrites),
+			NewProgramStep("listed", listed, refs(docKey.Ref()), refs(scoreKey.Ref())),
+			NewProgramStep("again", outer, refs(docKey.Ref()), outerWrites),
+		},
+		Merges: []MergeRule{keepNext(amountKey.Ref()), keepNext(letterKey.Ref()), keepNext(summaryKey.Ref())},
+	}.Build()
+	require.NoError(t, err)
 
-	capture := newEvaluationCapture(program)
+	capture := newEvaluationCapture(&program)
 	require.Len(t, capture.redactors, 5, "each pipeline's Redactor is found once")
 	for _, name := range []string{"outer", "parallel", "deepest", "fallback", "listed"} {
 		require.Equal(t, "["+name+"]", applyRedactors(capture.redactors, name, "secret"), name)
@@ -66,13 +75,21 @@ func TestNewEvaluationCaptureFindsThePipelinesOfAProgramme(t *testing.T) {
 	require.Equal(t, reflect.TypeFor[int](), capture.types["amount"])
 	require.Equal(t, reflect.TypeFor[float64](), capture.types["score"])
 
-	cyclic := &PipelineProgram{}
-	cyclic.Steps = []PipelineStep{
-		{Name: "self", Program: cyclic},
-		{Name: "listed", Program: listed},
-		{Name: "self again", Program: cyclic},
-	}
-	require.Len(t, newEvaluationCapture(cyclic).redactors, 1, "a programme that holds itself is searched once")
+	// Build checks the step against the pipeline cyclic holds then, which the assignment
+	// replaces with the pipeline that holds it.
+	cyclic := listed
+	cyclic, err = PipelineSpec{
+		Inputs: refs(docKey.Ref()),
+		Steps: []Step{
+			NewProgramStep("self", &cyclic, refs(docKey.Ref()), refs(scoreKey.Ref())),
+			NewProgramStep("self again", &cyclic, refs(docKey.Ref()), refs(letterKey.Ref())),
+		},
+		Redactor: hideKey("cyclic", "[cyclic]"),
+	}.Build()
+	require.NoError(t, err)
+	cyclicCapture := newEvaluationCapture(cyclic)
+	require.Len(t, cyclicCapture.redactors, 1, "a pipeline that holds itself is searched once")
+	require.Equal(t, "[cyclic]", applyRedactors(cyclicCapture.redactors, "cyclic", "secret"))
 	require.Empty(t, newEvaluationCapture(nil).redactors)
 	require.Empty(t, newEvaluationCapture((*Pipeline)(nil)).redactors)
 	require.Empty(t, newEvaluationCapture(programFunc(nil)).redactors)

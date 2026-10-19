@@ -183,16 +183,15 @@ type ProgramEvaluator struct {
 // attributes of their RunContexts included. Then the text of every value the Redactors change,
 // among those and those the example's runs were given, wrote, tried to write or attached to
 // their errors, and the attributes of their RunContexts, is removed from every string in them
-// (see Redactor). The
-// Redactors are those of the Pipelines the programme's structure shows, found before any
-// example runs: the programme itself when it is a Pipeline, the Pipelines its steps run
-// through NewProgramStep, inside composite steps and policy fallbacks too, and the steps of a
-// PipelineProgram; a Pipeline reached only through another kind of Program adds its Redactor
-// for the examples on which it runs, from when it starts: the values runs gave, wrote or
-// attached to errors before then do not pass through it, so it removes their text only where
-// it changes one of the item's own values that holds them. Without any Redactor no values are
-// kept, and each example's values are released once its item is redacted. The Metric still
-// scores the real values.
+// (see Redactor). The Redactors are those of the Pipelines the programme's structure shows,
+// found before any example runs: the programme itself when it is a Pipeline and the Pipelines
+// its steps run through NewProgramStep, inside composite steps and policy fallbacks too; a
+// Pipeline reached only through another kind of Program adds its Redactor for the examples on
+// which it runs, from when it starts: the values runs gave, wrote or attached to errors before
+// then do not pass through it, so it removes their text only where it changes one of the
+// item's own values that holds them. Without any Redactor no values are kept, and each
+// example's values are released once its item is redacted. The Metric still scores the real
+// values.
 func (e ProgramEvaluator) Evaluate(
 	ctx context.Context,
 	candidate Candidate,

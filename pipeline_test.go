@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"os"
 	"path/filepath"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -824,7 +824,11 @@ func TestPipelineRecordsUsageOfFailedModelStep(t *testing.T) {
 	require.Equal(t, Usage{PromptTokens: 3, CompletionTokens: 30, TotalTokens: 33}, usage)
 }
 
-func TestPipelineLoadsPipelineProgramArtifact(t *testing.T) {
+// TestPipelineLoadsStepScopedArtifactWithoutFingerprint checks that an artefact saved before
+// v0.8, without a fingerprint, whose candidate is scoped by step name loads into a Pipeline
+// with those steps, and that each step then prompts as its programme alone would with its
+// trained component.
+func TestPipelineLoadsStepScopedArtifactWithoutFingerprint(t *testing.T) {
 	prompts := map[string]string{}
 	predict := func(name string, input, output, reply string) Predict {
 		return Predict{
@@ -838,16 +842,15 @@ func TestPipelineLoadsPipelineProgramArtifact(t *testing.T) {
 	}
 	extract := predict("extract", "document", "amount", `{"amount": 10}`)
 	decide := predict("decide", "amount", "decision", `{"decision": "approve"}`)
-
-	legacy := PipelineProgram{Steps: []PipelineStep{
-		{Name: "extract", Program: extract},
-		{Name: "decide", Program: decide, InputKeys: []string{"amount"}},
-	}}
-	trained := legacy.SeedCandidate()
-	trained["extract.instruction"] = "extract trained"
-	trained["decide.instruction"] = "decide trained"
+	v07 := `{
+  "format_version": 1,
+  "name": "underwriting",
+  "candidate": {"extract.instruction": "extract trained", "decide.instruction": "decide trained"},
+  "created_at": "2026-01-02T03:04:05Z"
+}
+`
 	path := filepath.Join(t.TempDir(), "underwriting.json")
-	require.NoError(t, SaveProgramArtifact(path, NewProgramArtifact("underwriting", trained)))
+	require.NoError(t, os.WriteFile(path, []byte(v07), 0o600))
 
 	pipeline, err := PipelineSpec{
 		Inputs: refs(docKey.Ref()),
@@ -857,27 +860,21 @@ func TestPipelineLoadsPipelineProgramArtifact(t *testing.T) {
 		},
 	}.Build()
 	require.NoError(t, err)
-	require.Equal(
-		t,
-		slices.Sorted(maps.Keys(legacy.SeedCandidate())),
-		slices.Sorted(maps.Keys(pipeline.SeedCandidate())),
-	)
-
-	compiled, _, err := LoadCompiledProgram(path, pipeline)
+	compiled, artifact, err := LoadCompiledProgram(path, pipeline)
 	require.NoError(t, err)
-	require.Equal(t, trained, compiled.Candidate)
+	require.Empty(t, artifact.Fingerprint)
+	require.Equal(t, Candidate{"extract.instruction": "extract trained", "decide.instruction": "decide trained"},
+		compiled.Candidate)
 
-	ctx := context.Background()
-	inputs := Prediction{"document": "cash 10"}
-	_, err = legacy.RunCandidate(ctx, compiled.Candidate, inputs)
+	got, err := compiled.Run(context.Background(), Prediction{"document": "cash 10"})
 	require.NoError(t, err)
-	legacyPrompts := maps.Clone(prompts)
-
-	_, err = compiled.Run(ctx, inputs)
+	require.Equal(t, Prediction{"amount": 10, "decision": "approve"}, got)
+	want, err := extract.BuildPrompt(Candidate{InstructionComponent: "extract trained"}, Prediction{"document": "cash 10"})
 	require.NoError(t, err)
-	require.Equal(t, legacyPrompts, prompts)
-	require.Contains(t, prompts["extract"], "extract trained")
-	require.Contains(t, prompts["decide"], "decide trained")
+	require.Equal(t, want, prompts["extract"])
+	want, err = decide.BuildPrompt(Candidate{InstructionComponent: "decide trained"}, Prediction{"amount": 10})
+	require.NoError(t, err)
+	require.Equal(t, want, prompts["decide"])
 }
 
 func TestPipelineChainOfThoughtStep(t *testing.T) {

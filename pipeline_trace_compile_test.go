@@ -112,8 +112,29 @@ func TestProgramTrainConfigPassesItsDatasetBuilder(t *testing.T) {
 	require.Contains(t, reflection.all(), `"step": "summarise"`)
 }
 
+// namedProgram runs a programme under a name and scopes its candidate keys by that name, as a
+// programme that composes others might.
+type namedProgram struct {
+	name    string
+	program Program
+}
+
+func (p namedProgram) Validate() error { return p.program.Validate() }
+
+func (p namedProgram) SeedCandidate() Candidate {
+	candidate := Candidate{}
+	for component, value := range p.program.SeedCandidate() {
+		candidate[StepComponentName(p.name, component)] = value
+	}
+	return candidate
+}
+
+func (p namedProgram) RunCandidate(ctx context.Context, candidate Candidate, inputs Prediction) (Prediction, error) {
+	return p.program.RunCandidate(ctx, stepCandidate(candidate, p.name), inputs)
+}
+
 func TestTraceDatasetBuilderMatchesKeysAWrappingProgrammeScopes(t *testing.T) {
-	program := PipelineProgram{Steps: []PipelineStep{{Name: "outer", Program: redactedSummaryPipeline(t)}}}
+	program := namedProgram{name: "outer", program: redactedSummaryPipeline(t)}
 	evaluator := ProgramEvaluator{Program: program, Metric: ExactMatchMetric{Fields: []string{"summary"}}, RecordTraces: true}
 	examples := []Example{NewIOExample("one", Prediction{"document": "secret doc"}, Prediction{"summary": "short"})}
 	candidate := program.SeedCandidate()
@@ -224,9 +245,13 @@ func TestProgramEvaluatorRedactsReflectionValues(t *testing.T) {
 		require.Equal(t, Prediction{"document": "d"}, examples[0].Input.(IOExample).Inputs, "the example is unchanged")
 	})
 
-	t.Run("a pipeline inside another programme", func(t *testing.T) {
+	t.Run("a pipeline inside another pipeline", func(t *testing.T) {
 		pipeline := build(tenTokenModel(`{"summary": "private words"}`))
-		program := PipelineProgram{Steps: []PipelineStep{{Name: "outer", Program: pipeline}}}
+		program, err := PipelineSpec{
+			Inputs: refs(docKey.Ref()),
+			Steps:  []Step{NewProgramStep("outer", pipeline, refs(docKey.Ref()), refs(summaryKey.Ref()))},
+		}.Build()
+		require.NoError(t, err)
 		result, err := ProgramEvaluator{Program: program, Metric: metric}.
 			Evaluate(context.Background(), program.SeedCandidate(), examples, false)
 		require.NoError(t, err)

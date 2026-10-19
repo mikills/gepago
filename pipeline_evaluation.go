@@ -36,13 +36,12 @@ type evaluationCapture struct {
 }
 
 // newEvaluationCapture returns a capture holding the Redactors and key types of every Pipeline
-// program holds, as far as its structure shows them: the programme itself, the pipelines its
-// steps run through NewProgramStep, composite steps and policy fallbacks included, and those of
-// PipelineProgram steps. A pipeline reached only through another kind of Program joins when it
-// runs.
+// program holds, as far as its structure shows them: the programme itself and the pipelines
+// its steps run through NewProgramStep, composite steps and policy fallbacks included. A
+// pipeline reached only through another kind of Program joins when it runs.
 func newEvaluationCapture(program Program) *evaluationCapture {
 	capture := &evaluationCapture{types: map[string]reflect.Type{}, known: map[*stepNode]bool{}}
-	capture.addProgram(program, 0, map[*PipelineProgram]bool{})
+	capture.addProgram(program, 0)
 	return capture
 }
 
@@ -66,9 +65,10 @@ func (c *evaluationCapture) fork(recorder *RecordingObserver) *evaluationCapture
 	}
 }
 
-// addProgram adds the pipelines program holds, at depth programmes deep. programs holds the
-// PipelineProgram pointers already searched, so a programme that holds itself is searched once.
-func (c *evaluationCapture) addProgram(program Program, depth int, programs map[*PipelineProgram]bool) {
+// addProgram adds the pipelines program holds, at depth programmes deep. A pipeline already
+// known is not searched again, so a pipeline that holds itself through a pointer is searched
+// once.
+func (c *evaluationCapture) addProgram(program Program, depth int) {
 	if depth > maxProgramDepth || isNil(program) {
 		return
 	}
@@ -76,36 +76,27 @@ func (c *evaluationCapture) addProgram(program Program, depth int, programs map[
 	case Pipeline:
 		if c.addPipeline(p) {
 			for _, node := range p.steps {
-				c.addStep(node, depth+1, programs)
+				c.addStep(node, depth+1)
 			}
 		}
 	case *Pipeline:
-		c.addProgram(*p, depth, programs)
-	case PipelineProgram:
-		for _, step := range p.Steps {
-			c.addProgram(step.Program, depth+1, programs)
-		}
-	case *PipelineProgram:
-		if !programs[p] {
-			programs[p] = true
-			c.addProgram(*p, depth, programs)
-		}
+		c.addProgram(*p, depth)
 	}
 }
 
 // addStep adds the pipelines the step of node runs through NewProgramStep, its children's
 // included.
-func (c *evaluationCapture) addStep(node *stepNode, depth int, programs map[*PipelineProgram]bool) {
+func (c *evaluationCapture) addStep(node *stepNode, depth int) {
 	if depth > maxProgramDepth || node == nil {
 		return
 	}
 	switch step := node.step.(type) {
 	case compositeStep:
 		for _, child := range step.children() {
-			c.addStep(child.node, depth+1, programs)
+			c.addStep(child.node, depth+1)
 		}
 	case programStep:
-		c.addProgram(step.program, depth+1, programs)
+		c.addProgram(step.program, depth+1)
 	}
 }
 

@@ -80,9 +80,16 @@ import (
 // those of every run around it, and removes from its error messages the text those runs
 // removed, whether or not the runs around it have observers: a run with a Redactor and no
 // observers still redacts its values, for the runs nested in it, though no event carries them.
-// Redactor calls are serialised with observer calls, so a Redactor need not be safe for
-// concurrent use unless pipelines that use it run concurrently. Without a Redactor anywhere in
-// the trace, events carry copies of the values and the original errors.
+// So a pipeline with a Redactor pays the cost of redaction on every value of every run, with or
+// without observers. Without a Redactor anywhere in the trace, events carry copies of the values
+// and the original errors.
+//
+// A Redactor must be safe for concurrent use: the calls of one observed run are serialised with
+// its observer calls, but concurrent runs of a pipeline, or of pipelines that share a Redactor,
+// call it at the same time. A plain string it returns is used verbatim as the replacement for
+// the original value's text in error messages and details, so it must not put other hidden
+// values into its result: return a fixed placeholder, or a masked form that holds nothing
+// secret.
 type Redactor func(key string, value any) any
 
 const (

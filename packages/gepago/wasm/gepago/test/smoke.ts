@@ -392,7 +392,10 @@ test("loads generated Go WASM and exposes deterministic APIs", async () => {
             kind: "predict",
             signature: {
               inputs: [{ name: "text" }],
-              outputs: [{ name: "topic" }],
+              outputs: [
+                { name: "topic" },
+                { name: "note", type: "string", optional: true },
+              ],
             },
             instruction: "Extract the topic.",
             outputPrefix: "extract.",
@@ -446,7 +449,7 @@ test("loads generated Go WASM and exposes deterministic APIs", async () => {
     const pipelineResult = await gepago.runCompiled(
       pipelineProgram,
       pipelineCompiled.candidate,
-      { text: "great" },
+      { text: "great", id: "not read" },
       async (hostRequest: PredictHostRequest): Promise<PredictModelResult> => {
         pipelineRequests.push(hostRequest);
         await new Promise((resolve) => setTimeout(resolve, 1));
@@ -471,9 +474,13 @@ test("loads generated Go WASM and exposes deterministic APIs", async () => {
             };
       },
     );
+    // as in Compile, a step without inputKeys reads only its signature's inputs, and an
+    // optional output the reply leaves out holds its type's zero value.
     assert.deepEqual(pipelineResult.prediction, {
       text: "great",
+      id: "not read",
       "extract.topic": "service",
+      "extract.note": "",
       label: "positive",
     });
     assert.deepEqual(pipelineResult.usage, {
@@ -482,6 +489,8 @@ test("loads generated Go WASM and exposes deterministic APIs", async () => {
       total_tokens: 5,
     });
     assert.equal(pipelineRequests.length, 2);
+    assert.ok(pipelineRequests[0].prompt.includes('"text": "great"'));
+    assert.ok(!pipelineRequests[0].prompt.includes("not read"));
 
     await assert.rejects(
       gepago.compile(

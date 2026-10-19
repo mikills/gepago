@@ -275,8 +275,11 @@ pending compile jobs.
 `chainOfThought`, and `pipeline` programs. COT programs add the reasoning output
 and instruction once; compiled COT candidates are overlaid after that normalization.
 Pipeline candidates use scoped keys such as `extract.instruction`. Steps run
-sequentially through the async `predict` bridge, honoring each step's
-`inputKeys`, `outputPrefix`, and the pipeline's `returnAll` setting.
+sequentially through the async `predict` bridge, as Compile runs them: each step
+sees its `inputKeys`, or only its signature's inputs when it lists none, its
+outputs are stored under its `outputPrefix` (an optional output the reply leaves
+out holds its type's zero value), and the pipeline's `returnAll` setting picks
+the result.
 
 ## Async Agents
 

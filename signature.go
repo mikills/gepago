@@ -223,6 +223,13 @@ func (f Field) propertySchema() (any, error) {
 	return node, nil
 }
 
+// GoType returns the Go type f's Type names, the type Predict checks an output's value against
+// and so the type a pipeline key for the field holds, or nil when Type is empty or not one
+// Signature.Validate accepts.
+func (f Field) GoType() reflect.Type {
+	return fieldTypes[f.Type]
+}
+
 func unknownFieldType(name string) error {
 	names := make([]string, 0, len(fieldTypes))
 	for typeName := range fieldTypes {

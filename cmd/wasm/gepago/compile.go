@@ -292,7 +292,11 @@ func validateCompilePipeline(program *compileWireProgram) error {
 			return err
 		}
 	}
-	return nil
+	// building the pipeline checks how its steps' keys fit together; the placeholder model is
+	// never called.
+	placeholder := newCompileLanguageModel(nil, "task")
+	_, err := buildCompilePipeline(program, placeholder, placeholder)
+	return err
 }
 
 func validateCompilePipelineStep(step compileWireStep, index int, seen map[string]struct{}) error {
@@ -574,7 +578,10 @@ func buildCompileConfigWithMetric(
 	taskLM := newCompileLanguageModel(invoker, "task")
 	repairLM := newCompileLanguageModel(invoker, "repair")
 	reflectionLM := newCompileLanguageModel(invoker, "reflector")
-	program := buildCompileProgram(wire.Program, taskLM, repairLM)
+	program, err := buildCompileProgram(wire.Program, taskLM, repairLM)
+	if err != nil {
+		return gepa.CompileConfig{}, err
+	}
 	metric, err := buildCompileMetric(wire.Metric, options, invoker, customMetric)
 	if err != nil {
 		return gepa.CompileConfig{}, err
@@ -609,10 +616,23 @@ func validateCompileMetricOptions(options compileMetricOptions) error {
 	return validateCompileMetricFields(options.Fields)
 }
 
+// buildCompileProgram builds the programme a wire programme describes: a Predict, the Predict
+// a ChainOfThought runs as, or a pipeline (see buildCompilePipeline).
 func buildCompileProgram(
 	wire *compileWireProgram,
 	taskLM, repairLM *compileLanguageModel,
-) gepa.Program {
+) (gepa.Program, error) {
+	if compileProgramKind(wire.Kind) == "pipeline" {
+		return buildCompilePipeline(wire, taskLM, repairLM)
+	}
+	return buildCompilePredict(wire, taskLM, repairLM), nil
+}
+
+// buildCompilePredict builds the Predict a predict or chainOfThought programme runs as.
+func buildCompilePredict(
+	wire *compileWireProgram,
+	taskLM, repairLM *compileLanguageModel,
+) gepa.Predict {
 	if compileProgramKind(wire.Kind) == "chainOfThought" {
 		program := gepa.ChainOfThought{
 			Signature:      wire.Signature,
@@ -629,19 +649,6 @@ func buildCompileProgram(
 		// for the augmented signature and reasoning instruction.
 		return program.ToPredict()
 	}
-	if compileProgramKind(wire.Kind) == "pipeline" {
-		steps := make([]gepa.PipelineStep, 0, len(wire.Steps))
-		for _, wireStep := range wire.Steps {
-			steps = append(steps, gepa.PipelineStep{
-				Name:         wireStep.Name,
-				Program:      buildCompileProgram(wireStep.Program, taskLM, repairLM),
-				InputKeys:    append([]string(nil), wireStep.Program.InputKeys...),
-				OutputPrefix: wireStep.Program.OutputPrefix,
-			})
-		}
-		return gepa.PipelineProgram{Steps: steps, ReturnAll: wire.ReturnAll}
-	}
-
 	program := gepa.Predict{
 		Signature:   wire.Signature,
 		LM:          taskLM,
