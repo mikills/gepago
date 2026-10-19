@@ -12,10 +12,12 @@ import (
 type pipelineRunKey struct{}
 
 // pipelineRun is what the steps of one Pipeline run share: the defaults a skipped step
-// commits, the step cache, and the outcome of every step execution. It is safe for
-// concurrent use, and a nil run, outside a pipeline, records and caches nothing.
+// commits, the step cache, the outcome of every step execution and the run's tool session,
+// which records every tool call. It is safe for concurrent use, and a nil run, outside a
+// pipeline, records and caches nothing.
 type pipelineRun struct {
 	defaults map[string]any
+	tools    *ToolSession
 	mu       sync.Mutex
 	cache    map[stepCacheKey]stepResult
 	attempts map[string]int

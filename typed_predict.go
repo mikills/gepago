@@ -37,6 +37,13 @@ type TypedPredict[In, Out any] struct {
 	Demos           []Demo
 	MaxParseRetries int
 	RepairLM        Generator
+	// Tools, MaxToolTurns, Middleware, ToolRegistry and ToolPolicy give the programme a bounded
+	// tool loop, as they do on Predict.
+	Tools        []string
+	MaxToolTurns int
+	Middleware   []string
+	ToolRegistry *ToolRegistry
+	ToolPolicy   ToolPolicy
 }
 
 // Validate derives the signature and checks it and the language model.
@@ -183,8 +190,23 @@ func (p TypedPredict[In, Out]) predict() (Predict, error) {
 		Demos:           p.Demos,
 		MaxParseRetries: p.MaxParseRetries,
 		RepairLM:        p.RepairLM,
+		Tools:           p.Tools,
+		MaxToolTurns:    p.MaxToolTurns,
+		Middleware:      p.Middleware,
+		ToolRegistry:    p.ToolRegistry,
+		ToolPolicy:      p.ToolPolicy,
 	}
 	return predict, predict.Validate()
+}
+
+// bindTools checks the programme's tools and middleware against a pipeline's registry and
+// policy, as Predict's are.
+func (p TypedPredict[In, Out]) bindTools(registry *ToolRegistry, policy ToolPolicy) error {
+	predict, err := p.predict()
+	if err != nil {
+		return err
+	}
+	return predict.bindTools(registry, policy)
 }
 
 func typedSignature(base Signature, in, out reflect.Type) (Signature, error) {

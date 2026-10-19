@@ -68,13 +68,26 @@ func toolBindings(tools []ToolSpec) []agents.ToolBinding {
 	for _, spec := range tools {
 		output := spec.Output
 		bindings = append(bindings, agents.ToolBinding{
-			Definition: agents.Tool{Name: spec.Name, Description: spec.Description, Parameters: spec.Parameters},
+			Definition: agents.Tool{Name: spec.Name, Description: spec.Description, Parameters: toolParameters(spec.Parameters)},
 			Handler: func(context.Context, *agents.Memory, string) (string, error) {
 				return output, nil
 			},
 		})
 	}
 	return bindings
+}
+
+// toolParameters encodes a configured parameter schema as the JSON Schema an agents.Tool
+// carries; no schema, or one JSON cannot encode, gives none.
+func toolParameters(parameters map[string]any) json.RawMessage {
+	if parameters == nil {
+		return nil
+	}
+	data, err := json.Marshal(parameters)
+	if err != nil {
+		return nil
+	}
+	return data
 }
 
 func (c openAIChatClient) Chat(ctx context.Context, req agents.ChatRequest) (agents.ChatResponse, error) {
@@ -207,16 +220,16 @@ type openAIFunctionTool struct {
 }
 
 type openAIResponsesTool struct {
-	Type        string         `json:"type"`
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Parameters  map[string]any `json:"parameters,omitempty"`
+	Type        string          `json:"type"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
 }
 
 type openAIFunctionDef struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Parameters  map[string]any `json:"parameters,omitempty"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
 }
 
 type openAIResponseFormatDef struct {
@@ -225,9 +238,9 @@ type openAIResponseFormatDef struct {
 }
 
 type openAIJSONSchemaFormat struct {
-	Name   string         `json:"name"`
-	Schema map[string]any `json:"schema"`
-	Strict bool           `json:"strict"`
+	Name   string          `json:"name"`
+	Schema json.RawMessage `json:"schema"`
+	Strict bool            `json:"strict"`
 }
 
 type openAIToolCall struct {

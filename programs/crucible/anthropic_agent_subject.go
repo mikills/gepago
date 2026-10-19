@@ -118,9 +118,9 @@ type anthropicContentBlock struct {
 }
 
 type anthropicTool struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	InputSchema map[string]any `json:"input_schema,omitempty"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema json.RawMessage `json:"input_schema,omitempty"`
 }
 
 type anthropicResponse struct {

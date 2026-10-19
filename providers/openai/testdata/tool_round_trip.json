@@ -1,0 +1,129 @@
+{
+  "exchanges": [
+    {
+      "path": "/chat/completions",
+      "request": {
+        "model": "gpt-4.1-mini",
+        "max_completion_tokens": 512,
+        "messages": [{"role": "user"}],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup_order",
+              "description": "Look up an order",
+              "strict": true,
+              "parameters": {
+                "type": "object",
+                "properties": {"order_id": {"type": "string", "description": "The order to look up"}},
+                "required": ["order_id"],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "response_format": {
+          "type": "json_schema",
+          "json_schema": {
+            "name": "order_status",
+            "strict": true,
+            "schema": {
+              "type": "object",
+              "properties": {"status": {"type": "string"}, "summary": {"type": "string"}},
+              "required": ["status", "summary"],
+              "additionalProperties": false
+            }
+          }
+        }
+      },
+      "response": {
+        "id": "chatcmpl-CQ7nH2xW9kRzD4vYbLq1tA8sE3m",
+        "object": "chat.completion",
+        "created": 1760600000,
+        "model": "gpt-4.1-mini-2025-04-14",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": null,
+              "tool_calls": [
+                {
+                  "id": "call_Qm3bV8xT2kLp9Rw4",
+                  "type": "function",
+                  "function": {"name": "lookup_order", "arguments": "{\"order_id\":\"A-1001\"}"}
+                }
+              ],
+              "refusal": null,
+              "annotations": []
+            },
+            "logprobs": null,
+            "finish_reason": "tool_calls"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 182,
+          "completion_tokens": 19,
+          "total_tokens": 201,
+          "prompt_tokens_details": {"cached_tokens": 64, "audio_tokens": 0},
+          "completion_tokens_details": {"reasoning_tokens": 0, "audio_tokens": 0}
+        },
+        "service_tier": "default",
+        "system_fingerprint": "fp_6f2eabb9a5"
+      }
+    },
+    {
+      "path": "/chat/completions",
+      "request": {
+        "model": "gpt-4.1-mini",
+        "messages": [
+          {"role": "user"},
+          {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "id": "call_Qm3bV8xT2kLp9Rw4",
+                "type": "function",
+                "function": {"name": "lookup_order", "arguments": "{\"order_id\":\"A-1001\"}"}
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_Qm3bV8xT2kLp9Rw4",
+            "content": "{\"status\":\"shipped\",\"carrier\":\"DHL\"}"
+          }
+        ],
+        "tools": [{"type": "function", "function": {"name": "lookup_order"}}]
+      },
+      "response": {
+        "id": "chatcmpl-CQ7nIb5uT0pYc6eHkVr2wN9dF1g",
+        "object": "chat.completion",
+        "created": 1760600001,
+        "model": "gpt-4.1-mini-2025-04-14",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "{\"status\":\"shipped\",\"summary\":\"Order A-1001 shipped with DHL.\"}",
+              "refusal": null,
+              "annotations": []
+            },
+            "logprobs": null,
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 231,
+          "completion_tokens": 17,
+          "total_tokens": 248,
+          "prompt_tokens_details": {"cached_tokens": 128, "audio_tokens": 0},
+          "completion_tokens_details": {"reasoning_tokens": 0, "audio_tokens": 0}
+        },
+        "service_tier": "default",
+        "system_fingerprint": "fp_6f2eabb9a5"
+      }
+    }
+  ]
+}

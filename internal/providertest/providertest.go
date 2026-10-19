@@ -4,12 +4,15 @@ package providertest
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -196,6 +199,119 @@ func abortingServer(t *testing.T, http2, afterHeaders bool) *httptest.Server {
 	server.StartTLS()
 	t.Cleanup(server.Close)
 	return server
+}
+
+// Exchange is one HTTP request and reply of a fixture: the path the request must go to, a JSON
+// value its body must contain (see ContainsJSON), and the body the server answers with.
+type Exchange struct {
+	Path     string          `json:"path"`
+	Request  json.RawMessage `json:"request"`
+	Response json.RawMessage `json:"response"`
+}
+
+// Fixture is a recorded conversation with a provider, one exchange per request, in order.
+type Fixture struct {
+	Exchanges []Exchange `json:"exchanges"`
+}
+
+// ReplayFixture serves the exchanges of the fixture file at path in order. Each request must
+// go to the exchange's path and its body must contain the exchange's request; the server then
+// answers with the exchange's response. When the test ends, every exchange must have been
+// served.
+func ReplayFixture(t *testing.T, path string) *httptest.Server {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	var fixture Fixture
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		t.Fatalf("decode fixture %s: %v", path, err)
+	}
+	var mu sync.Mutex
+	served := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if served >= len(fixture.Exchanges) {
+			t.Errorf("request %d to %s: the fixture has only %d exchanges", served+1, r.URL.Path, len(fixture.Exchanges))
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		exchange := fixture.Exchanges[served]
+		served++
+		if r.URL.Path != exchange.Path {
+			t.Errorf("request %d path = %q, want %q", served, r.URL.Path, exchange.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("request %d: read body: %v", served, err)
+		}
+		if err := ContainsJSON(exchange.Request, body); err != nil {
+			t.Errorf("request %d body does not match the fixture: %v\nbody: %s", served, err, body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(exchange.Response)
+	}))
+	t.Cleanup(func() {
+		server.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		if served != len(fixture.Exchanges) {
+			t.Errorf("fixture %s: %d of %d exchanges served", path, served, len(fixture.Exchanges))
+		}
+	})
+	return server
+}
+
+// ContainsJSON reports, as an error naming the first difference, whether the JSON document got
+// contains want: every key of a want object must be in the got object with a value that
+// contains the want value, a want array must have as many elements as the got array, each
+// contained in its counterpart, and any other want value must equal the got value.
+func ContainsJSON(want, got []byte) error {
+	var wantValue, gotValue any
+	if err := json.Unmarshal(want, &wantValue); err != nil {
+		return fmt.Errorf("want: %w", err)
+	}
+	if err := json.Unmarshal(got, &gotValue); err != nil {
+		return fmt.Errorf("got: %w", err)
+	}
+	return containsValue("$", wantValue, gotValue)
+}
+
+func containsValue(path string, want, got any) error {
+	switch want := want.(type) {
+	case map[string]any:
+		object, ok := got.(map[string]any)
+		if !ok {
+			return fmt.Errorf("%s: got %v, want an object", path, got)
+		}
+		for key, value := range want {
+			gotValue, ok := object[key]
+			if !ok {
+				return fmt.Errorf("%s.%s is missing", path, key)
+			}
+			if err := containsValue(path+"."+key, value, gotValue); err != nil {
+				return err
+			}
+		}
+		return nil
+	case []any:
+		items, ok := got.([]any)
+		if !ok || len(items) != len(want) {
+			return fmt.Errorf("%s: got %v, want %d elements", path, got, len(want))
+		}
+		for i := range want {
+			if err := containsValue(fmt.Sprintf("%s[%d]", path, i), want[i], items[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if want != got {
+		return fmt.Errorf("%s: got %v, want %v", path, got, want)
+	}
+	return nil
 }
 
 func requireKind(t *testing.T, err error, want gepa.ErrorKind) {

@@ -251,6 +251,8 @@ type pipelineBuilder struct {
 	inputs      map[string]reflect.Type
 	merges      map[string]func(prev, next any) (any, error)
 	defaults    map[string]KeyDefault
+	tools       *ToolRegistry
+	toolPolicy  ToolPolicy
 	sources     map[string]keySource
 	names       map[string]bool
 	maybeAbsent map[string]string
@@ -291,6 +293,9 @@ func (b *pipelineBuilder) checkStep(node *stepNode, position stepPosition) error
 		return err
 	}
 	if err := validateStep(node); err != nil {
+		return err
+	}
+	if err := b.bindTools(node); err != nil {
 		return err
 	}
 	if composite != nil {
@@ -335,6 +340,19 @@ func (b *pipelineBuilder) checkWrapper(node *stepNode, composite compositeStep, 
 	}
 	if composite.skipsOnError() {
 		b.skippable = append(b.skippable, skippableStep{index: b.index, name: node.name, writes: node.writes})
+	}
+	return nil
+}
+
+// bindTools binds the tools and chat middleware a step names, directly or through the
+// programme a NewProgramStep runs, against the pipeline's registry and policy.
+func (b *pipelineBuilder) bindTools(node *stepNode) error {
+	binder, ok := node.step.(toolBinder)
+	if !ok {
+		return nil
+	}
+	if err := binder.bindTools(b.tools, b.toolPolicy); err != nil {
+		return fmt.Errorf("pipeline step %q: %w", node.name, err)
 	}
 	return nil
 }

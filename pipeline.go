@@ -153,6 +153,14 @@ func (s programStep) Validate() error {
 	return matchKeyTypes("writes", s.writes, "returns", signature.OutputTypes)
 }
 
+// bindTools binds the tools and chat middleware the programme names, such as a Predict's Tools.
+func (s programStep) bindTools(registry *ToolRegistry, policy ToolPolicy) error {
+	if binder, ok := s.program.(toolBinder); ok {
+		return binder.bindTools(registry, policy)
+	}
+	return nil
+}
+
 // matchKeyTypes checks that each key's type is the Go type the programme gives its field, when
 // it gives one. A key without a type is left to Build, which rejects it.
 func matchKeyTypes(keyKind string, keys []KeyRef, verb string, types map[string]reflect.Type) error {
@@ -281,8 +289,9 @@ func MergeWith[T any](k Key[T], merge func(prev, next T) (T, error)) MergeRule {
 
 // PipelineSpec declares a Pipeline: its read-only inputs, its ordered steps, merge rules for
 // keys written by more than one step, defaults for the writes of steps that skip on error,
-// and the budget of each run. A run fails when its inputs hold a key that is not declared in
-// Inputs, unless AllowExtraInputs is set, in which case such keys are dropped.
+// the budget of each run, and the tools its steps call. A run fails when its inputs hold a key
+// that is not declared in Inputs, unless AllowExtraInputs is set, in which case such keys are
+// dropped.
 type PipelineSpec struct {
 	Inputs   []KeyRef
 	Steps    []Step
@@ -291,6 +300,14 @@ type PipelineSpec struct {
 	// Budget limits every run of the pipeline; the zero value sets no limits.
 	Budget           RunBudget
 	AllowExtraInputs bool
+	// Tools holds the tools and chat middleware that ToolSteps and Predict steps name. Build
+	// binds every name and fails on one that is not registered. Each run calls the tools
+	// through a ToolSession of its own, whose ToolMemory is the one the run's context carries
+	// (see WithToolMemory) or a new one.
+	Tools *ToolRegistry
+	// ToolPolicy governs the tool calls of every run. Build rejects a policy that names a tool
+	// Tools does not hold, and a step that names a tool the policy does not allow.
+	ToolPolicy ToolPolicy
 }
 
 // Pipeline is a validated, immutable sequence of steps created by PipelineSpec.Build. It
@@ -307,6 +324,8 @@ type Pipeline struct {
 	merges           map[string]func(prev, next any) (any, error)
 	defaults         map[string]any
 	budget           RunBudget
+	tools            *ToolRegistry
+	toolPolicy       ToolPolicy
 }
 
 // keySource records the type of an available key and where it comes from; an empty step
@@ -333,6 +352,10 @@ func (s keySource) describe(key string) string {
 // step name, nested ones included, must be unique. Each write of a step whose policy skips on
 // error needs a default in Defaults or a later step that writes it, and no step may read such
 // a key between the skippable step and its next writer unless it has a default.
+//
+// Every tool and chat middleware that a ToolStep, or a Predict or TypedPredict run by
+// NewProgramStep, names must be registered on Tools, and every such tool allowed by
+// ToolPolicy; a ToolStep's keys must also fit its tool (see ToolStep).
 func (s PipelineSpec) Build() (Pipeline, error) {
 	if len(s.Steps) == 0 {
 		return Pipeline{}, errors.New("pipeline requires at least one step")
@@ -352,7 +375,11 @@ func (s PipelineSpec) Build() (Pipeline, error) {
 	if err := s.Budget.validate(); err != nil {
 		return Pipeline{}, err
 	}
+	if err := s.ToolPolicy.check(registered(s.Tools)); err != nil {
+		return Pipeline{}, fmt.Errorf("pipeline %w", err)
+	}
 	builder := newPipelineBuilder(inputs, merges, defaults)
+	builder.tools, builder.toolPolicy = s.Tools, s.ToolPolicy
 	steps := make([]*stepNode, 0, len(s.Steps))
 	for i, step := range s.Steps {
 		node := newStepNode(step)
@@ -390,6 +417,8 @@ func (s PipelineSpec) Build() (Pipeline, error) {
 		merges:           merges,
 		defaults:         defaultValues,
 		budget:           s.Budget.clone(),
+		tools:            s.Tools,
+		toolPolicy:       s.ToolPolicy.clone(),
 	}, nil
 }
 
@@ -560,6 +589,14 @@ func (p Pipeline) execute(ctx context.Context, candidate Candidate, inputs Predi
 	run := newPipelineRun(p.defaults)
 	ctx, release := startRunBudget(context.WithValue(ctx, pipelineRunKey{}, run), p.budget)
 	defer release()
+	if p.tools != nil {
+		session, err := NewToolSession(p.tools.providers(), p.toolPolicy, ToolMemoryFrom(ctx))
+		if err != nil {
+			return State{}, nil, err
+		}
+		run.tools = session
+		ctx = withToolEnv(WithToolMemory(ctx, session.Memory()), &toolEnv{registry: p.tools, session: session})
+	}
 	state := State{values: values}
 	for _, node := range p.steps {
 		if err := p.runStep(ctx, candidate, node, state); err != nil {
