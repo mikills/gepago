@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -230,31 +231,46 @@ func TestRedactorHidesToolCalls(t *testing.T) {
 	})
 
 	t.Run("a ToolStep's output in its details", func(t *testing.T) {
-		raw := NewToolFunc(
-			Tool{Name: "lookup", Description: "lookup", Parameters: json.RawMessage(`{"type":"object"}`)},
-			func(context.Context, ToolCall) (ToolResult, error) {
-				return ToolResult{Output: json.RawMessage(`{"carrier":"` + secretCarrier + `"}`)}, nil
-			},
-		)
-		registry, err := NewToolRegistry(raw)
-		require.NoError(t, err)
-		recorder := &RecordingObserver{}
-		log := &eventLog{}
-		pipeline, err := PipelineSpec{
-			Inputs:    refs(orderIDKey.Ref()),
-			Steps:     []Step{ToolStep("lookup", "lookup", refs(orderIDKey.Ref()), refs(statusKey.Ref()))},
-			Tools:     registry,
-			Observers: []PipelineObserver{recorder, log},
-			Redactor:  hideKey("tool:lookup", "[hidden]"),
-		}.Build()
-		require.NoError(t, err)
+		// JSON as other encoders write it: spaced, with escapes Go does not use, and with numbers
+		for name, output := range map[string]string{
+			"go compact":  `{"carrier":"Café Confidential","balance":12345.67,"active":true}`,
+			"escaped":     `{"carrier": ` + strconv.QuoteToASCII("Café Confidential") + `, "balance": 12345.67, "active": true}`,
+			"spaced only": `{ "carrier" : "Café Confidential" , "balance" : 12345.67 , "active" : true }`,
+		} {
+			t.Run(name, func(t *testing.T) {
+				raw := NewToolFunc(
+					Tool{Name: "lookup", Description: "lookup", Parameters: json.RawMessage(`{"type":"object"}`)},
+					func(context.Context, ToolCall) (ToolResult, error) {
+						return ToolResult{Output: json.RawMessage(output)}, nil
+					},
+				)
+				registry, err := NewToolRegistry(raw)
+				require.NoError(t, err)
+				recorder := &RecordingObserver{}
+				log := &eventLog{}
+				pipeline, err := PipelineSpec{
+					Inputs:    refs(orderIDKey.Ref()),
+					Steps:     []Step{ToolStep("lookup", "lookup", refs(orderIDKey.Ref()), refs(statusKey.Ref()))},
+					Tools:     registry,
+					Observers: []PipelineObserver{recorder, log},
+					Redactor:  hideKey("tool:lookup", "[hidden]"),
+				}.Build()
+				require.NoError(t, err)
 
-		_, err = pipeline.Run(context.Background(), NewState(Prediction{"order_id": "A-1"}))
+				_, err = pipeline.Run(context.Background(), NewState(Prediction{"order_id": "A-1"}))
 
-		require.ErrorIs(t, err, ErrInvalidOutput)
-		event := log.finishedStep(t, "lookup", 1)
-		require.Equal(t, json.RawMessage(`"[hidden]"`), event.Details["output"])
-		requireHidden(t, log, recorder.Traces()[0], secretCarrier)
+				require.ErrorIs(t, err, ErrInvalidOutput)
+				event := log.finishedStep(t, "lookup", 1)
+				require.Equal(t, json.RawMessage(`"[hidden]"`), event.ToolCalls[0].Output)
+				require.Equal(
+					t,
+					json.RawMessage(`{"active":true,"balance":"[hidden]","carrier":"[hidden]"}`),
+					event.Details["output"],
+					"each value is hidden and each key kept",
+				)
+				requireHidden(t, log, recorder.Traces()[0], "Confidential", "12345.67")
+			})
+		}
 	})
 }
 
@@ -384,21 +400,108 @@ func TestTraceToolCallsSurviveAJSONRoundTrip(t *testing.T) {
 }
 
 func TestReplaceStringsScrubsRawJSON(t *testing.T) {
-	scrub := func(text string) string { return strings.ReplaceAll(text, "secret", "[x]") }
+	scrub := strings.NewReplacer("secret", "[x]", "sécret", "[x]", "12345.67", "[x]").Replace
+	foreign := `{ "secret" : ` + strconv.QuoteToASCII("sécret") +
+		`, "n": 12345.67, "ok": true, "none": null, "list": ["secret", 1] }`
 	got := replaceStrings(map[string]any{
 		"string":  json.RawMessage(`{"a":"secret"}`),
+		"foreign": json.RawMessage(foreign),
 		"broken":  json.RawMessage(`{"a":secret}`),
 		"nil":     json.RawMessage(nil),
-		"kept":    json.RawMessage(`{"a":1}`),
+		"kept":    json.RawMessage(`{ "a" : 1 }`),
 		"literal": "secret",
 	}, scrub)
 	require.Equal(t, map[string]any{
 		"string":  json.RawMessage(`{"a":"[x]"}`),
+		"foreign": json.RawMessage(`{"list":["[x]",1],"n":"[x]","none":null,"ok":true,"secret":"[x]"}`),
 		"broken":  json.RawMessage(`"{\"a\":[x]}"`),
 		"nil":     json.RawMessage(nil),
-		"kept":    json.RawMessage(`{"a":1}`),
+		"kept":    json.RawMessage(`{ "a" : 1 }`),
 		"literal": "[x]",
 	}, got)
+}
+
+func TestRedactorHidesNumericToolArguments(t *testing.T) {
+	const account = "48213977"
+	frozen := NewTool("lookup", "Look up an account", func(_ context.Context, args struct {
+		Account int `json:"account"`
+	}) (orderStatus, error) {
+		return orderStatus{}, fmt.Errorf("account %d is frozen", args.Account)
+	})
+	registry, err := NewToolRegistry(frozen)
+	require.NoError(t, err)
+	lm := newScriptedChat(toolCallReply("1", "lookup", `{"account": `+account+`}`, Usage{}))
+	question := Key[string]{Name: "question"}
+	predict := Predict{
+		Signature: Signature{
+			Name:    "answer",
+			Inputs:  []Field{{Name: "question"}},
+			Outputs: []Field{{Name: "summary", Type: "string"}},
+		},
+		LM:    lm,
+		Tools: []string{"lookup"},
+	}
+	recorder := &RecordingObserver{}
+	log := &eventLog{}
+	pipeline, err := PipelineSpec{
+		Inputs:    refs(question.Ref()),
+		Steps:     []Step{NewProgramStep("answer", predict, refs(question.Ref()), refs(summaryKey.Ref()))},
+		Tools:     registry,
+		Observers: []PipelineObserver{recorder, log},
+		Redactor:  hideKey("tool:lookup", "[hidden]"),
+	}.Build()
+	require.NoError(t, err)
+
+	_, err = pipeline.Run(context.Background(), NewState(Prediction{"question": "is it frozen?"}))
+
+	require.ErrorContains(t, err, "account "+account+" is frozen", "the caller's error is not redacted")
+	event := log.finishedStep(t, "answer", 1)
+	require.Equal(t, "[hidden]", event.ToolCalls[0].Arguments)
+	require.EqualError(t, event.Err, `tool "lookup": account [hidden] is frozen`)
+	require.Equal(t, `tool "lookup": account [hidden] is frozen`, event.ToolCalls[0].Err)
+	require.EqualError(t, log.runsFinished[0].Err, `pipeline step "answer": tool "lookup": account [hidden] is frozen`)
+	trace := recorder.Traces()[0]
+	data := requireTraceRoundTrip(t, trace)
+	report, err := HTMLRunReport(trace, HTMLReportOptions{})
+	require.NoError(t, err)
+	require.NotContains(t, data, account)
+	require.NotContains(t, report, account)
+}
+
+func TestRedactedToolJSONKeepsItsKeys(t *testing.T) {
+	carrier := Key[int]{Name: "carrier"}
+	raw := NewToolFunc(
+		Tool{Name: "lookup", Description: "lookup", Parameters: json.RawMessage(`{"type":"object"}`)},
+		func(context.Context, ToolCall) (ToolResult, error) {
+			return ToolResult{Output: json.RawMessage(`{"account": 48213977, "carrier": "Secret Co"}`)}, nil
+		},
+	)
+	registry, err := NewToolRegistry(raw)
+	require.NoError(t, err)
+	recorder := &RecordingObserver{}
+	log := &eventLog{}
+	pipeline, err := PipelineSpec{
+		Inputs:    refs(orderIDKey.Ref()),
+		Steps:     []Step{ToolStep("lookup", "lookup", refs(orderIDKey.Ref()), refs(carrier.Ref()))},
+		Tools:     registry,
+		Observers: []PipelineObserver{recorder, log},
+		Redactor:  hideKey("tool:lookup", "[hidden]"),
+	}.Build()
+	require.NoError(t, err)
+
+	_, err = pipeline.Run(context.Background(), NewState(Prediction{"order_id": "A-1"}))
+
+	require.ErrorIs(t, err, ErrInvalidOutput)
+	event := log.finishedStep(t, "lookup", 1)
+	require.Contains(t, event.Err.Error(), `state key "carrier"`, "a field name of the hidden output is not removed")
+	require.NotContains(t, event.Err.Error(), "[hidden]")
+	require.Equal(t, json.RawMessage(`{"account":"[hidden]","carrier":"[hidden]"}`), event.Details["output"],
+		"no entry is lost to a hidden key")
+	step := recorder.Traces()[0].Steps[0]
+	require.Equal(t, map[string]any{"carrier": "[hidden]", "account": "[hidden]"}, step.Details["output"])
+	data := requireTraceRoundTrip(t, recorder.Traces()[0])
+	require.NotContains(t, data, "48213977")
+	require.NotContains(t, data, "Secret Co")
 }
 
 func TestToolCallUsageIsRecordedOnceInEvents(t *testing.T) {
@@ -548,11 +651,12 @@ func TestReflectionRedactsTheFailingStepsReads(t *testing.T) {
 }
 
 func TestProgramEvaluatorRedactsToolCalls(t *testing.T) {
-	const secretCarrier = "Carrier Confidential"
+	// the output as Python's json.dumps writes it, with a non-ASCII letter escaped
+	output := `{"carrier": ` + strconv.QuoteToASCII("Café Secret") + `, "balance": 12345.67}`
 	raw := NewToolFunc(
 		Tool{Name: "lookup", Description: "lookup", Parameters: json.RawMessage(`{"type":"object"}`)},
 		func(context.Context, ToolCall) (ToolResult, error) {
-			return ToolResult{Output: json.RawMessage(`{"carrier":"` + secretCarrier + `"}`)}, nil
+			return ToolResult{Output: json.RawMessage(output)}, nil
 		},
 	)
 	registry, err := NewToolRegistry(raw)
@@ -571,19 +675,23 @@ func TestProgramEvaluatorRedactsToolCalls(t *testing.T) {
 				RecordTraces: record,
 			}
 			examples := []Example{NewIOExample("1", Prediction{"order_id": "A-1"}, Prediction{"status": "shipped"})}
+			candidate := pipeline.SeedCandidate()
 
-			eval, err := evaluator.Evaluate(context.Background(), pipeline.SeedCandidate(), examples, true)
+			eval, err := evaluator.Evaluate(context.Background(), candidate, examples, true)
 
 			require.NoError(t, err)
 			item := eval.Items[0]
-			require.Equal(t, json.RawMessage(`"[hidden]"`), item.SideInfo["details"].(map[string]any)["output"])
-			data, err := json.Marshal(item)
-			require.NoError(t, err)
-			require.NotContains(t, string(data), secretCarrier)
+			require.Equal(t, json.RawMessage(`{"balance":"[hidden]","carrier":"[hidden]"}`),
+				item.SideInfo["details"].(map[string]any)["output"])
 			if record {
 				trace := item.Trace.(PipelineTrace)
 				require.Equal(t, "[hidden]", trace.Steps[0].ToolCalls[0].Arguments)
 			}
+			dataset := TraceDatasetBuilder{}.BuildReflectiveDataset(candidate, eval, []string{"lookup.x"})
+			data, err := json.Marshal(map[string]any{"item": item, "dataset": dataset})
+			require.NoError(t, err)
+			require.NotContains(t, string(data), "Secret")
+			require.NotContains(t, string(data), "12345.67")
 		})
 	}
 }

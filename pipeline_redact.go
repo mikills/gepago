@@ -1,6 +1,7 @@
 package gepa
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -41,10 +42,13 @@ import (
 // is the output's JSON, in which case it becomes the redacted output's, and its Provenance as a
 // []Provenance. A result of another type is stored as its JSON encoding, and for Provenance as
 // one entry whose Source holds that text. When the Redactor changes arguments or output that
-// are JSON, the strings their decoded value holds are removed from error messages too. Then the
-// text removed from error messages is also removed from each call's arguments, output, text,
-// error and provenance, and from the text of every json.RawMessage in details, such as the
-// "output" a ToolStep attaches when its tool's output does not fit its writes.
+// are JSON, the strings and numbers their decoded value holds are removed from error messages
+// too, but not its object keys, booleans or nulls. Then the text removed from error messages is
+// also removed from each call's arguments, output, text, error and provenance, and from every
+// json.RawMessage in details, such as the "output" a ToolStep attaches when its tool's output
+// does not fit its writes. In JSON, text is removed from the decoded value of each string and
+// number, whatever the spacing or escapes, a number whose text changes becoming a string, and
+// object keys are kept; the JSON is encoded again when a value changes.
 //
 // The Attributes of the RunContext that every event carries pass through the Redactor once per
 // run, before RunStarted, each under the key "attribute:<name>", where <name> is the
@@ -386,25 +390,67 @@ func (r *runObservation) redactToolCalls(records []ToolCallRecord) []ToolCallRec
 }
 
 // redactTool passes value, one field of a tool call, through the redactors under key as redact
-// does. When they change it and data, the field's text, is JSON, the text forms of the JSON's
-// decoded value are remembered too, so that the strings in the arguments or the output are
-// removed from error messages as well as the whole text.
+// does. When they change it and data, the field's text, is JSON, the text of each string and
+// number the JSON holds is remembered too, so that the values in the arguments or the output
+// are removed from error messages as well as the whole text. Object keys, booleans and nulls
+// are not remembered: a field name or a bare true is too common to remove everywhere. A value
+// the redacted JSON still holds is not remembered either.
 func (r *runObservation) redactTool(key string, value any, data []byte) any {
 	redacted := r.redact(key, value)
 	if reflect.DeepEqual(value, redacted) {
 		return redacted
 	}
-	var decoded any
-	if json.Unmarshal(data, &decoded) != nil {
+	decoded, ok := decodeJSON(data)
+	if !ok {
 		return redacted
 	}
 	kept := redacted
 	if raw, ok := redacted.(json.RawMessage); ok {
-		kept = nil
-		_ = json.Unmarshal(raw, &kept)
+		kept, _ = decodeJSON(raw)
 	}
-	r.trace.remember(decoded, kept)
+	r.trace.rememberForms(jsonLeafForms(decoded, nil), kept)
 	return redacted
+}
+
+// decodeJSON decodes data, keeping numbers as json.Number, and reports whether it is JSON.
+func decodeJSON(data []byte) (any, bool) {
+	if !json.Valid(data) {
+		return nil, false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var value any
+	if decoder.Decode(&value) != nil {
+		return nil, false
+	}
+	return value, true
+}
+
+// jsonLeafForms appends to forms the text forms of each string and number in value, a JSON
+// value decodeJSON decoded: a string's as stringForms gives them, and a number's text as
+// written and as Go prints it decoded as a float64 or an int64.
+func jsonLeafForms(value any, forms []string) []string {
+	switch v := value.(type) {
+	case string:
+		forms = append(forms, stringForms(v)...)
+	case json.Number:
+		forms = append(forms, v.String())
+		if f, err := v.Float64(); err == nil {
+			forms = append(forms, strconv.FormatFloat(f, 'g', -1, 64))
+		}
+		if i, err := v.Int64(); err == nil {
+			forms = append(forms, strconv.FormatInt(i, 10))
+		}
+	case map[string]any:
+		for _, item := range v {
+			forms = jsonLeafForms(item, forms)
+		}
+	case []any:
+		for _, item := range v {
+			forms = jsonLeafForms(item, forms)
+		}
+	}
+	return forms
 }
 
 // scrubToolCalls returns records with the redacted text removed from their arguments, output,
@@ -415,9 +461,9 @@ func (r *runObservation) scrubToolCalls(records []ToolCallRecord) []ToolCallReco
 	}
 	for i := range records {
 		record := &records[i]
-		record.Arguments = r.trace.scrub(record.Arguments)
+		record.Arguments = scrubJSONText(record.Arguments, r.trace.scrub)
 		record.Output = scrubJSON(record.Output, r.trace.scrub)
-		record.Text = r.trace.scrub(record.Text)
+		record.Text = scrubJSONText(record.Text, r.trace.scrub)
 		record.Err = r.trace.scrub(record.Err)
 		for j := range record.Provenance {
 			record.Provenance[j].Source = r.trace.scrub(record.Provenance[j].Source)
@@ -478,21 +524,72 @@ func safeJSON(value any) (data []byte, ok bool) {
 	return data, err == nil
 }
 
-// scrubJSON returns data with replace applied to its text, as a JSON string when the result is
-// no longer JSON.
+// scrubJSON returns data with replace applied as scrubJSONText applies it, as a JSON string when
+// data is not JSON and the result is not JSON either.
 func scrubJSON(data json.RawMessage, replace func(string) string) json.RawMessage {
 	if data == nil {
 		return nil
 	}
-	text := replace(string(data))
-	if text == string(data) {
+	text := scrubJSONText(string(data), replace)
+	switch {
+	case text == string(data):
 		return data
-	}
-	if json.Valid([]byte(text)) {
+	case json.Valid([]byte(text)):
 		return json.RawMessage(text)
 	}
 	encoded, _ := json.Marshal(text)
 	return encoded
+}
+
+// scrubJSONText returns text with replace applied. When text is JSON, replace applies to the
+// value of each string and number in it, as decoded, so that neither spacing nor escapes keep a
+// value from matching, and not to object keys; the JSON is encoded again when that changes a
+// value, a number whose text changes becoming a string. Other text is replaced as a whole.
+func scrubJSONText(text string, replace func(string) string) string {
+	value, ok := decodeJSON([]byte(text))
+	if !ok {
+		return replace(text)
+	}
+	value, changed := scrubJSONValue(value, replace)
+	if !changed {
+		return text
+	}
+	data, ok := safeJSON(value)
+	if !ok {
+		return replace(text)
+	}
+	return string(data)
+}
+
+// scrubJSONValue applies replace to each string and number in value, a JSON value decodeJSON
+// decoded, changing value in place, and reports whether it changed any.
+func scrubJSONValue(value any, replace func(string) string) (any, bool) {
+	switch v := value.(type) {
+	case string:
+		out := replace(v)
+		return out, out != v
+	case json.Number:
+		if out := replace(v.String()); out != v.String() {
+			return out, true
+		}
+	case map[string]any:
+		changed := false
+		for key, item := range v {
+			if out, ok := scrubJSONValue(item, replace); ok {
+				v[key], changed = out, true
+			}
+		}
+		return v, changed
+	case []any:
+		changed := false
+		for i, item := range v {
+			if out, ok := scrubJSONValue(item, replace); ok {
+				v[i], changed = out, true
+			}
+		}
+		return v, changed
+	}
+	return value, false
 }
 
 // redactError returns err as the run's events carry it: unchanged when nothing in the trace is
@@ -541,6 +638,12 @@ type redactedText struct {
 // remember records the text forms of original, which a redactor turned into redacted. The
 // forms of a string redacted still holds, such as a field the redactor kept, are not recorded.
 func (t *redactedText) remember(original, redacted any) {
+	t.rememberForms(textForms(original), redacted)
+}
+
+// rememberForms records forms, the text forms of a value a redactor turned into redacted, as
+// remember does.
+func (t *redactedText) rememberForms(forms []string, redacted any) {
 	replacement := RedactedText
 	if text, ok := redacted.(string); ok {
 		replacement = text
@@ -552,7 +655,7 @@ func (t *redactedText) remember(original, redacted any) {
 	for _, form := range stringForms(redacted) {
 		kept[form] = true
 	}
-	for _, form := range textForms(original) {
+	for _, form := range forms {
 		if form != "" && form != replacement && !kept[form] {
 			t.forms[form] = replacement
 		}
@@ -642,8 +745,8 @@ func walkStrings(v reflect.Value, seen map[uintptr]bool, visit func(string)) {
 }
 
 // replaceStrings returns a copy of value with replace applied to every string it holds that
-// can be set, and to the text of every json.RawMessage, which stays JSON: map keys and
-// unexported struct fields are left as they are.
+// can be set, and to every json.RawMessage as scrubJSON applies it, so it stays JSON: map keys,
+// object keys and unexported struct fields are left as they are.
 func replaceStrings(value any, replace func(string) string) any {
 	if value == nil {
 		return nil
