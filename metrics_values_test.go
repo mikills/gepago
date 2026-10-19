@@ -248,7 +248,10 @@ func TestMetricTextCanonicalForm(t *testing.T) {
 		{"map", map[string]any{"b": 1, "a": []any{}}, `{"a":[],"b":1}`},
 		{"raw message", json.RawMessage(`{"b": 1, "a": 2}`), `{"a":2,"b":1}`},
 		{"NaN", math.NaN(), "NaN"},
-		{"NaN in a struct", struct{ V float64 }{math.NaN()}, "{NaN}"},
+		{"NaN in a struct", struct{ V float64 }{math.NaN()}, `{"V":"NaN"}`},
+		{"infinities", []float64{math.Inf(1), math.Inf(-1)}, `["+Inf","-Inf"]`},
+		{"complex", complex(1, 2), "(1+2i)"},
+		{"function", func() {}, "<func()>"},
 		{"deeper than the decoder allows", deep, strings.Repeat("[", 10001) + `"x"` + strings.Repeat("]", 10001)},
 	}
 	for _, c := range cases {
@@ -258,7 +261,7 @@ func TestMetricTextCanonicalForm(t *testing.T) {
 	}
 	channel, ok := metricText(make(chan int))
 	require.True(t, ok)
-	require.True(t, strings.HasPrefix(channel, "0x"), "a channel falls back to its fmt form")
+	require.Equal(t, "<chan int>", channel, "a channel is its type, never its address")
 
 	for name, value := range map[string]any{
 		"nil":              nil,
@@ -266,6 +269,8 @@ func TestMetricTextCanonicalForm(t *testing.T) {
 		"nil slice":        []string(nil),
 		"nil map":          map[string]any(nil),
 		"null raw message": json.RawMessage("null"),
+		"nil function":     (func())(nil),
+		"nil channel":      (chan int)(nil),
 	} {
 		got, ok := metricText(value)
 		require.False(t, ok, name)
@@ -541,8 +546,16 @@ func TestMetricTextWalksHiddenStructs(t *testing.T) {
 		},
 		{"int map keys", map[int]metricHidden{-1: {1}}, `{"-1":"gepa.metricHidden{v:1}"}`},
 		{"uint map keys", map[uint]metricHidden{1: {1}}, `{"1":"gepa.metricHidden{v:1}"}`},
-		{"failing text keys", map[metricFailingKey]metricHidden{{1}: {1}}, `{"{1}":"gepa.metricHidden{v:1}"}`},
-		{"struct keys", map[metricStructKey]metricHidden{{2}: {1}}, `{"{2}":"gepa.metricHidden{v:1}"}`},
+		{
+			"failing text keys",
+			map[metricFailingKey]metricHidden{{1}: {1}},
+			`{"gepa.metricFailingKey{id:1}":"gepa.metricHidden{v:1}"}`,
+		},
+		{
+			"struct keys",
+			map[metricStructKey]metricHidden{{2}: {1}},
+			`{"gepa.metricStructKey{id:2}":"gepa.metricHidden{v:1}"}`,
+		},
 		{
 			"pointer receiver marshaler",
 			&metricMarshalHolder{Hidden: metricHidden{1}},
@@ -635,5 +648,5 @@ func TestMetricTextEndsCyclesInPlainValues(t *testing.T) {
 
 	text, ok = metricText(map[string]any{"ratio": math.NaN(), "list": []int{1}})
 	require.True(t, ok)
-	require.Equal(t, "map[list:[1] ratio:NaN]", text, "a value JSON cannot encode still falls back to its fmt form")
+	require.Equal(t, `{"list":[1],"ratio":"NaN"}`, text, "NaN is a string in a thorough walk")
 }

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"math"
 	"reflect"
 	"strconv"
@@ -340,21 +339,18 @@ func metricText(value any) (string, bool) {
 // metricJSON returns the canonical JSON encoding of value: pointers followed, object keys
 // sorted whether value is a struct or a map, numbers kept as encoded and HTML left unescaped.
 // A struct whose fields JSON cannot see, which would encode as {} whatever it holds, is a JSON
-// string of its type and fields at any depth, as metricWalker describes. A value JSON cannot
-// encode, such as NaN or a channel, is a JSON string of its fmt form.
+// string of its type and fields at any depth, as metricWalker describes. A value that
+// encoding/json refuses, such as one holding NaN or a cycle, is walked thoroughly instead, so
+// NaN becomes "NaN" and a cycle ends at "<cycle>"; the encoding never shows a pointer address.
 func metricJSON(value any) json.RawMessage {
-	form, _ := newMetricWalker(false).walk(reflect.ValueOf(value))
+	walker := newMetricWalker(false)
+	form, _ := walker.walk(reflect.ValueOf(value))
 	encoded, err := encodeMetricJSON(form)
-	if err != nil {
-		// encoding/json refuses a cycle in a value the walker left to it; a thorough walk ends
-		// the cycle at "<cycle>" instead.
+	if err != nil || walker.failed {
+		// encoding/json refuses a cycle or NaN in a value the walker left to it; a thorough walk
+		// builds a form that always encodes.
 		form, _ = newMetricWalker(true).walk(reflect.ValueOf(value))
-		encoded, err = encodeMetricJSON(form)
-	}
-	if err != nil {
-		// a string always encodes.
-		encoded, _ = encodeMetricJSON(fmt.Sprint(value))
-		return encoded
+		encoded, _ = encodeMetricJSON(form)
 	}
 	var decoded any
 	decoder := json.NewDecoder(bytes.NewReader(encoded))

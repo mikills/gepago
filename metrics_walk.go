@@ -3,9 +3,9 @@ package gepa
 import (
 	"encoding"
 	"encoding/json"
-	"fmt"
 	"math"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,11 +34,17 @@ type metricVisit struct {
 // field that is empty or zero), and a struct without any becomes goSyntax holding every field
 // in declaration order. Equal values therefore build equal forms, and values that differ only
 // inside such a struct do not.
+//
+// A thorough walk rebuilds every value instead, so its form always encodes: NaN and the
+// infinities become the strings "NaN", "+Inf" and "-Inf", a cycle ends at "<cycle>", and a
+// channel, function or unsafe pointer becomes its type in angle brackets, such as "<chan int>".
+// It never prints a pointer address.
 type metricWalker struct {
-	path map[metricVisit]bool
-	// thorough walks values whose type cannot hold such a struct too, instead of leaving them
-	// to encoding/json, so that a cycle in one ends at "<cycle>".
+	path     map[metricVisit]bool
 	thorough bool
+	// failed records that a form the walk wrote as text did not encode, which only a walk that
+	// is not thorough can leave behind.
+	failed bool
 }
 
 func newMetricWalker(thorough bool) *metricWalker {
@@ -52,15 +58,16 @@ func (w *metricWalker) walk(v reflect.Value) (any, bool) {
 		return nil, false
 	}
 	if v.CanInterface() {
-		if self, ok := selfEncoded(v); ok {
-			return self, false
+		if form, ok := w.selfEncoded(v); ok {
+			return form, false
 		}
 		if !w.thorough && !mayHideFields(v.Type()) {
 			return v.Interface(), false
 		}
 	}
 	switch v.Kind() {
-	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func,
+		reflect.UnsafePointer:
 		if v.IsNil() {
 			return nil, false
 		}
@@ -78,7 +85,7 @@ func (w *metricWalker) walk(v reflect.Value) (any, bool) {
 		defer delete(w.path, visit)
 	}
 	form, hidden := w.walkKind(v)
-	if !hidden && v.CanInterface() {
+	if !hidden && !w.thorough && v.CanInterface() {
 		return v.Interface(), false
 	}
 	return form, hidden
@@ -109,16 +116,18 @@ func (w *metricWalker) walkKind(v reflect.Value) (any, bool) {
 		return v.Uint(), false
 	case reflect.Float32, reflect.Float64:
 		if f := v.Float(); math.IsNaN(f) || math.IsInf(f, 0) {
-			return fmt.Sprint(f), false
+			return strconv.FormatFloat(f, 'g', -1, 64), false
 		}
 		if v.Kind() == reflect.Float32 {
 			return float32(v.Float()), false
 		}
 		return v.Float(), false
+	case reflect.Complex64, reflect.Complex128:
+		return strconv.FormatComplex(v.Complex(), 'g', -1, v.Type().Bits()), false
 	case reflect.String:
 		return v.String(), false
 	}
-	return fmt.Sprint(v), false
+	return "<" + v.Type().String() + ">", false
 }
 
 func (w *metricWalker) walkItems(v reflect.Value) (any, bool) {
@@ -132,13 +141,36 @@ func (w *metricWalker) walkItems(v reflect.Value) (any, bool) {
 	return items, hidden
 }
 
+// walkMap builds the object of a map. Keys that write the same text, such as two pointers to
+// equal values, are told apart by suffixes "#2", "#3" and so on, in the order of their values'
+// text, so the object does not depend on the order the map yields them in.
 func (w *metricWalker) walkMap(v reflect.Value) (any, bool) {
-	object := make(map[string]any, v.Len())
+	type entry struct {
+		form any
+		text string
+	}
+	entries := make(map[string][]entry, v.Len())
 	hidden := false
-	for entry := v.MapRange(); entry.Next(); {
-		var valueHidden bool
-		object[metricMapKey(entry.Key())], valueHidden = w.walk(entry.Value())
+	for item := v.MapRange(); item.Next(); {
+		form, valueHidden := w.walk(item.Value())
 		hidden = hidden || valueHidden
+		key := w.mapKey(item.Key())
+		entries[key] = append(entries[key], entry{form: form})
+	}
+	object := make(map[string]any, v.Len())
+	for key, group := range entries {
+		if len(group) == 1 {
+			object[key] = group[0].form
+			continue
+		}
+		for i := range group {
+			group[i].text = w.fieldText(group[i].form)
+		}
+		slices.SortStableFunc(group, func(a, b entry) int { return strings.Compare(a.text, b.text) })
+		object[key] = group[0].form
+		for i, item := range group[1:] {
+			object[key+"#"+strconv.Itoa(i+2)] = item.form
+		}
 	}
 	return object, hidden
 }
@@ -156,7 +188,7 @@ func (w *metricWalker) walkStruct(v reflect.Value) (any, bool) {
 		form, fieldHidden := w.walk(fieldValue)
 		hidden = hidden || fieldHidden
 		if field.quoted && quotable(field.typ) {
-			form = metricFieldText(form)
+			form = w.fieldText(form)
 		}
 		object[name] = form
 	}
@@ -176,26 +208,29 @@ func (w *metricWalker) goSyntax(v reflect.Value) goSyntax {
 		text.WriteString(v.Type().Field(i).Name)
 		text.WriteByte(':')
 		form, _ := w.walk(v.Field(i))
-		text.WriteString(metricFieldText(form))
+		text.WriteString(w.fieldText(form))
 	}
 	text.WriteByte('}')
 	return goSyntax(text.String())
 }
 
-// metricFieldText writes a form as JSON, or a goSyntax form as it is.
-func metricFieldText(form any) string {
+// fieldText writes a form as JSON, or a goSyntax form as it is. A form that does not encode,
+// which only a walk that is not thorough leaves, marks the walk failed.
+func (w *metricWalker) fieldText(form any) string {
 	if syntax, ok := form.(goSyntax); ok {
 		return string(syntax)
 	}
 	encoded, err := encodeMetricJSON(form)
 	if err != nil {
-		return fmt.Sprint(form)
+		w.failed = true
+		return ""
 	}
 	return string(encoded)
 }
 
-// metricMapKey writes a map key as encoding/json does, or in its fmt form when JSON has none.
-func metricMapKey(key reflect.Value) string {
+// mapKey writes a map key as encoding/json does, or as the text of its form when JSON has no
+// text for it.
+func (w *metricWalker) mapKey(key reflect.Value) string {
 	if key.Kind() == reflect.String {
 		return key.String()
 	}
@@ -212,22 +247,34 @@ func metricMapKey(key reflect.Value) string {
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 		return strconv.FormatUint(key.Uint(), 10)
 	}
-	return fmt.Sprint(key)
+	form, _ := w.walk(key)
+	return w.fieldText(form)
 }
 
-// selfEncoded returns what encoding/json encodes with v's own MarshalJSON or MarshalText, if v
-// has one: v itself, or its address when the method has a pointer receiver and v is
-// addressable, as encoding/json requires.
-func selfEncoded(v reflect.Value) (any, bool) {
+// selfEncoded returns the form of a value encoding/json encodes with its own MarshalJSON or
+// MarshalText, if v has one: v itself, or its address when the method has a pointer receiver
+// and v is addressable, as encoding/json requires. A thorough walk encodes it now and uses the
+// JSON, or, when that fails, walks v as if it had no such method.
+func (w *metricWalker) selfEncoded(v reflect.Value) (any, bool) {
+	var self any
 	typ := v.Type()
-	if typ.Implements(jsonMarshalerType) || typ.Implements(textMarshalerType) {
-		return v.Interface(), true
-	}
 	ptr := reflect.PointerTo(typ)
-	if v.CanAddr() && (ptr.Implements(jsonMarshalerType) || ptr.Implements(textMarshalerType)) {
-		return v.Addr().Interface(), true
+	switch {
+	case typ.Implements(jsonMarshalerType) || typ.Implements(textMarshalerType):
+		self = v.Interface()
+	case v.CanAddr() && (ptr.Implements(jsonMarshalerType) || ptr.Implements(textMarshalerType)):
+		self = v.Addr().Interface()
+	default:
+		return nil, false
 	}
-	return nil, false
+	if !w.thorough {
+		return self, true
+	}
+	encoded, err := encodeMetricJSON(self)
+	if err != nil {
+		return nil, false
+	}
+	return json.RawMessage(encoded), true
 }
 
 // hiddenFieldTypes caches mayHideFields for each type it has seen.

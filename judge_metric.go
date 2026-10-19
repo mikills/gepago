@@ -16,7 +16,7 @@ import (
 // ErrContentFiltered, rather than being scored or repaired. The expected and actual
 // predictions are shown to the judge as JSON in the canonical form ExactMatchMetric
 // describes, so typed Go values read as their JSON encoding, and a value JSON cannot encode,
-// such as NaN, is shown as a string of its fmt form rather than failing the score.
+// such as NaN, is shown as a string such as "NaN" rather than failing the score.
 type LLMJudgeMetric struct {
 	LM         Generator
 	Rubric     string
