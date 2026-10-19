@@ -63,6 +63,9 @@ func (m LLMJudgeMetric) Score(ctx context.Context, expected Prediction, actual P
 
 // generate makes one judge call, records its usage and rejects a truncated reply.
 func (m LLMJudgeMetric) generate(ctx context.Context, prompt string) (string, error) {
+	if err := AdmitModelCall(ctx); err != nil {
+		return "", err
+	}
 	generation, err := m.LM.Generate(ctx, prompt)
 	RecordUsage(ctx, generation.Usage)
 	if err != nil {

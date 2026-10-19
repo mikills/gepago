@@ -123,6 +123,9 @@ func (p Predict) RunCandidate(ctx context.Context, candidate Candidate, inputs P
 
 // generate makes one model call, records its usage and rejects a truncated reply.
 func (p Predict) generate(ctx context.Context, lm Generator, prompt string) (string, error) {
+	if err := AdmitModelCall(ctx); err != nil {
+		return "", err
+	}
 	generation, err := lm.Generate(ctx, prompt)
 	RecordUsage(ctx, generation.Usage)
 	if err != nil {

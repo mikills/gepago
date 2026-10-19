@@ -290,6 +290,38 @@ func TestPipelineSpecBuildErrors(t *testing.T) {
 				`do not match declared writes ["answer" "other"]`,
 		},
 		{
+			name:    "untyped input",
+			spec:    PipelineSpec{Inputs: refs(KeyRef{Name: "document"}), Steps: []Step{amountStep()}},
+			wantErr: `pipeline inputs: state key "document" type is required; use Key.Ref`,
+		},
+		{
+			name: "merge rule without key",
+			spec: PipelineSpec{
+				Steps:  []Step{amountStep()},
+				Merges: []MergeRule{{Merge: func(_, next any) (any, error) { return next, nil }}},
+			},
+			wantErr: "merge rule 0 key is required",
+		},
+		{
+			name: "merge rule without function",
+			spec: PipelineSpec{
+				Steps:  []Step{amountStep()},
+				Merges: []MergeRule{{Key: amountKey.Ref()}},
+			},
+			wantErr: `merge rule for "amount" requires a merge function`,
+		},
+		{
+			name: "duplicated merge rule",
+			spec: PipelineSpec{
+				Steps: []Step{amountStep()},
+				Merges: []MergeRule{
+					MergeWith(amountKey, func(a, b int) (int, error) { return a + b, nil }),
+					MergeWith(amountKey, func(a, b int) (int, error) { return a + b, nil }),
+				},
+			},
+			wantErr: `merge rule for "amount" is duplicated`,
+		},
+		{
 			name: "merge rule without type",
 			spec: PipelineSpec{
 				Inputs: docInput,
@@ -469,6 +501,14 @@ func TestPipelineEnforcesDeclaredKeysAtRunTime(t *testing.T) {
 				},
 			),
 			wantErr: `pipeline step "invalid": state key "obligation": currency is required`,
+		},
+		{
+			name: "undeclared write and an error",
+			step: NewStep("both", refs(docKey.Ref()), refs(amountKey.Ref()), func(_ context.Context, s State) error {
+				docKey.Set(s, "rewritten")
+				return errors.New("model unavailable")
+			}),
+			wantErr: "pipeline step \"both\": model unavailable\nstate key \"document\" is not a declared write",
 		},
 		{
 			name: "read own write before setting it",
@@ -972,6 +1012,24 @@ func TestPipelineRecoversStepPanic(t *testing.T) {
 	require.EqualError(t, err, `pipeline step "explode": step panicked: boom`)
 	require.Contains(t, stepErr.Details["stack"], "TestPipelineRecoversStepPanic")
 	require.Equal(t, Prediction{"amount": 125000}, got)
+}
+
+func TestPipelineRecoversMergePanic(t *testing.T) {
+	pipeline, err := PipelineSpec{
+		Steps: []Step{writeAmount("first", 1), writeAmount("second", 2)},
+		Merges: []MergeRule{MergeWith(amountKey, func(int, int) (int, error) {
+			panic("merge exploded")
+		})},
+	}.Build()
+	require.NoError(t, err)
+
+	got, err := pipeline.RunCandidate(context.Background(), nil, Prediction{})
+
+	var stepErr *StepError
+	require.ErrorAs(t, err, &stepErr)
+	require.EqualError(t, err, `pipeline step "second": step panicked: merge exploded`)
+	require.Contains(t, stepErr.Details["stack"], "TestPipelineRecoversMergePanic")
+	require.Equal(t, Prediction{"amount": 1}, got)
 }
 
 func TestPipelineStopsWhenContextIsCancelled(t *testing.T) {
