@@ -310,7 +310,7 @@ func TestRedactToolCallsConvertsWhatTheRedactorReturns(t *testing.T) {
 				Name:       "lookup",
 				Arguments:  `{"order_id":"A-1"}`,
 				Output:     json.RawMessage(`{"carrier":"***","status":"shipped"}`),
-				Text:       "shipped with ***",
+				Text:       "shipped with [redacted]",
 				Provenance: []Provenance{{Source: "orders.db", Detail: "row A-1"}},
 				Err:        "tool failed for A-1",
 			},
@@ -898,7 +898,7 @@ func TestRedactorThatMasksOneArgumentFieldKeepsTheRest(t *testing.T) {
 			name:     "a JSON string with the field masked",
 			redactor: asString(func(args map[string]any) { args["order_id"] = "***" }),
 			wantArgs: `{"order_id":"***","region":"europe"}`,
-			wantErr:  `tool "lookup": order *** not found in europe`,
+			wantErr:  `tool "lookup": order [redacted] not found in europe`,
 		},
 		{
 			name:     "a JSON string without the field",
@@ -915,7 +915,18 @@ func TestRedactorThatMasksOneArgumentFieldKeepsTheRest(t *testing.T) {
 				return value
 			},
 			wantArgs: `{"order_id":"***","region":"europe"}`,
-			wantErr:  `tool "lookup": order *** not found in europe`,
+			wantErr:  `tool "lookup": order [redacted] not found in europe`,
+		},
+		{
+			name: "a placeholder for the whole arguments",
+			redactor: func(key string, value any) any {
+				if text, ok := value.(string); ok && key == "tool:lookup" && strings.Contains(text, secret) {
+					return "[arguments]"
+				}
+				return value
+			},
+			wantArgs: "[arguments]",
+			wantErr:  `tool "lookup": order [arguments] not found in [arguments]`,
 		},
 	}
 	for _, tt := range tests {
@@ -953,8 +964,13 @@ func TestRedactorThatMasksOneArgumentFieldKeepsTheRest(t *testing.T) {
 
 			require.Error(t, err)
 			event := log.finishedStep(t, "answer", 1)
-			require.JSONEq(t, tt.wantArgs, event.ToolCalls[0].Arguments, "the arguments are what the Redactor returned")
-			require.EqualError(t, event.Err, tt.wantErr, "the kept field stays and the masked one is replaced")
+			if json.Valid([]byte(tt.wantArgs)) {
+				require.JSONEq(t, tt.wantArgs, event.ToolCalls[0].Arguments, "the arguments are what the Redactor returned")
+			} else {
+				require.Equal(t, tt.wantArgs, event.ToolCalls[0].Arguments, "the arguments are what the Redactor returned")
+			}
+			require.EqualError(t, event.Err, tt.wantErr, "a kept field stays, and a removed one is replaced, but "+
+				"not by what the Redactor put in its place")
 			require.Equal(t, tt.wantErr, event.ToolCalls[0].Err)
 		})
 	}
@@ -1103,4 +1119,200 @@ func TestHTMLRunReportGrowsLinearlyWithJSONDepth(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRedactorReplacementsNeverEnterText checks that a value a Redactor removes from a tool's
+// JSON is replaced in error messages and details by RedactedText, never by what the Redactor put
+// in its place, which may name someone else or hold a value hidden under another key.
+func TestRedactorReplacementsNeverEnterText(t *testing.T) {
+	customer := Key[string]{Name: "customer"}
+	editOutput := func(edit func(map[string]any)) Redactor {
+		return func(key string, value any) any {
+			switch key {
+			case "customer":
+				return "[customer]"
+			case "tool:lookup":
+				raw, ok := value.(json.RawMessage)
+				var output map[string]any
+				if !ok || json.Unmarshal(raw, &output) != nil {
+					return value
+				}
+				edit(output)
+				data, _ := json.Marshal(output)
+				return json.RawMessage(data)
+			}
+			return value
+		}
+	}
+	tests := []struct {
+		name     string
+		output   string
+		note     string
+		redactor Redactor
+		wantNote string
+		hidden   []string
+	}{
+		{
+			name:   "an entry dropped from an array",
+			output: `{"contacts": ["Mallory Secret", "Carol Client"]}`,
+			note:   "Mallory Secret did not answer",
+			redactor: editOutput(func(output map[string]any) {
+				var kept []any
+				for _, contact := range output["contacts"].([]any) {
+					if !strings.HasPrefix(contact.(string), "Mallory") {
+						kept = append(kept, contact)
+					}
+				}
+				output["contacts"] = kept
+			}),
+			wantNote: "[redacted] did not answer",
+			hidden:   []string{"Mallory Secret", "Carol Client"},
+		},
+		{
+			name:     "a replacement that holds another hidden value",
+			output:   `{"ssn": "123-45-6789", "status": "ok"}`,
+			note:     "ssn 123-45-6789 checked",
+			redactor: editOutput(func(output map[string]any) { output["ssn"] = "ssn of Carol Client" }),
+			wantNote: "ssn [redacted] checked",
+			hidden:   []string{"123-45-6789", "Carol Client"},
+		},
+		{
+			name:     "a number replaced by another value the output keeps",
+			output:   `{"pin": 4321, "retries": 7}`,
+			note:     "pin 4321 after 7 retries",
+			redactor: editOutput(func(output map[string]any) { output["pin"] = 7 }),
+			wantNote: "pin [redacted] after 7 retries",
+			hidden:   []string{"4321"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tool := NewToolFunc(
+				Tool{Name: "lookup", Description: "lookup", Parameters: json.RawMessage(`{"type":"object"}`)},
+				func(context.Context, ToolCall) (ToolResult, error) {
+					return ToolResult{Output: json.RawMessage(tt.output)}, nil
+				},
+			)
+			registry, err := NewToolRegistry(tool)
+			require.NoError(t, err)
+			lm := newScriptedChat(
+				toolCallReply("1", "lookup", `{"q":"x"}`, Usage{}),
+				textReply(`{"summary": null, "note": "`+tt.note+`"}`, Usage{}),
+			)
+			predict := Predict{
+				Signature: Signature{
+					Name:    "answer",
+					Inputs:  []Field{{Name: "customer"}},
+					Outputs: []Field{{Name: "summary", Type: "string"}},
+				},
+				LM:    lm,
+				Tools: []string{"lookup"},
+			}
+			recorder := &RecordingObserver{}
+			log := &eventLog{}
+			pipeline, err := PipelineSpec{
+				Inputs:    refs(customer.Ref()),
+				Steps:     []Step{NewProgramStep("answer", predict, refs(customer.Ref()), refs(summaryKey.Ref()))},
+				Tools:     registry,
+				Observers: []PipelineObserver{recorder, log},
+				Redactor:  tt.redactor,
+			}.Build()
+			require.NoError(t, err)
+
+			_, err = pipeline.Run(context.Background(), NewState(Prediction{"customer": "Carol Client"}))
+
+			require.ErrorIs(t, err, ErrInvalidOutput)
+			event := log.finishedStep(t, "answer", 1)
+			require.Equal(t, tt.wantNote, event.Details["output"].(Prediction)["note"])
+			data := requireTraceRoundTrip(t, recorder.Traces()[0])
+			report, err := HTMLRunReport(recorder.Traces()[0], HTMLReportOptions{})
+			require.NoError(t, err)
+			for _, secret := range tt.hidden {
+				require.NotContains(t, data, secret)
+				require.NotContains(t, report, secret)
+				require.NotContains(t, fmt.Sprintf("%+v", log.finished), secret)
+			}
+		})
+	}
+}
+
+func TestRedactorHidesMalformedToolArguments(t *testing.T) {
+	const secret = "SECRET-ORDER-5"
+	for name, arguments := range map[string]string{
+		"truncated":      `{"order_id":"` + secret,
+		"trailing comma": `{"order_id":"` + secret + `",}`,
+		"two values":     `{"order_id":"` + secret + `"} {}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			lookup := NewTool("lookup", "Look up an order", func(context.Context, lookupArgs) (orderStatus, error) {
+				return orderStatus{}, nil
+			})
+			registry, err := NewToolRegistry(lookup)
+			require.NoError(t, err)
+			lm := newScriptedChat(toolCallReply("1", "lookup", arguments, Usage{}))
+			question := Key[string]{Name: "question"}
+			predict := Predict{
+				Signature: Signature{
+					Name:    "answer",
+					Inputs:  []Field{{Name: "question"}},
+					Outputs: []Field{{Name: "summary", Type: "string"}},
+				},
+				LM:    lm,
+				Tools: []string{"lookup"},
+			}
+			recorder := &RecordingObserver{}
+			log := &eventLog{}
+			pipeline, err := PipelineSpec{
+				Inputs:    refs(question.Ref()),
+				Steps:     []Step{NewProgramStep("answer", predict, refs(question.Ref()), refs(summaryKey.Ref()))},
+				Tools:     registry,
+				Observers: []PipelineObserver{recorder, log},
+				Redactor:  hideKey("tool:lookup", "[hidden]"),
+			}.Build()
+			require.NoError(t, err)
+
+			_, err = pipeline.Run(context.Background(), NewState(Prediction{"question": "q"}))
+
+			require.ErrorIs(t, err, ErrInvalidToolArguments)
+			event := log.finishedStep(t, "answer", 1)
+			require.Equal(t, "[hidden]", event.ToolCalls[0].Arguments)
+			data := requireTraceRoundTrip(t, recorder.Traces()[0])
+			report, err := HTMLRunReport(recorder.Traces()[0], HTMLReportOptions{})
+			require.NoError(t, err)
+			require.NotContains(t, data, secret)
+			require.NotContains(t, report, secret)
+			require.NotContains(t, fmt.Sprintf("%+v", log.finished), secret)
+		})
+	}
+}
+
+func TestRedactorHidesALargeToolString(t *testing.T) {
+	paragraph := strings.Repeat("confidential paragraph. ", 40_000)
+	tool := NewToolFunc(
+		Tool{Name: "lookup", Description: "lookup", Parameters: json.RawMessage(`{"type":"object"}`)},
+		func(context.Context, ToolCall) (ToolResult, error) {
+			return ToolResult{Output: json.RawMessage(`{"doc": "` + paragraph + `", "n": 1}`)}, nil
+		},
+	)
+	registry, err := NewToolRegistry(tool)
+	require.NoError(t, err)
+	recorder := &RecordingObserver{}
+	log := &eventLog{}
+	pipeline, err := PipelineSpec{
+		Inputs:    refs(orderIDKey.Ref()),
+		Steps:     []Step{ToolStep("lookup", "lookup", refs(orderIDKey.Ref()), refs(statusKey.Ref()))},
+		Tools:     registry,
+		Observers: []PipelineObserver{recorder, log},
+		Redactor:  hideKey("tool:lookup", "[hidden]"),
+	}.Build()
+	require.NoError(t, err)
+
+	_, err = pipeline.Run(context.Background(), NewState(Prediction{"order_id": "A-1"}))
+
+	require.ErrorIs(t, err, ErrInvalidOutput)
+	event := log.finishedStep(t, "lookup", 1)
+	require.Equal(t, json.RawMessage(`{"doc":"[hidden]","n":"[hidden]"}`), event.Details["output"])
+	data := requireTraceRoundTrip(t, recorder.Traces()[0])
+	require.NotContains(t, data, "confidential paragraph")
+	require.Less(t, len(data), 16<<10, "the hidden string leaves no copy in the trace")
 }

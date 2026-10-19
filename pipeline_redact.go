@@ -46,8 +46,9 @@ import (
 // are JSON, each string and number they hold, duplicate keys included, is removed from error
 // messages too, but not their object keys, booleans or nulls, nor a value the Redactor's result
 // still holds: one that returns JSON, as a string or a json.RawMessage, or a map, may mask one
-// field and keep the others. A removed value is replaced by what the Redactor put in its place,
-// when that is a string or a number, or else by the string it returned, or by RedactedText.
+// field and keep the others. A removed value is replaced by the string the Redactor returned,
+// when that is not JSON, and otherwise by RedactedText, never by what the Redactor put in its
+// place, which may hold another hidden value.
 // Then the text removed from error messages is also removed from each call's arguments, output,
 // text, error and provenance, and from every json.RawMessage in details, such as the "output" a
 // ToolStep attaches when its tool's output does not fit its writes. In JSON, text is removed
@@ -353,51 +354,38 @@ func (r *runObservation) redactToolCalls(records []ToolCallRecord) []ToolCallRec
 // keys, booleans and nulls are not remembered, since a field name or a bare true is too common
 // to remove everywhere. Other data is remembered as a whole. A value the redacted value still
 // holds is not remembered: when the redactors return JSON, as a json.RawMessage or a string, or
-// a map or slice, each value they kept stays. A value they replaced is replaced in error
-// messages by what they put in its place, when that is a string or a number; otherwise by the
-// string they returned for the whole field, when that is not JSON, and otherwise by
-// RedactedText.
+// a map or slice, each value they kept stays. Each value remembered is replaced in text by the
+// string the redactors returned for the whole field, when that is not JSON, and otherwise by
+// RedactedText; never by what they put in its place, which may itself be a hidden value.
 func (r *runObservation) redactTool(key string, value any, data []byte) any {
 	redacted := applyRedactors(r.redactors, key, deepCopy(value))
 	if reflect.DeepEqual(value, redacted) {
 		return redacted
 	}
-	kept := redacted
+	kept, replacement := redacted, RedactedText
 	switch v := redacted.(type) {
 	case json.RawMessage:
 		kept, _ = decodeJSON(v)
 	case string:
 		if decoded, ok := decodeJSON([]byte(v)); ok {
 			kept = decoded
+		} else {
+			replacement = v
 		}
-	}
-	placeholder := RedactedText
-	if text, ok := kept.(string); ok {
-		placeholder = text
 	}
 	keptForms := map[string]bool{}
 	for _, form := range stringForms(kept) {
 		keptForms[form] = true
 	}
-	remember := func(forms []string, replacement string) {
+	remember := func(forms []string) {
 		for _, form := range forms {
 			if !keptForms[form] {
 				r.trace.rememberForm(form, replacement)
 			}
 		}
 	}
-	leaves := &jsonLeafCollector{mirror: kept, visit: func(leaf, counterpart any) {
-		replacement := placeholder
-		switch c := counterpart.(type) {
-		case string:
-			replacement = c
-		case json.Number:
-			replacement = c.String()
-		}
-		remember(jsonLeafForms(leaf), replacement)
-	}}
-	if !walkJSON(data, leaves) {
-		remember(stringForms(string(data)), placeholder)
+	if !walkJSON(data, jsonLeafCollector{visit: func(leaf json.Token) { remember(jsonLeafForms(leaf)) }}) {
+		remember(stringForms(string(data)))
 	}
 	return redacted
 }
@@ -483,64 +471,20 @@ func walkJSON(data []byte, visitor jsonVisitor) bool {
 }
 
 // jsonLeafCollector is a jsonVisitor that calls visit with each string and number of a JSON
-// text and its counterpart in mirror, the value at the same place in another decoded JSON value,
-// or nil when mirror has none there.
+// text.
 type jsonLeafCollector struct {
-	mirror any
-	visit  func(leaf, counterpart any)
-	frames []jsonMirrorFrame
+	visit func(leaf json.Token)
 }
 
-// jsonMirrorFrame is an object or array being read and its counterpart in the mirror.
-type jsonMirrorFrame struct {
-	mirror any
-	object bool
-	key    string
-	index  int
-}
+func (c jsonLeafCollector) open(json.Delim)  {}
+func (c jsonLeafCollector) close(json.Delim) {}
+func (c jsonLeafCollector) key(string)       {}
 
-// counterpart returns the mirror's value at the place of the next value.
-func (c *jsonLeafCollector) counterpart() any {
-	if len(c.frames) == 0 {
-		return c.mirror
-	}
-	top := c.frames[len(c.frames)-1]
-	if top.object {
-		object, _ := top.mirror.(map[string]any)
-		return object[top.key]
-	}
-	if array, ok := top.mirror.([]any); ok && top.index < len(array) {
-		return array[top.index]
-	}
-	return nil
-}
-
-// next moves past a value read in the current array.
-func (c *jsonLeafCollector) next() {
-	if n := len(c.frames); n > 0 && !c.frames[n-1].object {
-		c.frames[n-1].index++
-	}
-}
-
-func (c *jsonLeafCollector) open(delim json.Delim) {
-	c.frames = append(c.frames, jsonMirrorFrame{mirror: c.counterpart(), object: delim == '{'})
-}
-
-func (c *jsonLeafCollector) close(json.Delim) {
-	c.frames = c.frames[:len(c.frames)-1]
-	c.next()
-}
-
-func (c *jsonLeafCollector) key(name string) {
-	c.frames[len(c.frames)-1].key = name
-}
-
-func (c *jsonLeafCollector) value(token json.Token) {
+func (c jsonLeafCollector) value(token json.Token) {
 	switch token.(type) {
 	case string, json.Number:
-		c.visit(token, c.counterpart())
+		c.visit(token)
 	}
-	c.next()
 }
 
 // scrubToolCalls returns records with the redacted text removed from their arguments, output,
