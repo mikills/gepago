@@ -4,7 +4,7 @@ All notable changes to `gepago` will be documented in this file.
 
 The project follows semantic versioning once public tags are published.
 
-## Unreleased (v0.7.0)
+## v0.7.0
 
 ### Breaking changes
 
