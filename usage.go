@@ -57,7 +57,7 @@ func RecordUsage(ctx context.Context, usage Usage) {
 // model call; a custom Program or Metric that calls a Generator directly should do the same,
 // and must not make the call when it returns an error.
 func AdmitModelCall(ctx context.Context) error {
-	return usageFrameFrom(ctx).admit(0)
+	return usageFrameFrom(ctx).admit()
 }
 
 // Add adds usage to the collector. A nil collector ignores it.

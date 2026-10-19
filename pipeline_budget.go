@@ -132,14 +132,21 @@ type budgetClockKey struct{}
 // usageFrame attributes model usage to one step execution, or to a whole run when step is
 // empty, and enforces their limits. Frames chain from the innermost running step out through
 // its enclosing steps and runs, including the runs of pipelines that run this one as a step.
-// pending is the part of the budget's pending tokens that calls made with this frame's context
-// have yet to record.
+// returned lists the retried calls made with this frame's context that have returned with
+// pending tokens their callers have yet to record.
 type usageFrame struct {
-	parent  *usageFrame
-	budget  *runBudget
-	step    string
-	cancel  context.CancelCauseFunc
-	usage   Usage
+	parent   *usageFrame
+	budget   *runBudget
+	step     string
+	cancel   context.CancelCauseFunc
+	usage    Usage
+	returned []returnedCall
+}
+
+// returnedCall is a retried call that has returned: the tokens of the usage it returned, which
+// its caller records, and the part of them still pending.
+type returnedCall struct {
+	tokens  int
 	pending int
 }
 
@@ -227,11 +234,12 @@ func (f *usageFrame) enterStep(ctx context.Context, step string) (context.Contex
 	return context.WithValue(ctx, usageFrameKey{}, frame), frame, func() { cancel(nil) }
 }
 
-// add records usage against f and every frame around it, failing each limit it exceeds. The
-// recorded tokens first settle the tokens that calls made with f's context left pending, so a
-// retried call's failed attempts, counted when the call reported them, are not counted again.
-// Calls made concurrently with one context share its pending tokens, so one may settle
-// another's early; the totals are right again once both have recorded.
+// add records usage against f and every frame around it, failing each limit it exceeds. When
+// usage is what a retried call made with f's context returned, recording it settles that call's
+// pending tokens, so its failed attempts, counted when the call reported them, are not counted
+// again; a call still in progress is never settled. Two returned calls with the same token
+// total whose callers record them at the same moment may settle each other's pending tokens;
+// the totals are right again once both have recorded.
 func (f *usageFrame) add(usage Usage) {
 	if f == nil {
 		return
@@ -239,8 +247,11 @@ func (f *usageFrame) add(usage Usage) {
 	tokens := usageTokens(usage)
 	f.budget.mu.Lock()
 	defer f.budget.mu.Unlock()
-	settled := min(f.pending, tokens)
-	f.pending -= settled
+	settled := 0
+	if i := slices.IndexFunc(f.returned, func(call returnedCall) bool { return call.tokens == tokens }); i >= 0 {
+		settled = f.returned[i].pending
+		f.returned = slices.Delete(f.returned, i, i+1)
+	}
 	for frame := f; frame != nil; frame = frame.parent {
 		frame.usage = frame.usage.Add(usage)
 		budget := frame.budget
@@ -286,45 +297,88 @@ func (f *usageFrame) checkStepTokens(spent int) error {
 	return budget.stepErrs[f.step]
 }
 
-// retryAdmission admits the attempts after the first of one retried call, such as a call of
-// RetryingLanguageModel, against the budgets of the pipeline run in its context. The zero
-// value is ready to use for one call.
+type retryAdmissionKey struct{}
+
+// retryAdmission admits the attempts after the first of one call of a retrying model, such as
+// RetryingLanguageModel, against the budgets of the pipeline run in its context.
+//
+// Tokens of failed attempts are pending from the moment the call reports them until its caller
+// records the usage the call returns: the run and its steps count them as spent, for every
+// call's admissions. reported is the number of tokens of the call's attempts already pending.
+// A retrying model called by another with the same usage frame is nested in it: the tokens it
+// reports count as reported by every call it is nested in, so the outer call does not report
+// them again, and only the outermost call leaves its pending tokens to settle on return.
 type retryAdmission struct {
+	frame    *usageFrame
+	parent   *retryAdmission
 	reported int
 }
 
-// next reserves the next attempt of the call. spent is the summed usage of the attempts so far,
-// which the caller records once the call ends. Until then the tokens of attempts not reported
-// before are pending: the run and its steps count them as spent, for this call's admissions
-// and for every other call's, so no attempt starts once a token limit is exceeded.
-func (r *retryAdmission) next(ctx context.Context, spent Usage) error {
-	tokens := usageTokens(spent)
-	unreported := max(tokens-r.reported, 0)
-	r.reported = tokens
-	return usageFrameFrom(ctx).admit(unreported)
+// beginRetryAdmission starts the admission of one call and returns the context its attempts
+// run with. Outside a pipeline run it admits everything.
+func beginRetryAdmission(ctx context.Context) (context.Context, *retryAdmission) {
+	frame := usageFrameFrom(ctx)
+	if frame == nil {
+		return ctx, &retryAdmission{}
+	}
+	call := &retryAdmission{frame: frame}
+	if parent, _ := ctx.Value(retryAdmissionKey{}).(*retryAdmission); parent != nil && parent.frame == frame {
+		call.parent = parent
+	}
+	return context.WithValue(ctx, retryAdmissionKey{}, call), call
 }
 
-// admit reserves one model call against every run around f, or returns the budget error that
-// refuses it without reserving the call. unrecorded is the number of tokens the caller has
-// spent since it was last admitted and will record later; they are pending on every frame
-// around f from now until the caller records them, whether the call is admitted or not, and a
-// token limit that the spent tokens exceed refuses the call.
-func (f *usageFrame) admit(unrecorded int) error {
+// next reserves the next attempt of the call. spent is the summed usage of its attempts so far;
+// the tokens of it that are not yet reported become pending.
+func (r *retryAdmission) next(spent Usage) error {
+	f := r.frame
 	if f == nil {
 		return nil
 	}
 	f.budget.mu.Lock()
 	defer f.budget.mu.Unlock()
-	if unrecorded > 0 {
-		f.pending += unrecorded
-		for frame := f; frame != nil; frame = frame.parent {
-			if frame.step == "" {
-				frame.budget.pending += unrecorded
-			} else {
-				frame.budget.stepPending[frame.step] += unrecorded
-			}
+	unreported := max(usageTokens(spent)-r.reported, 0)
+	for call := r; call != nil; call = call.parent {
+		call.reported += unreported
+	}
+	for frame := f; frame != nil; frame = frame.parent {
+		if frame.step == "" {
+			frame.budget.pending += unreported
+		} else {
+			frame.budget.stepPending[frame.step] += unreported
 		}
 	}
+	return f.admitLocked()
+}
+
+// finish ends the call, which returns spent. An outermost call leaves its pending tokens on its
+// frame for the caller's RecordUsage of spent to settle; a nested call's pending tokens belong
+// to the call around it.
+func (r *retryAdmission) finish(spent *Usage) {
+	if r.frame == nil || r.parent != nil {
+		return
+	}
+	r.frame.budget.mu.Lock()
+	defer r.frame.budget.mu.Unlock()
+	if r.reported > 0 {
+		r.frame.returned = append(r.frame.returned, returnedCall{tokens: usageTokens(*spent), pending: r.reported})
+	}
+}
+
+// admit reserves one model call against every run around f, or returns the budget error that
+// refuses it without reserving anything.
+func (f *usageFrame) admit() error {
+	if f == nil {
+		return nil
+	}
+	f.budget.mu.Lock()
+	defer f.budget.mu.Unlock()
+	return f.admitLocked()
+}
+
+// admitLocked is admit for a caller that holds mu. A token limit that the spent tokens,
+// pending ones included, exceed refuses the call.
+func (f *usageFrame) admitLocked() error {
 	if err := f.checkLocked(); err != nil {
 		return err
 	}
