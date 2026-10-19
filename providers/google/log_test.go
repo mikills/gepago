@@ -109,3 +109,47 @@ func TestFailedModelCallsAreLoggedAtWarn(t *testing.T) {
 		require.True(t, strings.Contains(err.Error(), "key=REDACTED"), err.Error())
 	})
 }
+
+func TestPanickingModelCallsAreLoggedAsFailures(t *testing.T) {
+	recorder := &providertest.LogRecorder{}
+	config := loggedConfig("http://model.test", recorder)
+	config.Client = providertest.PanickingClient("transport exploded")
+	lm, err := NewLanguageModel(config)
+	require.NoError(t, err)
+	client, err := NewChatClient(config)
+	require.NoError(t, err)
+	ctx := context.Background()
+	chat := gepa.ChatRequest{Messages: []gepa.Message{{Role: gepa.RoleUser, Content: "prompt"}}}
+
+	providertest.RequirePanicLogged(t, recorder, "transport exploded", "generate", func() {
+		_, _ = lm.Generate(ctx, "prompt")
+	})
+	providertest.RequirePanicLogged(t, recorder, "transport exploded", "chat", func() {
+		_, _ = lm.Chat(ctx, chat)
+	})
+	providertest.RequirePanicLogged(t, recorder, "transport exploded", "chat", func() {
+		_, _ = client.Chat(ctx, chat)
+	})
+}
+
+func TestPanicLogRedactsTheAPIKey(t *testing.T) {
+	recorder := &providertest.LogRecorder{}
+	config := loggedConfig("http://model.test", recorder)
+	config.Client = &http.Client{Transport: panicWithURL{}}
+	client, err := NewChatClient(config)
+	require.NoError(t, err)
+
+	require.Panics(t, func() {
+		_, _ = client.Chat(context.Background(), gepa.ChatRequest{Messages: []gepa.Message{{Role: gepa.RoleUser}}})
+	})
+	records := recorder.ModelCalls(t, "secret-key")
+	require.Len(t, records, 1)
+	require.Contains(t, records[0]["error"], "key=REDACTED")
+}
+
+// panicWithURL is a transport that panics with the request's URL, API key included.
+type panicWithURL struct{}
+
+func (panicWithURL) RoundTrip(req *http.Request) (*http.Response, error) {
+	panic("cannot send " + req.URL.String())
+}

@@ -23,8 +23,9 @@ import (
 //
 // A run's PipelineObserver events carry its RunContext, and their spans use its TraceID and,
 // for the run's own span, its RunID; see PipelineObserver. Before an attribute leaves the
-// process in an event, a PipelineTrace or a run report, it passes through the pipeline's
-// Redactor under the key "attribute:<name>" (see Redactor). The providers in this module log
+// process in an event, a PipelineTrace or a run report, it passes through the Redactor of the
+// pipeline and of every run around it, observed or not, under the key "attribute:<name>" (see
+// Redactor). The providers in this module log
 // the RunContext of each model call when given a Logger (see LogAttrs); those logs carry the
 // attributes as they are, so filter them in the logger's handler.
 type RunContext struct {

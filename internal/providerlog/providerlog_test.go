@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -88,5 +89,89 @@ func TestLogSkipsADisabledLevel(t *testing.T) {
 func TestLogWithoutALogger(t *testing.T) {
 	require.NotPanics(t, func() {
 		Log(context.Background(), nil, Call{Err: errors.New("boom")})
+	})
+}
+
+func TestLogScrubsTheError(t *testing.T) {
+	recorder := &providertest.LogRecorder{}
+	Log(context.Background(), slog.New(recorder), Call{
+		Started: time.Now(),
+		Err:     errors.New("key=k1 failed"),
+		Scrub:   func(text string) string { return strings.ReplaceAll(text, "k1", "REDACTED") },
+	})
+	require.Equal(t, "key=REDACTED failed", recorder.ModelCalls(t, "k1")[0]["error"])
+}
+
+func TestGenerateLogsTheCall(t *testing.T) {
+	recorder := &providertest.LogRecorder{}
+	logger := slog.New(recorder)
+	usage := gepa.Usage{PromptTokens: 1, TotalTokens: 1}
+	call := Call{Provider: "p", Operation: "generate", Model: "m"}
+
+	got, err := Generate(context.Background(), logger, call, func() (gepa.Generation, error) {
+		return gepa.Generation{Text: "reply", Usage: usage, Model: "m-1", FinishReason: gepa.FinishStop}, nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, "reply", got.Text)
+	_, err = Generate(context.Background(), logger, call, func() (gepa.Generation, error) {
+		return gepa.Generation{Usage: usage, Model: "m-1"}, errors.New("empty")
+	})
+	require.EqualError(t, err, "empty")
+
+	records := recorder.ModelCalls(t, "reply")
+	require.Len(t, records, 2)
+	require.Equal(t, "INFO", records[0]["level"])
+	require.Equal(t, "m-1", records[0]["resolved_model"])
+	require.Equal(t, "stop", records[0]["finish_reason"])
+	require.Equal(t, int64(1), records[0]["usage"].(map[string]any)["prompt_tokens"])
+	require.Equal(t, "WARN", records[1]["level"])
+	require.Equal(t, "empty", records[1]["error"])
+	require.Equal(t, int64(1), records[1]["usage"].(map[string]any)["total_tokens"], "a failed call keeps its usage")
+}
+
+func TestChatLogsTheCall(t *testing.T) {
+	recorder := &providertest.LogRecorder{}
+	resp, err := Chat(context.Background(), slog.New(recorder), Call{Operation: "chat"}, func() (gepa.ChatResponse, error) {
+		return gepa.ChatResponse{ResolvedModel: "m-1", FinishReason: gepa.FinishToolCalls, Usage: gepa.Usage{TotalTokens: 2}}, nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, "m-1", resp.ResolvedModel)
+	records := recorder.ModelCalls(t)
+	require.Len(t, records, 1)
+	require.Equal(t, "tool_calls", records[0]["finish_reason"])
+	require.Equal(t, "m-1", records[0]["resolved_model"])
+}
+
+func TestAPanickingCallIsLoggedAndRaisedAgain(t *testing.T) {
+	recorder := &providertest.LogRecorder{}
+	logger := slog.New(recorder)
+
+	require.PanicsWithValue(t, "exploded", func() {
+		_, _ = Generate(context.Background(), logger, Call{Operation: "generate"}, func() (gepa.Generation, error) {
+			panic("exploded")
+		})
+	})
+	require.PanicsWithValue(t, "exploded", func() {
+		_, _ = Chat(context.Background(), logger, Call{Operation: "chat"}, func() (gepa.ChatResponse, error) {
+			panic("exploded")
+		})
+	})
+	records := recorder.ModelCalls(t)
+	require.Len(t, records, 2)
+	for i, operation := range []string{"generate", "chat"} {
+		require.Equal(t, "WARN", records[i]["level"])
+		require.Equal(t, operation, records[i]["operation"])
+		require.Equal(t, "model call panicked: exploded", records[i]["error"])
+	}
+}
+
+func TestCallsWithoutALoggerRunAlone(t *testing.T) {
+	got, err := Generate(context.Background(), nil, Call{}, func() (gepa.Generation, error) {
+		return gepa.Generation{Text: "reply"}, nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, "reply", got.Text)
+	require.PanicsWithValue(t, "exploded", func() {
+		_, _ = Chat(context.Background(), nil, Call{}, func() (gepa.ChatResponse, error) { panic("exploded") })
 	})
 }

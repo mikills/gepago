@@ -141,3 +141,25 @@ func TestRequestsRejectedBeforeSendingAreNotLogged(t *testing.T) {
 	require.Error(t, err)
 	require.Empty(t, recorder.Records())
 }
+
+func TestPanickingModelCallsAreLoggedAsFailures(t *testing.T) {
+	recorder := &providertest.LogRecorder{}
+	lm, err := NewLanguageModel(Config{
+		BaseURL: "http://model.test",
+		Model:   "requested-model",
+		Client:  providertest.PanickingClient("transport exploded"),
+		Logger:  slog.New(recorder),
+	})
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	providertest.RequirePanicLogged(t, recorder, "transport exploded", "generate", func() {
+		_, _ = lm.Generate(ctx, "prompt")
+	})
+	providertest.RequirePanicLogged(t, recorder, "transport exploded", "generate_structured", func() {
+		_, _ = lm.GenerateStructured(ctx, "prompt", gepa.ResponseFormat{Schema: json.RawMessage(`{}`), Strict: true})
+	})
+	providertest.RequirePanicLogged(t, recorder, "transport exploded", "chat", func() {
+		_, _ = lm.Chat(ctx, gepa.ChatRequest{Messages: []gepa.Message{{Role: gepa.RoleUser, Content: "prompt"}}})
+	})
+}

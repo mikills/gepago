@@ -50,12 +50,16 @@ import (
 // number, whatever the spacing or escapes, a number whose text changes becoming a string, and
 // object keys are kept; the JSON is encoded again when a value changes.
 //
-// The Attributes of the RunContext that every event carries pass through the Redactor once per
-// run, before RunStarted, each under the key "attribute:<name>", where <name> is the
-// attribute's, with its value as a string. A result that is not a string becomes its JSON
-// encoding, or RedactedText when it has none. An attribute the Redactor changes is removed from
-// error messages like any other redacted value. RunContext's RunID, ParentRunID and TraceID are
-// not redacted.
+// The Attributes of the RunContext that every event carries pass through the Redactor when a
+// run starts, before RunStarted, each under the key "attribute:<name>", where <name> is the
+// attribute's, with its value as a string; its events then carry the result. A result that is
+// not a string becomes its JSON encoding, or RedactedText when it has none. An attribute the
+// Redactor changes is removed from error messages like any other redacted value. RunContext's
+// RunID, ParentRunID and TraceID are not redacted. Like every value, the attributes pass
+// through the Redactor once for each observation that reports the run: once outside an
+// evaluation, but under a ProgramEvaluator that records traces the evaluation's recorder
+// observes a run apart from the run's own observers, or apart from its silent observation (see
+// PipelineObserver), so the Redactor sees the run's values once for each.
 //
 // A Redactor that panics is recovered: the value is replaced by RedactionFailed and removed
 // from error messages like any other redacted value, so a failing Redactor never lets a value
@@ -67,10 +71,12 @@ import (
 // value with a fixed placeholder does.
 //
 // A pipeline nested in a run passes the values of its events through its own Redactor and then
-// those of every run around it. Redactor calls are serialised with observer calls, so a
-// Redactor need not be safe for concurrent use unless pipelines that use it run concurrently.
-// Without a Redactor anywhere in the trace, events carry copies of the values and the original
-// errors.
+// those of every run around it, and removes from its error messages the text those runs
+// removed, whether or not the runs around it have observers: a run with a Redactor and no
+// observers still redacts its values, for the runs nested in it, though no event carries them.
+// Redactor calls are serialised with observer calls, so a Redactor need not be safe for
+// concurrent use unless pipelines that use it run concurrently. Without a Redactor anywhere in
+// the trace, events carry copies of the values and the original errors.
 type Redactor func(key string, value any) any
 
 const (

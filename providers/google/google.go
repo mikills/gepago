@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
-	"time"
 
 	gepa "github.com/mikills/gepago"
 	"github.com/mikills/gepago/internal/providererr"
@@ -34,7 +33,8 @@ type Config struct {
 	// and Warn on failure, with the gepa.RunContext of the call's context (see
 	// gepa.RunContext.LogAttrs), the operation, the requested and resolved model, finish reason,
 	// usage, duration and error, with the API key redacted as in returned errors, but never the
-	// prompt or the reply. Nil logs nothing.
+	// prompt or the reply. A call that panics, such as in a custom transport, is logged as a
+	// failure before the panic continues. Nil logs nothing.
 	Logger *slog.Logger
 }
 
@@ -75,7 +75,7 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 // a cancelled or expired ctx returns its error unwrapped. A reply that fails after the API
 // reported usage returns that usage with the error. An empty reply is an error unless it
 // stopped at the token limit or under a content policy.
-func (m *LanguageModel) Generate(ctx context.Context, prompt string) (generation gepa.Generation, err error) {
+func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Generation, error) {
 	req := gepa.ChatRequest{
 		Model:       m.client.model,
 		MaxTokens:   &m.maxTokens,
@@ -88,12 +88,15 @@ func (m *LanguageModel) Generate(ctx context.Context, prompt string) (generation
 			{Role: gepa.RoleUser, Content: prompt},
 		},
 	}
-	started := time.Now()
-	defer func() {
-		m.client.log(ctx, "generate", req, started, generation.Model, generation.FinishReason, generation.Usage, err)
-	}()
+	return providerlog.Generate(ctx, m.client.logger, m.client.logCall("generate", req), func() (gepa.Generation, error) {
+		return m.generate(ctx, req)
+	})
+}
+
+// generate sends req as Generate's request and converts the reply.
+func (m *LanguageModel) generate(ctx context.Context, req gepa.ChatRequest) (gepa.Generation, error) {
 	resp, err := m.client.send(ctx, req)
-	generation = gepa.Generation{
+	generation := gepa.Generation{
 		Text:         strings.TrimSpace(resp.Message.Content),
 		Usage:        resp.Usage,
 		Model:        resp.ResolvedModel,
@@ -174,10 +177,9 @@ func NewChatClient(config Config) (*ChatClient, error) {
 // returns ctx.Err() unwrapped. The API key, which travels in the request URL, is redacted
 // from every error. A response without candidates still returns its usage with the error.
 func (c *ChatClient) Chat(ctx context.Context, req gepa.ChatRequest) (gepa.ChatResponse, error) {
-	started := time.Now()
-	resp, err := c.send(ctx, req)
-	c.log(ctx, "chat", req, started, resp.ResolvedModel, resp.FinishReason, resp.Usage, err)
-	return resp, err
+	return providerlog.Chat(ctx, c.logger, c.logCall("chat", req), func() (gepa.ChatResponse, error) {
+		return c.send(ctx, req)
+	})
 }
 
 // send is Chat without the log record.
@@ -186,27 +188,15 @@ func (c *ChatClient) send(ctx context.Context, req gepa.ChatRequest) (gepa.ChatR
 	return resp, c.redact(err)
 }
 
-// log records one call of the named operation made with req to the client's logger.
-func (c *ChatClient) log(
-	ctx context.Context,
-	operation string,
-	req gepa.ChatRequest,
-	started time.Time,
-	resolvedModel string,
-	finish gepa.FinishReason,
-	usage gepa.Usage,
-	err error,
-) {
-	providerlog.Log(ctx, c.logger, providerlog.Call{
-		Provider:      "google",
-		Operation:     operation,
-		Model:         googleRequestModel(c.model, req.Model),
-		ResolvedModel: resolvedModel,
-		FinishReason:  finish,
-		Usage:         usage,
-		Started:       started,
-		Err:           err,
-	})
+// logCall describes a call of the named operation made with req for its log record, which
+// redacts the API key from the error as returned errors do.
+func (c *ChatClient) logCall(operation string, req gepa.ChatRequest) providerlog.Call {
+	return providerlog.Call{
+		Provider:  "google",
+		Operation: operation,
+		Model:     googleRequestModel(c.model, req.Model),
+		Scrub:     redactKeyParam,
+	}
 }
 
 func (c *ChatClient) chat(ctx context.Context, req gepa.ChatRequest) (gepa.ChatResponse, error) {

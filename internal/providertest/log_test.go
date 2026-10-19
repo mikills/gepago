@@ -2,6 +2,7 @@ package providertest
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"reflect"
 	"testing"
@@ -37,6 +38,23 @@ func TestModelCallsDropsTheDuration(t *testing.T) {
 	want := []map[string]any{{"level": "INFO", "msg": "model call", "model": "m"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ModelCalls() = %v, want %v", got, want)
+	}
+}
+
+func TestPanickingClientAndRequirePanicLogged(t *testing.T) {
+	recorder := &LogRecorder{}
+	logger := slog.New(recorder)
+	client := PanickingClient("exploded")
+	RequirePanicLogged(t, recorder, "exploded", "chat", func() {
+		defer func() {
+			recovered := recover()
+			logger.Warn("model call", "operation", "chat", "error", fmt.Sprintf("model call panicked: %v", recovered))
+			panic(recovered)
+		}()
+		_, _ = client.Get("http://model.test")
+	})
+	if len(recorder.Records()) != 1 {
+		t.Fatalf("records = %v", recorder.Records())
 	}
 }
 

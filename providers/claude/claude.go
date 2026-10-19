@@ -9,7 +9,6 @@ import (
 	"maps"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -30,7 +29,8 @@ type Config struct {
 	// that sends a request: at Info on success and Warn on failure, with the gepa.RunContext of
 	// the call's context (see gepa.RunContext.LogAttrs), the operation, the requested and
 	// resolved model, finish reason, usage, duration and error, but never the prompt or the
-	// reply. Nil logs nothing.
+	// reply. A call that panics, such as in a custom transport, is logged as a failure before
+	// the panic continues. Nil logs nothing.
 	Logger *slog.Logger
 }
 
@@ -163,25 +163,20 @@ func (m *LanguageModel) complete(
 	ctx context.Context,
 	operation string,
 	params anthropic.MessageNewParams,
-) (generation gepa.Generation, err error) {
-	started := time.Now()
-	defer func() {
-		providerlog.Log(ctx, m.logger, providerlog.Call{
-			Provider:      "claude",
-			Operation:     operation,
-			Model:         string(params.Model),
-			ResolvedModel: generation.Model,
-			FinishReason:  generation.FinishReason,
-			Usage:         generation.Usage,
-			Started:       started,
-			Err:           err,
-		})
-	}()
+) (gepa.Generation, error) {
+	call := providerlog.Call{Provider: "claude", Operation: operation, Model: string(params.Model)}
+	return providerlog.Generate(ctx, m.logger, call, func() (gepa.Generation, error) {
+		return m.generate(ctx, params)
+	})
+}
+
+// generate sends one Messages API request with params and converts the reply.
+func (m *LanguageModel) generate(ctx context.Context, params anthropic.MessageNewParams) (gepa.Generation, error) {
 	message, err := m.client.Messages.New(ctx, params)
 	if err != nil {
 		return gepa.Generation{}, classifyError(ctx, err)
 	}
-	generation = gepa.Generation{
+	generation := gepa.Generation{
 		Text:         strings.TrimSpace(claudeText(message.Content)),
 		Usage:        claudeUsage(message.Usage),
 		Model:        string(message.Model),
@@ -229,19 +224,10 @@ func (m *LanguageModel) Chat(ctx context.Context, req gepa.ChatRequest) (gepa.Ch
 	if err != nil {
 		return gepa.ChatResponse{}, gepa.PermanentError(fmt.Errorf("claude chat: %w", err))
 	}
-	started := time.Now()
-	resp, err := m.chat(ctx, params)
-	providerlog.Log(ctx, m.logger, providerlog.Call{
-		Provider:      "claude",
-		Operation:     "chat",
-		Model:         string(params.Model),
-		ResolvedModel: resp.ResolvedModel,
-		FinishReason:  resp.FinishReason,
-		Usage:         resp.Usage,
-		Started:       started,
-		Err:           err,
+	call := providerlog.Call{Provider: "claude", Operation: "chat", Model: string(params.Model)}
+	return providerlog.Chat(ctx, m.logger, call, func() (gepa.ChatResponse, error) {
+		return m.chat(ctx, params)
 	})
-	return resp, err
 }
 
 // chat sends one Messages API request with params and converts the reply.

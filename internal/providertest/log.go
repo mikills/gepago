@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -87,6 +88,41 @@ func (r *LogRecorder) ModelCalls(t *testing.T, secrets ...string) []map[string]a
 		}
 	}
 	return records
+}
+
+// PanickingClient returns an HTTP client whose transport panics with value on every request.
+func PanickingClient(value any) *http.Client {
+	return &http.Client{Transport: panickingTransport{value: value}}
+}
+
+type panickingTransport struct{ value any }
+
+func (t panickingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	panic(t.value)
+}
+
+// RequirePanicLogged calls call, which must panic with value, and then requires recorder to
+// hold one more record, a failed model call of operation whose error names the panic.
+func RequirePanicLogged(t *testing.T, recorder *LogRecorder, value any, operation string, call func()) {
+	t.Helper()
+	before := len(recorder.Records())
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != value {
+				t.Fatalf("recovered %v, want a panic with %v", recovered, value)
+			}
+		}()
+		call()
+	}()
+	records := recorder.Records()
+	if len(records) != before+1 {
+		t.Fatalf("records = %d, want %d", len(records), before+1)
+	}
+	record := records[before]
+	wantErr := fmt.Sprintf("model call panicked: %v", value)
+	if record["level"] != "WARN" || record["operation"] != operation || record["error"] != wantErr {
+		t.Fatalf("record = %v, want a WARN %s record with error %q", record, operation, wantErr)
+	}
 }
 
 // LogRunContext is a RunContext with every field set, for a model call whose record a test

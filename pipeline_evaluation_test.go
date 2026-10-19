@@ -146,7 +146,8 @@ func TestProgramEvaluatorRedactsWithAPipelineInACustomProgram(t *testing.T) {
 
 // TestProgramEvaluatorKeepsNestedObserverEvents checks that a nested pipeline's own observers
 // see the same events during an evaluation as outside one, whether or not traces are recorded,
-// while the recorded trace still holds the nested run, as the outer Redactor redacts it.
+// redacted by the outer Redactor though the outer run has no observers, while the recorded
+// trace still holds the nested run, as the outer Redactor redacts it.
 func TestProgramEvaluatorKeepsNestedObserverEvents(t *testing.T) {
 	build := func(log *eventLog) Pipeline {
 		t.Helper()
@@ -163,8 +164,10 @@ func TestProgramEvaluatorKeepsNestedObserverEvents(t *testing.T) {
 	production := &eventLog{}
 	_, err := build(production).Run(context.Background(), NewState(Prediction{"document": "cash 10"}))
 	require.NoError(t, err)
-	want := []string{"start run", "start parse#1 in run", "finish parse#1", "finish run"}
+	// the nested run's parent is a step of the outer run, which no observer of it sees
+	want := []string{"start run in ?", "start parse#1 in run in ?", "finish parse#1", "finish run in ?"}
 	require.Equal(t, want, production.Lines())
+	require.Equal(t, map[string]any{"document": "[doc]"}, production.runsStarted[0].Inputs)
 	examples := []Example{NewIOExample("one", Prediction{"document": "cash 10"}, Prediction{"amount": 7})}
 
 	for _, recordTraces := range []bool{false, true} {
@@ -176,9 +179,9 @@ func TestProgramEvaluatorKeepsNestedObserverEvents(t *testing.T) {
 		require.Equal(t, want, log.Lines(), "recordTraces %v", recordTraces)
 		require.Len(t, log.runsStarted, 1)
 		started := log.runsStarted[0]
-		require.Empty(t, started.Span.ParentID, "recordTraces %v", recordTraces)
-		require.Equal(t, map[string]any{"document": "cash 10"}, started.Inputs, "the outer Redactor does not apply")
-		require.Equal(t, map[string]any{"document": "cash 10"}, log.stepsStarted[0].Reads)
+		require.NotEmpty(t, started.Span.ParentID, "recordTraces %v", recordTraces)
+		require.Equal(t, map[string]any{"document": "[doc]"}, started.Inputs, "the outer Redactor applies")
+		require.Equal(t, map[string]any{"document": "[doc]"}, log.stepsStarted[0].Reads)
 		require.Len(t, log.traceIDs(), 1)
 		if !recordTraces {
 			require.Nil(t, result.Items[0].Trace)

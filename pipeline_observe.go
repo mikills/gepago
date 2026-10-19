@@ -36,7 +36,10 @@ import (
 //   - A pipeline run by a step, through NewProgramStep or a step that runs it with its
 //     context, joins the observation of the run: its RunStarted and RunFinished come between
 //     that step's StepStarted and StepFinished, and its run span's parent is the step's span.
-//     Its events go to its own observers and then to those of every run around it.
+//     Its events go to its own observers and then to those of every run around it. A run that
+//     has a Redactor but no observers, of its own or of a run around it, is observed with no
+//     observers, so the pipelines nested in it redact their events with its Redactor too (see
+//     Redactor); their run spans then have the span of a step no observer saw as their parent.
 //
 // Under Parallel the events of steps that run side by side interleave, but the observer and
 // redactor calls of one observed run, the runs nested in it included, are serialised: no two of
@@ -77,8 +80,9 @@ type PipelineObserver interface {
 // RunStartedEvent reports the start of a pipeline run.
 type RunStartedEvent struct {
 	// Span is the run's span, of kind UsageSpanPipelineRun, whose ID is RunContext.RunID and
-	// TraceID RunContext.TraceID. ParentID is the span of the step that started a nested run in
-	// the same observation, and empty otherwise.
+	// TraceID RunContext.TraceID. ParentID is the span of the step that started a nested run,
+	// and empty for a top-level run or one nested in a run that has neither observers nor a
+	// Redactor; see PipelineObserver.
 	Span UsageSpan
 	// RunContext is the run's, with its Attributes redacted.
 	RunContext RunContext
@@ -244,14 +248,15 @@ type runObservation struct {
 
 // observeRun starts observing a run of p over its converted inputs, with rc as its RunContext,
 // as part of the observation in ctx if there is one, and emits RunStarted. caller is the context
-// the caller passed to the run. It returns ctx carrying the run, and nil when nothing observes
-// the run.
+// the caller passed to the run. It returns ctx carrying the run, and nil when the run is not
+// observed, not even silently (see startRun).
 //
 // A top-level run of an example that ProgramEvaluator records traces for reports to the
 // evaluation's RecordingObserver as well as to its own observers. When it has no observers of
-// its own, the recorder alone observes it, apart from its observers' trace: the runs inside it
+// its own, the recorder observes it apart from its observers' observation: the runs inside it
 // report to the recorder as part of the recorded trace and, separately, to their own observers
-// as they would outside an evaluation.
+// as they would outside an evaluation, which for a run with a Redactor means within its silent
+// observation.
 func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any, rc RunContext) (
 	context.Context,
 	*runObservation,
@@ -268,6 +273,7 @@ func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any,
 	switch {
 	case recorder != nil && len(p.observers) == 0:
 		recording = p.startRun(nil, "", caller, []PipelineObserver{recorder}, nil, rc)
+		run = p.startRun(nil, "", caller, nil, recording.trace.mu, rc)
 	case recorder != nil:
 		run = p.startRun(nil, "", caller, append(slices.Clone(p.observers), recorder), nil, rc)
 	default:
@@ -313,7 +319,10 @@ func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any,
 // to those of parent: in parent's observation, under the span parentSpan, when parent is set,
 // and otherwise in a new observation serialised by lock, or by a lock of its own when lock is
 // nil. The run's span has rc's RunID as its ID and rc's TraceID. It returns nil when there is
-// neither a parent nor an observer. caller is the context the caller passed to the run.
+// neither a parent, an observer nor a Redactor. A run with a Redactor and nothing else is
+// observed silently, by no observer, so that the runs nested in it, which join its
+// observation, redact their events with its Redactor and the text it removed (see Redactor).
+// caller is the context the caller passed to the run.
 func (p Pipeline) startRun(
 	parent *runObservation,
 	parentSpan string,
@@ -322,7 +331,7 @@ func (p Pipeline) startRun(
 	lock *sync.Mutex,
 	rc RunContext,
 ) *runObservation {
-	if parent == nil && len(observers) == 0 {
+	if parent == nil && len(observers) == 0 && p.redactor == nil {
 		return nil
 	}
 	run := &runObservation{observers: appendObservers(nil, observers...), start: time.Now(), life: caller}
