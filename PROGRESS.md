@@ -9,10 +9,10 @@ Branch `feat/v0.8.0-flow-runtime`, started from `1e3cc7b` (v0.7.0).
 | A. Model call contract | done | a1791af, 53893a4, b8fd03f | 1: 14 findings, fixed; 2: 4 findings, fixed; 3: none | none |
 | B. Structured output | done | 6eb19d9, 59c26b8, 04521cf, fb9e31a, 096233f, 3ff9b8c, 75803f9, c468be7 | 1: 11, 2: 3, 3: 3, 4: 2 + deferred, 5: 2 + perf, 6: 1, 7: 2, all fixed; 8: none | none |
 | C. Pipeline control flow and policy | done (merged in 1306f2b) | 8a69ad8, 9b95e07, c76a7b9, 82e32ca, 3c5a14b, merge 1306f2b | 1: 5, 2: 3, 3: 1, 4: 1 finding, all fixed; 5: none | none |
-| I. Tools | implementing (worktree from 096233f) | | | |
-| D. Observability | implementing (worktree from 096233f) | | | |
+| I. Tools | review round 1 | 3344220 (worktree branch) | | |
+| D. Observability | review round 1 | 5351b86 (worktree branch) | | |
 | E. Run context | not started | | | |
-| F. Artefacts and compile | implementing (worktree from 096233f) | | | |
+| F. Artefacts and compile | done (merged in 8212dbf) | 442358c, 4c92e2a, 309504d, merge 8212dbf | 1: 2, 2: 1, all fixed; 3: none | none |
 | G. Test kit | not started | | | |
 | H. Housekeeping | not started | | | |
 
@@ -34,6 +34,9 @@ Branch `feat/v0.8.0-flow-runtime`, started from `1e3cc7b` (v0.7.0).
 | clean worktree: full set (after merging C; one mechanical conflict in program.go resolved as the union of both sides) | pass | 1306f2b |
 | clean worktree: full set | pass | 096233f |
 | clean worktree: fmt, diff, test, vet, staticcheck | pass | 3ff9b8c, 75803f9, c468be7 |
+| clean worktree: fmt, diff, test, vet, staticcheck | pass | 442358c (F), 5351b86 (D), worktree branches |
+| same | pass | 4c92e2a, 309504d (F, worktree branch) |
+| same (after merging F, no conflicts) | pass | 8212dbf |
 | clean worktree: same plus `npm ci`, `make diago`, `make wasm-test` | pass | 6eb19d9 |
 
 ## Decisions
@@ -57,6 +60,11 @@ Branch `feat/v0.8.0-flow-runtime`, started from `1e3cc7b` (v0.7.0).
   with `ErrContentFiltered` (matches `ErrInvalidOutput`) and never repairs it.
 - To save time, I, D and F run in parallel worktrees from 096233f (none depends on another's
   types); E follows D, then G and H.
+- `LoadOrTrain` always checks the fingerprint: a config's `ProgramVersion` is a label, not an explicit
+  override (F review round 1).
+- `gepa.TraceDatasetBuilder` mirrors `agents.TraceDatasetBuilder`: it implements
+  `ReflectiveDatasetBuilder`, and `ProgramEvaluator` records a `PipelineTrace` per example (D review round 1).
+- Agent chat calls go through `AdmitModelCall` and `RecordUsage`; `RetryingLanguageModel` gains `Chat`.
 - `programs/kiln` and `programs/documentscout` are gitignored local projects inside the root
   module. They are not part of the repo; the final `make verify` runs in a clean worktree,
   as CI does.
@@ -94,6 +102,13 @@ C (pipeline control flow):
 - When a budget or timeout ends a step's context, a step that finishes anyway fails and its writes are dropped.
 - `PipelineSpec` gains `Defaults` and `Budget` (breaks unkeyed struct literals only).
 
+F (artefacts and compile):
+- `StepError` gains `Reads`; `ProgramArtifact` gains `Fingerprint` (unkeyed literals break).
+- Every loader returns `*FingerprintMismatchError` when a v0.8 artefact's fingerprint differs from the programme's or the programme has none; `LoadOrTrain` always checks.
+- `TrainAndSave` and `CompiledProgram.Artifact` write `fingerprint` into the artefact JSON.
+- The `ProgramEvaluator` record for an invalid output gains `step` and `reads` keys.
+- For `WithPolicy` with `OnErrorFallback`, `StepError.Err` wraps a `StepError` for the failed step (text and `errors.Is` unchanged).
+
 A (model call contract):
 - `Predict`/`ChainOfThought` `LM` and `RepairLM`, `LLMJudgeMetric.LM`, `ReflectiveProposer.LM`, `LLMMergeProposer.LM`, `ReflectionLM` on `CompileConfig`, `OptimizationConfig` and `ProgramTrainConfig`, `DefaultCompileConfig` and `RetryingLanguageModel.LM` take `Generator`.
 - crucible: judge and subject `LM`, `JudgeLM`, `RAGGroundingPack` and `BuildLanguageModel` use `gepa.Generator`.
@@ -124,4 +139,6 @@ A (model call contract):
 ## Open findings
 
 - `make fmt` and `make verify` fail in the main checkout because the gitignored kiln and documentscout no longer compile against the new API. CI and the clean-worktree checks are unaffected.
+- crucible's go.mod requires gepago v0.6.0; bump it after the root v0.8.0 tag.
+- F's `StepError.Reads` and reflection `SideInfo` must go through D's `Redactor` when D and F merge.
 - README and `docs/architecture.html` still describe `LanguageModel` (H3).
