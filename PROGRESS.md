@@ -7,12 +7,12 @@ Branch `feat/v0.8.0-flow-runtime`, started from `1e3cc7b` (v0.7.0).
 | Package | Status | Commits | Review rounds | Open findings |
 |---|---|---|---|---|
 | A. Model call contract | done | a1791af, 53893a4, b8fd03f | 1: 14 findings, fixed; 2: 4 findings, fixed; 3: none | none |
-| B. Structured output | fixing round 4 + deferred pipeline items | 6eb19d9, 59c26b8, 04521cf, fb9e31a | 1: 11 (2 deferred), 2: 3, 3: 3, all fixed; 4: 2 findings, fixing | |
+| B. Structured output | done | 6eb19d9, 59c26b8, 04521cf, fb9e31a, 096233f, 3ff9b8c, 75803f9, c468be7 | 1: 11, 2: 3, 3: 3, 4: 2 + deferred, 5: 2 + perf, 6: 1, 7: 2, all fixed; 8: none | none |
 | C. Pipeline control flow and policy | done (merged in 1306f2b) | 8a69ad8, 9b95e07, c76a7b9, 82e32ca, 3c5a14b, merge 1306f2b | 1: 5, 2: 3, 3: 1, 4: 1 finding, all fixed; 5: none | none |
-| I. Tools | not started | | | |
-| D. Observability | not started | | | |
+| I. Tools | implementing (worktree from 096233f) | | | |
+| D. Observability | implementing (worktree from 096233f) | | | |
 | E. Run context | not started | | | |
-| F. Artefacts and compile | not started | | | |
+| F. Artefacts and compile | implementing (worktree from 096233f) | | | |
 | G. Test kit | not started | | | |
 | H. Housekeeping | not started | | | |
 
@@ -32,6 +32,8 @@ Branch `feat/v0.8.0-flow-runtime`, started from `1e3cc7b` (v0.7.0).
 | clean worktree: full set | pass | 04521cf |
 | clean worktree: fmt, diff, test, vet, staticcheck | pass | fb9e31a |
 | clean worktree: full set (after merging C; one mechanical conflict in program.go resolved as the union of both sides) | pass | 1306f2b |
+| clean worktree: full set | pass | 096233f |
+| clean worktree: fmt, diff, test, vet, staticcheck | pass | 3ff9b8c, 75803f9, c468be7 |
 | clean worktree: same plus `npm ci`, `make diago`, `make wasm-test` | pass | 6eb19d9 |
 
 ## Decisions
@@ -53,6 +55,8 @@ Branch `feat/v0.8.0-flow-runtime`, started from `1e3cc7b` (v0.7.0).
   a canonical form rather than `fmt.Sprint` (B review round 2).
 - Providers report a refusal as a `Generation` with `FinishContentFilter`; `Predict` fails
   with `ErrContentFiltered` (matches `ErrInvalidOutput`) and never repairs it.
+- To save time, I, D and F run in parallel worktrees from 096233f (none depends on another's
+  types); E follows D, then G and H.
 - `programs/kiln` and `programs/documentscout` are gitignored local projects inside the root
   module. They are not part of the repo; the final `make verify` runs in a clean worktree,
   as CI does.
@@ -78,6 +82,8 @@ B (structured output):
 - Metric text for nil is "null" (was "<nil>"); non-string values compare by canonical JSON, which changes `ClassificationMetric` details.
 - crucible `RawModelSubject` and `AgentSubject` fail on truncation or refusal; the OpenAI agent subject maps refusals to `content_filter`.
 - `Key.Get` rejects a quoted "null", a quoted float that underflows and quoted non-JSON numbers ("01", "1.") in `,string` fields.
+- `Build` checks a signature step's reads and writes against its signature names and Go types (`SignatureProgram`); a `TypedPredict` step must declare its required `Out` fields as writes with exact types.
+- An absent or null `Optional` output commits the zero value of the key's type instead of failing the step.
 - `StrictJSONSchema` is stricter (provider limits, unique required, scalar enums).
 - WASM task and repair host requests carry `response_format`; the TS Claude chat sends `output_config` for a strict `response_format`.
 
@@ -119,4 +125,3 @@ A (model call contract):
 
 - `make fmt` and `make verify` fail in the main checkout because the gitignored kiln and documentscout no longer compile against the new API. CI and the clean-worktree checks are unaffected.
 - README and `docs/architecture.html` still describe `LanguageModel` (H3).
-- After C merges: pipeline `programOutput` must accept null for `Optional` outputs, and `Build` must check a `TypedPredict` step's keys and types (B review round 1, items 4 and 5).
