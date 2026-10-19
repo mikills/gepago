@@ -196,6 +196,7 @@ type openAIChatRequest struct {
 type openAIMessage struct {
 	Role       string           `json:"role"`
 	Content    string           `json:"content,omitempty"`
+	Refusal    string           `json:"refusal,omitempty"`
 	ToolCallID string           `json:"tool_call_id,omitempty"`
 	ToolCalls  []openAIToolCall `json:"tool_calls,omitempty"`
 }
@@ -330,8 +331,9 @@ type openAIResponsesOutputItem struct {
 }
 
 type openAIResponsesContentBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text,omitempty"`
+	Type    string `json:"type"`
+	Text    string `json:"text,omitempty"`
+	Refusal string `json:"refusal,omitempty"`
 }
 
 type openAIResponsesOutputToolCall struct {
@@ -456,7 +458,7 @@ func decodeOpenAIChatResponse(data []byte) (agents.ChatResponse, error) {
 		return agents.ChatResponse{}, errors.New("openai agent chat returned no choices")
 	}
 	choice := response.Choices[0]
-	return agents.ChatResponse{
+	chat := agents.ChatResponse{
 		Message: agents.Message{
 			Role:      agents.RoleAssistant,
 			Content:   choice.Message.Content,
@@ -465,7 +467,23 @@ func decodeOpenAIChatResponse(data []byte) (agents.ChatResponse, error) {
 		Usage:         response.Usage.gepaUsage(),
 		FinishReason:  finishReason(choice.FinishReason),
 		ResolvedModel: response.Model,
-	}, nil
+	}
+	applyOpenAIRefusal(&chat, choice.Message.Refusal)
+	return chat, nil
+}
+
+// applyOpenAIRefusal marks a reply the model refused as FinishContentFilter, as the openai
+// provider does: OpenAI reports a refusal in its own field with an ordinary finish reason. The
+// refusal becomes the content when the reply has no other text.
+func applyOpenAIRefusal(chat *agents.ChatResponse, refusal string) {
+	refusal = strings.TrimSpace(refusal)
+	if refusal == "" {
+		return
+	}
+	if strings.TrimSpace(chat.Message.Content) == "" {
+		chat.Message.Content = refusal
+	}
+	chat.FinishReason = agents.FinishContentFilter
 }
 
 func decodeOpenAIResponsesResponse(data []byte) (agents.ChatResponse, error) {
@@ -477,8 +495,9 @@ func decodeOpenAIResponsesResponse(data []byte) (agents.ChatResponse, error) {
 		return agents.ChatResponse{}, errors.New("openai agent responses returned no output")
 	}
 	message := agents.Message{Role: agents.RoleAssistant}
+	var refusal strings.Builder
 	for _, item := range response.Output {
-		applyOpenAIResponsesOutput(&message, item)
+		applyOpenAIResponsesOutput(&message, &refusal, item)
 	}
 	usage := gepa.Usage{
 		PromptTokens:      response.Usage.InputTokens,
@@ -500,15 +519,22 @@ func decodeOpenAIResponsesResponse(data []byte) (agents.ChatResponse, error) {
 	case "content_filter":
 		finish = agents.FinishContentFilter
 	}
-	return agents.ChatResponse{Message: message, Usage: usage, FinishReason: finish, ResolvedModel: response.Model}, nil
+	chat := agents.ChatResponse{Message: message, Usage: usage, FinishReason: finish, ResolvedModel: response.Model}
+	applyOpenAIRefusal(&chat, refusal.String())
+	return chat, nil
 }
 
-func applyOpenAIResponsesOutput(message *agents.Message, item openAIResponsesOutputItem) {
+// applyOpenAIResponsesOutput adds an output item's text and tool calls to message and its
+// refusal blocks to refusal.
+func applyOpenAIResponsesOutput(message *agents.Message, refusal *strings.Builder, item openAIResponsesOutputItem) {
 	switch item.Type {
 	case "message":
 		for _, block := range item.Content {
-			if block.Type == "output_text" || block.Type == "text" {
+			switch block.Type {
+			case "output_text", "text":
 				message.Content += block.Text
+			case "refusal":
+				refusal.WriteString(block.Refusal)
 			}
 		}
 		for _, call := range item.ToolCalls {

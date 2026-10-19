@@ -11,7 +11,10 @@ import (
 	"github.com/mikills/gepago/agents"
 )
 
-// AgentSubject adapts a tool-calling agent into an evaluation subject.
+// AgentSubject adapts a tool-calling agent into an evaluation subject. A run whose final reply
+// stopped at the output token limit fails the case with gepa.ErrOutputTruncated, and one a
+// content policy withheld or the model refused with gepa.ErrContentFiltered, so neither is
+// scored as the answer; the failed output still carries the transcript, tool calls and usage.
 type AgentSubject struct {
 	SubjectName       string
 	Agent             *agents.Agent
@@ -30,7 +33,24 @@ func (s AgentSubject) Run(ctx context.Context, input gepa.Prediction) (SubjectOu
 		Memory:   memory,
 		Messages: []agents.Message{{Role: agents.RoleUser, Content: s.message(input)}},
 	})
+	if err == nil {
+		err = agentStopError(result)
+	}
 	return agentOutput(result), err
+}
+
+// agentStopError returns gepa.FinishReasonError for the run's final reply: an error when the
+// run stopped at the output token limit or under a content policy, and nil otherwise. The
+// completion tokens it reports are the whole run's.
+func agentStopError(result agents.RunResult) error {
+	generation := gepa.Generation{Text: result.Final.Content, Usage: result.Usage}
+	switch result.StopReason {
+	case agents.StopLength:
+		generation.FinishReason = gepa.FinishLength
+	case agents.StopContentFilter:
+		generation.FinishReason = gepa.FinishContentFilter
+	}
+	return gepa.FinishReasonError(generation, "agent run")
 }
 
 func (s AgentSubject) memory(input gepa.Prediction) *agents.Memory {

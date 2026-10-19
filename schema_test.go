@@ -689,16 +689,27 @@ func TestJSONSchemaForQuotedFieldsAgreesWithKeyGet(t *testing.T) {
 	}{
 		{"name", `"bob"`, true},
 		{"name", `"say \"hi\""`, true},
+		{"name", `"a\/b\\c\b\f\n\r\t\u00e9"`, true},
+		{"name", `""`, true},
 		{"name", "bob", false},
+		{"name", `"\x"`, false},
+		{"name", `"\u12"`, false},
+		{"name", "\"line\nbreak\"", false},
+		{"name", `"open`, false},
+		{"name", "null", false},
 		{"count", "-12", true},
 		{"count", "abc", false},
 		{"count", "1.5", false},
+		{"count", "null", false},
 		{"ratio", "-1.5e3", true},
 		{"ratio", "half", false},
+		{"ratio", "null", false},
 		{"flag", "false", true},
 		{"flag", "yes", false},
+		{"flag", "null", false},
 		{"size", "7", true},
 		{"size", "-7", false},
+		{"size", "null", false},
 	} {
 		t.Run(tt.field+"="+tt.value, func(t *testing.T) {
 			value := maps.Clone(valid)
@@ -708,6 +719,50 @@ func TestJSONSchemaForQuotedFieldsAgreesWithKeyGet(t *testing.T) {
 		})
 	}
 	require.False(t, StrictJSONSchema(data), "a pattern is outside the strict subset")
+}
+
+type quotedInt struct {
+	N int    `json:"n,string"`
+	S string `json:"s,string"`
+}
+
+type quotedFloat struct {
+	Small float32  `json:"small,string"`
+	Ratio *float64 `json:"ratio,string"`
+}
+
+// TestKeyGetRejectsQuotedDrift checks the strings encoding/json silently decodes into a
+// ",string" field as a zero: "null", and a float that underflows.
+func TestKeyGetRejectsQuotedDrift(t *testing.T) {
+	_, err := Key[quotedInt]{Name: "k"}.Get(NewState(Prediction{"k": map[string]any{"n": "null", "s": `"ok"`}}))
+	require.EqualError(
+		t,
+		err,
+		`state key "k": decode as gepa.quotedInt: field "n" is the string "null", which a ",string" field decodes as no value`,
+	)
+	_, err = Key[quotedInt]{Name: "k"}.Get(NewState(Prediction{"k": map[string]any{"n": "1", "s": `"\x"`}}))
+	require.Error(t, err, "an escape JSON does not define")
+	got, err := Key[quotedInt]{Name: "k"}.Get(NewState(Prediction{"k": map[string]any{"n": "1", "s": `"ok"`}}))
+	require.NoError(t, err)
+	require.Equal(t, quotedInt{N: 1, S: "ok"}, got)
+
+	_, err = Key[quotedFloat]{Name: "k"}.Get(NewState(Prediction{"k": map[string]any{"small": "1e-50", "ratio": nil}}))
+	require.EqualError(
+		t,
+		err,
+		`state key "k": decode as gepa.quotedFloat: field "small": number 1e-50 is too small for float32 and would decode as 0`,
+	)
+	_, err = Key[quotedFloat]{Name: "k"}.Get(NewState(Prediction{"k": map[string]any{"small": "1", "ratio": "1e-400"}}))
+	require.ErrorContains(t, err, `field "ratio": number 1e-400 is too small for float64`)
+	_, err = Key[quotedFloat]{Name: "k"}.Get(NewState(Prediction{"k": map[string]any{"small": "1", "ratio": "null"}}))
+	require.ErrorContains(t, err, `field "ratio" is the string "null"`)
+	gotFloat, err := Key[quotedFloat]{
+		Name: "k",
+	}.Get(
+		NewState(Prediction{"k": map[string]any{"small": "0", "ratio": nil}}),
+	)
+	require.NoError(t, err)
+	require.Equal(t, quotedFloat{}, gotFloat)
 }
 
 type pairValue struct {

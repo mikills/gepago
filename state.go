@@ -236,8 +236,9 @@ func customJSON(typ reflect.Type) bool {
 }
 
 // checkJSONShape reports drift that encoding/json accepts silently: object keys that match a
-// struct field only by case, required struct fields that are missing, and nulls decoded into
-// values that cannot hold them.
+// struct field only by case, required struct fields that are missing, nulls decoded into
+// values that cannot hold them, arrays of the wrong length, floats that underflow to zero and
+// the string "null" in a ",string" field.
 func checkJSONShape(typ reflect.Type, value any, path string) error {
 	if value == nil {
 		if path != "" && !nillable(typ) {
@@ -301,12 +302,32 @@ func checkJSONObject(typ reflect.Type, object map[string]any, path string) error
 			return fmt.Errorf("required field %q is missing", fieldPath)
 		case !ok, value == nil && field.optional:
 		default:
-			if err := checkJSONShape(field.typ, value, fieldPath); err != nil {
+			if err := checkJSONField(field, value, fieldPath); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// checkJSONField checks the value of one struct field. A field with the ",string" option holds
+// the JSON encoding of a boolean, number or string inside a string. encoding/json silently
+// decodes the string "null" there as no value, leaving a zero or a nil pointer, and a float in
+// it that underflows as 0, so both are rejected, as an unquoted underflow is; the field's
+// schema pattern rejects "null" too.
+func checkJSONField(field jsonField, value any, path string) error {
+	text, isString := value.(string)
+	if !isString || !field.quoted || !quotable(field.typ) {
+		return checkJSONShape(field.typ, value, path)
+	}
+	if text == "null" {
+		return fmt.Errorf("field %q is the string \"null\", which a \",string\" field decodes as no value", path)
+	}
+	typ := field.typ
+	if typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	return checkJSONShape(typ, json.Number(text), path)
 }
 
 // underflows reports whether a non-zero JSON number rounds to zero at the given float size,

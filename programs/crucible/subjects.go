@@ -61,7 +61,10 @@ func (s CompiledProgramSubject) Run(ctx context.Context, input gepa.Prediction) 
 	return SubjectOutput{Value: value, Usage: usage}, err
 }
 
-// RawModelSubject adapts a text-generating model into an evaluation subject.
+// RawModelSubject adapts a text-generating model into an evaluation subject. A reply cut at
+// the output token limit fails the case with gepa.ErrOutputTruncated, and one a content policy
+// withheld or the model refused with gepa.ErrContentFiltered, so neither is scored as the
+// answer; the failed output still carries the raw reply, usage and resolved model.
 type RawModelSubject struct {
 	SubjectName    string
 	LM             gepa.Generator
@@ -85,6 +88,9 @@ func (s RawModelSubject) Run(ctx context.Context, input gepa.Prediction) (Subjec
 	var metadata map[string]any
 	if model := strings.TrimSpace(generation.Model); model != "" {
 		metadata = map[string]any{"resolved_model": model}
+	}
+	if err == nil {
+		err = gepa.FinishReasonError(generation, "subject reply")
 	}
 	if err != nil {
 		return SubjectOutput{Raw: raw, Usage: usage, Metadata: metadata}, err

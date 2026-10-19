@@ -340,9 +340,11 @@ from replaying cached outputs forever. Scheduled provider-drift runs should omit
 entirely. Library callers must provide `RunConfig.CacheIdentity` whenever `RunConfig.Cache` is
 set.
 
-Execution failures count as zero scores. The CLI also fails on subject execution failures by
-default after writing the run artifacts. Use `-allow-subject-failures` only for exploratory
-runs where a successful process exit is more useful than a regression gate.
+Execution failures count as zero scores. A raw model or agent reply cut at the output token
+limit, or withheld or refused under a content policy, is an execution failure rather than an
+answer to score. The CLI also fails on subject execution failures by default after writing the
+run artifacts. Use `-allow-subject-failures` only for exploratory runs where a successful
+process exit is more useful than a regression gate.
 The CLI also applies a ten-minute cancellation deadline by default. Set `-timeout` explicitly
 for larger suites. Subjects are required to honour context cancellation.
 Crucible caps a run at 1,000 subject/case executions and 10,000 total evaluator calls,
