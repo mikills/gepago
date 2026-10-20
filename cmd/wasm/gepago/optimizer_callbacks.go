@@ -77,7 +77,7 @@ func (p *hostProposer) Propose(
 	dataset gepa.ReflectiveDataset,
 	components []string,
 ) (gepa.Candidate, error) {
-	// the optimizer reads LastUsage and LastModelCalls after failed proposals too, so clear
+	// the optimiser reads LastUsage and LastModelCalls after failed proposals too, so clear
 	// the previous call's.
 	p.mu.Lock()
 	p.usage = gepa.Usage{}

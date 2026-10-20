@@ -4,6 +4,7 @@ export interface ProgramArtifact {
   name: string;
   version?: string;
   program_version?: string;
+  fingerprint?: string;
   candidate: Record<string, string>;
   metadata?: Record<string, unknown>;
   created_at: string;

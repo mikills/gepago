@@ -37,7 +37,7 @@ func newHostResponseFormat(format gepa.ResponseFormat) *hostResponseFormat {
 	return &hostResponseFormat{Name: format.Name, Schema: format.Schema, Strict: format.Strict}
 }
 
-// compileModelResult is the normalized result returned by a host model. FinishReason and
+// compileModelResult is the normalised result returned by a host model. FinishReason and
 // Model are optional: hosts that report them let Predict detect a truncated reply.
 type compileModelResult struct {
 	Text         string
@@ -78,8 +78,8 @@ func (fn compileModelInvokerFunc) GenerateModel(
 
 // compileLanguageModel adapts the role-aware host callback to Gepago's provider-neutral
 // Generator interface. Each role has an independent attempt counter, and every result carries
-// the host-reported usage so the optimizer records it once per call. The type keeps its name
-// because the optimizer's config fingerprint includes it: renaming it would stop runs saved by
+// the host-reported usage so the optimiser records it once per call. The type keeps its name
+// because the optimiser's config fingerprint includes it: renaming it would stop runs saved by
 // earlier releases from resuming.
 type compileLanguageModel struct {
 	invoker compileModelInvoker

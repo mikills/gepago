@@ -29,6 +29,7 @@ type FingerprintMismatchError struct {
 	ProgramFingerprint  string
 }
 
+// Error names the artefact, both fingerprints and the two ways to resolve the mismatch.
 func (e *FingerprintMismatchError) Error() string {
 	program := fmt.Sprintf("the programme's is %q", e.ProgramFingerprint)
 	if e.ProgramFingerprint == "" {

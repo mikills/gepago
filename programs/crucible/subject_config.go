@@ -177,7 +177,7 @@ func buildAgentSubject(spec SubjectSpec, _ SubjectBuildOptions) (Subject, error)
 	return nil, fmt.Errorf("unsupported agent provider %q", spec.Provider)
 }
 
-// BuildLanguageModel constructs an OpenAI-compatible generator from a serialized model subject
+// BuildLanguageModel constructs an OpenAI-compatible generator from a serialised model subject
 // spec.
 func BuildLanguageModel(spec SubjectSpec) (gepa.Generator, error) {
 	apiKey := strings.TrimSpace(spec.APIKey)

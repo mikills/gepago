@@ -102,6 +102,34 @@ func TestLoadCompiledProgramLoadsArtefactsWithoutFingerprint(t *testing.T) {
 	require.Equal(t, gepa.Prediction{"instruction": "trained"}, got)
 }
 
+// TestLoadCompiledProgramChecksAnArtefactSavedByJavaScript loads the JSON that the TypeScript
+// saveProgramArtifact in packages/gepago/wasm writes for a loaded Go artefact.
+func TestLoadCompiledProgramChecksAnArtefactSavedByJavaScript(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "echo.json")
+	original, renamed := echoPipeline(t, "instruction"), echoPipeline(t, "answer")
+	saved := fmt.Sprintf(`{
+  "format_version": 1,
+  "name": "echo",
+  "candidate": {
+    "echo.instruction": "trained"
+  },
+  "created_at": "2026-01-02T03:04:05.000Z",
+  "program_version": "v1",
+  "fingerprint": %q
+}
+`, original.Fingerprint())
+	require.NoError(t, os.WriteFile(path, []byte(saved), 0o600))
+
+	_, _, err := gepa.LoadCompiledProgram(path, renamed)
+	var mismatch *gepa.FingerprintMismatchError
+	require.ErrorAs(t, err, &mismatch)
+	require.EqualError(t, err, mismatchMessage(original.Fingerprint(), renamed.Fingerprint()))
+
+	_, artifact, err := gepa.LoadCompiledProgram(path, original)
+	require.NoError(t, err)
+	require.Equal(t, original.Fingerprint(), artifact.Fingerprint)
+}
+
 func TestLoadCompiledProgramVersionSkipsTheFingerprintCheck(t *testing.T) {
 	dir := t.TempDir()
 	original, renamed := echoPipeline(t, "instruction"), echoPipeline(t, "answer")
