@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"encoding"
 	"encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
+	"errors"
 	"fmt"
 	"maps"
 	"reflect"
@@ -171,11 +174,13 @@ func (s State) store(key string, typ reflect.Type, value any, fresh bool) {
 
 // Key is a typed handle on one State value. Name is the state key and T is the value shape.
 //
-// A value stored as another type, such as a model's JSON output, is converted to T strictly:
-// unknown fields, fields that match only by case, missing fields not tagged omitempty or
-// omitzero, nulls in non-nullable positions, arrays with too few or too many elements, and
-// non-zero numbers too small for a float type are errors rather than zero values. Types
-// with their own UnmarshalJSON or UnmarshalText are decoded as they define.
+// A value stored as another type, such as a model's JSON output, is converted to T strictly,
+// through its JSON form and encoding/json/v2: unknown fields, fields that match only by case,
+// duplicate object names, missing fields not tagged omitempty or omitzero, nulls in
+// non-nullable positions, arrays with too few or too many elements, non-zero numbers too small
+// for a float type, times that are not RFC 3339 and base64 with line breaks are errors rather
+// than zero values. Types with their own UnmarshalJSON or UnmarshalText are decoded as they
+// define.
 //
 // If T or *T has a Validate() error method, Get calls it on every value it returns (except a
 // nil pointer) and returns its error, so a value that decodes but breaks T's invariants is
@@ -247,6 +252,19 @@ func convertStateValue(key string, typ reflect.Type, value any) (any, error) {
 	return out, nil
 }
 
+// decodeOptions are the encoding/json/v2 options decodeJSONValue decodes with: v2's strict
+// defaults with unknown members rejected, plus the encoding/json forms that json.Marshal still
+// writes and gepago's JSON Schema still describes. v2 refuses each of them by default: the
+// ",string" option on a bool or string field, a time.Duration as a number of nanoseconds, a
+// [N]byte as an array of numbers and a []~byte as base64.
+var decodeOptions = jsonv2.JoinOptions(
+	jsonv2.RejectUnknownMembers(true),
+	json.StringifyWithLegacySemantics(true),
+	json.FormatDurationAsNano(true),
+	json.FormatByteArrayAsArray(true),
+	json.FormatBytesWithLegacySemantics(true),
+)
+
 func decodeJSONValue(typ reflect.Type, value any) (any, error) {
 	data, err := json.Marshal(value)
 	if err != nil {
@@ -258,16 +276,104 @@ func decodeJSONValue(typ reflect.Type, value any) (any, error) {
 	if err := decoder.Decode(&generic); err != nil {
 		return nil, err
 	}
+	out := reflect.New(typ)
+	err = jsonv2.Unmarshal(data, out.Interface(), decodeOptions)
+	// an unknown member, such as a renamed field, explains a missing field, so it comes first.
+	if errors.Is(err, jsonv2.ErrUnknownName) {
+		return nil, decodeError(typ, err)
+	}
 	if err := checkJSONShape(typ, generic, ""); err != nil {
 		return nil, err
 	}
-	out := reflect.New(typ)
-	decoder = json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(out.Interface()); err != nil {
-		return nil, err
+	if err != nil {
+		return nil, decodeError(typ, err)
 	}
 	return out.Elem().Interface(), nil
+}
+
+// decodeError words an error from decoding into typ as gepago did before encoding/json/v2: an
+// unknown member is `field "a.b" is not in T`, and any other error about a Go type reads as the
+// *json.UnmarshalTypeError encoding/json reports, wrapping v2's underlying error. This also
+// keeps the text stable: v2 words its own errors with "cannot" or "unable to" at random. A
+// syntax error keeps v2's wording.
+func decodeError(typ reflect.Type, err error) error {
+	var semantic *jsonv2.SemanticError
+	if !errors.As(err, &semantic) || semantic.GoType == nil {
+		return err
+	}
+	if errors.Is(semantic.Err, jsonv2.ErrUnknownName) {
+		return fmt.Errorf("field %q is not in %s", jsonPointerPath(typ, semantic.JSONPointer), semantic.GoType)
+	}
+	value, ok := jsonKindNames[semantic.JSONKind]
+	if !ok {
+		// v2 refused the Go type before it read a value, such as a misused ",string" option.
+		value = "JSON"
+	}
+	typeErr := &json.UnmarshalTypeError{
+		Value:  value,
+		Type:   semantic.GoType,
+		Offset: semantic.ByteOffset,
+		Err:    semantic.Err,
+	}
+	if semantic.JSONPointer != "" {
+		root := typ
+		if root.Kind() == reflect.Pointer {
+			root = root.Elem()
+		}
+		typeErr.Struct = root.Name()
+		typeErr.Field = strings.Join(slices.Collect(semantic.JSONPointer.Tokens()), ".")
+	}
+	literal := semantic.JSONValue
+	switch {
+	case len(literal) == 0:
+	case numberKind(semantic.GoType) && (semantic.Err == strconv.ErrSyntax || semantic.Err == strconv.ErrRange):
+		// a number that does not fit its type, quoted or not, as encoding/json words it.
+		if literal.Kind() == '"' {
+			literal, _ = jsontext.AppendUnquote(nil, literal)
+		}
+		typeErr.Value, typeErr.Err = "number "+string(literal), nil
+	default:
+		typeErr.Value += " " + string(literal)
+	}
+	return typeErr
+}
+
+// jsonKindNames names each JSON kind as encoding/json's errors do.
+var jsonKindNames = map[jsontext.Kind]string{
+	'n': "null", 'f': "bool", 't': "bool", '"': "string", '0': "number",
+	'{': "object", '}': "object", '[': "array", ']': "array",
+}
+
+func numberKind(typ reflect.Type) bool {
+	switch typ.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64:
+		return true
+	}
+	return false
+}
+
+// jsonPointerPath writes a JSON pointer into a value of typ as checkJSONShape writes paths:
+// "items[0].amount". typ tells an array index from an object member named by digits.
+func jsonPointerPath(typ reflect.Type, pointer jsontext.Pointer) string {
+	var path string
+	for token := range pointer.Tokens() {
+		for typ != nil && typ.Kind() == reflect.Pointer {
+			typ = typ.Elem()
+		}
+		switch {
+		case typ != nil && (typ.Kind() == reflect.Slice || typ.Kind() == reflect.Array):
+			path, typ = fmt.Sprintf("%s[%s]", path, token), typ.Elem()
+		case typ != nil && typ.Kind() == reflect.Map:
+			path, typ = joinJSONPath(path, token), typ.Elem()
+		case typ != nil && typ.Kind() == reflect.Struct:
+			path, typ = joinJSONPath(path, token), jsonFields(typ)[token].typ
+		default:
+			path, typ = joinJSONPath(path, token), nil
+		}
+	}
+	return path
 }
 
 func nillable(typ reflect.Type) bool {
@@ -289,10 +395,11 @@ func customJSON(typ reflect.Type) bool {
 		typ.Implements(textUnmarshalerType) || ptr.Implements(textUnmarshalerType)
 }
 
-// checkJSONShape reports drift that encoding/json accepts silently: object keys that match a
-// struct field only by case, required struct fields that are missing, nulls decoded into
-// values that cannot hold them, arrays of the wrong length, floats that underflow to zero and
-// the string "null" in a ",string" field.
+// checkJSONShape reports drift that encoding/json/v2 accepts silently: required struct fields
+// that are missing, nulls decoded into values that cannot hold them, floats that underflow to
+// zero, and in a ",string" field the string "null" or a number outside the JSON grammar. It
+// also refuses arrays of the wrong length, which v2 refuses without saying how many elements
+// it found.
 func checkJSONShape(typ reflect.Type, value any, path string) error {
 	if value == nil {
 		if path != "" && !nillable(typ) {
@@ -342,11 +449,6 @@ func checkJSONShape(typ reflect.Type, value any, path string) error {
 
 func checkJSONObject(typ reflect.Type, object map[string]any, path string) error {
 	fields := jsonFields(typ)
-	for _, key := range slices.Sorted(maps.Keys(object)) {
-		if _, ok := fields[key]; !ok {
-			return fmt.Errorf("field %q is not in %s", joinJSONPath(path, key), typ)
-		}
-	}
 	for _, name := range slices.Sorted(maps.Keys(fields)) {
 		field := fields[name]
 		value, ok := object[name]
@@ -368,11 +470,12 @@ func checkJSONObject(typ reflect.Type, object map[string]any, path string) error
 var jsonNumber = regexp.MustCompile(jsonNumberPattern)
 
 // checkJSONField checks the value of one struct field. A field with the ",string" option holds
-// the JSON encoding of a boolean, number or string inside a string. encoding/json silently
-// decodes the string "null" there as no value, leaving a zero or a nil pointer, parses a number
-// there with strconv, which admits text JSON does not, such as "01", "1." or "-Inf", and
-// decodes a float in it that underflows as 0. All three are rejected, as the field's schema
-// pattern rejects the first two and Get rejects an unquoted underflow.
+// the JSON encoding of a boolean, number or string inside a string. Under the encoding/json
+// ",string" semantics decodeOptions keeps, v2 silently decodes the string "null" there as no
+// value, leaving a zero or a nil pointer, parses a number there with strconv, which admits
+// text JSON does not, such as "01", "1." or "-Inf", and decodes a float in it that underflows
+// as 0. All three are rejected, as the field's schema pattern rejects the first two and Get
+// rejects an unquoted underflow.
 func checkJSONField(field jsonField, value any, path string) error {
 	text, isString := value.(string)
 	if !isString || !field.quoted || !quotable(field.typ) {
@@ -397,7 +500,7 @@ func checkJSONField(field jsonField, value any, path string) error {
 }
 
 // underflows reports whether a non-zero JSON number rounds to zero at the given float size,
-// which encoding/json accepts silently.
+// which encoding/json/v2 accepts silently.
 func underflows(number json.Number, bits int) bool {
 	parsed, err := strconv.ParseFloat(number.String(), bits)
 	if err != nil || parsed != 0 {

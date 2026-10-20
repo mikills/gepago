@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/json/jsontext"
+	"errors"
+	"maps"
 	"math"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -347,10 +351,13 @@ func metricJSON(value any) json.RawMessage {
 	form, _ := walker.walk(reflect.ValueOf(value))
 	encoded, err := encodeMetricJSON(form)
 	if err != nil || walker.failed {
-		// encoding/json refuses a cycle or NaN in a value the walker left to it; a thorough walk
-		// builds a form that always encodes.
+		// encoding/json refuses a cycle, NaN, map keys that write the same text or nesting deeper
+		// than it allows in a value the walker left to it; a thorough walk builds a form that
+		// always encodes, and writeMetricJSON writes it at any depth.
 		form, _ = newMetricWalker(true).walk(reflect.ValueOf(value))
-		encoded, _ = encodeMetricJSON(form)
+		var buffer bytes.Buffer
+		writeMetricJSON(&buffer, form)
+		encoded = buffer.Bytes()
 	}
 	var decoded any
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
@@ -364,7 +371,9 @@ func metricJSON(value any) json.RawMessage {
 	return canonical
 }
 
-// encodeMetricJSON encodes value as compact JSON without escaping HTML.
+// encodeMetricJSON encodes value as compact JSON without escaping HTML. It refuses an encoding
+// with duplicate object names, which encoding/json writes since Go 1.27 for map keys that write
+// the same text, such as two pointers to equal values, where it used to refuse such keys.
 func encodeMetricJSON(value any) (json.RawMessage, error) {
 	var buffer bytes.Buffer
 	encoder := json.NewEncoder(&buffer)
@@ -372,5 +381,40 @@ func encodeMetricJSON(value any) (json.RawMessage, error) {
 	if err := encoder.Encode(value); err != nil {
 		return nil, err
 	}
-	return bytes.TrimSpace(buffer.Bytes()), nil
+	encoded := bytes.TrimSpace(buffer.Bytes())
+	if !jsontext.Value(encoded).IsValid(jsontext.AllowInvalidUTF8(true)) {
+		return nil, errors.New("encoding/json wrote duplicate object names")
+	}
+	return encoded, nil
+}
+
+// writeMetricJSON writes a thorough walk's form as encodeMetricJSON encodes it, writing arrays
+// and objects itself so that no nesting limit applies: encoding/json refuses to write a value
+// nested deeper than 10000 levels since Go 1.27. Every other value in such a form encodes.
+func writeMetricJSON(buffer *bytes.Buffer, form any) {
+	switch form := form.(type) {
+	case []any:
+		buffer.WriteByte('[')
+		for i, item := range form {
+			if i > 0 {
+				buffer.WriteByte(',')
+			}
+			writeMetricJSON(buffer, item)
+		}
+		buffer.WriteByte(']')
+	case map[string]any:
+		buffer.WriteByte('{')
+		for i, key := range slices.Sorted(maps.Keys(form)) {
+			if i > 0 {
+				buffer.WriteByte(',')
+			}
+			writeMetricJSON(buffer, key)
+			buffer.WriteByte(':')
+			writeMetricJSON(buffer, form[key])
+		}
+		buffer.WriteByte('}')
+	default:
+		encoded, _ := encodeMetricJSON(form)
+		buffer.Write(encoded)
+	}
 }

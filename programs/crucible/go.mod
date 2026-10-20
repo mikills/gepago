@@ -1,6 +1,6 @@
 module github.com/mikills/gepago/programs/crucible
 
-go 1.25.0
+go 1.27.1
 
 require (
 	github.com/mikills/gepago v0.8.0

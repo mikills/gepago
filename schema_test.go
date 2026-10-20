@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -750,6 +751,37 @@ func TestJSONSchemaForQuotedFieldsCrossCheck(t *testing.T) {
 			}
 			require.Equal(t, re.MatchString(value), err == nil, "%s: %v", name, err)
 		}
+	}
+}
+
+// TestJSONSchemaForQuotedStringsAdmitsSurrogatesOnlyInPairs checks that a quoted string's
+// pattern admits a UTF-16 surrogate escape exactly when Get decodes it: as a high surrogate
+// followed by a low one.
+func TestJSONSchemaForQuotedStringsAdmitsSurrogatesOnlyInPairs(t *testing.T) {
+	var pattern *regexp.Regexp
+	for _, keyword := range quotedSchema(reflect.TypeFor[string]()) {
+		if keyword.key == "pattern" {
+			pattern = regexp.MustCompile(keyword.value.(string))
+		}
+	}
+	require.NotNil(t, pattern)
+	u := func(hex string) string { return "\\" + "u" + hex }
+	quote := func(text string) string { return `"` + text + `"` }
+	for value, decodes := range map[string]bool{
+		quote(u("d83d") + u("de00")):             true,
+		quote(u("D83D") + u("DE00")):             true,
+		quote("a" + u("d800") + u("dc00") + "b"): true,
+		quote(u("d7ff") + u("e000") + u("ffff")): true,
+		quote(u("d800")):                         false,
+		quote(u("dc00")):                         false,
+		quote(u("de00") + u("d83d")):             false,
+		quote(u("d800") + u("0041")):             false,
+		quote(u("d83d") + u("d83d") + u("de00")): false,
+		quote(u("d800") + "x"):                   false,
+	} {
+		_, err := Key[quotedInt]{Name: "k"}.Get(NewState(Prediction{"k": map[string]any{"n": "1", "s": value}}))
+		require.Equal(t, decodes, pattern.MatchString(value), "pattern %s", value)
+		require.Equal(t, decodes, err == nil, "Key.Get %s: %v", value, err)
 	}
 }
 

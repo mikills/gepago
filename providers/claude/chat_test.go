@@ -258,7 +258,7 @@ func TestChatRejectsInvalidRequestsWithoutSendingThem(t *testing.T) {
 		{
 			name:    "tool parameters that are not an object",
 			req:     gepa.ChatRequest{Tools: []gepa.Tool{{Name: "t", Parameters: json.RawMessage(`[1]`)}}},
-			wantErr: `claude chat: tool "t" parameters: json: cannot unmarshal array into Go value of type map[string]json.RawMessage`,
+			wantErr: `claude chat: tool "t" parameters: json: cannot unmarshal array into Go value of type map[string]jsontext.Value`,
 		},
 		{
 			name: "tool parameters with a malformed required list",
@@ -275,7 +275,7 @@ func TestChatRejectsInvalidRequestsWithoutSendingThem(t *testing.T) {
 				Strict: true,
 			}},
 			wantErr: "claude chat: response format schema: json: cannot unmarshal array into Go value of type " +
-				"map[string]json.RawMessage",
+				"map[string]jsontext.Value",
 		},
 	}
 	for _, tt := range tests {

@@ -253,7 +253,8 @@ const jsonNumberPattern = `^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$`
 
 // quotedSchema is the schema of a field with the ",string" option: a string that holds the JSON
 // encoding of the value, as encoding/json requires. For a string value that is a JSON string
-// literal: no raw control characters, and only the escapes JSON defines.
+// literal: no raw control characters, and only the escapes JSON defines, with a UTF-16
+// surrogate escaped only as a high and low pair, as encoding/json requires since Go 1.27.
 func quotedSchema(typ reflect.Type) schemaNode {
 	if typ.Name() == "" && typ.Kind() == reflect.Pointer {
 		typ = typ.Elem()
@@ -263,7 +264,8 @@ func quotedSchema(typ reflect.Type) schemaNode {
 	case reflect.Bool:
 		pattern = `^(true|false)$`
 	case reflect.String:
-		pattern = `^"([^"\\\x00-\x1f]|\\(["\\/bfnrt]|u[0-9a-fA-F]{4}))*"$`
+		pattern = `^"([^"\\\x00-\x1f]|\\(["\\/bfnrt]|u([0-9a-cA-CefEF][0-9a-fA-F]{3}|[dD][0-7][0-9a-fA-F]{2}|` +
+			`[dD][89abAB][0-9a-fA-F]{2}\\u[dD][c-fC-F][0-9a-fA-F]{2})))*"$`
 	case reflect.Float32, reflect.Float64:
 		pattern = jsonNumberPattern
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
