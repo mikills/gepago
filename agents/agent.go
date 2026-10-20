@@ -185,10 +185,11 @@ func (r RunRequest) Validate() error {
 
 // RunResult is the transcript, stop reason, usage, and tool calls from an agent run.
 //
-// Usage and Ledger count the usage of the run's successful chat calls and of its tool calls,
-// their unbudgeted usage included, as gepa.CompiledProgram.RunWithUsage does; Ledger counts
-// failed chat calls too. The run span and each tool call span report the unbudgeted usage in
-// Unbudgeted, apart from Usage.
+// Usage and Ledger count the usage of the run's successful chat calls and the Usage and
+// UnbudgetedUsage its tool calls return in their ToolResult; Ledger counts failed chat calls
+// too. Usage a tool records itself with gepa.RecordUsage, for example by running a Predict,
+// reaches a usage collector and the run's budget but not these totals. The run span and each
+// tool call span report the unbudgeted usage in Unbudgeted, apart from Usage.
 type RunResult struct {
 	Final          Message          `json:"final"`
 	Transcript     []Message        `json:"transcript"`
