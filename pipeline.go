@@ -264,7 +264,12 @@ func programOutput(outputs Prediction, key KeyRef, optional bool) (any, error) {
 }
 
 // MergeRule lets more than one step write Key. When a later step writes it, Merge combines
-// a copy of the value already in state with the new one.
+// a copy of the value already in state with the new one. It combines writes only: the first
+// write of a key that has a Default replaces the default.
+//
+// Two steps that write the same key need a MergeRule unless a run can never commit both writes:
+// the earlier step's transitions on success all skip past the later one (see Transition), and
+// no rewind lands between them.
 type MergeRule struct {
 	Key   KeyRef
 	Merge func(prev, next any) (any, error)
@@ -285,16 +290,40 @@ func MergeWith[T any](k Key[T], merge func(prev, next T) (T, error)) MergeRule {
 	}}
 }
 
-// PipelineSpec declares a Pipeline: its read-only inputs, its ordered steps, merge rules for
-// keys written by more than one step, defaults for the writes of steps that skip on error,
-// the budget of each run, the tools its steps call, and who observes its runs. A run fails
-// when its inputs hold a key that is not declared in Inputs, unless AllowExtraInputs is set, in
-// which case such keys are dropped.
+// Default seeds a state key before a run's first step, so every step sees Value until a
+// committed write of Key replaces it. Build it with DefaultValue. A key that a step may not
+// write (see Transition) needs a Default for any later step to read it.
+//
+// Build requires the default's type to match every step that reads or writes Key, refuses a
+// default for a pipeline input, and refuses one for a key no step reads or writes. Each run
+// gets its own copy of Value.
+type Default struct {
+	Key   KeyRef
+	Value any
+}
+
+// DefaultValue builds a Default for a typed key.
+func DefaultValue[T any](k Key[T], value T) Default {
+	return Default{Key: k.Ref(), Value: value}
+}
+
+// PipelineSpec declares a Pipeline: its read-only inputs, its ordered steps, the transitions
+// between them, merge rules for keys written by more than one step, defaults that seed keys
+// before the first step, the budget of each run, the tools its steps call, and who observes its
+// runs. A run fails when its inputs hold a key that is not declared in Inputs, unless
+// AllowExtraInputs is set, in which case such keys are dropped.
 type PipelineSpec struct {
-	Inputs   []KeyRef
-	Steps    []Step
-	Merges   []MergeRule
-	Defaults []KeyDefault
+	Inputs []KeyRef
+	Steps  []Step
+	// Transitions move a run from a top-level step to another in place of the next one in order;
+	// see Transition.
+	Transitions []Transition
+	// MaxVisits bounds how often a run visits a top-level step, by name. A step a transition
+	// rewinds to needs at least 2; a rewind that would exceed it fails the step that rewinds
+	// with ErrMaxVisits. Build refuses an entry for a step no transition rewinds to.
+	MaxVisits map[string]int
+	Merges    []MergeRule
+	Defaults  []Default
 	// Budget limits every run of the pipeline; the zero value sets no limits.
 	Budget           RunBudget
 	AllowExtraInputs bool
@@ -339,8 +368,10 @@ type Pipeline struct {
 	inputTypes       map[string]reflect.Type
 	allowExtraInputs bool
 	steps            []*stepNode
+	flow             transitionTable
 	merges           map[string]func(prev, next any) (any, error)
 	defaults         map[string]any
+	defaultKeys      []KeyRef
 	budget           RunBudget
 	tools            *ToolRegistry
 	toolPolicy       ToolPolicy
@@ -351,26 +382,37 @@ type Pipeline struct {
 	optional map[string]map[string]bool
 }
 
-// keySource records the type of an available key and where it comes from; an empty step
-// means a pipeline input.
+// keySource records the type of an available key and where it comes from: a step, the first
+// that writes it, or else a pipeline input, or a Default when def is set.
 type keySource struct {
 	typ     reflect.Type
 	step    string
+	def     bool
 	writers int
 }
 
+// describe names where a key from a step or a pipeline input comes from; Build words a
+// mismatch with a Default itself.
 func (s keySource) describe(key string) string {
-	if s.step == "" {
-		return fmt.Sprintf("pipeline input %q is %s", key, s.typ)
+	if s.step != "" {
+		return fmt.Sprintf("step %q writes it as %s", s.step, s.typ)
 	}
-	return fmt.Sprintf("step %q writes it as %s", s.step, s.typ)
+	return fmt.Sprintf("pipeline input %q is %s", key, s.typ)
 }
 
 // Build checks the state contract once and returns a runnable Pipeline. Every key a step
-// reads must be a pipeline input or written by an earlier step with the same type, pipeline
-// inputs are read-only, and a key written by more than one step needs a MergeRule.
+// reads must be a pipeline input, have a Default or be written by an earlier step, with the
+// same type, pipeline inputs are read-only, and a key written by more than one step needs a
+// MergeRule unless no run can commit both writes (see MergeRule).
 //
-// Steps nested in WithPolicy, WithCache, Branch, Parallel and Fallback are checked by the same
+// Transitions name top-level steps and are checked as Transition describes. A step may not
+// write when a transition skips over it or it has an OnError transition to a later step or End;
+// a later step may read such a step's write only when the key has a Default. A key is
+// guaranteed at a step when it is an input, has a Default, or is written by an earlier step
+// that always writes, and every read must be guaranteed. Build makes one pass over the
+// transitions and then one over the steps; it never enumerates paths.
+//
+// Steps nested in WithPolicy, WithCache, WithAmendable and Parallel are checked by the same
 // rules against the keys available before the top-level step that contains them, and every
 // step name, nested ones included, must be unique. Each write of a step whose policy skips on
 // error needs a default in Defaults or a later step that writes it, and no step may read such
@@ -406,17 +448,34 @@ func (s PipelineSpec) Build() (Pipeline, error) {
 			return Pipeline{}, fmt.Errorf("pipeline observer %d is nil", i)
 		}
 	}
+	steps := make([]*stepNode, len(s.Steps))
+	index := make(map[string]int, len(s.Steps))
+	for i, step := range s.Steps {
+		steps[i] = newStepNode(step)
+		// transitions name top-level steps, so a repeated name is refused before they are read.
+		if name := steps[i].name; name != "" {
+			if _, ok := index[name]; ok {
+				return Pipeline{}, fmt.Errorf("pipeline step %q is duplicated", name)
+			}
+			index[name] = i
+		}
+	}
 	builder := newPipelineBuilder(inputs, merges, defaults)
 	builder.tools, builder.toolPolicy = s.Tools, s.ToolPolicy
-	steps := make([]*stepNode, 0, len(s.Steps))
-	for i, step := range s.Steps {
-		node := newStepNode(step)
-		builder.index = i
+	// the one pass over transitions, then the one pass over steps.
+	flow, err := builder.checkTransitions(s.Transitions, s.MaxVisits, steps, index)
+	if err != nil {
+		return Pipeline{}, err
+	}
+	for i, node := range steps {
+		builder.enter(i)
 		if err := builder.checkStep(node, topLevelPosition(i)); err != nil {
 			return Pipeline{}, err
 		}
+		if err := builder.checkAmendable(node); err != nil {
+			return Pipeline{}, err
+		}
 		builder.register(node)
-		steps = append(steps, node)
 	}
 	if err := builder.checkMerges(s.Merges); err != nil {
 		return Pipeline{}, err
@@ -434,16 +493,20 @@ func (s PipelineSpec) Build() (Pipeline, error) {
 		return Pipeline{}, err
 	}
 	defaultValues := make(map[string]any, len(defaults))
+	defaultKeys := make([]KeyRef, 0, len(defaults))
 	for name, def := range defaults {
 		defaultValues[name] = def.Value
+		defaultKeys = append(defaultKeys, def.Key)
 	}
 	return Pipeline{
 		inputs:           slices.Clone(s.Inputs),
 		inputTypes:       inputs,
 		allowExtraInputs: s.AllowExtraInputs,
 		steps:            steps,
+		flow:             flow,
 		merges:           merges,
 		defaults:         defaultValues,
+		defaultKeys:      defaultKeys,
 		budget:           s.Budget.clone(),
 		tools:            s.Tools,
 		toolPolicy:       s.ToolPolicy.clone(),
@@ -485,7 +548,7 @@ func isNil(value any) bool {
 // state accumulated by the steps before it. Details holds diagnostics the step attached with
 // WithStepDetails; a step that panicked has the stack under "stack".
 //
-// When a step nested in a composite step (Branch, Parallel, Fallback or a policy fallback)
+// When a step nested in a composite step (a Parallel or a policy fallback)
 // fails, the composite's StepError wraps a StepError for the nested step, so the message
 // names each step from the top-level one down and Details holds the innermost diagnostics.
 //
@@ -552,7 +615,7 @@ func (p Pipeline) Validate() error {
 
 // SeedCandidate returns the components of every ComponentStep under step-scoped names. A
 // component of a nested step is scoped by each enclosing step, as "<outer>.<inner>.<component>".
-// WithPolicy and WithCache add no scope of their own, and an OnErrorFallback step is scoped
+// WithPolicy, WithCache and WithAmendable add no scope of their own, and an OnErrorFallback step is scoped
 // beside the step it stands in for. Build rejects a pipeline in which two components would
 // share a key.
 func (p Pipeline) SeedCandidate() Candidate {
@@ -627,7 +690,7 @@ func (p Pipeline) execute(ctx context.Context, candidate Candidate, inputs Predi
 	caller := ctx
 	rc := childRunContext(ctx)
 	ctx = context.WithValue(ctx, runContextKey{}, rc)
-	run := newPipelineRun(p.defaults, p.optional)
+	run := newPipelineRun(p.optional)
 	ctx, release := startRunBudget(context.WithValue(ctx, pipelineRunKey{}, run), p.budget)
 	defer release()
 	if p.tools != nil || !p.toolPolicy.isZero() {
@@ -641,13 +704,20 @@ func (p Pipeline) execute(ctx context.Context, candidate Candidate, inputs Predi
 		ctx = withToolEnv(WithToolMemory(ctx, session.Memory()), env)
 	}
 	ctx, observed := p.observeRun(ctx, caller, values, rc)
+	// each run seeds its own copy of every default, after RunStarted reported the inputs.
+	defaulted := make(map[string]bool, len(p.defaults))
+	seeded := make(map[string]any, len(p.defaults))
+	for name, value := range p.defaults {
+		seeded[name] = deepCopy(value)
+		defaulted[name] = true
+	}
+	evaluationCaptureFrom(ctx).offer(seeded)
+	maps.Copy(values, seeded)
 	state := State{values: values}
-	for _, node := range p.steps {
-		if err := p.runStep(ctx, candidate, node, state); err != nil {
-			stepErr := failStep(node, state.values, err)
-			observed.finish(ctx, stepErr)
-			return state, run, stepErr
-		}
+	flow := newFlowRun(p, ctx, candidate, state, defaulted, observed)
+	if err := flow.run(); err != nil {
+		observed.finish(ctx, err)
+		return state, run, err
 	}
 	observed.finish(ctx, nil)
 	return state, run, nil
@@ -670,32 +740,12 @@ func (p Pipeline) checkUndeclaredInputs(inputs Prediction) error {
 	)
 }
 
-// runStep runs a top-level step on a view limited to its declared keys and commits its writes
-// only when it succeeds, so a failed step leaves the state as the previous step left it. The
-// step's writes are merged with the values already in state as part of its execution, so a
-// merge that fails fails the step's execution. A key left unwritten by a skipped step keeps
-// any value it already had. What the step staged for tools commits after its state writes
-// (see commitStaged).
-func (p Pipeline) runStep(ctx context.Context, candidate Candidate, node *stepNode, state State) error {
-	var committed map[string]any
-	result, err := runNode(ctx, childCandidate(candidate, node), node, state.values, func(result stepResult) error {
-		var err error
-		committed, err = p.mergeWrites(node, result, state.values)
-		return err
-	})
-	if err != nil {
-		return err
-	}
-	maps.Copy(state.values, committed)
-	commitStaged(ctx, result.staged)
-	return nil
-}
-
 // mergeWrites returns the values a top-level step's result commits: its pending writes,
-// already copies of their declared types, with each key that already has a value in values
-// combined with it by the key's MergeRule and converted back to its type. A panic in a merge
+// already copies of their declared types, with each key that already holds a write in values
+// combined with it by the key's MergeRule and converted back to its type. A key that holds
+// only its default, as defaulted records, takes the new write as it is. A panic in a merge
 // becomes an error.
-func (p Pipeline) mergeWrites(node *stepNode, result stepResult, values map[string]any) (
+func (p Pipeline) mergeWrites(node *stepNode, result stepResult, values map[string]any, defaulted map[string]bool) (
 	committed map[string]any,
 	err error,
 ) {
@@ -714,8 +764,14 @@ func (p Pipeline) mergeWrites(node *stepNode, result stepResult, values map[stri
 		if !ok {
 			continue
 		}
-		if prev, exists := values[key]; exists {
-			merged, err := p.merges[key](deepCopy(prev), next)
+		if prev, exists := values[key]; exists && !defaulted[key] {
+			merge := p.merges[key]
+			if merge == nil {
+				// Build lets two steps write a key without a MergeRule only when no run commits
+				// both, so this guards a broken invariant rather than a user error.
+				return nil, fmt.Errorf("state key %q already holds a write and has no MergeRule", key)
+			}
+			merged, err := merge(deepCopy(prev), next)
 			if err != nil {
 				return nil, fmt.Errorf("merge state key %q: %w", key, err)
 			}

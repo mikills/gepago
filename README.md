@@ -223,21 +223,23 @@ extract := gepa.WithPolicy(
     },
 )
 
-pipeline, err := gepa.PipelineSpec{
-    Inputs: []gepa.KeyRef{document.Ref()},
-    Steps: []gepa.Step{
-        extract,
-        gepa.Branch("route", route, map[string]gepa.Step{"review": review, "approve": approve}, amount.Ref()),
-    },
-    Budget: gepa.RunBudget{MaxDuration: time.Minute, MaxModelCalls: 6, MaxTokens: 20000},
-}.Build()
+spec := gepa.PipelineSpec{
+    Inputs:   []gepa.KeyRef{document.Ref()},
+    Steps:    []gepa.Step{extract},
+    Defaults: []gepa.Default{gepa.DefaultValue(decision, "undecided")},
+    Budget:   gepa.RunBudget{MaxDuration: time.Minute, MaxModelCalls: 6, MaxTokens: 20000},
+}
+spec.Add(gepa.Branch("route", route, map[string]gepa.Step{"review": review, "approve": approve}, amount.Ref()))
+pipeline, err := spec.Build()
 ```
 
-- `WithPolicy` gives a step a per-attempt `Timeout`, retries (of transient errors unless `RetryIf` says otherwise) and an action for when it still fails: `OnErrorFail`, `OnErrorSkip` (its writes take their `PipelineSpec.Defaults`, see `DefaultValue`) or `OnErrorFallback(step)`.
-- `Branch` runs one of several arms that write the same keys, `Parallel` runs steps with disjoint writes concurrently and commits them together, `Fallback` runs a secondary step when the primary fails with a non-permanent error, and `WithCache` reuses a step's result within a run when its key function returns a key it has seen.
+- `Transitions` move a run from a top-level step to a later one (skipping those between), back to an earlier one (a rewind, bounded by `MaxVisits`, with `Amend` and `Accept`), to `End` or to `Fail`. A step a transition skips over may not write, so a later reader of its keys needs a `Default`, which seeds the key before the first step.
+- `Branch` and `Fallback` build a `Flow` of ordinary steps and transitions that `PipelineSpec.Add` appends: `Branch` runs one of several arms that write the same keys, and `Fallback` runs a secondary step when the primary fails with a non-permanent error.
+- `WithPolicy` gives a step a per-attempt `Timeout`, retries (of transient errors unless `RetryIf` says otherwise) and an action for when it still fails: `OnErrorFail`, `OnErrorSkip` or `OnErrorFallback(step)`.
+- `Parallel` runs steps with disjoint writes concurrently and commits them together, and `WithCache` reuses a step's result within a run when its key function returns a key it has seen.
 - `RunBudget` limits a run's duration, model calls, tokens and tokens per step; exceeding a limit fails with a `Budget` error naming it. A step reads what is left with `gepa.BudgetFrom(ctx).Remaining()`.
 
-`Build` checks all of this before the first run: arms that disagree, overlapping parallel writes, a skippable write with neither a default nor a later writer, and budgets that name unknown steps all fail it.
+`Build` checks all of this before the first run: transitions that name unknown steps or overlap as rewinds, reads of keys a step may not write without a default, arms that disagree, overlapping parallel writes, a skippable write with neither a default nor a later writer, and budgets that name unknown steps all fail it.
 
 ## Tools
 
@@ -259,7 +261,7 @@ tools, err := gepa.NewToolRegistry(lookup)
 
 ## Observability and redaction
 
-`PipelineSpec.Observers` receive `RunStarted`, `StepStarted`, `StepFinished` (duration, usage, error, reads, writes, tool calls, attempt and whether the result was cached) and `RunFinished` events; an observer that panics does not fail the run. `RecordingObserver` turns the events into serialisable `PipelineTrace`s, which `WriteHTMLRunReport` renders step by step and `TraceDatasetBuilder` turns into reflection records during `Compile`.
+`PipelineSpec.Observers` receive `RunStarted`, `StepStarted`, `StepFinished` (duration, usage, error, reads, writes, tool calls, attempt, visit and whether the result was cached) and `RunFinished` events, and a `TransitionObserver` also `TransitionTaken` and `RewindRejected`; an observer that panics does not fail the run. `RecordingObserver` turns the events into serialisable `PipelineTrace`s, which `WriteHTMLRunReport` renders step by step and `TraceDatasetBuilder` turns into reflection records during `Compile`.
 
 ```go
 recorder := &gepa.RecordingObserver{}

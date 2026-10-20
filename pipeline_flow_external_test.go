@@ -44,14 +44,14 @@ func TestComposedPipelineConcurrentRuns(t *testing.T) {
 					replyStep(lm, "b", "document", tenTokens),
 					gepa.StepPolicy{Retry: gepa.RetryPolicy{MaxAttempts: 2}},
 				),
-				gepa.Branch(
+				gepa.LegacyBranch(
 					"route",
 					route,
 					map[string]gepa.Step{"even": label("even", "even"), "odd": label("odd", "odd")},
 					docKey.Ref(),
 				),
 			),
-			gepa.Fallback("guard", failAmount("primary", errRateLimited), writeAmount("secondary", 1)),
+			gepa.LegacyFallback("guard", failAmount("primary", errRateLimited), writeAmount("secondary", 1)),
 		},
 		Budget: gepa.RunBudget{MaxModelCalls: 2, MaxTokens: 20},
 	}.Build()
@@ -105,13 +105,13 @@ func TestNestedStepsFollowTheBuildRules(t *testing.T) {
 			name: "nested name repeats a top-level name",
 			steps: []gepa.Step{
 				writeNotes("a"),
-				gepa.Branch("route", route, map[string]gepa.Step{"a": writeAmount("a", 1)}),
+				gepa.LegacyBranch("route", route, map[string]gepa.Step{"a": writeAmount("a", 1)}),
 			},
 			wantErr: `pipeline step "a" is duplicated`,
 		},
 		{
 			name:    "duplicate names inside a Fallback",
-			steps:   []gepa.Step{gepa.Fallback("guard", writeAmount("a", 1), writeAmount("a", 2))},
+			steps:   []gepa.Step{gepa.LegacyFallback("guard", writeAmount("a", 1), writeAmount("a", 2))},
 			wantErr: `pipeline step "a" is duplicated`,
 		},
 		{
@@ -159,7 +159,7 @@ func TestNestedStepsFollowTheBuildRules(t *testing.T) {
 		{
 			name: "nested invalid step",
 			steps: []gepa.Step{
-				gepa.Fallback("guard", writeAmount("a", 1), gepa.NewStep("b", nil, refs(amountKey.Ref()), nil)),
+				gepa.LegacyFallback("guard", writeAmount("a", 1), gepa.NewStep("b", nil, refs(amountKey.Ref()), nil)),
 			},
 			wantErr: `pipeline step "b": run function is required`,
 		},

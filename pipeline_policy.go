@@ -55,9 +55,10 @@ type ErrorAction struct {
 var (
 	// OnErrorFail fails the step with its error. It is the zero ErrorAction.
 	OnErrorFail = ErrorAction{kind: errorActionFail}
-	// OnErrorSkip drops the failed step's writes and lets the pipeline continue: each write
-	// with a default in PipelineSpec.Defaults commits the default, and each other write is left
-	// unwritten. Build requires every write to have a default or a later step that writes it.
+	// OnErrorSkip drops the failed step's writes and lets the pipeline continue: each write is
+	// left unwritten, so its key keeps the value it had, such as its Default (see
+	// PipelineSpec.Defaults). Build requires every write to have a default or a later step that
+	// writes it.
 	OnErrorSkip = ErrorAction{kind: errorActionSkip}
 )
 
@@ -210,19 +211,11 @@ func (p *policyStep) backoff(attempt int) time.Duration {
 func (p *policyStep) onError(ctx context.Context, candidate Candidate, s State, err error) error {
 	switch p.policy.OnError.kind {
 	case errorActionSkip:
-		run := pipelineRunFrom(ctx)
 		finish := beginStandIn(ctx, skippedOnError, p.child, s.values)
-		defaults := stepResult{writes: map[string]any{}}
 		for _, key := range p.child.writes {
-			if value, ok := run.defaultFor(key.Name); ok {
-				value = deepCopy(value)
-				s.store(key.Name, key.Type, value, true)
-				defaults.writes[key.Name] = value
-			} else {
-				s.skip(key.Name)
-			}
+			s.skip(key.Name)
 		}
-		finish(defaults, nil)
+		finish(stepResult{}, nil)
 		return nil
 	case errorActionFallback:
 		result, fallbackErr := runChild(ctx, candidate, p.child.name, p.fallback, s.values)
@@ -233,18 +226,6 @@ func (p *policyStep) onError(ctx context.Context, candidate Candidate, s State, 
 		return nil
 	}
 	return err
-}
-
-// KeyDefault is the value a step that skips on error commits for one of its writes. Build it
-// with DefaultValue.
-type KeyDefault struct {
-	Key   KeyRef
-	Value any
-}
-
-// DefaultValue builds a KeyDefault for a typed key.
-func DefaultValue[T any](k Key[T], value T) KeyDefault {
-	return KeyDefault{Key: k.Ref(), Value: value}
 }
 
 // fallbackError keeps both errors of a step that failed, fell back and failed again. The

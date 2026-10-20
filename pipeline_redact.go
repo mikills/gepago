@@ -354,6 +354,11 @@ func mapTrace(trace PipelineTrace, mapping traceMapping) PipelineTrace {
 		step.Details = mapping.details(step.Details)
 		step.ToolCalls = mapping.tools(step.ToolCalls)
 		step.Err = mapping.text(step.Err)
+		step.Attributes = maps.Clone(step.Attributes)
+		if step.Transition != nil {
+			transition := *step.Transition
+			step.Transition = &transition
+		}
 		nested := mapTrace(PipelineTrace{Steps: step.Steps}, mapping)
 		step.Steps = nested.Steps
 		if step.Runs != nil {

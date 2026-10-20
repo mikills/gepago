@@ -671,7 +671,7 @@ func TestRetryPendingTokensSettleOnEveryPath(t *testing.T) {
 					),
 					probe,
 				},
-				Defaults: []gepa.KeyDefault{gepa.DefaultValue(gepa.Key[string]{Name: "a"}, "")},
+				Defaults: []gepa.Default{gepa.DefaultValue(gepa.Key[string]{Name: "a"}, "")},
 				Budget:   tt.budget,
 			}.Build()
 			require.NoError(t, err)
@@ -882,7 +882,7 @@ func TestRunBudgetStepLimitCanFallBack(t *testing.T) {
 	)
 	pipeline, err := gepa.PipelineSpec{
 		Inputs: refs(docKey.Ref()),
-		Steps:  []gepa.Step{gepa.Fallback("guard", replyStep(lm, "a", "document", tenTokens), cheap)},
+		Steps:  []gepa.Step{gepa.LegacyFallback("guard", replyStep(lm, "a", "document", tenTokens), cheap)},
 		Budget: gepa.RunBudget{PerStepTokens: map[string]int{"a": 5}},
 	}.Build()
 	require.NoError(t, err)

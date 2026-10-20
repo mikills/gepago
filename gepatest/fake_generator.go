@@ -20,7 +20,7 @@ import (
 
 // ErrNoScript marks a call that no script of a FakeGenerator answers. It is a Permanent error
 // (see gepa.IsPermanent), so gepa.RetryingLanguageModel does not retry it and a gepa.Fallback
-// step does not fall back on it. Other error handling can still hide it: a step policy with
+// does not fall back on it. Other error handling can still hide it: a step policy with
 // OnErrorFallback or OnErrorSkip, a RetryIf that accepts it, an evaluator that scores a failed
 // example as zero. Check Unmatched to catch such calls.
 var ErrNoScript = errors.New("gepatest: no scripted reply")
@@ -188,7 +188,7 @@ func NewFakeGenerator() *FakeGenerator {
 
 // OnStep adds replies to the script for calls made inside the pipeline step whose path, or own
 // name, is step, and returns f. A step path joins the names of the executions that contain the
-// step with '.', such as "route.summarise" for an arm of a Branch "route". Adding to a step
+// step with '.', such as "route.summarise" for a step of a Parallel "route". Adding to a step
 // that has a script appends to it; adding no replies does nothing.
 func (f *FakeGenerator) OnStep(step string, replies ...Reply) *FakeGenerator {
 	if len(replies) == 0 {

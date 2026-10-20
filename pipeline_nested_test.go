@@ -54,10 +54,10 @@ func TestNestedStepsScopeTheirCandidates(t *testing.T) {
 			Parallel(
 				"fan",
 				scopedStep(seen, "left", "left", nil),
-				Branch("route", always, map[string]Step{"x": scopedStep(seen, "arm", "routed", nil)}),
+				legacyBranch("route", always, map[string]Step{"x": scopedStep(seen, "arm", "routed", nil)}),
 				writeNotes("plain", "no components"),
 			),
-			Fallback(
+			legacyFallback(
 				"guard",
 				scopedStep(seen, "main", "guarded", errRateLimited),
 				scopedStep(seen, "spare", "guarded", nil),
@@ -213,7 +213,7 @@ func TestCandidateKeysReachTheirLeaves(t *testing.T) {
 			Parallel(
 				"ip",
 				WithPolicy(leaf("i3", "k3", false), StepPolicy{}),
-				Branch("ib", always, map[string]Step{"x": WithCache(leaf("i4", "k4", false), nil)}),
+				legacyBranch("ib", always, map[string]Step{"x": WithCache(leaf("i4", "k4", false), nil)}),
 			),
 		},
 	}.Build()
@@ -234,7 +234,7 @@ func TestCandidateKeysReachTheirLeaves(t *testing.T) {
 			WithPolicy(Parallel(
 				"wp",
 				WithCache(leaf("w1", "r", false), nil),
-				Fallback("wf", leaf("w2", "s", true), WithPolicy(leaf("w3", "s", true), StepPolicy{
+				legacyFallback("wf", leaf("w2", "s", true), WithPolicy(leaf("w3", "s", true), StepPolicy{
 					OnError: OnErrorFallback(leaf("w4", "s", false)),
 				})),
 			), StepPolicy{}),
@@ -296,9 +296,9 @@ func TestCompositesAreComponentStepsOnlyWithComponents(t *testing.T) {
 	build := map[string]func(Step) Step{
 		"WithPolicy": func(step Step) Step { return WithPolicy(step, StepPolicy{}) },
 		"WithCache":  func(step Step) Step { return WithCache(step, nil) },
-		"Branch":     func(step Step) Step { return Branch("b", route, map[string]Step{"a": step}) },
+		"Branch":     func(step Step) Step { return legacyBranch("b", route, map[string]Step{"a": step}) },
 		"Parallel":   func(step Step) Step { return Parallel("p", step) },
-		"Fallback":   func(step Step) Step { return Fallback("f", step, writeAmount("other", 2)) },
+		"Fallback":   func(step Step) Step { return legacyFallback("f", step, writeAmount("other", 2)) },
 	}
 	for name, wrap := range build {
 		t.Run(name, func(t *testing.T) {
@@ -322,7 +322,7 @@ func TestComponentCompositesAreValidated(t *testing.T) {
 	}{
 		{
 			name:    "Branch",
-			step:    Branch("route", nil, map[string]Step{"a": model}),
+			step:    legacyBranch("route", nil, map[string]Step{"a": model}),
 			wantErr: `pipeline step "route": branch condition is required`,
 		},
 		{
@@ -375,8 +375,12 @@ func TestNestedStepPanicBecomesAStepError(t *testing.T) {
 			wantInner: true,
 		},
 		{
-			name:      "inside a Branch arm",
-			step:      Branch("route", func(State) (string, error) { return "a", nil }, map[string]Step{"a": boom}),
+			name: "inside a Branch arm",
+			step: legacyBranch(
+				"route",
+				func(State) (string, error) { return "a", nil },
+				map[string]Step{"a": boom},
+			),
 			wantErr:   `pipeline step "route": pipeline step "boom": step panicked: kaboom`,
 			wantInner: true,
 		},
@@ -387,7 +391,7 @@ func TestNestedStepPanicBecomesAStepError(t *testing.T) {
 		},
 		{
 			name: "inside a Branch condition",
-			step: Branch("route", func(State) (string, error) { panic("no route") }, map[string]Step{
+			step: legacyBranch("route", func(State) (string, error) { panic("no route") }, map[string]Step{
 				"a": writeAmount("a", 1),
 			}),
 			wantErr: `pipeline step "route": step panicked: no route`,
@@ -450,12 +454,12 @@ func TestCompositesRunOutsideAPipeline(t *testing.T) {
 		},
 		{
 			name: "Branch",
-			step: Branch("route", route, map[string]Step{"a": writeAmount("a", 1)}),
+			step: legacyBranch("route", route, map[string]Step{"a": writeAmount("a", 1)}),
 			want: Prediction{"amount": 1},
 		},
 		{
 			name: "Fallback with components",
-			step: Fallback(
+			step: legacyFallback(
 				"guard",
 				scopedStep(seen, "main", "out", errRateLimited),
 				scopedStep(seen, "spare", "out", nil),

@@ -24,14 +24,14 @@ func routeBy(s State) (string, error) {
 	return routeKey.Get(s)
 }
 
-func TestBranchRunsTheChosenArm(t *testing.T) {
+func TestLegacyBranchRunsTheChosenArm(t *testing.T) {
 	arms := map[string]Step{
 		"approve": writeDecision("approve", "approved"),
 		"review":  writeDecision("review", "needs review"),
 	}
 	pipeline, err := PipelineSpec{
 		Inputs: refs(routeKey.Ref()),
-		Steps:  []Step{writeAmount("parse", 10), Branch("decide", routeBy, arms, routeKey.Ref())},
+		Steps:  []Step{writeAmount("parse", 10), legacyBranch("decide", routeBy, arms, routeKey.Ref())},
 	}.Build()
 	require.NoError(t, err)
 
@@ -43,7 +43,7 @@ func TestBranchRunsTheChosenArm(t *testing.T) {
 	}
 }
 
-func TestBranchFailures(t *testing.T) {
+func TestLegacyBranchFailures(t *testing.T) {
 	arms := map[string]Step{"approve": writeDecision("approve", "approved")}
 	tests := []struct {
 		name    string
@@ -97,7 +97,7 @@ func TestBranchFailures(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			pipeline, err := PipelineSpec{
 				Inputs: refs(routeKey.Ref()),
-				Steps:  []Step{writeAmount("parse", 10), Branch("decide", tt.cond, tt.arms, routeKey.Ref())},
+				Steps:  []Step{writeAmount("parse", 10), legacyBranch("decide", tt.cond, tt.arms, routeKey.Ref())},
 			}.Build()
 			require.NoError(t, err)
 
@@ -110,7 +110,7 @@ func TestBranchFailures(t *testing.T) {
 	t.Run("unknown arm is permanent", func(t *testing.T) {
 		pipeline, err := PipelineSpec{
 			Inputs: refs(routeKey.Ref()),
-			Steps:  []Step{writeAmount("parse", 10), Branch("decide", routeBy, arms, routeKey.Ref())},
+			Steps:  []Step{writeAmount("parse", 10), legacyBranch("decide", routeBy, arms, routeKey.Ref())},
 		}.Build()
 		require.NoError(t, err)
 
@@ -119,7 +119,7 @@ func TestBranchFailures(t *testing.T) {
 	})
 }
 
-func TestBranchBuildErrors(t *testing.T) {
+func TestLegacyBranchBuildErrors(t *testing.T) {
 	noop := func(context.Context, State) error { return nil }
 	tests := []struct {
 		name    string
@@ -128,7 +128,7 @@ func TestBranchBuildErrors(t *testing.T) {
 	}{
 		{
 			name: "arms write different keys",
-			step: Branch("decide", routeBy, map[string]Step{
+			step: legacyBranch("decide", routeBy, map[string]Step{
 				"a": writeDecision("a", "x"),
 				"b": NewStep("b", nil, refs(decisionKey.Ref(), notesKey.Ref()), noop),
 			}, routeKey.Ref()),
@@ -137,7 +137,7 @@ func TestBranchBuildErrors(t *testing.T) {
 		},
 		{
 			name: "arms write different types",
-			step: Branch("decide", routeBy, map[string]Step{
+			step: legacyBranch("decide", routeBy, map[string]Step{
 				"a": writeDecision("a", "x"),
 				"b": NewStep("b", nil, refs(Key[int]{Name: "decision"}.Ref()), noop),
 			}, routeKey.Ref()),
@@ -145,32 +145,37 @@ func TestBranchBuildErrors(t *testing.T) {
 		},
 		{
 			name:    "no condition",
-			step:    Branch("decide", nil, map[string]Step{"a": writeDecision("a", "x")}),
+			step:    legacyBranch("decide", nil, map[string]Step{"a": writeDecision("a", "x")}),
 			wantErr: `pipeline step "decide": branch condition is required`,
 		},
 		{
 			name:    "no arms",
-			step:    Branch("decide", routeBy, nil, routeKey.Ref()),
+			step:    legacyBranch("decide", routeBy, nil, routeKey.Ref()),
 			wantErr: `pipeline step "decide": branch requires at least one arm`,
 		},
 		{
 			name:    "empty label",
-			step:    Branch("decide", routeBy, map[string]Step{"": writeDecision("a", "x")}, routeKey.Ref()),
+			step:    legacyBranch("decide", routeBy, map[string]Step{"": writeDecision("a", "x")}, routeKey.Ref()),
 			wantErr: `pipeline step "decide": branch arm label must not be empty`,
 		},
 		{
 			name:    "nil arm",
-			step:    Branch("decide", routeBy, map[string]Step{"a": nil}, routeKey.Ref()),
+			step:    legacyBranch("decide", routeBy, map[string]Step{"a": nil}, routeKey.Ref()),
 			wantErr: `pipeline step "decide": arm "a" is nil`,
 		},
 		{
-			name:    "untyped condition read",
-			step:    Branch("decide", routeBy, map[string]Step{"a": writeDecision("a", "x")}, KeyRef{Name: "route"}),
+			name: "untyped condition read",
+			step: legacyBranch(
+				"decide",
+				routeBy,
+				map[string]Step{"a": writeDecision("a", "x")},
+				KeyRef{Name: "route"},
+			),
 			wantErr: `pipeline step "decide": branch condition reads: state key "route" type is required; use Key.Ref`,
 		},
 		{
 			name: "condition reads an unknown key",
-			step: Branch(
+			step: legacyBranch(
 				"decide",
 				routeBy,
 				map[string]Step{"a": writeDecision("a", "x")},
@@ -180,7 +185,7 @@ func TestBranchBuildErrors(t *testing.T) {
 		},
 		{
 			name:    "unnamed branch",
-			step:    Branch(" ", routeBy, map[string]Step{"a": writeDecision("a", "x")}, routeKey.Ref()),
+			step:    legacyBranch(" ", routeBy, map[string]Step{"a": writeDecision("a", "x")}, routeKey.Ref()),
 			wantErr: "pipeline step 1 name is required",
 		},
 	}
@@ -341,7 +346,7 @@ func TestParallelBuildErrors(t *testing.T) {
 	}
 }
 
-func TestFallback(t *testing.T) {
+func TestLegacyFallback(t *testing.T) {
 	tests := []struct {
 		name          string
 		primaryErr    error
@@ -380,7 +385,7 @@ func TestFallback(t *testing.T) {
 				return nil
 			})
 			pipeline, err := PipelineSpec{
-				Steps: []Step{Fallback("guard", failAmount("primary", tt.primaryErr), secondary)},
+				Steps: []Step{legacyFallback("guard", failAmount("primary", tt.primaryErr), secondary)},
 			}.Build()
 			require.NoError(t, err)
 
@@ -401,7 +406,9 @@ func TestFallback(t *testing.T) {
 	t.Run("both errors are kept", func(t *testing.T) {
 		errSpare := errors.New("spare broke")
 		pipeline, err := PipelineSpec{
-			Steps: []Step{Fallback("guard", failAmount("primary", errRateLimited), failAmount("secondary", errSpare))},
+			Steps: []Step{
+				legacyFallback("guard", failAmount("primary", errRateLimited), failAmount("secondary", errSpare)),
+			},
 		}.Build()
 		require.NoError(t, err)
 
@@ -424,7 +431,9 @@ func TestFallback(t *testing.T) {
 			cancel()
 			return errRateLimited
 		})
-		pipeline, err := PipelineSpec{Steps: []Step{Fallback("guard", primary, writeAmount("secondary", 2))}}.Build()
+		pipeline, err := PipelineSpec{
+			Steps: []Step{legacyFallback("guard", primary, writeAmount("secondary", 2))},
+		}.Build()
 		require.NoError(t, err)
 
 		_, run, err := pipeline.execute(ctx, nil, Prediction{})
@@ -434,7 +443,7 @@ func TestFallback(t *testing.T) {
 	})
 }
 
-func TestFallbackBuildErrors(t *testing.T) {
+func TestLegacyFallbackBuildErrors(t *testing.T) {
 	tests := []struct {
 		name    string
 		step    Step
@@ -442,13 +451,13 @@ func TestFallbackBuildErrors(t *testing.T) {
 	}{
 		{
 			name: "different keys",
-			step: Fallback("guard", writeAmount("a", 1), writeNotes("b")),
+			step: legacyFallback("guard", writeAmount("a", 1), writeNotes("b")),
 			wantErr: `pipeline step "guard": secondary step "b" writes ["notes"], but primary step "a" writes ` +
 				`["amount"]; they must write the same keys`,
 		},
 		{
 			name: "different types",
-			step: Fallback(
+			step: legacyFallback(
 				"guard",
 				writeAmount("a", 1),
 				NewStep("b", nil, refs(Key[string]{Name: "amount"}.Ref()), func(
@@ -463,12 +472,12 @@ func TestFallbackBuildErrors(t *testing.T) {
 		},
 		{
 			name:    "nil primary",
-			step:    Fallback("guard", nil, writeAmount("b", 1)),
+			step:    legacyFallback("guard", nil, writeAmount("b", 1)),
 			wantErr: `pipeline step "guard": primary step is nil`,
 		},
 		{
 			name:    "nil secondary",
-			step:    Fallback("guard", writeAmount("a", 1), nil),
+			step:    legacyFallback("guard", writeAmount("a", 1), nil),
 			wantErr: `pipeline step "guard": secondary step is nil`,
 		},
 	}

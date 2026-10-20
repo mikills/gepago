@@ -26,7 +26,7 @@ func TestPolicyRetryAndFallbackAsTheTraceShows(t *testing.T) {
 				modelStep("classify", lm, docKey.Ref(), label.Ref()),
 				gepa.StepPolicy{Retry: gepa.RetryPolicy{MaxAttempts: 2}},
 			),
-			gepa.Fallback(
+			gepa.LegacyFallback(
 				"answer",
 				modelStep("draft", lm, label.Ref(), reply.Ref()),
 				modelStep("template", lm, label.Ref(), reply.Ref()),
@@ -55,14 +55,14 @@ func TestPolicyRetryAndFallbackAsTheTraceShows(t *testing.T) {
 	})
 }
 
-func TestFallbackDoesNotFallBackOnAPermanentErrorAsTheTraceShows(t *testing.T) {
+func TestLegacyFallbackDoesNotFallBackOnAPermanentErrorAsTheTraceShows(t *testing.T) {
 	reply := gepa.Key[string]{Name: "reply"}
 	lm := gepatest.NewFakeGenerator().
 		OnStep("draft", gepatest.Fail(gepa.PermanentError(errors.New("bad request"))).WithUsage(tokens(3)))
 	recorder := &gepa.RecordingObserver{}
 	pipeline, err := gepa.PipelineSpec{
 		Inputs: refs(docKey.Ref()),
-		Steps: []gepa.Step{gepa.Fallback(
+		Steps: []gepa.Step{gepa.LegacyFallback(
 			"answer",
 			modelStep("draft", lm, docKey.Ref(), reply.Ref()),
 			modelStep("template", lm, docKey.Ref(), reply.Ref()),

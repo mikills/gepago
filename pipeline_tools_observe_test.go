@@ -577,7 +577,7 @@ func TestStepErrorReadsNeverLeaveUnredacted(t *testing.T) {
 	})
 	arms := map[string]Step{"check": check}
 	route := func(State) (string, error) { return "check", nil }
-	for _, step := range []Step{check, Branch("route", route, arms)} {
+	for _, step := range []Step{check, legacyBranch("route", route, arms)} {
 		t.Run(step.Name(), func(t *testing.T) {
 			recorder := &RecordingObserver{}
 			log := &eventLog{}

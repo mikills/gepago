@@ -240,15 +240,13 @@ func orderPipeline(t *testing.T, recorder *gepa.RecordingObserver) gepa.Pipeline
 	primary := gepa.NewStep("primary", nil, nil, func(context.Context, gepa.State) error {
 		return gepa.TransientError(errors.New("primary down"))
 	})
-	pipeline, err := gepa.PipelineSpec{
-		Steps: []gepa.Step{
-			noop("first"),
-			gepa.Fallback("fb", primary, noop("secondary")),
-			gepa.WithPolicy(flaky, gepa.StepPolicy{Retry: gepa.RetryPolicy{MaxAttempts: 2}}),
-			gepa.Parallel("fan", noop("left"), noop("right")),
-		},
-		Observers: []gepa.PipelineObserver{recorder},
-	}.Build()
+	spec := gepa.PipelineSpec{Steps: []gepa.Step{noop("first")}, Observers: []gepa.PipelineObserver{recorder}}
+	spec.Add(gepa.Fallback("fb", primary, noop("secondary")))
+	spec.Steps = append(spec.Steps,
+		gepa.WithPolicy(flaky, gepa.StepPolicy{Retry: gepa.RetryPolicy{MaxAttempts: 2}}),
+		gepa.Parallel("fan", noop("left"), noop("right")),
+	)
+	pipeline, err := spec.Build()
 	require.NoError(t, err)
 	return pipeline
 }
@@ -260,11 +258,12 @@ func TestAssertTraceChecksTheOrderOfARecordedRun(t *testing.T) {
 		_, err := pipeline.Run(context.Background(), gepa.NewState(nil))
 		require.NoError(t, err)
 	}
+	// v0.9.0: Fallback's steps are top-level steps followed by the step named after it.
 	inOrder := []gepatest.ExpectedStep{
 		{Step: "first"},
+		{Step: "primary", Err: "primary down"},
+		{Step: "secondary"},
 		{Step: "fb"},
-		{Step: "fb.primary", Err: "primary down"},
-		{Step: "fb.secondary"},
 		{Step: "flaky", Attempt: 1, Err: "busy"},
 		{Step: "flaky", Attempt: 2},
 		{Step: "fan"},
@@ -278,7 +277,7 @@ func TestAssertTraceChecksTheOrderOfARecordedRun(t *testing.T) {
 			Steps: moved(t, inOrder, "fan.right #1", "fan.left #1"),
 		}), "the steps of a Parallel pass in either order, whichever started first")
 		for _, swap := range [][2]string{
-			{"fb.secondary #1", "fb.primary #1"},
+			{"secondary #1", "primary #1"},
 			{"flaky #2", "flaky #1"},
 			{"fb #1", "first #1"},
 		} {

@@ -119,12 +119,9 @@ func TestFakeGeneratorMatchOrder(t *testing.T) {
 			OnStep("summarise", gepatest.Text("name")).
 			OnStep("route.summarise", gepatest.Text("path"))
 	}
+	// v0.9.0: Branch runs its arms as top-level steps, so a Parallel of one step nests it.
 	branch := func(fake *gepatest.FakeGenerator) gepa.Step {
-		return gepa.Branch(
-			"route",
-			func(gepa.State) (string, error) { return "only", nil },
-			map[string]gepa.Step{"only": callFrom("summarise", fake)},
-		)
+		return gepa.Parallel("route", callFrom("summarise", fake))
 	}
 
 	t.Run("the step path first", func(t *testing.T) {

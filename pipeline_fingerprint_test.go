@@ -56,6 +56,7 @@ type fpOptions struct {
 	timeout     time.Duration
 	retries     int
 	skip        bool
+	scoreDef    *int
 	cache       bool
 	budget      RunBudget
 	allowExtra  bool
@@ -89,10 +90,12 @@ func fpSpec(t *testing.T, o fpOptions) PipelineSpec {
 		fpStep("score", refs(amountKey.Ref()), refs(fpScore.Ref())),
 		StepPolicy{OnError: OnErrorFallback(fpStep("default_score", refs(docKey.Ref()), refs(fpScore.Ref())))},
 	)
-	var defaults []KeyDefault
+	var defaults []Default
 	if o.skip {
 		score = WithPolicy(score, StepPolicy{OnError: OnErrorSkip})
-		defaults = append(defaults, DefaultValue(fpScore, 0))
+	}
+	if o.scoreDef != nil {
+		defaults = append(defaults, DefaultValue(fpScore, *o.scoreDef))
 	}
 	inner := fpBuild(t, PipelineSpec{
 		Inputs: refs(amountKey.Ref()),
@@ -103,13 +106,13 @@ func fpSpec(t *testing.T, o fpOptions) PipelineSpec {
 		Steps: []Step{
 			parse,
 			fpStep("route", order(docKey.Ref(), amountKey.Ref()), refs(routeKey.Ref())),
-			Branch("decide", routeBy, map[string]Step{
+			legacyBranch("decide", routeBy, map[string]Step{
 				"approve": fpStep("approve", refs(amountKey.Ref()), refs(decisionKey.Ref())),
 				"review":  fpStep("review", refs(amountKey.Ref()), refs(decisionKey.Ref())),
 				"refuse":  fpStep("refuse", refs(amountKey.Ref()), refs(decisionKey.Ref())),
 			}, routeKey.Ref()),
 			Parallel("annotate", annotate...),
-			Fallback(
+			legacyFallback(
 				"summarise",
 				fpStep("draft", order(decisionKey.Ref(), notesKey.Ref()), refs(fpSummary.Ref())),
 				fpStep("template", refs(decisionKey.Ref()), refs(fpSummary.Ref())),
@@ -142,7 +145,6 @@ func TestPipelineFingerprintLeavesOutValuesOutsideTheShape(t *testing.T) {
 		"candidate demos":   {instruction: "seed", demos: []Demo{{Inputs: Prediction{"document": "x"}}}},
 		"declaration order": {instruction: "seed", reverse: true},
 		"policy values":     {instruction: "seed", timeout: time.Minute, retries: 3},
-		"skip on error":     {instruction: "seed", skip: true},
 		"cache":             {instruction: "seed", cache: true},
 		"budget": {instruction: "seed", budget: RunBudget{
 			MaxModelCalls: 3,
@@ -157,13 +159,27 @@ func TestPipelineFingerprintLeavesOutValuesOutsideTheShape(t *testing.T) {
 			}
 		})
 	}
+	// v0.9.0: the keys of Defaults are part of the shape, so the skip, which needs a default, is
+	// compared with the same pipeline and default without it; a default's value is left out.
+	zero, five := 0, 5
+	defaulted := fpOf(t, fpSpec(t, fpOptions{instruction: "seed", scoreDef: &zero}))
+	require.NotEqual(t, base, defaulted)
+	defaultVariants := map[string]fpOptions{
+		"skip on error": {instruction: "seed", skip: true, scoreDef: &zero},
+		"default value": {instruction: "seed", scoreDef: &five},
+	}
+	for name, options := range defaultVariants {
+		t.Run(name, func(t *testing.T) {
+			require.Equal(t, defaulted, fpOf(t, fpSpec(t, options)))
+		})
+	}
 }
 
 func TestPipelineFingerprintChangesWithTheShape(t *testing.T) {
 	total := Key[int]{Name: "total"}
 	amountFloat := Key[float64]{Name: "amount"}
 	decide := func(name string, arms map[string]Step) Step {
-		return Branch(name, routeBy, arms, routeKey.Ref())
+		return legacyBranch(name, routeBy, arms, routeKey.Ref())
 	}
 	arm := func(name string) Step { return fpStep(name, refs(amountKey.Ref()), refs(decisionKey.Ref())) }
 	first := func(State) (string, error) { return "primary", nil }
@@ -221,12 +237,12 @@ func TestPipelineFingerprintChangesWithTheShape(t *testing.T) {
 			spec(route, decide("decide", map[string]Step{"approve": arm("a"), "review": arm("c")})),
 		},
 		"branch made fallback": {
-			spec(Branch("decide", first, map[string]Step{"primary": arm("a"), "secondary": arm("b")})),
-			spec(Fallback("decide", arm("a"), arm("b"))),
+			spec(legacyBranch("decide", first, map[string]Step{"primary": arm("a"), "secondary": arm("b")})),
+			spec(legacyFallback("decide", arm("a"), arm("b"))),
 		},
 		"fallback roles swapped": {
-			spec(Fallback("decide", arm("a"), arm("b"))),
-			spec(Fallback("decide", arm("b"), arm("a"))),
+			spec(legacyFallback("decide", arm("a"), arm("b"))),
+			spec(legacyFallback("decide", arm("b"), arm("a"))),
 		},
 		"policy fallback added": {
 			spec(arm("a")),

@@ -94,6 +94,22 @@ func (l *eventLog) RunFinished(_ context.Context, event RunFinishedEvent) {
 	l.runsFinished = append(l.runsFinished, event)
 }
 
+func (l *eventLog) TransitionTaken(_ context.Context, event TransitionTakenEvent) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	line := fmt.Sprintf("transition %d %s -> %s", event.Rule, event.From, event.To)
+	if event.Rewind {
+		line += " rewind"
+	}
+	l.lines = append(l.lines, line)
+}
+
+func (l *eventLog) RewindRejected(_ context.Context, event RewindRejectedEvent) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprintf("rewind %d rejected at %s", event.Rule, event.Step))
+}
+
 func (l *eventLog) Lines() []string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -352,7 +368,7 @@ func TestPipelineObserverNestedCompositeSequence(t *testing.T) {
 		decisionKey.Set(s, "full")
 		return nil
 	})
-	route := Branch("route", func(State) (string, error) { return "short", nil }, map[string]Step{
+	route := legacyBranch("route", func(State) (string, error) { return "short", nil }, map[string]Step{
 		"short": brief,
 		"long":  full,
 	})
@@ -370,14 +386,18 @@ func TestPipelineObserverNestedCompositeSequence(t *testing.T) {
 		Inputs: refs(docKey.Ref()),
 		Steps: []Step{
 			route,
-			Fallback("fb", failAmount("primary", TransientError(errors.New("down"))), writeAmount("secondary", 7)),
+			legacyFallback(
+				"fb",
+				failAmount("primary", TransientError(errors.New("down"))),
+				writeAmount("secondary", 7),
+			),
 			WithPolicy(guess, StepPolicy{OnError: OnErrorSkip}),
 			WithPolicy(
 				verdict("estimate", "x", errBadRequest),
 				StepPolicy{OnError: OnErrorFallback(verdict("spare", "ok", nil))},
 			),
 		},
-		Defaults:  []KeyDefault{DefaultValue(notesKey, []string{"none"})},
+		Defaults:  []Default{DefaultValue(notesKey, []string{"none"})},
 		Observers: []PipelineObserver{log},
 	}.Build()
 	require.NoError(t, err)
@@ -416,7 +436,8 @@ func TestPipelineObserverNestedCompositeSequence(t *testing.T) {
 	skipped := log.finishedStep(t, "guess", 2)
 	require.True(t, skipped.Skipped)
 	require.NoError(t, skipped.Err)
-	require.Equal(t, map[string]any{"notes": []string{"none"}}, skipped.Writes)
+	// v0.9.0: a default seeds its key before the first step, so a skip writes nothing.
+	require.Empty(t, skipped.Writes)
 }
 
 func TestPipelineObserverNestedPipelineSequence(t *testing.T) {

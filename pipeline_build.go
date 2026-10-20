@@ -42,8 +42,9 @@ func newStepNode(step Step) *stepNode {
 	return node
 }
 
-// compositeStep is implemented by this package's control-flow steps: WithPolicy, WithCache,
-// Branch, Parallel and Fallback. Build checks their children with the rules it applies to
+// compositeStep is implemented by this package's steps that hold others: WithPolicy, WithCache,
+// WithAmendable, Parallel and the v0.8.0 Branch and Fallback steps, which remain as
+// legacyBranch and legacyFallback. Build checks their children with the rules it applies to
 // top-level steps, and the pipeline runs each child on its own view of the state.
 type compositeStep interface {
 	Step
@@ -247,10 +248,15 @@ type skippableStep struct {
 // pipelineBuilder checks a PipelineSpec step by step. sources holds the keys available after
 // the steps checked so far; maybeAbsent maps a key to the step that may skip writing it when
 // nothing guarantees the key exists afterwards.
+//
+// The rest is what the pass over transitions leaves for the pass over steps (see
+// checkTransitions): unwritten maps a key to an earlier step that may not write it, for keys
+// without a default; writers records, for each key a step has written, what the merge rule
+// check needs; used marks the defaults a step reads or writes.
 type pipelineBuilder struct {
 	inputs      map[string]reflect.Type
 	merges      map[string]func(prev, next any) (any, error)
-	defaults    map[string]KeyDefault
+	defaults    map[string]Default
 	tools       *ToolRegistry
 	toolPolicy  ToolPolicy
 	sources     map[string]keySource
@@ -260,16 +266,39 @@ type pipelineBuilder struct {
 	index       int
 	// optional holds the optional outputs of each programme step, by step name.
 	optional map[string]map[string]bool
+
+	flow      *transitionFacts
+	rewinds   int
+	unwritten map[string]unwrittenKey
+	writers   map[string]writerFacts
+	used      map[string]bool
+}
+
+// unwrittenKey names a step that may not write a key and why.
+type unwrittenKey struct {
+	step   string
+	reason string
+}
+
+// writerFacts summarises the top-level steps that have written a key so far: the smallest index
+// at which a run may continue after one of them succeeds, and how many of the steps up to the
+// first of them a rewind lands on.
+type writerFacts struct {
+	reach   int
+	rewinds int
 }
 
 func newPipelineBuilder(
 	inputs map[string]reflect.Type,
 	merges map[string]func(prev, next any) (any, error),
-	defaults map[string]KeyDefault,
+	defaults map[string]Default,
 ) *pipelineBuilder {
 	sources := map[string]keySource{}
 	for name, typ := range inputs {
 		sources[name] = keySource{typ: typ}
+	}
+	for name, def := range defaults {
+		sources[name] = keySource{typ: def.Key.Type, def: true}
 	}
 	return &pipelineBuilder{
 		inputs:      inputs,
@@ -279,6 +308,9 @@ func newPipelineBuilder(
 		names:       map[string]bool{},
 		maybeAbsent: map[string]string{},
 		optional:    map[string]map[string]bool{},
+		unwritten:   map[string]unwrittenKey{},
+		writers:     map[string]writerFacts{},
+		used:        map[string]bool{},
 	}
 }
 
@@ -347,6 +379,12 @@ func (b *pipelineBuilder) checkWrapper(node *stepNode, composite compositeStep, 
 	if composite.skipsOnError() {
 		b.skippable = append(b.skippable, skippableStep{index: b.index, name: node.name, writes: node.writes})
 	}
+	if _, ok := unwrapComposite(node.step).(*amendableStep); ok && position.parent != "" {
+		return fmt.Errorf(
+			"pipeline step %q has amendable keys, but only a top-level step can be the target of a rewind",
+			node.name,
+		)
+	}
 	return nil
 }
 
@@ -374,6 +412,7 @@ func validateStep(node *stepNode) error {
 
 func (b *pipelineBuilder) checkReads(node *stepNode) error {
 	for _, key := range node.reads {
+		b.used[key.Name] = true
 		source, ok := b.sources[key.Name]
 		if !ok {
 			return fmt.Errorf(
@@ -383,12 +422,33 @@ func (b *pipelineBuilder) checkReads(node *stepNode) error {
 			)
 		}
 		if source.typ != key.Type {
+			if source.def && source.step == "" {
+				return fmt.Errorf(
+					"default for %q has type %s, but step %q reads it as %s",
+					key.Name,
+					source.typ,
+					node.name,
+					key.Type,
+				)
+			}
 			return fmt.Errorf(
 				"pipeline step %q reads %q as %s, but %s",
 				node.name,
 				key.Name,
 				key.Type,
 				source.describe(key.Name),
+			)
+		}
+		if unwritten, ok := b.unwritten[key.Name]; ok {
+			return fmt.Errorf(
+				"pipeline step %q reads %q (%s), which step %q may not write because %s; "+
+					"declare a Default for %q",
+				node.name,
+				key.Name,
+				key.Type,
+				unwritten.step,
+				unwritten.reason,
+				key.Name,
 			)
 		}
 		if skipper, ok := b.maybeAbsent[key.Name]; ok {
@@ -413,11 +473,21 @@ func (b *pipelineBuilder) checkWrites(node *stepNode) error {
 				key.Name,
 			)
 		}
+		b.used[key.Name] = true
 		source, ok := b.sources[key.Name]
 		if !ok {
 			continue
 		}
 		if source.typ != key.Type {
+			if source.def && source.step == "" {
+				return fmt.Errorf(
+					"default for %q has type %s, but step %q writes it as %s",
+					key.Name,
+					source.typ,
+					node.name,
+					key.Type,
+				)
+			}
 			return fmt.Errorf(
 				"pipeline step %q writes %q as %s, but %s",
 				node.name,
@@ -426,7 +496,7 @@ func (b *pipelineBuilder) checkWrites(node *stepNode) error {
 				source.describe(key.Name),
 			)
 		}
-		if b.merges[key.Name] == nil {
+		if source.writers > 0 && b.merges[key.Name] == nil && b.bothCommit(key.Name) {
 			return fmt.Errorf(
 				"pipeline steps %q and %q both write %q; declare a MergeRule to combine them",
 				source.step,
@@ -436,6 +506,16 @@ func (b *pipelineBuilder) checkWrites(node *stepNode) error {
 		}
 	}
 	return nil
+}
+
+// bothCommit reports whether a run may commit a write of key by an earlier top-level step and
+// then one by the current step: one of the earlier writers may continue at or before the
+// current step after it succeeds, or a rewind lands after the first of them and at or before
+// the current step, re-running the current step without them. register records every earlier
+// writer, and a key with none has the zero writerFacts, which counts as both committing.
+func (b *pipelineBuilder) bothCommit(key string) bool {
+	earlier := b.writers[key]
+	return earlier.reach <= b.index || b.rewinds > earlier.rewinds
 }
 
 // register makes a checked top-level step's writes available to the steps after it. A key
@@ -453,6 +533,7 @@ func (b *pipelineBuilder) register(node *stepNode) {
 			}
 		}
 	}
+	reach, unwritten := b.flow.reach(b.index), b.flow.unwritten(b.index)
 	for _, key := range node.writes {
 		source, existed := b.sources[key.Name]
 		_, wasAbsent := b.maybeAbsent[key.Name]
@@ -461,8 +542,19 @@ func (b *pipelineBuilder) register(node *stepNode) {
 		} else {
 			delete(b.maybeAbsent, key.Name)
 		}
-		if !existed {
-			b.sources[key.Name] = keySource{typ: key.Type, step: node.name, writers: 1}
+		if _, ok := b.defaults[key.Name]; !ok && unwritten != "" {
+			if _, ok := b.unwritten[key.Name]; !ok {
+				b.unwritten[key.Name] = unwrittenKey{step: node.name, reason: unwritten}
+			}
+		}
+		if facts, ok := b.writers[key.Name]; ok {
+			facts.reach = min(facts.reach, reach)
+			b.writers[key.Name] = facts
+		} else {
+			b.writers[key.Name] = writerFacts{reach: reach, rewinds: b.rewinds}
+		}
+		if !existed || source.writers == 0 {
+			b.sources[key.Name] = keySource{typ: key.Type, step: node.name, def: existed, writers: 1}
 			continue
 		}
 		source.writers++
@@ -494,23 +586,12 @@ func (b *pipelineBuilder) checkSkips(steps []*stepNode) error {
 	return nil
 }
 
-// checkDefaults requires each default to match the type of the key's writers and to belong
-// to a step that skips on error.
+// checkDefaults requires each default to be read or written by some step. The steps that read
+// or write its key have already checked its type.
 func (b *pipelineBuilder) checkDefaults() error {
-	used := map[string]bool{}
-	for _, skippable := range b.skippable {
-		for _, key := range skippable.writes {
-			used[key.Name] = true
-		}
-	}
 	for _, name := range slices.Sorted(maps.Keys(b.defaults)) {
-		def := b.defaults[name]
-		source, ok := b.sources[name]
-		switch {
-		case !ok || !used[name]:
-			return fmt.Errorf("default for %q is unused: no step that skips on error writes it", name)
-		case source.typ != def.Key.Type:
-			return fmt.Errorf("default for %q has type %s, but %s", name, def.Key.Type, source.describe(name))
+		if !b.used[name] {
+			return fmt.Errorf("default for %q is unused: no step reads or writes it", name)
 		}
 	}
 	return nil
@@ -519,7 +600,7 @@ func (b *pipelineBuilder) checkDefaults() error {
 func (b *pipelineBuilder) checkMerges(rules []MergeRule) error {
 	for _, rule := range rules {
 		source, ok := b.sources[rule.Key.Name]
-		if !ok {
+		if !ok || source.writers == 0 {
 			return fmt.Errorf("merge rule for %q matches no step write", rule.Key.Name)
 		}
 		if source.typ != rule.Key.Type {
@@ -580,8 +661,8 @@ func buildMerges(
 }
 
 // buildDefaults checks each default and converts its value to the key's type.
-func buildDefaults(defaults []KeyDefault, inputs map[string]reflect.Type) (map[string]KeyDefault, error) {
-	built := map[string]KeyDefault{}
+func buildDefaults(defaults []Default, inputs map[string]reflect.Type) (map[string]Default, error) {
+	built := map[string]Default{}
 	for i, def := range defaults {
 		name := def.Key.Name
 		switch {
@@ -599,7 +680,7 @@ func buildDefaults(defaults []KeyDefault, inputs map[string]reflect.Type) (map[s
 		if err != nil {
 			return nil, fmt.Errorf("default for %q: %w", name, err)
 		}
-		built[name] = KeyDefault{Key: def.Key, Value: value}
+		built[name] = Default{Key: def.Key, Value: value}
 	}
 	return built, nil
 }

@@ -235,9 +235,9 @@ func TestSignatureStepChecksInsideComposites(t *testing.T) {
 	cacheKey := func(gepa.State) (string, error) { return "k", nil }
 	route := func(gepa.State) (string, error) { return "a", nil }
 	composites := map[string]gepa.Step{
-		"Branch":     gepa.Branch("route", route, map[string]gepa.Step{"a": bad(), "b": partner()}),
+		"Branch":     gepa.LegacyBranch("route", route, map[string]gepa.Step{"a": bad(), "b": partner()}),
 		"Parallel":   gepa.Parallel("fan", bad()),
-		"Fallback":   gepa.Fallback("guard", bad(), partner()),
+		"Fallback":   gepa.LegacyFallback("guard", bad(), partner()),
 		"WithPolicy": gepa.WithPolicy(bad(), gepa.StepPolicy{Retry: gepa.RetryPolicy{MaxAttempts: 2}}),
 		"WithCache":  gepa.WithCache(bad(), cacheKey),
 		"nested":     gepa.Parallel("outer", gepa.WithPolicy(gepa.WithCache(bad(), cacheKey), gepa.StepPolicy{})),

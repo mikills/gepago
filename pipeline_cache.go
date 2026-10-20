@@ -15,7 +15,7 @@ import (
 //
 // The cache belongs to one Pipeline run, and entries are keyed by the step's name and its key,
 // so a hit is a repeat of the same step in the same run with the same reads: for example a
-// retry of an enclosing WithPolicy, where a Parallel or Fallback that failed in one part does
+// retry of an enclosing WithPolicy, where a Parallel that failed in one part does
 // not repeat the model calls of the parts that already succeeded. Failed executions are not
 // cached. Concurrent runs and nested pipelines have caches of their own.
 //

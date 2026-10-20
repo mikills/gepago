@@ -35,7 +35,7 @@ func TestReflectionRecordNamesTheFailingStep(t *testing.T) {
 		Steps: []gepa.Step{
 			amountStep(),
 			route,
-			gepa.Branch("decide", routeBy, map[string]gepa.Step{"model": classify}, routeKey.Ref()),
+			gepa.LegacyBranch("decide", routeBy, map[string]gepa.Step{"model": classify}, routeKey.Ref()),
 		},
 	})
 	evaluator := gepa.ProgramEvaluator{Program: pipeline, Metric: gepa.ExactMatchMetric{Fields: []string{"label"}}}

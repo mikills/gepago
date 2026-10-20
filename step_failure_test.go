@@ -46,7 +46,7 @@ func TestNestedStepErrorCarriesItsOwnReads(t *testing.T) {
 		refs(decisionKey.Ref()),
 		func(context.Context, State) error { return errors.New("no reviewer") },
 	)
-	decide := Branch("decide", routeBy, map[string]Step{"review": review}, routeKey.Ref())
+	decide := legacyBranch("decide", routeBy, map[string]Step{"review": review}, routeKey.Ref())
 	pipeline := fpBuild(t, PipelineSpec{Inputs: refs(docKey.Ref()), Steps: []Step{amountStep(), route, decide}})
 
 	_, err := pipeline.Run(context.Background(), NewState(Prediction{"document": "cash 125000"}))

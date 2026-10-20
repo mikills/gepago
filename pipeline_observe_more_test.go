@@ -459,7 +459,7 @@ func TestPipelineObserverContextOutlivesStepTimeouts(t *testing.T) {
 		Steps: []Step{
 			WithPolicy(slow, StepPolicy{Timeout: 5 * time.Millisecond, OnError: OnErrorSkip}),
 		},
-		Defaults:  []KeyDefault{DefaultValue(amountKey, 0)},
+		Defaults:  []Default{DefaultValue(amountKey, 0)},
 		Observers: []PipelineObserver{observer},
 	}.Build()
 	require.NoError(t, err)
@@ -503,7 +503,7 @@ func TestPipelineObserverStress(t *testing.T) {
 				return nil
 			},
 		)
-		return Fallback(
+		return legacyFallback(
 			fmt.Sprintf("f%d", i),
 			WithPolicy(WithCache(flaky, nil), StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}}),
 			spare,

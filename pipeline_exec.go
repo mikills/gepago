@@ -11,12 +11,10 @@ import (
 
 type pipelineRunKey struct{}
 
-// pipelineRun is what the steps of one Pipeline run share: the defaults a skipped step
-// commits, the step cache, the outcome of every step execution and the run's tool session,
-// which records every tool call. It is safe for concurrent use, and a nil run, outside a
-// pipeline, records and caches nothing.
+// pipelineRun is what the steps of one Pipeline run share: the step cache, the outcome of every
+// step execution and the run's tool session, which records every tool call. It is safe for
+// concurrent use, and a nil run, outside a pipeline, records and caches nothing.
 type pipelineRun struct {
-	defaults map[string]any
 	optional map[string]map[string]bool
 	tools    *ToolSession
 	mu       sync.Mutex
@@ -50,9 +48,8 @@ type stepOutcome struct {
 	ToolCalls  []ToolCallRecord
 }
 
-func newPipelineRun(defaults map[string]any, optional map[string]map[string]bool) *pipelineRun {
+func newPipelineRun(optional map[string]map[string]bool) *pipelineRun {
 	return &pipelineRun{
-		defaults: defaults,
 		optional: optional,
 		cache:    map[stepCacheKey]stepResult{},
 		attempts: map[string]int{},
@@ -91,14 +88,6 @@ func (r *pipelineRun) optionalOutputs(step string) (map[string]bool, bool) {
 	}
 	optional, ok := r.optional[step]
 	return optional, ok
-}
-
-func (r *pipelineRun) defaultFor(key string) (any, bool) {
-	if r == nil {
-		return nil, false
-	}
-	value, ok := r.defaults[key]
-	return value, ok
 }
 
 // cached returns a copy of the result cached for step under key.
@@ -402,7 +391,7 @@ func beginExecution(ctx context.Context, node *stepNode, values map[string]any) 
 	run := pipelineRunFrom(ctx)
 	attempt := run.nextAttempt(node.name)
 	capture := evaluationCaptureFrom(ctx)
-	ctx, observed := observeStep(ctx, node, attempt, values)
+	ctx, observed := observeStep(ctx, node, attempt, visitFrom(ctx), values)
 	ctx, frame, release := usageFrameFrom(ctx).enterStep(ctx, node.name)
 	start := time.Now()
 	return ctx, func(result stepResult, err error, attempted []stateWrite) {
@@ -429,7 +418,7 @@ type standIn int
 const (
 	// cacheHit commits a WithCache step's cached writes.
 	cacheHit standIn = iota
-	// skippedOnError commits the defaults of a step that skips on error.
+	// skippedOnError leaves the writes of a step that skips on error unwritten.
 	skippedOnError
 	// commitFailed fails a top-level WithPolicy or WithCache step whose writes cannot be merged
 	// into the state.
@@ -442,7 +431,7 @@ func beginStandIn(ctx context.Context, kind standIn, node *stepNode, values map[
 	run := pipelineRunFrom(ctx)
 	attempt := run.nextAttempt(node.name)
 	capture := evaluationCaptureFrom(ctx)
-	_, observed := observeStep(ctx, node, attempt, values)
+	_, observed := observeStep(ctx, node, attempt, visitFrom(ctx), values)
 	start := time.Now()
 	return func(result stepResult, err error) {
 		outcome := stepOutcome{

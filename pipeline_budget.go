@@ -25,7 +25,8 @@ import (
 // Exceeding a limit fails with a Budget error (see IsBudget) that names the limit and its
 // value. A run limit ends the run: it cancels the context of every running step, and a step
 // that finishes after that fails with the budget error, its writes dropped. A PerStepTokens
-// limit fails only the steps it names, which a policy or Fallback around them may handle.
+// limit fails only the steps it names, which a policy around them or an OnError transition
+// (see Transition and Fallback) may handle.
 //
 // MaxDuration does not bound a step that ignores its context: the pipeline waits for every
 // step to return rather than abandon a goroutine that still uses the run's state, and only then
@@ -35,7 +36,8 @@ type RunBudget struct {
 	MaxModelCalls int
 	MaxTokens     int
 	// PerStepTokens limits the tokens spent while the named step runs, nested steps included,
-	// summed over all its executions in the run. A name may be a nested step's. A step's
+	// summed over all its executions in the run, so over every visit a rewind makes (see
+	// Transition) as over every retry. A name may be a nested step's. A step's
 	// OnErrorFallback step is not part of it: the fallback is limited by its own entry, under
 	// its own name, and by the run limits.
 	PerStepTokens map[string]int

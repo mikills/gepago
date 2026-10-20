@@ -3,6 +3,7 @@ package gepa
 import (
 	"context"
 	"errors"
+	"maps"
 	"reflect"
 	"slices"
 	"sync"
@@ -21,16 +22,19 @@ import (
 // and WithCache are not executions of their own; their attempts, fallbacks, cache hits and skips
 // are. A top-level step's writes are merged into the state as part of its execution, so a
 // MergeRule that fails fails that execution; for a top-level WithPolicy or WithCache step it
-// adds a failed execution after the one that wrote.
+// adds a failed execution after the one that wrote. The same holds for the step's transitions
+// on success, evaluated before its execution ends: a When, Amend or Accept that fails or panics
+// fails that execution. Each execution reports the visit of its top-level step in Attributes.
 //
 // The events of a run are ordered:
 //   - RunStarted comes before every other event of the run and RunFinished after them. A run
 //     that fails before its first step, because the pipeline is not built or its inputs are
 //     invalid, emits no events.
 //   - Every execution emits StepStarted and later StepFinished with the same span.
-//   - A top-level step finishes before the next one starts. An execution nested in a composite
-//     step (Branch, Parallel, Fallback, or the fallback step of an OnErrorFallback policy
-//     nested in one) starts after the composite starts and finishes before it finishes.
+//   - A top-level step finishes before the next one starts, and a top-level step a transition
+//     skips over emits nothing (see Transition). An execution nested in a composite step (a
+//     Parallel, or the fallback step of an OnErrorFallback policy nested in one) starts after
+//     the composite starts and finishes before it finishes.
 //   - The attempts of a step follow each other in order. A skip, or the fallback step of an
 //     OnErrorFallback policy, follows the step's last failed attempt.
 //   - A pipeline run by a step, through NewProgramStep or a step that runs it with its
@@ -70,11 +74,48 @@ import (
 // The values an event carries pass through PipelineSpec.Redactor; see Redactor. Each observer
 // receives its own copy of them, its RunContext's Attributes included, so changing them changes
 // neither the run nor what other observers receive.
+//
+// An observer that also implements TransitionObserver receives the run's transitions too.
 type PipelineObserver interface {
 	RunStarted(ctx context.Context, event RunStartedEvent)
 	StepStarted(ctx context.Context, event StepStartedEvent)
 	StepFinished(ctx context.Context, event StepFinishedEvent)
 	RunFinished(ctx context.Context, event RunFinishedEvent)
+}
+
+// TransitionObserver is a PipelineObserver that also receives the transitions of the runs it
+// observes (see Transition), with the same ordering, serialisation, context and panic rules as
+// the other events: TransitionTaken follows the StepFinished of the last execution of the step
+// the transition leaves, after any RewindRejected for it, and comes before the next StepStarted
+// of the run. RecordingObserver is one.
+type TransitionObserver interface {
+	PipelineObserver
+	TransitionTaken(ctx context.Context, event TransitionTakenEvent)
+	RewindRejected(ctx context.Context, event RewindRejectedEvent)
+}
+
+// TransitionTakenEvent reports that a transition matched after its From step finished.
+type TransitionTakenEvent struct {
+	// RunContext is the RunContext of the run, as RunStarted reported it.
+	RunContext RunContext
+	// From and To name the steps the run moves between; To is End or Fail for those.
+	From string
+	To   string
+	// Rule is the transition's index in PipelineSpec.Transitions.
+	Rule int
+	// Rewind reports a transition to From itself or an earlier step.
+	Rewind bool
+}
+
+// RewindRejectedEvent reports that a rewind's Accept kept the visit before it: the values the
+// rewind's range committed before it are restored and the run goes on past Step.
+type RewindRejectedEvent struct {
+	// RunContext is the RunContext of the run, as RunStarted reported it.
+	RunContext RunContext
+	// Step is the From step of the rejected rewind.
+	Step string
+	// Rule is the rewind's index in PipelineSpec.Transitions.
+	Rule int
 }
 
 // RunStartedEvent reports the start of a pipeline run.
@@ -125,6 +166,9 @@ type StepStartedEvent struct {
 	// otherwise, for the executions nested in them too. The executions of different lanes of a
 	// Parallel run side by side, so they may start in any order.
 	Lane string
+	// Attributes describe where the execution runs. "visit" numbers, from one, the visits of the
+	// top-level step it belongs to: a rewind visits a step again (see Transition).
+	Attributes map[string]int
 }
 
 // StepFinishedEvent reports the end of one execution of a step.
@@ -156,8 +200,10 @@ type StepFinishedEvent struct {
 	// Cached reports a WithCache hit: the step did not run and its cached writes were committed.
 	Cached bool
 	// Skipped reports a step that skipped on error under OnErrorSkip: the step did not run
-	// again, and Writes holds the defaults it committed.
+	// again and wrote nothing.
 	Skipped bool
+	// Attributes are those StepStarted reported.
+	Attributes map[string]int
 	// ToolCalls holds the tool calls the execution made, through the run's ToolSession or any
 	// other, such as an agent's, in the order they finished, after redaction (see Redactor). The
 	// calls of the executions nested in it are in their own events. Each call's usage is part of
@@ -419,18 +465,20 @@ func (r *runObservation) finish(ctx context.Context, err error) {
 // stepObservation reports one execution of a step, and recording, when set, reports it to an
 // evaluation's RecordingObserver; see runObservation.
 type stepObservation struct {
-	run       *runObservation
-	ctx       context.Context
-	span      UsageSpan
-	step      string
-	reads     map[string]any
-	recording *stepObservation
+	run        *runObservation
+	ctx        context.Context
+	span       UsageSpan
+	step       string
+	reads      map[string]any
+	attributes map[string]int
+	recording  *stepObservation
 }
 
 // observeStep emits StepStarted for an execution of node over values, the state its view
-// reads, when the run in ctx is observed. It returns ctx carrying the execution's span, and
-// nil when nothing observes the run.
-func observeStep(ctx context.Context, node *stepNode, attempt int, values map[string]any) (
+// reads, when the run in ctx is observed. visit is the visit of the top-level step the execution
+// belongs to. It returns ctx carrying the execution's span, and nil when nothing observes the
+// run.
+func observeStep(ctx context.Context, node *stepNode, attempt, visit int, values map[string]any) (
 	context.Context,
 	*stepObservation,
 ) {
@@ -470,6 +518,7 @@ func observeStep(ctx context.Context, node *stepNode, attempt int, values map[st
 		}
 		lane.ctx = ctx
 		lane.reads = lane.run.redactValues(reads)
+		lane.attributes = visitAttributes(visit)
 		event := StepStartedEvent{
 			Span:       lane.span,
 			RunContext: lane.run.runContext,
@@ -477,12 +526,14 @@ func observeStep(ctx context.Context, node *stepNode, attempt int, values map[st
 			Attempt:    attempt,
 			Reads:      lane.reads,
 			Lane:       scope.lane,
+			Attributes: lane.attributes,
 		}
 		observerCtx := lane.run.observerContext(ctx)
 		lane.run.deliver(func(observer PipelineObserver) {
 			event := event
 			event.RunContext = event.RunContext.clone()
 			event.Reads = copyValues(event.Reads)
+			event.Attributes = maps.Clone(event.Attributes)
 			observer.StepStarted(observerCtx, event)
 		})
 	}
@@ -530,6 +581,7 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 			Reads:      lane.reads,
 			Cached:     outcome.Cached,
 			Skipped:    outcome.Skipped,
+			Attributes: lane.attributes,
 		}
 		event.ToolCalls = run.scrubToolCalls(toolCalls)
 		event.Err = run.redactError(outcome.Err)
@@ -542,7 +594,49 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 			event.Writes = copyValues(event.Writes)
 			event.Details = copyValues(event.Details)
 			event.ToolCalls = cloneRecords(event.ToolCalls)
+			event.Attributes = maps.Clone(event.Attributes)
 			observer.StepFinished(observerCtx, event)
+		})
+	}
+}
+
+// transitionTaken emits TransitionTaken to the observers that are TransitionObservers. ctx is
+// the run's context.
+func (r *runObservation) transitionTaken(ctx context.Context, event TransitionTakenEvent) {
+	r.deliverTransition(ctx, func(observer TransitionObserver, rc RunContext, observerCtx context.Context) {
+		event := event
+		event.RunContext = rc
+		observer.TransitionTaken(observerCtx, event)
+	})
+}
+
+// rewindRejected emits RewindRejected to the observers that are TransitionObservers. ctx is
+// the run's context.
+func (r *runObservation) rewindRejected(ctx context.Context, event RewindRejectedEvent) {
+	r.deliverTransition(ctx, func(observer TransitionObserver, rc RunContext, observerCtx context.Context) {
+		event := event
+		event.RunContext = rc
+		observer.RewindRejected(observerCtx, event)
+	})
+}
+
+// deliverTransition calls call for each TransitionObserver of the run and of its recording, with
+// a copy of the run's RunContext as its events carry it.
+func (r *runObservation) deliverTransition(
+	ctx context.Context,
+	call func(TransitionObserver, RunContext, context.Context),
+) {
+	if r == nil {
+		return
+	}
+	r.trace.mu.Lock()
+	defer r.trace.mu.Unlock()
+	for lane := r; lane != nil; lane = lane.recording {
+		observerCtx := lane.observerContext(ctx)
+		lane.deliver(func(observer PipelineObserver) {
+			if transitions, ok := observer.(TransitionObserver); ok {
+				call(transitions, lane.runContext.clone(), observerCtx)
+			}
 		})
 	}
 }

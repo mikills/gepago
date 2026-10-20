@@ -58,8 +58,8 @@ func stepReads(node *stepNode, values map[string]any) map[string]any {
 
 // invalidOutputStep returns the innermost StepError in err's tree whose error is an invalid
 // output, which names the step that produced it, or nil when there is none. It walks the tree
-// in the order errors.Is does, so when two branches hold an invalid output, as a Fallback whose
-// steps both failed can, the one errors.Is reaches first wins.
+// in the order errors.Is does, so when two branches hold an invalid output, as a policy whose
+// step and fallback step both failed can, the one errors.Is reaches first wins.
 func invalidOutputStep(err error) *StepError {
 	switch e := err.(type) {
 	case nil:

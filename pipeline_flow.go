@@ -11,16 +11,18 @@ import (
 	"sync"
 )
 
-// Branch returns a step that runs one of arms, chosen by cond. cond sees a State limited to
-// reads, the keys it declares, and returns the label of the arm to run; it cannot write. The
-// chosen arm runs on its own view of the state and its writes become the Branch's writes.
+// legacyBranch is v0.8.0's Branch step, which runs the chosen arm nested inside it. Branch
+// now builds a Flow of top-level steps; this stays until the composite is removed.
 //
-// Build requires a condition, at least one arm, no empty label, and every arm to write the
-// same keys with the same types; the Branch reads cond's keys and every arm's. Each arm is a
-// nested step: its name must be unique in the pipeline and its components are scoped as
+// It returns a step that runs one of arms, chosen by cond. cond sees a State limited to reads,
+// the keys it declares, and returns the label of the arm to run; it cannot write. The chosen arm
+// runs on its own view of the state and its writes become the step's writes. Build requires a
+// condition, at least one arm, no empty label, and every arm to write the same keys with the
+// same types; the step reads cond's keys and every arm's. Each arm is a nested step: its name
+// must be unique in the pipeline and its components are scoped as
 // "<branch>.<arm step>.<component>". A label with no arm fails the step with a Permanent error
-// that names the label. The Branch is a ComponentStep when an arm is one.
-func Branch(name string, cond func(State) (string, error), arms map[string]Step, reads ...KeyRef) Step {
+// that names the label. The step is a ComponentStep when an arm is one.
+func legacyBranch(name string, cond func(State) (string, error), arms map[string]Step, reads ...KeyRef) Step {
 	b := &branchStep{
 		name:      strings.TrimSpace(name),
 		cond:      cond,
@@ -244,17 +246,18 @@ func (p *parallelStep) runCandidate(ctx context.Context, candidate Candidate, s 
 	return errors.Join(kept...)
 }
 
-// Fallback returns a step that runs primary and, when primary fails with an error that is not
-// Permanent (see IsPermanent), runs secondary in its place on a fresh view of the state as it
-// was before the Fallback. Nothing falls back once the context the Fallback runs under has
-// ended, for example because the run was cancelled or spent a RunBudget limit.
+// legacyFallback is v0.8.0's Fallback step, which runs its two steps nested inside it.
+// Fallback now builds a Flow of top-level steps; this stays until the composite is removed.
 //
-// Build requires both steps to write the same keys with the same types; the Fallback reads
-// the keys of both. When secondary fails too, the error keeps both errors for errors.Is and
-// errors.As. Both are nested steps: their names must be unique in the pipeline and their
-// components are scoped as "<fallback>.<step>.<component>". The Fallback is a ComponentStep
-// when either step is one.
-func Fallback(name string, primary, secondary Step) Step {
+// It returns a step that runs primary and, when primary fails with an error that is not
+// Permanent (see IsPermanent), runs secondary in its place on a fresh view of the state as it
+// was before the step. Nothing falls back once the context the step runs under has ended, for
+// example because the run was cancelled or spent a RunBudget limit. Build requires both steps
+// to write the same keys with the same types; the step reads the keys of both. When secondary
+// fails too, the error keeps both errors for errors.Is and errors.As. Both are nested steps:
+// their names must be unique in the pipeline and their components are scoped as
+// "<fallback>.<step>.<component>". The step is a ComponentStep when either step is one.
+func legacyFallback(name string, primary, secondary Step) Step {
 	f := &fallbackStep{name: strings.TrimSpace(name), primary: newStepNode(primary), secondary: newStepNode(secondary)}
 	f.reads = unionKeys(f.primary.reads, f.secondary.reads)
 	return asComponentStep(f, f.primary, f.secondary)

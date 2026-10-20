@@ -56,7 +56,7 @@ func TestStepPathFromNamesEveryExecutionAsTheTraceDoes(t *testing.T) {
 	pipeline, err := gepa.PipelineSpec{
 		Steps: []gepa.Step{
 			paths.step("first"),
-			gepa.Branch(
+			gepa.LegacyBranch(
 				"route",
 				func(gepa.State) (string, error) { return "summary", nil },
 				map[string]gepa.Step{"summary": paths.step("summarise", answer.Ref())},

@@ -43,7 +43,7 @@ func TestRecordingObserverRecordsFailuresAndParallelLanes(t *testing.T) {
 		Steps: []gepa.Step{
 			gepa.Parallel("fan",
 				gepa.WithPolicy(noop("left"), gepa.StepPolicy{Retry: gepa.RetryPolicy{MaxAttempts: 2}}),
-				gepa.Fallback("guard", silent("quiet"), noop("backup")),
+				gepa.LegacyFallback("guard", silent("quiet"), noop("backup")),
 				gepa.WithPolicy(silent("shaky"), gepa.StepPolicy{OnError: gepa.OnErrorFallback(noop("spare"))}),
 			),
 			silent("last"),

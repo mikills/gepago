@@ -64,7 +64,7 @@ func tracedPipeline(t *testing.T) gepa.PipelineTrace {
 				modelStep("summarise", tenTokenModel(`{"summary": "short"}`), docKey.Ref(), summaryKey.Ref()),
 				measure,
 			),
-			gepa.Fallback("fb", primary, writeAmount("secondary", 3)),
+			gepa.LegacyFallback("fb", primary, writeAmount("secondary", 3)),
 			gepa.NewProgramStep("inner", inner, refs(docKey.Ref()), refs(decisionKey.Ref())),
 			check,
 		},

@@ -42,8 +42,9 @@ func WriteHTMLRunReport(path string, trace PipelineTrace, options HTMLReportOpti
 // HTMLRunReport renders a self-contained HTML report of one pipeline run, such as a trace from
 // a RecordingObserver: a summary of the run with its run context (run id, parent run id, trace
 // id and attributes, as redacted when the run's events carried them), then every step
-// execution in the order it started with its duration, usage, unbudgeted usage when it has any,
-// reads, writes, tool calls and error, executions nested in a composite step or a nested
+// execution in the order it started with its visit, duration, usage, unbudgeted usage when it
+// has any, reads, writes, tool calls, error, a rejected rewind and the transition taken after
+// it, executions nested in a composite step or a nested
 // pipeline shown inside the execution that ran them. Every value and error is escaped. Values are shown as JSON, indented when it
 // nests no deeper than 32 levels and is no larger than 64 KiB, and compact otherwise, so the
 // report grows linearly with the trace.
@@ -159,9 +160,10 @@ var runReportTemplate = template.Must(template.New("gepa-run-report").Funcs(temp
 <li class="step{{if or .Failed .Err}} failed{{end}}">
 <div class="step-head">
 <strong>{{.Step}}</strong>
-<span class="muted">attempt {{.Attempt}}</span>
+<span class="muted">attempt {{.Attempt}}{{with index .Attributes "visit"}} · visit {{.}}{{end}}</span>
 {{if .Cached}}<span class="badge">cached</span>{{end}}
 {{if .Skipped}}<span class="badge">skipped</span>{{end}}
+{{if .RewindRejected}}<span class="badge">rewind rejected</span>{{end}}
 {{if or .Failed .Err}}<span class="badge error-badge">failed{{with .ErrKind}} · {{.}}{{end}}</span>{{end}}
 <span class="muted">
 {{.Duration}} · {{.Usage.TotalTokens}} tokens ({{.Usage.PromptTokens}} in, {{.Usage.CompletionTokens}} out)
@@ -194,6 +196,7 @@ var runReportTemplate = template.Must(template.New("gepa-run-report").Funcs(temp
 </ol>
 </details>{{end}}
 {{if .Steps}}{{template "steps" .Steps}}{{end}}
+{{with .Transition}}<div class="transition muted">transition {{.Rule}}: {{.From}} → {{.To}}{{if .Rewind}} (rewind){{end}}</div>{{end}}
 {{range .Runs}}
 <div class="nested-run">
 <div class="muted">

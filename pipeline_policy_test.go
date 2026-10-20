@@ -250,14 +250,15 @@ func TestWithPolicyStopsWhenRunEnds(t *testing.T) {
 		})
 		pipeline, err := PipelineSpec{
 			Steps:    []Step{WithPolicy(flaky, StepPolicy{Retry: RetryPolicy{MaxAttempts: 3}, OnError: OnErrorSkip})},
-			Defaults: []KeyDefault{DefaultValue(amountKey, 0)},
+			Defaults: []Default{DefaultValue(amountKey, 0)},
 		}.Build()
 		require.NoError(t, err)
 
 		got, err := pipeline.RunCandidate(ctx, nil, Prediction{})
 		require.EqualError(t, err, `pipeline step "flaky": rate limited`)
 		require.Equal(t, 1, calls)
-		require.Equal(t, Prediction{}, got)
+		// v0.9.0: the default is seeded before the first step, so even a failed run holds it.
+		require.Equal(t, Prediction{"amount": 0}, got)
 	})
 
 	t.Run("cancelled during a backoff", func(t *testing.T) {
@@ -294,7 +295,7 @@ func TestWithPolicySkip(t *testing.T) {
 	t.Run("a default is committed", func(t *testing.T) {
 		pipeline, err := PipelineSpec{
 			Steps:    []Step{WithPolicy(failAmount("extract", errFlaky), skip), readAmount("decide")},
-			Defaults: []KeyDefault{DefaultValue(amountKey, 7)},
+			Defaults: []Default{DefaultValue(amountKey, 7)},
 		}.Build()
 		require.NoError(t, err)
 
@@ -304,7 +305,7 @@ func TestWithPolicySkip(t *testing.T) {
 		require.Equal(t, []string{"extract#1 err: flaky", "extract#2 skipped", "decide#1"}, outcomeSummary(run))
 	})
 
-	t.Run("a default merges with an earlier write", func(t *testing.T) {
+	t.Run("a skipped step keeps an earlier write over the default", func(t *testing.T) {
 		note := func(name string, err error) Step {
 			return NewStep(name, nil, refs(notesKey.Ref()), func(_ context.Context, s State) error {
 				notesKey.Set(s, []string{name})
@@ -314,13 +315,14 @@ func TestWithPolicySkip(t *testing.T) {
 		pipeline, err := PipelineSpec{
 			Steps:    []Step{note("first", nil), WithPolicy(note("second", errFlaky), skip)},
 			Merges:   []MergeRule{MergeWith(notesKey, appendNotes)},
-			Defaults: []KeyDefault{DefaultValue(notesKey, []string{"skipped"})},
+			Defaults: []Default{DefaultValue(notesKey, []string{"skipped"})},
 		}.Build()
 		require.NoError(t, err)
 
 		got, err := pipeline.RunCandidate(ctx, nil, Prediction{})
 		require.NoError(t, err)
-		require.Equal(t, Prediction{"notes": []string{"first", "skipped"}}, got)
+		// v0.9.0: the first write replaces the default and a skip writes nothing, so no merge runs.
+		require.Equal(t, Prediction{"notes": []string{"first"}}, got)
 	})
 
 	t.Run("a later writer stands in for a default", func(t *testing.T) {
@@ -379,7 +381,7 @@ func TestWithPolicySkip(t *testing.T) {
 				Parallel("fan", WithPolicy(failAmount("guess", errFlaky), skip), writeNotes("note", "seen")),
 				readAmount("report"),
 			},
-			Defaults: []KeyDefault{DefaultValue(amountKey, 5)},
+			Defaults: []Default{DefaultValue(amountKey, 5)},
 		}.Build()
 		require.NoError(t, err)
 
@@ -546,7 +548,7 @@ func TestWithPolicyBuildErrors(t *testing.T) {
 			name: "default without a key",
 			spec: PipelineSpec{
 				Steps:    []Step{WithPolicy(writeAmount("a", 1), StepPolicy{OnError: OnErrorSkip})},
-				Defaults: []KeyDefault{{Value: 1}},
+				Defaults: []Default{{Value: 1}},
 			},
 			wantErr: "default 0 key is required",
 		},
@@ -554,7 +556,7 @@ func TestWithPolicyBuildErrors(t *testing.T) {
 			name: "default without a type",
 			spec: PipelineSpec{
 				Steps:    []Step{WithPolicy(writeAmount("a", 1), StepPolicy{OnError: OnErrorSkip})},
-				Defaults: []KeyDefault{{Key: KeyRef{Name: "amount"}, Value: 1}},
+				Defaults: []Default{{Key: KeyRef{Name: "amount"}, Value: 1}},
 			},
 			wantErr: `default for "amount" key type is required; use DefaultValue`,
 		},
@@ -563,7 +565,7 @@ func TestWithPolicyBuildErrors(t *testing.T) {
 			spec: PipelineSpec{
 				Inputs:   refs(docKey.Ref()),
 				Steps:    []Step{WithPolicy(writeAmount("a", 1), StepPolicy{OnError: OnErrorSkip})},
-				Defaults: []KeyDefault{DefaultValue(docKey, "")},
+				Defaults: []Default{DefaultValue(docKey, "")},
 			},
 			wantErr: `default for "document" targets a pipeline input, which is read-only`,
 		},
@@ -571,7 +573,7 @@ func TestWithPolicyBuildErrors(t *testing.T) {
 			name: "duplicated default",
 			spec: PipelineSpec{
 				Steps:    []Step{WithPolicy(writeAmount("a", 1), StepPolicy{OnError: OnErrorSkip})},
-				Defaults: []KeyDefault{DefaultValue(amountKey, 1), DefaultValue(amountKey, 2)},
+				Defaults: []Default{DefaultValue(amountKey, 1), DefaultValue(amountKey, 2)},
 			},
 			wantErr: `default for "amount" is duplicated`,
 		},
@@ -579,7 +581,7 @@ func TestWithPolicyBuildErrors(t *testing.T) {
 			name: "default value of the wrong type",
 			spec: PipelineSpec{
 				Steps:    []Step{WithPolicy(writeAmount("a", 1), StepPolicy{OnError: OnErrorSkip})},
-				Defaults: []KeyDefault{{Key: amountKey.Ref(), Value: "many"}},
+				Defaults: []Default{{Key: amountKey.Ref(), Value: "many"}},
 			},
 			wantErr: `default for "amount": state key "amount": decode as int: ` +
 				`json: cannot unmarshal string into Go value of type int`,
@@ -591,25 +593,26 @@ func TestWithPolicyBuildErrors(t *testing.T) {
 					NewStep("a", nil, refs(Key[validatedObligation]{Name: "obligation"}.Ref()), nil),
 					StepPolicy{OnError: OnErrorSkip},
 				)},
-				Defaults: []KeyDefault{
+				Defaults: []Default{
 					DefaultValue(Key[validatedObligation]{Name: "obligation"}, validatedObligation{}),
 				},
 			},
 			wantErr: `default for "obligation": state key "obligation": currency is required`,
 		},
 		{
+			// v0.9.0: a default is used by any step that reads or writes its key.
 			name: "unused default",
 			spec: PipelineSpec{
 				Steps:    []Step{writeAmount("a", 1)},
-				Defaults: []KeyDefault{DefaultValue(amountKey, 1)},
+				Defaults: []Default{DefaultValue(notesKey, nil)},
 			},
-			wantErr: `default for "amount" is unused: no step that skips on error writes it`,
+			wantErr: `default for "notes" is unused: no step reads or writes it`,
 		},
 		{
 			name: "default type differs from the writer",
 			spec: PipelineSpec{
 				Steps:    []Step{WithPolicy(writeAmount("a", 1), StepPolicy{OnError: OnErrorSkip})},
-				Defaults: []KeyDefault{DefaultValue(Key[float64]{Name: "amount"}, 1)},
+				Defaults: []Default{DefaultValue(Key[float64]{Name: "amount"}, 1)},
 			},
 			wantErr: `default for "amount" has type float64, but step "a" writes it as int`,
 		},
