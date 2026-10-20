@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"maps"
 	"sync"
@@ -38,19 +37,23 @@ func (fn predictHostInvokerFunc) GeneratePredict(
 func decodePipelineRunRequest(payloadJSON string) (pipelineRunRequest, error) {
 	var request pipelineRunRequest
 	if err := decodeObject(payloadJSON, &request); err != nil {
-		return request, fmt.Errorf("pipeline.run payload: %w", err)
+		return request, fmt.Errorf("%s payload: %w", pipelineRunOperation, err)
 	}
 	if request.Program == nil {
-		return request, errors.New("pipeline.run payload: program is required")
+		return request, fmt.Errorf("%s payload: program is required", pipelineRunOperation)
 	}
 	if compileProgramKind(request.Program.Kind) != "pipeline" {
-		return request, fmt.Errorf("pipeline.run program kind %q is unsupported; use pipeline", request.Program.Kind)
+		return request, fmt.Errorf(
+			"%s program kind %q is unsupported; use pipeline",
+			pipelineRunOperation,
+			request.Program.Kind,
+		)
 	}
 	if err := validateCompileProgram(request.Program); err != nil {
 		return request, err
 	}
 	if request.Inputs == nil {
-		return request, errors.New("pipeline.run payload: inputs must be a JSON object")
+		return request, fmt.Errorf("%s payload: inputs must be a JSON object", pipelineRunOperation)
 	}
 	return request, nil
 }
@@ -66,7 +69,7 @@ func runCompiledPipeline(
 	invoker predictHostInvoker,
 ) (predictCompleteValue, error) {
 	if invoker == nil {
-		return predictCompleteValue{}, errors.New("pipeline.run host model is required")
+		return predictCompleteValue{}, fmt.Errorf("%s host model is required", pipelineRunOperation)
 	}
 	request, err := decodePipelineRunRequest(payloadJSON)
 	if err != nil {
