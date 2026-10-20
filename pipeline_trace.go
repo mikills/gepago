@@ -66,7 +66,9 @@ type StepTrace struct {
 	// otherwise, for the executions nested in them too. The executions of different lanes of a
 	// Parallel ran side by side, so they may have started in any order.
 	Lane string `json:"lane,omitempty"`
-	// Attributes are the execution's, as StepStartedEvent reported them, such as its "visit".
+	// Attributes are the execution's, as StepStartedEvent reported them, such as its "visit" and
+	// a Map element's "index", and once it has finished as StepFinishedEvent did, with a Map's
+	// "failed".
 	Attributes map[string]int `json:"attributes,omitempty"`
 	// Transition is the transition the run took after this execution, the last of a top-level
 	// step's visit, as TransitionTakenEvent reported it.

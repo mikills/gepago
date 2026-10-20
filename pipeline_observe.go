@@ -33,10 +33,13 @@ import (
 //   - Every execution emits StepStarted and later StepFinished with the same span.
 //   - A top-level step finishes before the next one starts, and a top-level step a transition
 //     skips over emits nothing (see Transition). An execution nested in a composite step (a
-//     Parallel, or the fallback step of an OnErrorFallback policy nested in one) starts after
-//     the composite starts and finishes before it finishes.
+//     Parallel, an element of a Map, or the fallback step of an OnErrorFallback policy nested in
+//     one) starts after the composite starts and finishes before it finishes.
 //   - The attempts of a step follow each other in order. A skip, or the fallback step of an
 //     OnErrorFallback policy, follows the step's last failed attempt.
+//   - The elements of a Map start in input order. With a MaxConcurrency of one or zero each
+//     finishes before the next starts; above one, the events of elements that run side by side
+//     interleave.
 //   - A pipeline run by a step, through NewProgramStep or a step that runs it with its
 //     context, joins the observation of the run: its RunStarted and RunFinished come between
 //     that step's StepStarted and StepFinished, and its run span's parent is the step's span.
@@ -45,12 +48,12 @@ import (
 //     observers, so the pipelines nested in it redact their events with its Redactor too (see
 //     Redactor); their run spans then have the span of a step no observer saw as their parent.
 //
-// Under Parallel the events of steps that run side by side interleave, but the observer and
-// redactor calls of one observed run, the runs nested in it included, are serialised: no two of
-// them run at once, and every observer of the run sees its events in the same order. Calls are
-// synchronous, so an observer that blocks stalls the run, and it must not wait for another step
-// of the same run. Separate top-level runs call a shared observer concurrently, even when they
-// share a TraceID because their callers gave them the same RunContext, so an observer of a
+// Under Parallel and Map the events of steps that run side by side interleave, but the observer
+// and redactor calls of one observed run, the runs nested in it included, are serialised: no two
+// of them run at once, and every observer of the run sees its events in the same order. Calls
+// are synchronous, so an observer that blocks stalls the run, and it must not wait for another
+// step of the same run. Separate top-level runs call a shared observer concurrently, even when
+// they share a TraceID because their callers gave them the same RunContext, so an observer of a
 // pipeline that runs concurrently must be safe for concurrent use.
 //
 // Observers are called in the order of PipelineSpec.Observers. An observer of a comparable
@@ -167,7 +170,9 @@ type StepStartedEvent struct {
 	// Parallel run side by side, so they may start in any order.
 	Lane string
 	// Attributes describe where the execution runs. "visit" numbers, from one, the visits of the
-	// top-level step it belongs to: a rewind visits a step again (see Transition).
+	// top-level step it belongs to: a rewind visits a step again (see Transition). "index" is set
+	// for the executions of an element of a Map, those nested in them included, to the element's
+	// index in the list, from zero.
 	Attributes map[string]int
 }
 
@@ -202,7 +207,8 @@ type StepFinishedEvent struct {
 	// Skipped reports a step that skipped on error under OnErrorSkip: the step did not run
 	// again and wrote nothing.
 	Skipped bool
-	// Attributes are those StepStarted reported.
+	// Attributes are those StepStarted reported, and for a Map or MapCollect also "failed", the
+	// number of its elements that failed.
 	Attributes map[string]int
 	// ToolCalls holds the tool calls the execution made, through the run's ToolSession or any
 	// other, such as an agent's, in the order they finished, after redaction (see Redactor). The
@@ -518,7 +524,7 @@ func observeStep(ctx context.Context, node *stepNode, attempt, visit int, values
 		}
 		lane.ctx = ctx
 		lane.reads = lane.run.redactValues(reads)
-		lane.attributes = visitAttributes(visit)
+		lane.attributes = executionAttributes(ctx, visit)
 		event := StepStartedEvent{
 			Span:       lane.span,
 			RunContext: lane.run.runContext,
@@ -569,6 +575,11 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 			}
 		}
 		toolCalls := run.redactToolCalls(outcome.ToolCalls)
+		attributes := lane.attributes
+		if len(outcome.Attributes) > 0 {
+			attributes = maps.Clone(attributes)
+			maps.Copy(attributes, outcome.Attributes)
+		}
 		event := StepFinishedEvent{
 			RunContext: run.runContext,
 			Step:       lane.step,
@@ -581,7 +592,7 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 			Reads:      lane.reads,
 			Cached:     outcome.Cached,
 			Skipped:    outcome.Skipped,
-			Attributes: lane.attributes,
+			Attributes: attributes,
 		}
 		event.ToolCalls = run.scrubToolCalls(toolCalls)
 		event.Err = run.redactError(outcome.Err)

@@ -35,7 +35,8 @@ type stepCacheKey struct {
 // executions in the run from one. Usage is what the execution's model calls recorded, nested
 // steps included, and Unbudgeted what RecordUnbudgetedUsage recorded. Err is the step's own
 // error, before any enclosing step wraps it. ToolCalls holds the tool calls the execution made
-// itself, not those of the executions nested in it.
+// itself, not those of the executions nested in it. Attributes holds what the step reported
+// about its execution, such as a Map's failed elements.
 type stepOutcome struct {
 	Step       string
 	Attempt    int
@@ -46,6 +47,7 @@ type stepOutcome struct {
 	Skipped    bool
 	Err        error
 	ToolCalls  []ToolCallRecord
+	Attributes map[string]int
 }
 
 func newPipelineRun(optional map[string]map[string]bool) *pipelineRun {
@@ -334,9 +336,9 @@ func runNode(
 	}
 	var scope *stepScope
 	if !isWrapper(node.step) {
-		var finish func(stepResult, error, []stateWrite)
+		var finish func(stepResult, error, *stepScope)
 		ctx, finish = beginExecution(ctx, node, values)
-		defer func() { finish(result, err, scope.attempted()) }()
+		defer func() { finish(result, err, scope) }()
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -454,12 +456,14 @@ func (h *finishHold) release(err error) bool {
 // beginExecution starts one execution of node over values, the state its view reads: it
 // numbers the attempt, reports the start to the run's observers, opens a usage frame, which also
 // collects the execution's tool calls, and returns a function that records the outcome when the
-// execution ends, given the values the step wrote or tried to write. An execution directly
-// inside a top-level wrapper reports a success through the wrapper's hold (see finishHold); the
-// executions inside it report their own.
+// execution ends, given the step's scope, which holds the values the step wrote or tried to
+// write and the attributes it reported. An execution directly inside a top-level wrapper
+// reports a success through the wrapper's hold (see finishHold); the executions inside it
+// report their own. An execution that an element of a Map runs itself adds its usage to the
+// element's when it ends, whether or not a hold delays its report, so the usage counts once.
 func beginExecution(ctx context.Context, node *stepNode, values map[string]any) (
 	context.Context,
-	func(stepResult, error, []stateWrite),
+	func(stepResult, error, *stepScope),
 ) {
 	run := pipelineRunFrom(ctx)
 	attempt := run.nextAttempt(node.name)
@@ -469,10 +473,12 @@ func beginExecution(ctx context.Context, node *stepNode, values map[string]any) 
 		ctx = context.WithValue(ctx, finishHoldKey{}, (*finishHold)(nil))
 	}
 	ctx, observed := observeStep(ctx, node, attempt, visitFrom(ctx), values)
+	ctx, element := claimElement(ctx)
 	ctx, frame, release := usageFrameFrom(ctx).enterStep(ctx, node.name)
 	start := time.Now()
-	return ctx, func(result stepResult, err error, attempted []stateWrite) {
+	return ctx, func(result stepResult, err error, scope *stepScope) {
 		release()
+		attempted := scope.attempted()
 		outcome := stepOutcome{
 			Step:       node.name,
 			Attempt:    attempt,
@@ -481,7 +487,9 @@ func beginExecution(ctx context.Context, node *stepNode, values map[string]any) 
 			Unbudgeted: frame.unbudgetedTotal(),
 			Err:        err,
 			ToolCalls:  frame.toolCallRecords(),
+			Attributes: scope.reported(),
 		}
+		element.add(outcome.Usage)
 		hold.finish(outcome, result, func(outcome stepOutcome, result stepResult) {
 			run.record(outcome)
 			capture.offerStep(attempted, outcome.Err)

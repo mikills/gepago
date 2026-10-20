@@ -10,7 +10,8 @@ import (
 // the executions that contain it, from the top-level step down through composite steps and
 // nested pipelines, and its own, joined with '.'. It is the path TraceDatasetBuilder gives an
 // execution of a PipelineTrace, so a step "summarise" in a Parallel "fan" has the path
-// "fan.summarise". A WithPolicy, WithCache or WithAmendable wrapper adds no segment of its own,
+// "fan.summarise", as has every element of a Map "fan" whose body is "summarise". A WithPolicy,
+// WithCache or WithAmendable wrapper adds no segment of its own,
 // since it shares the name of the step it wraps. It returns false outside a step execution of
 // a pipeline run, in the context an observer receives, and for a nil ctx.
 func StepPathFrom(ctx context.Context) (string, bool) {

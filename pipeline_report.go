@@ -42,12 +42,13 @@ func WriteHTMLRunReport(path string, trace PipelineTrace, options HTMLReportOpti
 // HTMLRunReport renders a self-contained HTML report of one pipeline run, such as a trace from
 // a RecordingObserver: a summary of the run with its run context (run id, parent run id, trace
 // id and attributes, as redacted when the run's events carried them), then every step
-// execution in the order it started with its visit, duration, usage, unbudgeted usage when it
-// has any, reads, writes, tool calls, error, a rejected rewind and the transition taken after
-// it, executions nested in a composite step or a nested
-// pipeline shown inside the execution that ran them. Every value and error is escaped. Values are shown as JSON, indented when it
-// nests no deeper than 32 levels and is no larger than 64 KiB, and compact otherwise, so the
-// report grows linearly with the trace.
+// execution in the order it started with its visit, the index of the Map element it ran for,
+// the number of a Map's elements that failed, duration, usage, unbudgeted usage when it has
+// any, reads, writes, tool calls, error, a rejected rewind and the transition taken after it,
+// executions nested in a composite step or a nested pipeline shown inside the execution that ran
+// them. Every value and error is escaped. Values are shown as JSON, indented when it nests no
+// deeper than 32 levels and is no larger than 64 KiB, and compact otherwise, so the report grows
+// linearly with the trace.
 func HTMLRunReport(trace PipelineTrace, options HTMLReportOptions) (string, error) {
 	title := strings.TrimSpace(options.Title)
 	if title == "" {
@@ -110,6 +111,16 @@ func reportJSON(data []byte) string {
 	return out.String()
 }
 
+// reportElement names the element of a Map an execution ran for, from its attributes, or
+// returns "" for an execution of no element.
+func reportElement(attributes map[string]int) string {
+	index, ok := attributes["index"]
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf(" · element %d", index)
+}
+
 // reportValues renders values as JSON, without escaping HTML, which the template escapes,
 // indented as reportJSON indents it.
 func reportValues(values map[string]any) string {
@@ -149,18 +160,20 @@ func jsonDepth(data []byte) int {
 }
 
 var runReportTemplate = template.Must(template.New("gepa-run-report").Funcs(template.FuncMap{
-	"values": reportValues,
-	"json":   reportJSON,
-	"bytes":  func(text string) []byte { return []byte(text) },
-	"runID":  traceRunID,
-	"tokens": usageTokens,
+	"values":  reportValues,
+	"json":    reportJSON,
+	"bytes":   func(text string) []byte { return []byte(text) },
+	"runID":   traceRunID,
+	"tokens":  usageTokens,
+	"element": reportElement,
 }).Parse(`{{define "steps"}}
 <ol class="steps">
 {{range .}}
 <li class="step{{if or .Failed .Err}} failed{{end}}">
 <div class="step-head">
 <strong>{{.Step}}</strong>
-<span class="muted">attempt {{.Attempt}}{{with index .Attributes "visit"}} · visit {{.}}{{end}}</span>
+<span class="muted">attempt {{.Attempt}}{{with index .Attributes "visit"}} · visit {{.}}{{end}}
+{{- element .Attributes}}{{with index .Attributes "failed"}} · {{.}} failed{{end}}</span>
 {{if .Cached}}<span class="badge">cached</span>{{end}}
 {{if .Skipped}}<span class="badge">skipped</span>{{end}}
 {{if .RewindRejected}}<span class="badge">rewind rejected</span>{{end}}

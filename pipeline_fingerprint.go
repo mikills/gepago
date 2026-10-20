@@ -26,8 +26,10 @@ const pipelineFingerprintVersion = 1
 //   - the top-level steps, in order;
 //   - each step's name and its reads and writes, by name and type, for nested steps too;
 //   - the structure of composite steps: the steps of a Parallel and the fallback step of a
-//     WithPolicy, and the labels of a Branch's arms and the roles of a Fallback's steps, which
-//     the steps Branch and Fallback add record;
+//     WithPolicy, the labels of a Branch's arms and the roles of a Fallback's steps, which the
+//     steps Branch and Fallback add record, and the body of a Map or MapCollect, which of its
+//     reads holds the items, its item key by name and type, its results key, and its
+//     MapOptions;
 //   - for a NewProgramStep whose programme is a Fingerprinter, such as a nested Pipeline, that
 //     programme's fingerprint;
 //   - the transitions, in order, by From, To, OnError and whether When, Amend and Accept are
@@ -107,7 +109,7 @@ type keyShape struct {
 // stepShape is the shape of one step. Kind is "step" for a step that is not a composite;
 // Program is the fingerprint of a Fingerprinter programme behind NewProgramStep; Fallbacks
 // holds the fallback steps of the policies wrapping the step, innermost first; Amendable holds
-// the keys WithAmendable declares.
+// the keys WithAmendable declares; Map holds what a Map or MapCollect adds to its body.
 type stepShape struct {
 	Kind      string       `json:"kind"`
 	Name      string       `json:"name"`
@@ -117,6 +119,17 @@ type stepShape struct {
 	Children  []childShape `json:"children,omitempty"`
 	Fallbacks []stepShape  `json:"fallbacks,omitempty"`
 	Amendable []keyShape   `json:"amendable,omitempty"`
+	Map       *mapShape    `json:"map,omitempty"`
+}
+
+// mapShape is the shape a Map or MapCollect adds to its body: the read that holds the items,
+// the item key, the results key and the options.
+type mapShape struct {
+	Items          string   `json:"items"`
+	Item           keyShape `json:"item"`
+	Results        string   `json:"results"`
+	MaxConcurrency int      `json:"max_concurrency,omitempty"`
+	MaxItems       int      `json:"max_items,omitempty"`
 }
 
 type childShape struct {
@@ -174,6 +187,19 @@ func shapeOf(node *stepNode) stepShape {
 			{Label: "primary", Step: stepShape{Kind: "step", Name: s.primary.name}},
 			{Label: "secondary", Step: stepShape{Kind: "step", Name: s.secondary.name}},
 		}
+	case *mapStep:
+		shape.Kind = "map"
+		if s.collect {
+			shape.Kind = "map collect"
+		}
+		shape.Map = &mapShape{
+			Items:          s.items.Name,
+			Item:           keyShape{Name: s.item.Name, Type: typeIdentity(s.item.Type)},
+			Results:        s.results.Name,
+			MaxConcurrency: s.opts.MaxConcurrency,
+			MaxItems:       s.opts.MaxItems,
+		}
+		shape.Children = []childShape{{Label: "body", Step: shapeOf(s.body)}}
 	case programStep:
 		shape.Program = programFingerprint(s.program)
 	case compositeStep:

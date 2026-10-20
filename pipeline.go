@@ -363,7 +363,7 @@ type PipelineSpec struct {
 //
 // A Pipeline is safe for concurrent runs: each run has its own State, budget, step cache and
 // RunContext, which its steps find with RunContextFrom. Steps shared between concurrent runs, or
-// run side by side by Parallel, must themselves be safe for concurrent use.
+// run side by side by Parallel or Map, must themselves be safe for concurrent use.
 type Pipeline struct {
 	inputs           []KeyRef
 	inputTypes       map[string]reflect.Type
@@ -412,9 +412,10 @@ func (s keySource) describe(key string) string {
 // that always writes, and every read must be guaranteed. Build makes one pass over the
 // transitions and then one over the steps; it never enumerates paths.
 //
-// Steps nested in WithPolicy, WithCache, WithAmendable and Parallel are checked by the same
-// rules against the keys available before the top-level step that contains them, and every
-// step name, nested ones included, must be unique. Each write of a step whose policy skips on
+// Steps nested in WithPolicy, WithCache, WithAmendable, Parallel, Map and MapCollect are checked
+// by the same rules against the keys available before the top-level step that contains them,
+// a Map's body also seeing the Map's item (see Map), and every step name, nested ones included,
+// must be unique. Each write of a step whose policy skips on
 // error needs a default in Defaults or a later step that writes it, and no step may read such
 // a key between the skippable step and its next writer unless it has a default.
 //
@@ -547,9 +548,10 @@ func isNil(value any) bool {
 // state accumulated by the steps before it. Details holds diagnostics the step attached with
 // WithStepDetails; a step that panicked has the stack under "stack".
 //
-// When a step nested in a composite step (a Parallel or a policy fallback)
+// When a step nested in a composite step (a Parallel, a policy fallback or the body of a Map)
 // fails, the composite's StepError wraps a StepError for the nested step, so the message
-// names each step from the top-level one down and Details holds the innermost diagnostics.
+// names each step from the top-level one down, with a Map's element index between the two, and
+// Details holds the innermost diagnostics.
 //
 // Reads holds copies of the values of the step's declared reads that were in state when it
 // ran, for diagnosis and reflection; Error does not print them. A PipelineTrace and its run

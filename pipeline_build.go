@@ -333,6 +333,9 @@ func (b *pipelineBuilder) checkStep(node *stepNode, position stepPosition) error
 	if composite != nil && composite.wrapper() {
 		return b.checkWrapper(node, composite, position)
 	}
+	if m, ok := unwrapComposite(node.step).(*mapStep); ok {
+		return b.checkMap(node, m, position)
+	}
 	if err := validateStepName(node.name, position, b.names); err != nil {
 		return err
 	}
@@ -392,6 +395,82 @@ func (b *pipelineBuilder) checkWrapper(node *stepNode, composite compositeStep, 
 		return fmt.Errorf(
 			"pipeline step %q has amendable keys, but only a top-level step can be the target of a rewind",
 			node.name,
+		)
+	}
+	return nil
+}
+
+// checkMap checks a Map or MapCollect: its own settings, its body against it, the body as a
+// nested step that may also read the item, and the map's reads and writes as any step's. The
+// item is available only while the body is checked, since only the elements' views hold it.
+func (b *pipelineBuilder) checkMap(node *stepNode, m *mapStep, position stepPosition) error {
+	if err := validateStepName(node.name, position, b.names); err != nil {
+		return err
+	}
+	if err := validateStep(node); err != nil {
+		return err
+	}
+	body := m.body
+	if body.step != nil && body.readsErr == nil && body.writesErr == nil {
+		if err := m.checkBody(); err != nil {
+			return fmt.Errorf("pipeline step %q: %w", node.name, err)
+		}
+	}
+	if err := b.checkElementKeys(node.name, m); err != nil {
+		return err
+	}
+	skippable := len(b.skippable)
+	b.sources[m.item.Name] = keySource{typ: m.item.Type, step: node.name}
+	err := b.checkStep(body, stepPosition{parent: node.name, label: "body"})
+	delete(b.sources, m.item.Name)
+	if err != nil {
+		return err
+	}
+	if len(b.skippable) > skippable {
+		return fmt.Errorf(
+			"pipeline step %q: body %q skips on error, but a map body must write; use MapCollect to keep "+
+				"the elements that succeed",
+			node.name,
+			body.name,
+		)
+	}
+	if node.readsErr != nil {
+		return fmt.Errorf("pipeline step %q reads: %w", node.name, node.readsErr)
+	}
+	if err := b.checkReads(node); err != nil {
+		return err
+	}
+	return b.checkWrites(node)
+}
+
+// checkElementKeys refuses a map whose item or body write names a key already in state where
+// the map runs: a pipeline input, a key with a Default or one an earlier step writes. Neither
+// reaches the state, so each needs a key of its own.
+func (b *pipelineBuilder) checkElementKeys(mapName string, m *mapStep) error {
+	keys := []string{m.item.Name}
+	for _, key := range m.body.writes {
+		keys = append(keys, key.Name)
+	}
+	for i, key := range keys {
+		source, ok := b.sources[key]
+		if !ok {
+			continue
+		}
+		origin := source.describe(key)
+		if source.def && source.step == "" {
+			origin = fmt.Sprintf("%q has a Default", key)
+		}
+		role := "item key"
+		if i > 0 {
+			role = fmt.Sprintf("body %q writes", m.body.name)
+		}
+		return fmt.Errorf(
+			"pipeline step %q: %s %q, which is already in state (%s); it never reaches the state, so "+
+				"give it a key of its own",
+			mapName,
+			role,
+			key,
+			origin,
 		)
 	}
 	return nil

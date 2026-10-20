@@ -46,6 +46,29 @@ type stepScope struct {
 	err      error
 	// stage holds what the step stages for tools until it commits.
 	stage *stepStage
+	// attributes holds what the step reports about its execution, which its StepFinished adds
+	// to the Attributes StepStarted reported, such as the elements of a Map that failed.
+	attributes map[string]int
+}
+
+// report sets an attribute of the step's execution. Outside a step there is nothing to report
+// to.
+func (s *stepScope) report(name string, value int) {
+	if s == nil {
+		return
+	}
+	if s.attributes == nil {
+		s.attributes = map[string]int{}
+	}
+	s.attributes[name] = value
+}
+
+// reported returns a copy of the attributes the step reported, or nil when there are none.
+func (s *stepScope) reported() map[string]int {
+	if s == nil || len(s.attributes) == 0 {
+		return nil
+	}
+	return maps.Clone(s.attributes)
 }
 
 // stateWrite is a value written under a state key.

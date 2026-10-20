@@ -745,6 +745,26 @@ func (r *runObservation) redactError(err error) error {
 	return WithErrorKind(redacted, ErrorKindOf(err))
 }
 
+// eventErrorText returns the message of err, a step's error, as the events of the run in ctx
+// carry it, with the text the run's redactors removed so far taken out; outside an observed run
+// it is err's own message.
+func eventErrorText(ctx context.Context, err error) string {
+	scope := observeScopeFrom(ctx)
+	if scope == nil {
+		return err.Error()
+	}
+	run := scope.run
+	if run == nil {
+		run = scope.recording
+	}
+	if run == nil {
+		return err.Error()
+	}
+	run.trace.mu.Lock()
+	defer run.trace.mu.Unlock()
+	return run.redactError(err).Error()
+}
+
 // redacting reports whether the run's events are redacted: the run or one around it has a
 // Redactor, or a run of its trace has already redacted a value. The caller holds the trace
 // lock.
