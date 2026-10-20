@@ -1,6 +1,6 @@
 # v0.8.0 progress
 
-Status: all packages done; final `make verify` and final review pass at 68b712a. Not pushed, no PR, not tagged.
+Status: all packages done; version and dependency bumps done; final `make verify` passes at c943353. Not pushed, no PR, not tagged.
 
 Branch `feat/v0.8.0-flow-runtime`, started from `1e3cc7b` (v0.7.0).
 
@@ -12,6 +12,7 @@ Branch `feat/v0.8.0-flow-runtime`, started from `1e3cc7b` (v0.7.0).
 | B. Structured output | done | 6eb19d9, 59c26b8, 04521cf, fb9e31a, 096233f, 3ff9b8c, 75803f9, c468be7 | 1: 11, 2: 3, 3: 3, 4: 2 + deferred, 5: 2 + perf, 6: 1, 7: 2, all fixed; 8: none | none |
 | C. Pipeline control flow and policy | done (merged in 1306f2b) | 8a69ad8, 9b95e07, c76a7b9, 82e32ca, 3c5a14b, merge 1306f2b | 1: 5, 2: 3, 3: 1, 4: 1 finding, all fixed; 5: none | none |
 | Final review (v0.7.0..68b712a) | done | 68b712a | 1: 1 low–medium (TS artefact helpers dropped fingerprint) + 1 nit + spelling, fixed; 2: none | none |
+| Version and dependency bumps | done | f023769, 657326c, c943353 | 1: 6 (Claude SDK tracing on by default, undocumented release order, redirect error kind, thinking tokens, go.mod tidiness accepted, dependency note), fixed; 2: 1 (CHANGELOG module list), fixed; 3: none | none |
 | I. Tools | done (merged in 19cc05e) | 3344220, acc200b, 58cf7ec, a696312, merge 19cc05e | 1: 8, 2: 3, all fixed; 3: none | none |
 | D. Observability | done (merged in fdaa382, 7e33dda) | 5351b86, 40af86e, 0e0d914, bbeaf71, 040c8a6, 72d5707, 0459b30 (worktree branch) | 1: 4 + D2 partial, 2: 4, 3: 4 + 1 decision, 4: 2, 5: 2, 6: 1, all fixed; 7: none | none |
 | D/F/I integration | done | merge fdaa382, 6bd1530, merge 7e33dda, 108cc8d, 8cf4f9d, 773ba2d | 1: 2, 2: 3, 3: 1, all fixed; 4: none | none |
@@ -60,6 +61,7 @@ Branch `feat/v0.8.0-flow-runtime`, started from `1e3cc7b` (v0.7.0).
 | clean worktree: full set | pass | ce202ba (G) |
 | clean worktree: `npm ci`, then `make verify` (fmt, test, vet, staticcheck, diago, wasm-test; both modules), then `git diff --exit-code` | pass, no formatting diff (diago 6/6 checks per module, TS 19/19) | c55c605 |
 | clean worktree: `npm ci`, then `make verify`, then `git diff --exit-code` | pass, no formatting diff (diago 6/6 per module, TS 22/22) | 68b712a (final) |
+| clean worktree: `npm ci`, then `make verify`, then `git diff --exit-code` | pass, no formatting diff (diago 6/6 per module, TS 24/24) | f023769, 657326c, c943353 (final) |
 | clean worktree: same plus `npm ci`, `make diago`, `make wasm-test` | pass | 6eb19d9 |
 
 ## Decisions
@@ -107,6 +109,9 @@ Branch `feat/v0.8.0-flow-runtime`, started from `1e3cc7b` (v0.7.0).
   step's `RunContext` through ctx but agent traces do not carry it (final review, not counted).
 - `RetryingLanguageModel` is not on the CHANGELOG unkeyed-literal list: it has had an unexported `mu`
   field since v0.7, so unkeyed literals were never possible outside the package (H review round 2).
+- Dependencies move to the newest releases that support Go 1.25 (CI); several next releases need Go 1.26.
+  `a-h/templ` and `golang.org/x/sync` stay as direct requirements for the gitignored local kiln.
+  The Claude provider turns off anthropic-sdk-go's default OpenTelemetry tracing (`Config.OpenTelemetry` opts in).
 - `programs/kiln` and `programs/documentscout` are gitignored local projects inside the root
   module. They are not part of the repo; the final `make verify` runs in a clean worktree,
   as CI does.
@@ -214,4 +219,4 @@ A (model call contract):
 None in the release. Follow-ups outside it:
 
 - `make fmt` and `make verify` fail in the main checkout because the gitignored kiln and documentscout no longer compile against the new API. CI and the clean-worktree checks are unaffected.
-- crucible's go.mod requires gepago v0.6.0; bump it after the root v0.8.0 tag.
+- Release order (CONTRIBUTING.md): tag v0.8.0; in programs/crucible run `GOWORK=off go mod tidy`, commit go.sum and drop the go.work replace; then tag programs/crucible.
