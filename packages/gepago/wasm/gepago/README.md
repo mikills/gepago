@@ -267,9 +267,11 @@ OpenAI and Claude model helpers enforce it when `strict` is true. Requests are t
 ledger.
 
 The wrapper validates inputs at the JSON boundary, converts model strings to
-`{ text }`, rejects Go error envelopes, and cancels the module-owned job when a
-model callback or completion fails. `close()` also requests cancellation for
-pending compile jobs.
+`{ text }` and rejects Go error envelopes. A model callback that throws or
+rejects fails that model call, in Node as in the browser, so `compile` and a
+pipeline's `runCompiled` reject with the failing step's error and the host's
+message rather than a cancelled job. `close()` requests cancellation for
+pending compile and pipeline jobs.
 
 `runCompiled(programConfig, candidate, inputs, model)` accepts wire `predict`,
 `chainOfThought`, and `pipeline` programs. COT programs add the reasoning output

@@ -492,6 +492,49 @@ test("loads generated Go WASM and exposes deterministic APIs", async () => {
     assert.ok(pipelineRequests[0].prompt.includes('"text": "great"'));
     assert.ok(!pipelineRequests[0].prompt.includes("not read"));
 
+    // a model callback that fails, by throwing or by rejecting, returns its error to Go as
+    // that call's error, so the step fails with the host's message and the job is not
+    // reported as cancelled.
+    const hostFailure = /pipeline step "extract": .*host model exploded/;
+    const failingModels = [
+      (): never => {
+        throw new Error("host model exploded");
+      },
+      async (): Promise<never> => {
+        throw new Error("host model exploded");
+      },
+    ];
+    for (const failingModel of failingModels) {
+      await assert.rejects(
+        gepago.runCompiled(
+          pipelineProgram,
+          pipelineCompiled.candidate,
+          { text: "great" },
+          failingModel,
+        ),
+        hostFailure,
+      );
+      await assert.rejects(
+        gepago.compile(
+          {
+            program: pipelineProgram,
+            trainset: [
+              {
+                id: "pipeline",
+                input: { text: "great" },
+                expected: { label: "positive" },
+              },
+            ],
+            metric: { kind: "exactMatch", fields: ["label"] },
+            maxMetricCalls: 1,
+            seed: 3,
+          },
+          failingModel,
+        ),
+        hostFailure,
+      );
+    }
+
     await assert.rejects(
       gepago.compile(
         {
@@ -849,7 +892,7 @@ test("loads generated Go WASM and exposes deterministic APIs", async () => {
       api.compile(compileConfig, async () => {
         throw new Error("compile model failed");
       }),
-      /compile model failed|model callback failed|Promise rejected|cancelled/,
+      /compile model failed/,
     );
     await assert.rejects(
       api.compile({ ...compileConfig, trainset: [] }, () => "never"),

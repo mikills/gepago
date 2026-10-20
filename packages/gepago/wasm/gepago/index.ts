@@ -2071,7 +2071,9 @@ export async function createGepagoWasm(
     }
 
     // runModelJob runs an async Go job whose model calls go to modelCallback and resolves with
-    // its result as parseResult reads it. A failed model callback cancels the job.
+    // its result as parseResult reads it. A model callback that fails returns its error to Go
+    // as that call's error, as in the browser runtime, so the job reports the host's message
+    // and keeps the usage already spent; only cancel and close cancel the job.
     async function runModelJob<T>(
       goOperation: string,
       operation: string,
@@ -2081,17 +2083,6 @@ export async function createGepagoWasm(
     ): Promise<T> {
       let jobID: string | undefined;
       let settled = false;
-      const modelFunction = async (requestJSON: string): Promise<unknown> => {
-        try {
-          return await modelCallback(requestJSON);
-        } catch (error) {
-          // The Go bridge turns callback failures into completion errors. Cancel
-          // immediately as well, so a pending model Promise cannot keep the
-          // job alive after a host callback failure.
-          cancelAsyncJob(jobID ?? "");
-          throw error;
-        }
-      };
       const completion = new Promise<T>((resolve, reject) => {
         const onComplete = (
           completedJobID: string,
@@ -2120,7 +2111,7 @@ export async function createGepagoWasm(
         };
         try {
           jobID = unwrapRuntimeCall(
-            startFunction(goOperation, payloadJSON, modelFunction, onComplete),
+            startFunction(goOperation, payloadJSON, modelCallback, onComplete),
             operation,
           );
           if (typeof jobID !== "string" || jobID === "") {

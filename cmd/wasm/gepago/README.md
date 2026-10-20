@@ -105,7 +105,10 @@ Gepago's structured `NewIOExample` API.
 
 `gepagoWasm.cancel(job_id)` requests cancellation and returns `true`; the job
 then completes with an error envelope when its goroutine observes cancellation.
-The bridge waits for a Promise only on a worker goroutine, so the JavaScript
+A model function that throws, or whose Promise rejects, fails only that model
+call with the host's message: the job is not cancelled, and a `compile` or
+`pipeline.run` job completes with that error, named by its step for a
+pipeline. The bridge waits for a Promise only on a worker goroutine, so the JavaScript
 event loop is not blocked by model calls. An arbitrary Promise cannot be
 force-cancelled: if a host callback itself blocks synchronously or never
 settles, cleanup is necessarily best effort. A settled Promise releases its Go
