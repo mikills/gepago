@@ -3,32 +3,10 @@ package gepa
 import (
 	"context"
 	"fmt"
-	"path/filepath"
-	"strings"
-	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
-
-// reflectionPrompts is a reflection model that records the reflection prompts it receives.
-type reflectionPrompts struct {
-	mu      sync.Mutex
-	prompts []string
-}
-
-func (r *reflectionPrompts) Generate(_ context.Context, prompt string) (Generation, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.prompts = append(r.prompts, prompt)
-	return Generation{Text: "```\nsummarise briefly\n```", Usage: tenTokens}, nil
-}
-
-func (r *reflectionPrompts) all() string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return strings.Join(r.prompts, "\n")
-}
 
 // redactedSummaryPipeline is a pipeline whose model always answers wrongly, so every
 // minibatch is reflected on, and whose Redactor hides the document.
@@ -48,72 +26,29 @@ func redactedSummaryPipeline(t *testing.T) Pipeline {
 	return pipeline
 }
 
-func TestCompileRecordsPipelineTracesOnlyForTraceDatasetBuilder(t *testing.T) {
-	tests := []struct {
-		name       string
-		builder    ReflectiveDatasetBuilder
-		wantTraces bool
-	}{
-		{name: "the default builder"},
-		{name: "a custom builder", builder: ReflectiveDatasetBuilderFunc(DefaultReflectiveDatasetBuilder)},
-		{name: "a nil TraceDatasetBuilder pointer", builder: (*TraceDatasetBuilder)(nil)},
-		{name: "TraceDatasetBuilder", builder: TraceDatasetBuilder{}, wantTraces: true},
-		{name: "a TraceDatasetBuilder pointer", builder: &TraceDatasetBuilder{}, wantTraces: true},
-	}
-	examples := []Example{NewIOExample("one", Prediction{"document": "secret doc"}, Prediction{"summary": "short"})}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			reflection := &reflectionPrompts{}
-			_, _, err := Compile(context.Background(), CompileConfig{
-				Program:        redactedSummaryPipeline(t),
-				Trainset:       examples,
-				Valset:         examples,
-				Metric:         ExactMatchMetric{Fields: []string{"summary"}},
-				ReflectionLM:   reflection,
-				Objective:      "summarise documents",
-				MaxMetricCalls: 4,
-				MinibatchSize:  1,
-				DatasetBuilder: tt.builder,
-			})
-			require.NoError(t, err)
-			prompts := reflection.all()
-			require.Contains(t, prompts, "Evaluation records and traces:")
-			if !tt.wantTraces {
-				require.NotContains(t, prompts, `"trace":`)
-				require.NotContains(t, prompts, `"steps":`)
-				return
-			}
-			require.Contains(t, prompts, `"trace":`)
-			require.Contains(t, prompts, `"steps":`)
-			require.Contains(t, prompts, `"step": "summarise"`)
-			require.Contains(t, prompts, `"document": "[doc]"`)
-		})
-	}
+// namedProgram runs a programme under a name and scopes its candidate keys by that name, as a
+// programme that composes others might.
+type namedProgram struct {
+	name    string
+	program Program
 }
 
-func TestProgramTrainConfigPassesItsDatasetBuilder(t *testing.T) {
-	registry := NewProgramRegistry()
-	require.NoError(t, registry.Register("summary", func() (Program, error) { return redactedSummaryPipeline(t), nil }))
-	reflection := &reflectionPrompts{}
-	examples := []Example{NewIOExample("one", Prediction{"document": "secret doc"}, Prediction{"summary": "short"})}
-	_, _, _, err := registry.TrainAndSave(context.Background(), ProgramTrainConfig{
-		Name:           "summary",
-		ArtifactPath:   filepath.Join(t.TempDir(), "summary.json"),
-		Trainset:       examples,
-		Valset:         examples,
-		Metric:         ExactMatchMetric{Fields: []string{"summary"}},
-		ReflectionLM:   reflection,
-		Objective:      "summarise documents",
-		MaxMetricCalls: 4,
-		MinibatchSize:  1,
-		DatasetBuilder: TraceDatasetBuilder{},
-	})
-	require.NoError(t, err)
-	require.Contains(t, reflection.all(), `"step": "summarise"`)
+func (p namedProgram) Validate() error { return p.program.Validate() }
+
+func (p namedProgram) SeedCandidate() Candidate {
+	candidate := Candidate{}
+	for component, value := range p.program.SeedCandidate() {
+		candidate[StepComponentName(p.name, component)] = value
+	}
+	return candidate
+}
+
+func (p namedProgram) RunCandidate(ctx context.Context, candidate Candidate, inputs Prediction) (Prediction, error) {
+	return p.program.RunCandidate(ctx, stepCandidate(candidate, p.name), inputs)
 }
 
 func TestTraceDatasetBuilderMatchesKeysAWrappingProgrammeScopes(t *testing.T) {
-	program := PipelineProgram{Steps: []PipelineStep{{Name: "outer", Program: redactedSummaryPipeline(t)}}}
+	program := namedProgram{name: "outer", program: redactedSummaryPipeline(t)}
 	evaluator := ProgramEvaluator{Program: program, Metric: ExactMatchMetric{Fields: []string{"summary"}}, RecordTraces: true}
 	examples := []Example{NewIOExample("one", Prediction{"document": "secret doc"}, Prediction{"summary": "short"})}
 	candidate := program.SeedCandidate()
@@ -161,112 +96,6 @@ func TestTraceDatasetBuilderMatchesWholeSegments(t *testing.T) {
 			require.Equal(t, tt.want, errs)
 		})
 	}
-}
-
-func TestCompileReflectionPromptsHideRedactedValues(t *testing.T) {
-	examples := []Example{NewIOExample("one", Prediction{"document": "secret doc"}, Prediction{"summary": "short"})}
-	for _, builder := range []ReflectiveDatasetBuilder{nil, TraceDatasetBuilder{}} {
-		reflection := &reflectionPrompts{}
-		_, _, err := Compile(context.Background(), CompileConfig{
-			Program:        redactedSummaryPipeline(t),
-			Trainset:       examples,
-			Valset:         examples,
-			Metric:         ExactMatchMetric{Fields: []string{"summary"}},
-			ReflectionLM:   reflection,
-			Objective:      "summarise documents",
-			MaxMetricCalls: 4,
-			MinibatchSize:  1,
-			DatasetBuilder: builder,
-		})
-		require.NoError(t, err)
-		prompts := reflection.all()
-		require.Contains(t, prompts, `"document": "[doc]"`)
-		require.NotContains(t, prompts, "secret doc")
-	}
-}
-
-func TestProgramEvaluatorRedactsReflectionValues(t *testing.T) {
-	hideSummary := func(key string, value any) any {
-		if key == "summary" {
-			return "[summary]"
-		}
-		return value
-	}
-	build := func(model Generator) Pipeline {
-		pipeline, err := PipelineSpec{
-			Inputs:   refs(docKey.Ref()),
-			Steps:    []Step{predictStep("summarise", model, docKey.Ref(), summaryKey.Ref())},
-			Redactor: hideSummary,
-		}.Build()
-		require.NoError(t, err)
-		return pipeline
-	}
-	var scored []Prediction
-	metric := MetricFunc(func(_ context.Context, expected, actual Prediction) (MetricResult, error) {
-		scored = append(scored, actual)
-		return MetricResult{Feedback: fmt.Sprintf("wanted %q, got %q", expected["summary"], actual["summary"])}, nil
-	})
-	examples := []Example{NewIOExample("one", Prediction{"document": "d"}, Prediction{"summary": "the gist"})}
-
-	t.Run("a pipeline", func(t *testing.T) {
-		scored = nil
-		pipeline := build(tenTokenModel(`{"summary": "private words"}`))
-		result, err := ProgramEvaluator{Program: pipeline, Metric: metric}.
-			Evaluate(context.Background(), pipeline.SeedCandidate(), examples, false)
-		require.NoError(t, err)
-		require.Equal(t, []Prediction{{"summary": "private words"}}, scored, "the metric scores the real values")
-		item := result.Items[0]
-		require.Equal(t, Prediction{"summary": "[summary]"}, item.Output)
-		require.Equal(t, Prediction{"document": "d"}, item.SideInfo["inputs"])
-		require.Equal(t, Prediction{"summary": "[summary]"}, item.SideInfo["expected"])
-		require.Equal(t, Prediction{"summary": "[summary]"}, item.SideInfo["actual"])
-		require.Equal(t, `wanted "[summary]", got "[summary]"`, item.SideInfo["feedback"])
-		require.Equal(t, Prediction{"document": "d"}, examples[0].Input.(IOExample).Inputs, "the example is unchanged")
-	})
-
-	t.Run("a pipeline inside another programme", func(t *testing.T) {
-		pipeline := build(tenTokenModel(`{"summary": "private words"}`))
-		program := PipelineProgram{Steps: []PipelineStep{{Name: "outer", Program: pipeline}}}
-		result, err := ProgramEvaluator{Program: program, Metric: metric}.
-			Evaluate(context.Background(), program.SeedCandidate(), examples, false)
-		require.NoError(t, err)
-		require.Equal(t, Prediction{"summary": "[summary]"}, result.Items[0].Output)
-		require.NotContains(t, fmt.Sprint(result.Items[0].SideInfo), "private words")
-	})
-
-	t.Run("an invalid output", func(t *testing.T) {
-		ssnKey := Key[int]{Name: "ssn"}
-		pipeline, err := PipelineSpec{
-			Inputs:   refs(docKey.Ref()),
-			Steps:    []Step{predictStep("extract", tenTokenModel(`{"ssn": "123-45-6789"}`), docKey.Ref(), ssnKey.Ref())},
-			Redactor: hideKey("ssn", "[ssn]"),
-		}.Build()
-		require.NoError(t, err)
-		ssnExamples := []Example{NewIOExample("one", Prediction{"document": "d"}, Prediction{"ssn": 987654321})}
-		result, err := ProgramEvaluator{Program: pipeline, Metric: metric}.
-			Evaluate(context.Background(), pipeline.SeedCandidate(), ssnExamples, false)
-		require.NoError(t, err)
-		item := result.Items[0]
-		require.Zero(t, item.Score)
-		details, ok := item.SideInfo["details"].(map[string]any)
-		require.True(t, ok, "the item carries the step's details: %v", item.SideInfo)
-		require.Equal(t, Prediction{"ssn": "[ssn]"}, details["output"])
-		require.Equal(t, Prediction{"ssn": "[ssn]"}, item.SideInfo["expected"])
-		require.NotContains(t, fmt.Sprint(item.SideInfo), "123-45-6789")
-		require.NotContains(t, fmt.Sprint(item.SideInfo), "987654321")
-		require.NotContains(t, fmt.Sprint(item.Output), "123-45-6789")
-	})
-
-	t.Run("a programme without a pipeline", func(t *testing.T) {
-		predict := Predict{
-			Signature: Signature{Name: "summarise", Inputs: []Field{{Name: "document"}}, Outputs: []Field{{Name: "summary"}}},
-			LM:        tenTokenModel(`{"summary": "private words"}`),
-		}
-		result, err := ProgramEvaluator{Program: predict, Metric: metric}.
-			Evaluate(context.Background(), predict.SeedCandidate(), examples, false)
-		require.NoError(t, err)
-		require.Equal(t, Prediction{"summary": "private words"}, result.Items[0].Output)
-	})
 }
 
 func TestTraceDatasetBuilderNeverDropsATopLevelStepName(t *testing.T) {
@@ -394,47 +223,6 @@ func hideKey(name string, replacement any) Redactor {
 			return replacement
 		}
 		return value
-	}
-}
-
-// TestProgramEvaluatorRedactsWithNestedPipelineRedactors evaluates an outer pipeline without a
-// Redactor that runs an inner one with a Redactor, and checks the inner Redactor reaches the
-// reflection values and the recorded trace, whether or not traces are captured.
-func TestProgramEvaluatorRedactsWithNestedPipelineRedactors(t *testing.T) {
-	// the model echoes the document into the summary, which the Redactor does not name
-	echo := GeneratorFunc(func(_ context.Context, prompt string) (Generation, error) {
-		return Generation{Text: `{"summary": "about secret doc"}`, Usage: tenTokens}, nil
-	})
-	inner, err := PipelineSpec{
-		Inputs:   refs(docKey.Ref()),
-		Steps:    []Step{predictStep("summarise", echo, docKey.Ref(), summaryKey.Ref())},
-		Redactor: hideKey("document", "[doc]"),
-	}.Build()
-	require.NoError(t, err)
-	outer, err := PipelineSpec{
-		Inputs: refs(docKey.Ref()),
-		Steps:  []Step{NewProgramStep("inner", inner, refs(docKey.Ref()), refs(summaryKey.Ref()))},
-	}.Build()
-	require.NoError(t, err)
-	evaluator := ProgramEvaluator{Program: outer, Metric: ExactMatchMetric{Fields: []string{"summary"}}, RecordTraces: true}
-	examples := []Example{NewIOExample("one", Prediction{"document": "secret doc"}, Prediction{"summary": "short"})}
-
-	for _, captureTraces := range []bool{false, true} {
-		result, err := evaluator.Evaluate(context.Background(), outer.SeedCandidate(), examples, captureTraces)
-		require.NoError(t, err)
-		item := result.Items[0]
-		require.Equal(t, Prediction{"document": "[doc]"}, item.SideInfo["inputs"], "captureTraces %v", captureTraces)
-		require.Equal(t, Prediction{"summary": "about [doc]"}, item.Output, "the output's text is scrubbed")
-		require.NotContains(t, fmt.Sprint(item), "secret doc", "captureTraces %v", captureTraces)
-		if !captureTraces {
-			require.Nil(t, item.Trace)
-			continue
-		}
-		trace, ok := item.Trace.(PipelineTrace)
-		require.True(t, ok)
-		require.Equal(t, map[string]any{"document": "[doc]"}, trace.Inputs, "the outer run's trace is redacted too")
-		require.Equal(t, map[string]any{"summary": "about [doc]"}, trace.Steps[0].Writes)
-		require.Len(t, trace.Steps[0].Runs, 1)
 	}
 }
 

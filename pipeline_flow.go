@@ -213,7 +213,7 @@ func (p *parallelStep) runCandidate(ctx context.Context, candidate Candidate, s 
 	var wg sync.WaitGroup
 	for i, node := range p.steps {
 		wg.Go(func() {
-			result, err := runChild(ctx, candidate, p.name, node, s.values)
+			result, err := runChild(withLane(ctx, node.name), candidate, p.name, node, s.values)
 			if err == nil {
 				results[i] = result
 				return

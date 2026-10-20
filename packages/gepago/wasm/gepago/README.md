@@ -267,16 +267,24 @@ OpenAI and Claude model helpers enforce it when `strict` is true. Requests are t
 ledger.
 
 The wrapper validates inputs at the JSON boundary, converts model strings to
-`{ text }`, rejects Go error envelopes, and cancels the module-owned job when a
-model callback or completion fails. `close()` also requests cancellation for
-pending compile jobs.
+`{ text }` and rejects Go error envelopes. A model callback that throws or
+rejects fails that model call, in Node as in the browser, so `compile` and a
+pipeline's `runCompiled` reject with the failing step's error and the host's
+message rather than a cancelled job. `close()` requests cancellation for
+pending compile and pipeline jobs.
 
 `runCompiled(programConfig, candidate, inputs, model)` accepts wire `predict`,
 `chainOfThought`, and `pipeline` programs. COT programs add the reasoning output
 and instruction once; compiled COT candidates are overlaid after that normalization.
-Pipeline candidates use scoped keys such as `extract.instruction`. Steps run
-sequentially through the async `predict` bridge, honoring each step's
-`inputKeys`, `outputPrefix`, and the pipeline's `returnAll` setting.
+Pipeline candidates use scoped keys such as `extract.instruction`; a component
+the candidate leaves out keeps its seed text. A pipeline runs in the Go module
+as the same typed `gepa.Pipeline` that `compile` evaluates, so `runCompiled`
+accepts and rejects the same programs and inputs and sends the same prompts:
+each step sees its `inputKeys`, or only its signature's inputs when it lists
+none, typed inputs are converted to their types, its outputs are stored under
+its `outputPrefix` (an optional output the reply leaves out holds its type's
+zero value), and the pipeline's `returnAll` setting picks the result. Model
+requests have the `predict` host request shape.
 
 ## Async Agents
 

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	gepa "github.com/mikills/gepago"
+	"github.com/mikills/gepago/gepatest"
 	"github.com/stretchr/testify/require"
 )
 
@@ -46,13 +47,6 @@ func orderRegistry(t *testing.T, calls *atomic.Int32) *gepa.ToolRegistry {
 	return registry
 }
 
-func callReply(id, name, arguments string) ChatResponse {
-	return ChatResponse{
-		Message:      Message{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: id, Name: name, Arguments: arguments}}},
-		FinishReason: FinishToolCalls,
-	}
-}
-
 func runAgent(t *testing.T, agent Agent, memory *Memory) (RunResult, error) {
 	t.Helper()
 	return agent.Run(context.Background(), RunRequest{Memory: memory, Messages: []Message{{Role: RoleUser, Content: "hi"}}})
@@ -60,11 +54,11 @@ func runAgent(t *testing.T, agent Agent, memory *Memory) (RunResult, error) {
 
 func TestAgentRunsRegistryTools(t *testing.T) {
 	calls := &atomic.Int32{}
-	client := &fakeChatClient{responses: []ChatResponse{
-		callReply("call-1", "lookup_order", `{"order_id":"A-1"}`),
-		callReply("call-2", "order_status", `{"order_id":"A-1"}`),
-		{Message: Message{Role: RoleAssistant, Content: "shipped"}, FinishReason: FinishStop},
-	}}
+	client := gepatest.NewFakeGenerator().Default(
+		gepatest.ToolCall("call-1", "lookup_order", `{"order_id":"A-1"}`),
+		gepatest.ToolCall("call-2", "order_status", `{"order_id":"A-1"}`),
+		gepatest.Text("shipped"),
+	)
 	agent := Agent{
 		Name:         "orders",
 		Client:       client,
@@ -78,10 +72,11 @@ func TestAgentRunsRegistryTools(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, "shipped", result.Final.Content)
-	require.Len(t, client.requests[0].Tools, 2)
-	require.Equal(t, "lookup_order", client.requests[0].Tools[0].Name)
-	require.Equal(t, `{"status":"shipped"}`, client.requests[1].Messages[2].Content)
-	require.Equal(t, `{"status":"status of A-1"}`, client.requests[2].Messages[4].Content)
+	requests := chatRequests(client)
+	require.Len(t, requests[0].Tools, 2)
+	require.Equal(t, "lookup_order", requests[0].Tools[0].Name)
+	require.Equal(t, `{"status":"shipped"}`, requests[1].Messages[2].Content)
+	require.Equal(t, `{"status":"status of A-1"}`, requests[2].Messages[4].Content)
 	last, ok := memory.Get("last_order")
 	require.True(t, ok, "a successful call's memory writes reach the run's Memory")
 	require.Equal(t, `{"order_id":"A-1"}`, last)
@@ -93,7 +88,7 @@ func TestAgentRunsRegistryTools(t *testing.T) {
 
 func TestAgentDropsMemoryWritesOfAFailedTool(t *testing.T) {
 	calls := &atomic.Int32{}
-	client := &fakeChatClient{responses: []ChatResponse{callReply("call-1", "lookup_order", `{"order_id":"missing"}`)}}
+	client := gepatest.NewFakeGenerator().Default(gepatest.ToolCall("call-1", "lookup_order", `{"order_id":"missing"}`))
 	agent := Agent{
 		Name:         "orders",
 		Client:       client,
@@ -115,10 +110,11 @@ func TestAgentDropsMemoryWritesOfAFailedTool(t *testing.T) {
 func TestAgentToolPolicy(t *testing.T) {
 	t.Run("a cached call makes no invocation", func(t *testing.T) {
 		calls := &atomic.Int32{}
-		client := &fakeChatClient{responses: []ChatResponse{
-			callReply("call-1", "lookup_order", `{"order_id":"A-1"}`),
-			callReply("call-2", "lookup_order", `{ "order_id" : "A-1" }`),
-		}}
+		client := gepatest.NewFakeGenerator().Default(
+			gepatest.ToolCall("call-1", "lookup_order", `{"order_id":"A-1"}`),
+			gepatest.ToolCall("call-2", "lookup_order", `{ "order_id" : "A-1" }`),
+			gepatest.Text("done"),
+		)
 		agent := Agent{
 			Name:         "orders",
 			Client:       client,
@@ -140,10 +136,11 @@ func TestAgentToolPolicy(t *testing.T) {
 
 	t.Run("a cached call adds no usage", func(t *testing.T) {
 		calls := &atomic.Int32{}
-		client := &fakeChatClient{responses: []ChatResponse{
-			callReply("call-1", "lookup_order", `{"order_id":"A-1"}`),
-			callReply("call-2", "lookup_order", `{"order_id":"A-1"}`),
-		}}
+		client := gepatest.NewFakeGenerator().Default(
+			gepatest.ToolCall("call-1", "lookup_order", `{"order_id":"A-1"}`),
+			gepatest.ToolCall("call-2", "lookup_order", `{"order_id":"A-1"}`),
+			gepatest.Text("done"),
+		)
 		agent := Agent{
 			Name:         "orders",
 			Client:       client,
@@ -169,10 +166,10 @@ func TestAgentToolPolicy(t *testing.T) {
 
 	t.Run("a per-tool limit fails the run", func(t *testing.T) {
 		calls := &atomic.Int32{}
-		client := &fakeChatClient{responses: []ChatResponse{
-			callReply("call-1", "lookup_order", `{"order_id":"A-1"}`),
-			callReply("call-2", "lookup_order", `{"order_id":"A-2"}`),
-		}}
+		client := gepatest.NewFakeGenerator().Default(
+			gepatest.ToolCall("call-1", "lookup_order", `{"order_id":"A-1"}`),
+			gepatest.ToolCall("call-2", "lookup_order", `{"order_id":"A-2"}`),
+		)
 		agent := Agent{
 			Name:         "orders",
 			Client:       client,
@@ -192,7 +189,7 @@ func TestAgentToolPolicy(t *testing.T) {
 
 	t.Run("a disallowed tool is not offered and its call fails", func(t *testing.T) {
 		calls := &atomic.Int32{}
-		client := &fakeChatClient{responses: []ChatResponse{callReply("call-1", "order_status", `{"order_id":"A-1"}`)}}
+		client := gepatest.NewFakeGenerator().Default(gepatest.ToolCall("call-1", "order_status", `{"order_id":"A-1"}`))
 		agent := Agent{
 			Name:         "orders",
 			Client:       client,
@@ -205,13 +202,14 @@ func TestAgentToolPolicy(t *testing.T) {
 		_, err := runAgent(t, agent, NewMemory("run"))
 
 		require.ErrorIs(t, err, gepa.ErrToolNotAllowed)
-		require.Len(t, client.requests[0].Tools, 1)
-		require.Equal(t, "lookup_order", client.requests[0].Tools[0].Name)
+		requests := chatRequests(client)
+		require.Len(t, requests[0].Tools, 1)
+		require.Equal(t, "lookup_order", requests[0].Tools[0].Name)
 	})
 }
 
 func TestAgentContainsAPanickingTool(t *testing.T) {
-	client := &fakeChatClient{responses: []ChatResponse{callReply("call-1", "boom", `{}`)}}
+	client := gepatest.NewFakeGenerator().Default(gepatest.ToolCall("call-1", "boom", `{}`))
 	agent := Agent{
 		Name:   "test",
 		Client: client,
@@ -241,14 +239,14 @@ func TestAgentMiddlewareOrderIsOutermostFirst(t *testing.T) {
 			})
 		}))
 	}
-	client := &fakeChatClient{}
+	client := gepatest.NewFakeGenerator().Default(gepatest.Text("done"))
 	agent := Agent{Name: "test", Client: client, Model: "fake", ToolRegistry: registry, Middleware: []string{"outer", "inner"}}
 
 	_, err := runAgent(t, agent, NewMemory("run"))
 
 	require.NoError(t, err)
 	require.Equal(t, []string{"outer>", "inner>", "<inner", "<outer"}, trace)
-	require.Len(t, client.requests, 1)
+	require.Len(t, client.Calls(), 1)
 }
 
 func TestAgentValidateRegistryTools(t *testing.T) {
@@ -298,7 +296,7 @@ func TestAgentValidateRegistryTools(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tt.agent.Name, tt.agent.Client, tt.agent.Model = "test", &fakeChatClient{}, "fake"
+			tt.agent.Name, tt.agent.Client, tt.agent.Model = "test", gepatest.NewFakeGenerator(), "fake"
 			err := tt.agent.Validate()
 			if tt.wantErr == "" {
 				require.NoError(t, err)
@@ -310,7 +308,7 @@ func TestAgentValidateRegistryTools(t *testing.T) {
 		})
 	}
 	t.Run("an unknown tool is ErrUnknownTool", func(t *testing.T) {
-		agent := Agent{Name: "test", Client: &fakeChatClient{}, Model: "fake", ToolRegistry: registry, ToolNames: []string{"x"}}
+		agent := Agent{Name: "test", Client: gepatest.NewFakeGenerator(), Model: "fake", ToolRegistry: registry, ToolNames: []string{"x"}}
 		require.ErrorIs(t, agent.Validate(), ErrUnknownTool)
 	})
 }

@@ -2,6 +2,7 @@ package gepa
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -373,4 +374,30 @@ func TestFieldJSONRoundTrip(t *testing.T) {
 	var decoded Field
 	require.NoError(t, json.Unmarshal([]byte(`{"name":"obj","schema":{"type":"object"}}`), &decoded))
 	require.Equal(t, Field{Name: "obj", Schema: json.RawMessage(`{"type":"object"}`)}, decoded)
+}
+
+func TestFieldGoType(t *testing.T) {
+	tests := []struct {
+		field Field
+		want  reflect.Type
+	}{
+		{field: Field{Name: "a", Type: "bool"}, want: reflect.TypeFor[bool]()},
+		{field: Field{Name: "a", Type: "int8"}, want: reflect.TypeFor[int8]()},
+		{field: Field{Name: "a", Type: "uint64"}, want: reflect.TypeFor[uint64]()},
+		{field: Field{Name: "a", Type: "float32"}, want: reflect.TypeFor[float32]()},
+		{field: Field{Name: "a", Type: "string"}, want: reflect.TypeFor[string]()},
+		{field: Field{Name: "a", Type: "slice"}, want: reflect.TypeFor[[]any]()},
+		{field: Field{Name: "a", Type: "map"}, want: reflect.TypeFor[map[string]any]()},
+		{field: Field{Name: "a"}},
+		{field: Field{Name: "a", Schema: json.RawMessage(`{"type":"string"}`)}},
+		{field: Field{Name: "a", Type: "complex128"}},
+	}
+	for _, tt := range tests {
+		require.Equal(t, tt.want, tt.field.GoType(), "%+v", tt.field)
+	}
+	for name := range fieldTypes {
+		field := Field{Name: "a", Type: name}
+		require.NoError(t, Signature{Inputs: []Field{{Name: "in"}}, Outputs: []Field{field}}.Validate())
+		require.Equal(t, fieldTypes[name], field.GoType())
+	}
 }

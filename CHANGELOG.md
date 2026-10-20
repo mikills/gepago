@@ -4,6 +4,112 @@ All notable changes to `gepago` will be documented in this file.
 
 The project follows semantic versioning once public tags are published.
 
+## v0.8.0
+
+`Pipeline` becomes the unit of a production flow: typed steps, bounded model calls, tools, per-step policy and a trace for every run.
+
+### Breaking changes
+
+#### Model calls
+
+- Every model consumer takes a `Generator`, whose `Generate` returns a `Generation{Text, Usage, Model, FinishReason}`: `Predict` and `ChainOfThought` `LM` and `RepairLM`, `LLMJudgeMetric.LM`, `ReflectiveProposer.LM`, `LLMMergeProposer.LM`, `ReflectionLM` on `CompileConfig`, `OptimizationConfig` and `ProgramTrainConfig`, `DefaultCompileConfig` and `RetryingLanguageModel.LM`. Wrap a `LanguageModel` with `AdaptLanguageModel`.
+- Usage travels in the `Generation` instead of being read back after the call: `RunWithUsage`, `ProgramEvaluator` and crucible's `ProgramSubject` no longer fall back to `LastUsage`, so a custom programme reports its usage with `RecordUsage`.
+- `RecordUsage` also charges the run budget in the context; inside a budgeted pipeline, `Predict`, `LLMJudgeMetric`, the proposers and `RetryingLanguageModel` can return a `Budget` error before calling the model.
+- `(*RetryingLanguageModel).Generate` returns `(Generation, error)`, so `*RetryingLanguageModel` no longer satisfies `LanguageModel`, and `RetryingLanguageModel` is no longer comparable (its `Jitter` field is a func). It retries only transient errors, so an error without a kind (see `TransientError`) is no longer retried, and waits with capped exponential backoff and jitter from `Delay`. It implements `ChatClient`.
+- `Predict` fails with `ErrOutputTruncated` on `FinishLength` instead of running the repair prompt; `ReflectiveProposer`, `LLMMergeProposer`, `LLMJudgeMetric` and crucible's judges fail with it too. Truncation errors end with ", N completion tokens".
+- A refusal is a `Generation` with `FinishContentFilter` and no error (OpenAI's text reads "model refused: ..."); `Predict`, the proposers and the judges fail on it with `ErrContentFiltered`, which matches `ErrInvalidOutput`, and never repair it.
+- Missing or unknown finish reasons are `""`. `agents.FinishReason` is an alias of `gepa.FinishReason`, and a content-filter stop ends an agent with `StopContentFilter`.
+- `UsageLedger.AddUsage` adds the reasoning, cached-input and cache-creation tokens a `Usage` carries, so the ledger's `reasoning_tokens`, `cached_input_tokens` and `cache_creation_tokens`, always zero before, now hold what providers report; its `ModelCalls` counts failed proposals and merge calls.
+- Resuming a saved optimisation fails the config fingerprint check when the reflection model's Go type changed; a model wrapped by `AdaptLanguageModel` keeps its v0.7 fingerprint.
+
+#### Structured output
+
+- `Field.Required` is removed: outputs are required by default and `Field.Optional` opts out. In a pipeline, an absent or null `Optional` output commits the zero value of the key's type.
+- `Field` gains a `json.RawMessage` `Schema`, so it is no longer comparable: `==` on fields and fields as map keys stop compiling.
+- `Predict` rejects missing or null required outputs, extra fields and values that do not match `Type` as `ErrInvalidOutput`, and returns the invalid reply with its error; in a pipeline the reply is in `StepError.Details["output"]`. Missing and null outputs read `signature "x": output "b" is missing`.
+- `ChainOfThought` replies must include the reasoning field, which comes first in the output schema (Go and TypeScript).
+- `RepairPrompt(prompt, raw, err)` takes the original prompt and repeats it, and its wording changed to include the schema. Prompts for typed signatures gain a schema block.
+- OpenAI and Claude send native structured output for strict schemas, so a model or endpoint without support rejects those requests; `gepa.GeneratorFunc(lm.Generate)` sends the schema in the prompt only.
+- `Key.Get` rejects wrong-length arrays, floats that underflow, a quoted `"null"` and quoted non-JSON numbers such as `"01"` and `"1."` in `,string` fields.
+- Metric text for nil is `null` (was `<nil>`), and non-string values compare by canonical JSON, which changes `ClassificationMetric` details.
+- `Build` checks a signature step's reads and writes against its signature's names and Go types (`SignatureProgram`).
+
+#### Pipelines and evaluation
+
+- These structs gain fields, so unkeyed struct literals of them break: `Usage` (`ReasoningTokens`, `CachedInputTokens`, `CacheCreationTokens`), `Field` (`Type`, `Schema`, `Optional`), `Predict` (`Tools`, `MaxToolTurns`, `Middleware`, `ToolRegistry`, `ToolPolicy`), `PipelineSpec` (`Defaults`, `Budget`, `Tools`, `ToolPolicy`, `Observers`, `Redactor`), `CompileConfig` and `ProgramTrainConfig` (`DatasetBuilder`), `ProgramEvaluator` (`RecordTraces`), `StepError` (`Reads`), `ProgramArtifact` (`Fingerprint`), `agents.Agent` (`Middleware`, `ToolNames`, `ToolPolicy`, `ToolRegistry`), `agents.ToolCallRecord` (`Cached`), and the provider `Config`s (`Logger`, and `Client` on OpenAI's).
+- `StepError.Err` is the step's own error, not a one-element `errors.Join`; messages and `errors.Is` are unchanged.
+- A failing top-level merge is a failed step execution.
+- The `ProgramEvaluator` record for an invalid output gains `step` and `reads` keys, which `DefaultReflectiveDatasetBuilder` passes to reflection.
+
+#### Tools and agents
+
+- The chat types `Role`, `Message`, `ToolCall`, `Tool`, `ChatRequest`, `ChatResponse` and `ChatClient` move to the root package and `agents` keeps aliases; `agents.JSONSchemaResponseFormat` is `gepa.ResponseFormat`.
+- `Tool.Parameters` and `ResponseFormat.Schema` are `json.RawMessage` (were `map[string]any`), and `ResponseFormat`'s JSON keys are `name`, `schema` and `strict`; crucible marshals its schema maps.
+- `Tool.Validate` rejects an invalid or non-object schema, `ResponseFormat.Validate` requires a valid name and schema, and `Tool.InputSchema` adds `"type":"object"`.
+- `agents.ErrUnknownTool` is `gepa.ErrUnknownTool` ("unknown tool"), and agent tool errors and `ToolCallRecord.Err` are prefixed `tool "<name>": `.
+- `Agent.Validate` builds middleware and a tool session, and a panicking agent tool is contained as a tool error.
+- Agents admit and record each chat call, so run budgets apply and `RunResult.Usage` must not be recorded again; `RunResult.Usage` includes tool usage.
+
+#### Providers
+
+- Provider `Generate` returns `(gepa.Generation, error)`, so providers no longer satisfy `LanguageModel`.
+- OpenAI and Claude no longer retry inside their SDKs; wrap them in `RetryingLanguageModel`.
+- Errors are classified: 4xx is permanent except 429; 429, 5xx, network errors, HTTP/2 stream resets and GOAWAY are transient; TLS, unknown-host, bad-URL and bad-address errors are permanent; other unrecognised transport errors are unclassified. Context errors are returned bare, and pi's error text changed.
+- Google `CompletionTokens` includes `thoughtsTokenCount`, its error text shows `REDACTED` in place of the API key, and its chat sends `parametersJsonSchema` and `responseJsonSchema`, drops the response format when tools are present, merges consecutive tool results and sends function-call ids.
+- Claude's `model_context_window_exceeded` maps to `length`.
+
+#### Artefacts
+
+- Every loader returns a `*FingerprintMismatchError` when a v0.8.0 artefact's fingerprint differs from the programme's or the programme has none, and `LoadOrTrain` always checks it. `TrainAndSave` writes `fingerprint` into the artefact JSON. Artefacts from v0.7.0 and earlier have none and load as before.
+
+#### WASM and TypeScript
+
+- `compile` runs a `pipeline` programme as a typed `gepa.Pipeline`; its JSON shape is unchanged. A step without `inputKeys` sees only its signature's inputs (it saw every input and earlier output); a pipeline input whose first reading field sets `type` must convert to it; every input a step reads must be present (a missing signature input used to be left out of the prompt); an absent or null optional output holds its type's zero value; and validation fails for a step that writes a key it or an earlier step reads from the inputs (for example `inputKeys: ["text"]` with an output `text`: `writes pipeline input "text", which is read-only`) and for steps that write one key as different types.
+- `runCompiled` runs a pipeline in the Go module as the same `gepa.Pipeline` that `compile` evaluates (through the new `pipeline.run` job), so it accepts and rejects the same programmes and inputs and sends the same prompts, typed inputs converted (a `float32` input of 16777217 prompts as 16777216). Its errors are the pipeline's (a missing input reads `pipeline input "x" is missing`), its model requests have the `predict` host request shape with role `task` and attempts counted per step, and a candidate component it leaves out keeps its seed text.
+- WASM predict jobs apply the same output checks as `Predict` and fail on `length` without a repair; the JS `Field` type drops `required` and adds `type`, `schema` and `optional`.
+- WASM task and repair host requests carry `response_format`; the TypeScript OpenAI and Claude model callbacks send strict formats (Claude chat as `output_config`), so OpenAI-compatible endpoints without structured output can return 400.
+- An unknown host `finishReason` is an error, and host usage with negative breakdown fields is rejected.
+- WASM host chat requests send normalised tool schemas, and payload tools with invalid schemas are rejected.
+- TypeScript `FinishReason` and `StopReason` gain `content_filter`, `ChatResponse.finish_reason` is optional, providers omit unknown finish reasons instead of sending `stop`, and pi chat responses no longer carry `finish_reason: "stop"`.
+
+#### Crucible
+
+- Judge and subject `LM`, `JudgeLM`, `RAGGroundingPack` and `BuildLanguageModel` use `gepa.Generator`.
+- `RawModelSubject` and `AgentSubject` fail on truncation or refusal, the OpenAI agent subject maps refusals to `content_filter`, and the Anthropic subject's `PromptTokens` includes cache tokens.
+
+#### Removed
+
+- `PipelineProgram` and `PipelineStep`: build a `Pipeline` with `PipelineSpec` and `NewProgramStep`. An artefact trained on a `PipelineProgram` has no fingerprint and loads into a `Pipeline` with the same step names.
+- `ModelRouter`, `ModelRole` and the `Role*` constants. Nothing used them, and choosing models by role would need a model selection API on `Predict` and `Compile`.
+- `LastUsage` and `LastResolvedModel` on the providers, `Predict.LastUsage`, `ChainOfThought.LastUsage`, `ProgramLastUsage`, `Pipeline.LastUsage`, `PipelineProgram.LastUsage` and `RetryingLanguageModel.LastUsage`, so `Predict`, `ChainOfThought`, `Pipeline` and the providers no longer implement `UsageReporter`.
+
+### Added
+
+- `Generator`, `Generation`, `GeneratorFunc` and `AdaptLanguageModel`; every provider implements `Generator` natively. `Usage` gains `ReasoningTokens`, `CachedInputTokens` and `CacheCreationTokens`, mapped by every provider and carried by `UsageLedger.AddUsage`. For custom programmes, metrics and proposers that call a model themselves: `GenerateWithFormat`, `FinishReasonError`, `AdmitModelCall`, `RecordUsage` and `ModelCallReporter`.
+- `FinishReason` (`stop`, `length`, `tool_calls`, `content_filter`), `ErrOutputTruncated` and `ErrContentFiltered`.
+- `ErrorKind`, with the kinds `Permanent`, `Transient` and `Budget`, and `IsPermanent`, `IsTransient`, `IsBudget`, `ErrorKindOf`, `PermanentError`, `TransientError`, `BudgetError` and `WithErrorKind`; every provider classifies its errors.
+- Structured output: `Field.Type`, `Field.Schema`, `Field.Optional` and `Field.GoType`, `Signature.JSONSchema` and `Signature.ResponseFormat`, `ResponseFormat`, `JSONSchemaFor` and `StrictJSONSchema`, the optional `StructuredGenerator` provider interface (OpenAI and Claude), `Predict.ParseOutput` and a check of every reply before `Predict` returns it, `TypedPredict[In, Out]`, which decodes with the rules `Key.Get` uses, and `SignatureProgram` and `ProgramSignature`, which let `Build` check a programme step against its signature.
+- Pipeline control flow, checked at `Build`: `WithPolicy` and `StepPolicy` (per-attempt `Timeout`, `RetryPolicy`, and an `ErrorAction`: `OnErrorFail`, `OnErrorSkip` with `PipelineSpec.Defaults`, `KeyDefault` and `DefaultValue`, or `OnErrorFallback`), `Branch`, `Parallel`, `Fallback` and `WithCache`.
+- `RunBudget` on `PipelineSpec` (`MaxDuration`, `MaxModelCalls`, `MaxTokens`, `PerStepTokens`), with `BudgetFrom(ctx)`, whose `BudgetMeter` reports what a step has left of each limit as a `BudgetRemaining`. Exceeding a limit fails with a `Budget` error that names it, and a step that finishes after a budget or timeout ended its context fails with its writes dropped.
+- Tools: `ToolRegistry` (`NewToolRegistry`, `Register`, `Lookup`, `Schemas`), `ToolProvider`, `NewTool[Args, Out]` with a schema derived from `Args`, `NewToolFunc`, `ToolResult` (output, text, memory writes applied only on success, provenance, usage), `ToolPolicy` (allow-list, total and per-tool call limits, a cache keyed on name and canonical arguments), `ToolSession` with `NewToolSession`, and `ToolMemory` with `NewToolMemory`, `WithToolMemory`, which gives a run the memory to seed or read back, and `ToolMemoryFrom`. In a pipeline, `PipelineSpec.Tools`, `ToolStep` and `Predict.Tools` with `MaxToolTurns` call through the run's one tool session, and a step's tool memory writes and cache entries commit with its state writes. `Provenance`, the errors `ErrUnknownTool`, `ErrToolNotAllowed`, `ErrToolCallLimit`, `ErrToolTurnLimit` and `ErrInvalidToolArguments`, named `ChatMiddleware`, `ChatClientFunc`, and `ChatClient` on the OpenAI, Claude and Google providers (pi's print mode cannot return tool calls).
+- Observability: `PipelineObserver` with `RunStarted`, `StepStarted`, `StepFinished` (duration, usage, error, reads, writes, `ToolCalls`, cached, attempt) and `RunFinished`, built on `UsageSpan` with a run trace and a span per step (span kinds `UsageSpanPipelineRun` and `UsageSpanPipelineStep`); a panicking observer is contained. `RecordingObserver` records a serialisable `PipelineTrace` (with `StepTrace.ToolCalls`), `TraceDatasetBuilder` turns traces into reflection records, and `WriteHTMLRunReport` and `HTMLRunReport` render one run step by step, showing JSON indented up to 32 levels and 64 KiB and compact beyond.
+- `Redactor` on `PipelineSpec`: every value an event, trace, run report or reflection record carries passes through it by state key, tool calls under `tool:<name>` and run attributes under `attribute:<name>`, and the text of each redacted value is removed from error messages and details, replaced by the redacted value when that is a string and otherwise by `RedactedText`. A Redactor that panics is recovered and the value becomes `RedactionFailed`. Scrubbed JSON keeps its key order and duplicate keys, and a number whose text changes becomes a string. A nested run's values pass through every enclosing Redactor too, so its observers see outer-redacted values, and spans whose `ParentID` belongs to an enclosing run they do not observe. A run with a Redactor and no observers still redacts every value, for the runs nested in it. With a Redactor, `ProgramEvaluator` redacts each item's `Output` and `SideInfo`, `reads` included, while the metric scores the real values.
+- Run context: `RunContext{RunID, ParentRunID, TraceID, Attributes}`, `WithRunContext` and `RunContextFrom`. A run keeps the caller's trace ID and attributes, takes the caller's run as its parent and gets a fresh `RunID`, so nested pipelines form one trace. Events and `PipelineTrace` carry the `RunContext`, a run's span ID is its `RunID` and its trace ID is the `TraceID`, and the run report has a Run context section. Observer contexts carry neither the run's `RunContext` nor its `ToolMemory`, so an observer's own work is independent of the run. Provider `Config.Logger` writes one record per model call with the run context, a call that panics included.
+- Artefacts: `Pipeline.Fingerprint` from step names, keys and types, the `Fingerprinter` interface, `ProgramArtifact.Fingerprint`, `CompiledProgram.Artifact` and `FingerprintMismatchError`. A `ProgramVersion` stated by both the artefact and `LoadCompiledProgramVersion` or `LoadCompiledVersion` stands in for the fingerprint.
+- `DefaultReflectiveDatasetBuilder` names the failing step of an invalid output and carries its `StepError.Details` and the values it read.
+- WASM: `gepagoWasm.start` takes the `pipeline.run` operation, which runs a compiled pipeline programme as `compile` runs it; `runCompiled` uses it.
+- Test kit: package `gepatest` with `FakeGenerator`, a `Generator`, `StructuredGenerator` and `ChatClient` that answers from reply scripts keyed by step path or name, prompt substring or a default, each reply with its own text or tool calls, usage, finish reason and error, records every call and lists the calls no script answered (`Unmatched`), whose error a step policy's fallback or skip can hide; and `AssertTrace`, which checks a `PipelineTrace`'s step executions (path, attempt, failure, error text or kind, cached and skipped flags, usage, tool calls) and the run's outcome and usage, checks that executions which did not overlap in time ran in the order listed (different steps of a `Parallel` are unordered), and reports a diff. `StepPathFrom(ctx)` returns the path a running step has in traces. `StepTrace` and `PipelineTrace` record `Failed`, set even when the error's message is empty, and `StepTrace` and `StepStartedEvent` name the step of a `Parallel` an execution belongs to in `Lane`, shared by its retries and its policy's fallback.
+
+### Fixed
+
+- A provider call that fails after spending tokens returns that usage with its error, so it is recorded exactly once, also when calls run concurrently; v0.7 read it back through `LastUsage`.
+- `Predict` no longer sends a truncated reply through the repair prompt.
+- `RetryingLanguageModel` no longer retries permanent errors or a call whose context has ended.
+- Google provider error messages no longer include the API key.
+- A panicking agent tool no longer crashes the agent run.
+- A WASM async job (`compile`, `runAgent`, capability jobs) that fails before its first host call reports its error instead of "completed with an unexpected job id": the module now calls `onComplete` from a later JavaScript task, after `start` has returned the job id.
+- In Node, a `compile` model callback that throws or rejects fails that model call with its message, as in the browser, so `compile` rejects with the host's error instead of `WASM job "job-1" cancelled`; only `close()` cancels a pending job. A pipeline's `runCompiled` reports host errors the same way.
+
 ## v0.7.0
 
 ### Breaking changes

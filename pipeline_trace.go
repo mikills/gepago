@@ -28,8 +28,10 @@ type PipelineTrace struct {
 	Duration   time.Duration  `json:"duration"`
 	Inputs     map[string]any `json:"inputs,omitempty"`
 	Usage      Usage          `json:"usage"`
-	Err        string         `json:"err,omitempty"`
-	ErrKind    ErrorKind      `json:"err_kind,omitempty"`
+	// Failed reports that the run failed. Err is its error's message, which may be empty.
+	Failed  bool      `json:"failed,omitempty"`
+	Err     string    `json:"err,omitempty"`
+	ErrKind ErrorKind `json:"err_kind,omitempty"`
 	// Steps holds the executions of the run's top-level steps in the order they started.
 	Steps []StepTrace `json:"steps,omitempty"`
 }
@@ -37,21 +39,28 @@ type PipelineTrace struct {
 // StepTrace is the record of one execution of a step in a PipelineTrace. An execution that has
 // not finished has a zero EndedAt.
 type StepTrace struct {
-	SpanID    string         `json:"span_id"`
-	ParentID  string         `json:"parent_id"`
-	Step      string         `json:"step"`
-	Attempt   int            `json:"attempt"`
-	StartedAt time.Time      `json:"started_at"`
-	EndedAt   time.Time      `json:"ended_at,omitzero"`
-	Duration  time.Duration  `json:"duration"`
-	Usage     Usage          `json:"usage"`
-	Err       string         `json:"err,omitempty"`
-	ErrKind   ErrorKind      `json:"err_kind,omitempty"`
-	Details   map[string]any `json:"details,omitempty"`
-	Reads     map[string]any `json:"reads,omitempty"`
-	Writes    map[string]any `json:"writes,omitempty"`
-	Cached    bool           `json:"cached,omitempty"`
-	Skipped   bool           `json:"skipped,omitempty"`
+	SpanID    string        `json:"span_id"`
+	ParentID  string        `json:"parent_id"`
+	Step      string        `json:"step"`
+	Attempt   int           `json:"attempt"`
+	StartedAt time.Time     `json:"started_at"`
+	EndedAt   time.Time     `json:"ended_at,omitzero"`
+	Duration  time.Duration `json:"duration"`
+	Usage     Usage         `json:"usage"`
+	// Failed reports that the execution failed. Err is its error's message, which may be empty.
+	Failed  bool           `json:"failed,omitempty"`
+	Err     string         `json:"err,omitempty"`
+	ErrKind ErrorKind      `json:"err_kind,omitempty"`
+	Details map[string]any `json:"details,omitempty"`
+	Reads   map[string]any `json:"reads,omitempty"`
+	Writes  map[string]any `json:"writes,omitempty"`
+	Cached  bool           `json:"cached,omitempty"`
+	Skipped bool           `json:"skipped,omitempty"`
+	// Lane names the step of a Parallel the execution belongs to when the execution is that step
+	// or one its step policy ran, such as a retry or an OnErrorFallback step; it is empty
+	// otherwise, for the executions nested in them too. The executions of different lanes of a
+	// Parallel ran side by side, so they may have started in any order.
+	Lane string `json:"lane,omitempty"`
 	// ToolCalls holds the tool calls the execution made, as StepFinishedEvent reported them,
 	// with each Output compacted as encoding/json writes it, or stored as a JSON string when it
 	// is not JSON.
@@ -121,6 +130,7 @@ func (r *RecordingObserver) StepStarted(_ context.Context, event StepStartedEven
 		Attempt:   event.Attempt,
 		StartedAt: event.Span.StartedAt,
 		Reads:     traceValues(event.Reads),
+		Lane:      event.Lane,
 	}}
 	if run, ok := r.runs[event.Span.ParentID]; ok {
 		run.steps = append(run.steps, step)
@@ -143,6 +153,7 @@ func (r *RecordingObserver) StepFinished(_ context.Context, event StepFinishedEv
 	step.trace.EndedAt = event.Span.EndedAt
 	step.trace.Duration = event.Duration
 	step.trace.Usage = event.Usage
+	step.trace.Failed = event.Err != nil
 	step.trace.Err = errorString(event.Err)
 	step.trace.ErrKind = ErrorKindOf(event.Err)
 	step.trace.Details = traceValues(event.Details)
@@ -165,6 +176,7 @@ func (r *RecordingObserver) RunFinished(_ context.Context, event RunFinishedEven
 	run.trace.EndedAt = event.Span.EndedAt
 	run.trace.Duration = event.Duration
 	run.trace.Usage = event.Usage
+	run.trace.Failed = event.Err != nil
 	run.trace.Err = errorString(event.Err)
 	run.trace.ErrKind = ErrorKindOf(event.Err)
 	if _, nested := r.steps[run.trace.ParentID]; !nested {
@@ -309,11 +321,12 @@ func isTraceDatasetBuilder(builder ReflectiveDatasetBuilder) bool {
 // Pipeline scopes candidate keys; an execution owns a component when it has no nested
 // executions and its path followed by '.' starts the component's key. A composite step that
 // failed before running any nested step therefore owns the components of its nested steps.
-// When the pipeline runs inside a programme that scopes its keys further, such as a step of a
-// PipelineProgram, and no execution owns the whole key, the key is tried without its leading
-// segments, one at a time, until some execution owns it. A leading segment that names a
-// top-level step of the traces is never dropped, since the pipeline's own scoping added it,
-// and segments are matched whole, so a step "summarise" never owns "xsummarise.instruction".
+// When the pipeline runs inside a programme that scopes its keys further, such as a custom
+// Program that runs it under a name, and no execution owns the whole key, the key is tried
+// without its leading segments, one at a time, until some execution owns it. A leading
+// segment that names a top-level step of the traces is never dropped, since the pipeline's own
+// scoping added it, and segments are matched whole, so a step "summarise" never owns
+// "xsummarise.instruction".
 //
 // Each step record holds "trace_id", "step", the step's name, "attempt", "reads", "writes" and
 // "usage", and for a failed execution "error" and, when the step attached any, "details". A
@@ -436,7 +449,7 @@ func stepRecord(traceID string, step StepTrace) ReflectiveRecord {
 		"writes":   step.Writes,
 		"usage":    step.Usage,
 	}
-	if step.Err != "" {
+	if step.Failed || step.Err != "" {
 		record["error"] = step.Err
 		if step.Details != nil {
 			record["details"] = step.Details

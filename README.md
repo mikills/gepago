@@ -1,8 +1,9 @@
 # gepago
 
-`gepago` is a Go SDK for GEPA-style reflective optimisation.
+`gepago` is a Go SDK for GEPA-style reflective optimisation and for running the flows it optimises.
 It helps you improve prompts, policies, tool descriptions, and other text components
-using evaluation feedback, with optional agent traces and model providers.
+using evaluation feedback, and runs them as typed pipelines with bounded model calls, tools,
+per-step policies and a trace for every run.
 
 Original paper:
 [GEPA: Reflective Prompt Evolution Can Outperform Reinforcement Learning](https://arxiv.org/abs/2507.19457).
@@ -11,33 +12,35 @@ Original paper:
 
 ## What it can do
 
-- Run optional agent loops from the composable `agents` package.
-- Emit full agent trace events for runs, turns, LLM calls, tool calls, errors, and run completion.
+- Call any model through the provider-neutral `Generator` interface, with usage, the resolved model and a finish reason on every call.
+- Ask for structured output: typed signature fields, strict JSON schemas, native structured output where the provider has it, and validation before a reply is returned.
+- Build typed `Pipeline`s with retries, timeouts, fallbacks, branches, parallel steps, step caching and run budgets.
+- Give model steps tools from a registry, under a per-run policy with call limits and caching.
+- Observe every run with events, recorded traces, HTML run reports, a run context and redaction.
+- Run optional agent loops from the composable `agents` package, with full trace events for runs, turns, LLM calls, tool calls, errors, and run completion.
 - Track usage with spans and ledgers instead of relying only on turn counts.
 - Persist traces, run results, optimisation events, and optimiser state to files.
-- Define signatures with named input/output fields for task-shaped LLM programmes.
-- Run prompt-backed `Predict` programmes against structured inputs.
 - Optimise named text candidates such as prompts, tool descriptions, routing rules, and policies.
 - Load parsed text documents into examples for extraction-focused optimisation.
-- Build reflective datasets from evaluation feedback and optional agent traces.
+- Build reflective datasets from evaluation feedback, pipeline traces and agent traces.
 - Use built-in exact-match, contains, numeric, classification, and LLM judge metrics.
-- Compile a `Predict`, `ChainOfThought`, or typed sequential `Pipeline` from examples, a metric, and a reflection model.
-- Use a reflective LLM proposer to generate improved candidate text.
-- Select candidates from a Pareto frontier or current-best strategy.
-- Accept/reject candidates using configurable score criteria.
-- Resume optimisation from persisted state.
-- Use optional OpenAI, Claude, or Google/Gemini providers for real reflective proposals.
-- Generate a self-contained HTML report for candidates, proposals, scores, and usage spans.
+- Compile a `Predict`, `ChainOfThought`, `TypedPredict` or `Pipeline` from examples, a metric, and a reflection model.
+- Select candidates from a Pareto frontier or current-best strategy, accept or reject them with configurable score criteria, and resume optimisation from persisted state.
+- Save trained candidates as fingerprinted artefacts and load them at runtime.
+- Use optional OpenAI, Claude, Google/Gemini or pi providers.
+- Generate self-contained HTML reports for optimisation runs and pipeline runs.
 
 ## Package layout
 
 ```text
-github.com/mikills/gepago                  core optimiser and programme layer
+github.com/mikills/gepago                  core optimiser, programme and pipeline layer
 github.com/mikills/gepago/agents           optional evented agent runtime
+github.com/mikills/gepago/gepatest         test kit: fake models and trace assertions
 github.com/mikills/gepago/providers/openai OpenAI and OpenAI-compatible provider
 github.com/mikills/gepago/providers/claude Anthropic Claude provider
 github.com/mikills/gepago/providers/google Google Gemini provider
-packages/gepago/wasm                             Node.js ESM WASM packages
+github.com/mikills/gepago/providers/pi     pi CLI provider
+packages/gepago/wasm                       Node.js ESM WASM packages
 ```
 
 The root package is intentionally provider-neutral and does not depend on the agent runtime.
@@ -50,6 +53,22 @@ GEPA optimises text, not model weights. You provide a candidate text bundle, eva
 ```text
 Candidate text -> rollout/evaluate -> feedback/traces -> reflection -> patch -> frontier
 ```
+
+## Models
+
+Every model call goes through `Generator`:
+
+```go
+type Generator interface {
+    Generate(ctx context.Context, prompt string) (gepa.Generation, error)
+}
+```
+
+A `Generation` holds the reply `Text`, its `Usage` (prompt, completion, reasoning and cached tokens), the `Model` the provider resolved, and a `FinishReason`: `stop`, `length`, `tool_calls` or `content_filter`. A call that fails after the provider spent tokens returns that usage with the error, so it is recorded exactly once. `Predict` fails with `ErrOutputTruncated` on a truncated reply and `ErrContentFiltered` on a refusal rather than repairing them.
+
+Provider errors carry a kind: `gepa.IsTransient` (429, 5xx and network errors), `gepa.IsPermanent` (other 4xx) or `gepa.IsBudget` (a run budget is spent). `RetryingLanguageModel` retries transient errors only, with capped exponential backoff and jitter, and stops when its context ends.
+
+Use `gepa.GeneratorFunc` to turn a function into a `Generator`, and `gepa.AdaptLanguageModel` to wrap an older `LanguageModel` that returns a string.
 
 ## Programme layer
 
@@ -64,7 +83,7 @@ program := gepa.Predict{
         Outputs: []gepa.Field{{Name: "label"}},
     },
     Instruction: "Classify the sentiment.",
-    LM:          lm,
+    LM:          lm, // any gepa.Generator
 }
 
 examples := []gepa.Example{
@@ -99,6 +118,45 @@ Use `ChainOfThought` when the programme should expose a concise reasoning field.
 Use `DemosFromExamples` and the `demos` component when you want examples optimised with the instruction.
 Use `LLMJudgeMetric` when exact labels are too rigid for the task.
 
+## Structured output
+
+Give signature fields a `Type`, a Go kind name such as `"string"`, `"int"`, `"float64"`, `"bool"`, `"slice"` or `"map"`, or an explicit JSON `Schema`, and mark outputs the reply may leave out as `Optional`:
+
+```go
+signature := gepa.Signature{
+    Name:   "extract_amount",
+    Inputs: []gepa.Field{{Name: "document", Type: "string"}},
+    Outputs: []gepa.Field{
+        {Name: "amount", Type: "int"},
+        {Name: "note", Type: "string", Optional: true},
+    },
+}
+```
+
+`Signature.JSONSchema` returns the strict reply schema. Providers that implement `StructuredGenerator` (OpenAI and Claude) receive it as the response format; others get it in the prompt. `Predict` checks every reply before returning it: a missing or null required output, an extra field or a value that does not fit its `Type` fails with `ErrInvalidOutput` naming the field, and the repair prompt carries the schema.
+
+`TypedPredict[In, Out]` works with Go structs and decodes the reply with the strict rules `Key.Get` uses:
+
+```go
+type Document struct {
+    Document string `json:"document"`
+}
+
+type Extraction struct {
+    Amount int    `json:"amount"`
+    Note   string `json:"note,omitempty"`
+}
+
+extract := gepa.TypedPredict[Document, Extraction]{
+    Signature:   gepa.Signature{Name: "extract_amount"},
+    Instruction: "Extract the obligation amount.",
+    LM:          lm,
+}
+result, err := extract.Run(ctx, Document{Document: "Bond obligation for 125,000."})
+```
+
+## Pipelines
+
 For multi-step workflows, build a `Pipeline` from a `PipelineSpec`. Each step that wraps a programme has its own scoped components such as `extract.instruction`, so GEPA can improve the steps independently while `Compile` still sees one programme.
 
 ```go
@@ -110,7 +168,7 @@ extractProgram := gepa.Predict{
     Signature: gepa.Signature{
         Name:    "extract_amount",
         Inputs:  []gepa.Field{{Name: "document"}},
-        Outputs: []gepa.Field{{Name: "amount"}},
+        Outputs: []gepa.Field{{Name: "amount", Type: "int"}},
     },
     Instruction: "Extract the obligation amount.",
     LM:          lm,
@@ -144,24 +202,105 @@ Steps declare the keys they read and write as `KeyRef`s, which carry the value t
 
 At run time each step only sees the keys it declared. Its writes must have the declared type, and they are copied into state only when the step succeeds. Values are copied whenever they cross into or out of state, so a step cannot change an input or an earlier result through a shared map or slice. A run fails when its inputs hold a key not declared in `Inputs`, unless `AllowExtraInputs` is set, and input values are converted to their declared types before the first step runs.
 
-`NewProgramStep` copies only the declared outputs from a programme's reply into state, so a model cannot overwrite a document or record identifier. For `Predict`, `ChainOfThought` and `TypedPredict` the signature's inputs must be exactly the declared reads and its outputs exactly the declared writes; a `ChainOfThought` may also declare its reasoning field, and a `TypedPredict` step may leave out the optional fields of `Out` (omitempty, omitzero or nullable). For `TypedPredict` each read and write must also have the Go type of its field in `In` or `Out`. A reply that omits a declared output, sets it to null or gives a value that does not fit its type fails the step with `ErrInvalidOutput`, unless the signature marks that output `Optional`, in which case the step stores the zero value of the key's type. During `Compile` such an example scores zero, with the error as reflection feedback, instead of stopping optimisation. Deterministic steps built with `NewStep` take no candidate; only steps that carry components appear in `SeedCandidate`.
+`NewProgramStep` copies only the declared outputs from a programme's reply into state, so a model cannot overwrite a document or record identifier. For `Predict`, `ChainOfThought` and `TypedPredict` the signature's inputs must be exactly the declared reads and its outputs exactly the declared writes, with the Go types the signature gives them; a `ChainOfThought` may also declare its reasoning field, and a `TypedPredict` step may leave out the optional fields of `Out`. A reply that omits a declared output, sets it to null or gives a value that does not fit its type fails the step with `ErrInvalidOutput`, unless the signature marks that output `Optional`, in which case the step stores the zero value of the key's type. During `Compile` such an example scores zero, with the failing step, its reads and the error as reflection feedback, instead of stopping optimisation. Deterministic steps built with `NewStep` take no candidate; only steps that carry components appear in `SeedCandidate`.
 
 `Key.Get` converts model output into `T` strictly: unknown fields, fields that match only by case, missing fields not tagged `omitempty` and nulls in non-nullable positions are errors, not zero values. If `T` has a `Validate() error` method, `Get` calls it too.
 
-`Run` and `RunCandidate`, which `Compile` uses, return only the values the steps wrote; `RunState` also returns the inputs. A failed run returns what was accumulated before the failing step together with a `*StepError` naming it. A step can attach diagnostics with `WithStepDetails`, a panicking step's stack is kept under `Details["stack"]`, and usage from a failed model call is still recorded.
+`Run` and `RunCandidate`, which `Compile` uses, return only the values the steps wrote; `RunState` also returns the inputs. A failed run returns what was accumulated before the failing step together with a `*StepError` naming it and holding the values it read. A step can attach diagnostics with `WithStepDetails`, a panicking step's stack is kept under `Details["stack"]`, and usage from a failed model call is still recorded.
 
-This mirrors the GEPA paper's compound-system formulation `Φ = (M, C, X, Y)`: the `Pipeline` is `Φ`, each step is a language module `Mᵢ`, each wrapped `Predict` carries the prompt and local input/output schema `(πᵢ, Xᵢ, Yᵢ)`, and the ordered steps are the control flow `C`.
+This mirrors the GEPA paper's compound-system formulation `Φ = (M, C, X, Y)`: the `Pipeline` is `Φ`, each step is a language module `Mᵢ`, each wrapped `Predict` carries the prompt and local input/output schema `(πᵢ, Xᵢ, Yᵢ)`, and the steps and their control flow are `C`.
 
-`PipelineProgram`, which passes one untyped `Prediction` between steps, remains for the WASM compile bridge. Use `Pipeline` in Go code. Artifacts trained on a `PipelineProgram` load into a `Pipeline` with the same step names.
+### Control flow, policies and budgets
 
-## Reusable programme artifacts
+```go
+reads, writes := []gepa.KeyRef{document.Ref()}, []gepa.KeyRef{amount.Ref()}
+extract := gepa.WithPolicy(
+    gepa.NewProgramStep("extract", extractProgram, reads, writes),
+    gepa.StepPolicy{
+        Timeout: 20 * time.Second,
+        Retry:   gepa.RetryPolicy{MaxAttempts: 3},
+        OnError: gepa.OnErrorFallback(gepa.NewProgramStep("extract_small", smallProgram, reads, writes)),
+    },
+)
+
+pipeline, err := gepa.PipelineSpec{
+    Inputs: []gepa.KeyRef{document.Ref()},
+    Steps: []gepa.Step{
+        extract,
+        gepa.Branch("route", route, map[string]gepa.Step{"review": review, "approve": approve}, amount.Ref()),
+    },
+    Budget: gepa.RunBudget{MaxDuration: time.Minute, MaxModelCalls: 6, MaxTokens: 20000},
+}.Build()
+```
+
+- `WithPolicy` gives a step a per-attempt `Timeout`, retries (of transient errors unless `RetryIf` says otherwise) and an action for when it still fails: `OnErrorFail`, `OnErrorSkip` (its writes take their `PipelineSpec.Defaults`, see `DefaultValue`) or `OnErrorFallback(step)`.
+- `Branch` runs one of several arms that write the same keys, `Parallel` runs steps with disjoint writes concurrently and commits them together, `Fallback` runs a secondary step when the primary fails with a non-permanent error, and `WithCache` reuses a step's result within a run when its key function returns a key it has seen.
+- `RunBudget` limits a run's duration, model calls, tokens and tokens per step; exceeding a limit fails with a `Budget` error naming it. A step reads what is left with `gepa.BudgetFrom(ctx).Remaining()`.
+
+`Build` checks all of this before the first run: arms that disagree, overlapping parallel writes, a skippable write with neither a default nor a later writer, and budgets that name unknown steps all fail it.
+
+## Tools
+
+Register tools once and refer to them by name:
+
+```go
+type lookupArgs struct {
+    Customer string `json:"customer"`
+}
+
+lookup := gepa.NewTool("lookup_customer", "Look up a customer's plan.",
+    func(ctx context.Context, args lookupArgs) (Plan, error) {
+        return store.Plan(ctx, args.Customer)
+    })
+tools, err := gepa.NewToolRegistry(lookup)
+```
+
+`NewTool` derives the argument schema from `Args` and encodes `Out` as the result; `NewToolFunc` takes a hand-written schema. In a pipeline, set `PipelineSpec.Tools` and either call a tool deterministically with `gepa.ToolStep("lookup", "lookup_customer", reads, writes)` or give a `Predict` step a bounded tool loop with `Predict.Tools` (its `LM` must be a `ChatClient`, which the OpenAI, Claude and Google providers are). `PipelineSpec.ToolPolicy` sets the run's allow-list, total and per-tool call limits and result cache, and a tool's memory writes commit only with its step's writes. `Build` fails on a tool that is not registered or not allowed. Chat middleware registered with `RegisterMiddleware` wraps a step's or an agent's chat client by name, outermost first.
+
+## Observability and redaction
+
+`PipelineSpec.Observers` receive `RunStarted`, `StepStarted`, `StepFinished` (duration, usage, error, reads, writes, tool calls, attempt and whether the result was cached) and `RunFinished` events; an observer that panics does not fail the run. `RecordingObserver` turns the events into serialisable `PipelineTrace`s, which `WriteHTMLRunReport` renders step by step and `TraceDatasetBuilder` turns into reflection records during `Compile`.
+
+```go
+recorder := &gepa.RecordingObserver{}
+spec.Observers = []gepa.PipelineObserver{recorder}
+spec.Redactor = func(key string, value any) any {
+    if key == "document" {
+        return "[document]"
+    }
+    return value
+}
+pipeline, err := spec.Build()
+// after a run
+err = gepa.WriteHTMLRunReport("run.html", recorder.Traces()[0], gepa.HTMLReportOptions{})
+```
+
+A `Redactor` rewrites each value by its state key before it leaves the run in an event, a trace, a report or a reflection record; tool calls pass through it under `tool:<name>` and run attributes under `attribute:<name>`. State keeps the real values, and the text of every redacted value is removed from error messages. A Redactor must be safe for concurrent use. Its plain-string result is used verbatim as the replacement in text, so it must not put other hidden values into it. A pipeline with a Redactor pays the redaction cost on every value, even without observers.
+
+## Run context
+
+Every run has a `RunContext{RunID, ParentRunID, TraceID, Attributes}`. Put one on the context to correlate a run with your own request:
+
+```go
+ctx = gepa.WithRunContext(ctx, gepa.RunContext{
+    TraceID:    requestID,
+    Attributes: map[string]string{"job": jobID},
+})
+out, err := pipeline.Run(ctx, inputs)
+```
+
+Each run keeps the trace ID and attributes, gets a fresh `RunID` and records the caller's run as its parent, so nested pipelines form one trace. Steps, tools and models find it with `gepa.RunContextFrom(ctx)`, events, traces and run reports carry it, and providers given a `Config.Logger` log it with every model call. The library has no tenant model: attributes are plain strings, redacted like other values in events but logged as they are.
+
+## Reusable programme artefacts
 
 Optimisation can happen offline, then runtime applications can load the trained prompt bundle wherever the same programme can be initialised.
 
 ```go
-artifact := gepa.NewProgramArtifact("internal-program", compiled.Candidate)
+artifact := compiled.Artifact("internal-program")
 err := gepa.SaveProgramArtifact("internal-program.program.json", artifact)
 ```
+
+`compiled.Artifact` records the programme's fingerprint. `Pipeline.Fingerprint()` is derived from the step names, keys and types, and every loader refuses an artefact whose fingerprint differs from the programme's with a `*FingerprintMismatchError` that shows both, so a renamed key or step never silently picks up a stale prompt. Artefacts saved before v0.8.0 have no fingerprint and still load. To load an artefact across a shape change you know is compatible, record the same `ProgramVersion` on the artefact and pass it to `LoadCompiledProgramVersion` or `LoadCompiledVersion`.
 
 At runtime, register factories that inject app dependencies such as models, tools, stores, or retrievers:
 
@@ -176,7 +315,7 @@ result, err := compiled.Run(ctx, input)
 _ = artifact
 ```
 
-Services may also train on demand, then reuse the saved artifact on later calls:
+Services may also train on demand, then reuse the saved artefact on later calls:
 
 ```go
 compiled, artifact, state, trained, err := registry.LoadOrTrain(ctx, gepa.ProgramTrainConfig{
@@ -192,18 +331,27 @@ result, err := compiled.Run(ctx, input)
 _, _, _ = artifact, state, trained
 ```
 
-This separates reusable programme shape from trained candidate text. The artifact chooses the programme by name; the registry supplies the runtime dependencies. Use `LoadCompiledVersion` for reviewed production artifacts and `LoadOrTrain` when a service is allowed to bootstrap or refresh a programme at runtime. `ProgramVersion` lets the app reject stale artifacts when the programme shape changes.
+This separates reusable programme shape from trained candidate text. The artefact chooses the programme by name; the registry supplies the runtime dependencies. Use `LoadCompiledVersion` for reviewed production artefacts and `LoadOrTrain` when a service is allowed to bootstrap or refresh a programme at runtime. `LoadOrTrain` always checks the fingerprint; its `ProgramVersion` labels the artefacts it writes.
 
-For service-style deployments, reusable programme families can implement `ProgramTemplate` and be registered with `RegisterTemplate`. GEPAgo also includes helpers for JSONL training data (`LoadJSONLExamples`), artifact indexes (`WriteProgramArtifactManifest`), before/after prompt reports (`WriteCandidateDiffReport`), a minimal HTTP runner (`ProgramHTTPHandler`), and cross-process runtime-training locks (`FileTrainLock`, `LoadOrTrainLocked`).
+For service-style deployments, reusable programme families can implement `ProgramTemplate` and be registered with `RegisterTemplate`. GEPAgo also includes helpers for JSONL training data (`LoadJSONLExamples`), artefact indexes (`WriteProgramArtifactManifest`), before/after prompt reports (`WriteCandidateDiffReport`), a minimal HTTP runner (`ProgramHTTPHandler`), and cross-process runtime-training locks (`FileTrainLock`, `LoadOrTrainLocked`).
 
 Lower-level optimiser APIs remain available when you need full control.
 
+## Test kit
+
+Package `gepatest` provides `FakeGenerator`, a model with scripted replies, usage, finish reasons and errors per call, and `AssertTrace`, which compares a recorded run's steps, the order they ran in, their errors and usage.
+
+A call takes the next reply of the script for its step path (as `gepa.StepPathFrom` reports it), else its step name, else the first prompt substring it contains, else the default; a script repeats its last reply once used up. `Calls` returns every call the fake received, `Unmatched` the calls no script answered (a step policy's fallback or skip can hide their error), and `Plain` hides its structured and chat methods to test the prompt-only path.
+
 ## Key extension points
 
+- `Generator`: provider-neutral model interface; `StructuredGenerator` and `ChatClient` add response formats and tool calls.
+- `Step` and `ComponentStep`: pipeline steps, deterministic or optimisable.
+- `ToolProvider`: a tool a registry can hold.
+- `PipelineObserver` and `Redactor`: watch runs and control what leaves them.
 - `Evaluator`: scores candidates against examples.
 - `ReflectiveDatasetBuilder`: turns outputs, feedback, and traces into reflection records.
 - `Proposer`: creates candidate patches.
-- `LanguageModel`: provider-neutral reflection model interface.
 - `CandidateSelector`: chooses the next parent candidate.
 - `ComponentSelector`: chooses which text components to update.
 - `AcceptanceCriterion`: decides whether a proposal is kept.
@@ -225,7 +373,7 @@ if err != nil {
 err = gepa.WriteHTMLReport("report.html", state, gepa.HTMLReportOptions{})
 ```
 
-The report is a single HTML file you can open in a browser.
+The report is a single HTML file you can open in a browser. `WriteHTMLRunReport` does the same for one recorded pipeline run.
 
 ## Reflection traces
 
@@ -234,6 +382,8 @@ GEPA reflection does not require an agent runtime. Simple prompt or programme op
 ```text
 prompt -> completion -> score -> reflection -> improved candidate
 ```
+
+Pipelines add step traces: set `DatasetBuilder: gepa.TraceDatasetBuilder{}` on the compile config and each reflection record carries the run's steps, reads, writes and errors.
 
 Use `agents/` when the task itself is a tool-using workflow and you want richer execution traces:
 
@@ -276,13 +426,16 @@ import (
 )
 ```
 
-Each provider implements the core `LanguageModel` interface:
+Each provider's model implements `gepa.Generator`; the OpenAI and Claude models are also a `gepa.StructuredGenerator` and a `gepa.ChatClient`:
 
 ```go
 lm, err := gepaopenai.NewLanguageModel(gepaopenai.Config{
     APIKey: os.Getenv("OPENAI_API_KEY"),
     Model:  "gpt-4.1-mini",
+    Logger: slog.Default(), // optional: one record per call, with the run context
 })
+generation, err := lm.Generate(ctx, "Say hello.")
+fmt.Println(generation.Text, generation.Usage.TotalTokens, generation.FinishReason)
 ```
 
 OpenAI-compatible endpoints can use `BaseURL` and provider-specific headers:
@@ -298,6 +451,8 @@ lm, err := gepaopenai.NewLanguageModel(gepaopenai.Config{
 })
 ```
 
+An endpoint without structured-output support rejects strict response formats; wrap the model as `gepa.GeneratorFunc(lm.Generate)` to send the schema in the prompt only.
+
 ```go
 lm, err := gepaclaude.NewLanguageModel(gepaclaude.Config{
     APIKey: os.Getenv("ANTHROPIC_API_KEY"),
@@ -305,7 +460,7 @@ lm, err := gepaclaude.NewLanguageModel(gepaclaude.Config{
 })
 ```
 
-Google/Gemini supports both `LanguageModel` and `agents.ChatClient` for tool-calling agents:
+Google/Gemini supports both `Generator` and `ChatClient` for tool-calling agents and steps:
 
 ```go
 chatClient, err := gepagoogle.NewChatClient(gepagoogle.Config{
@@ -373,7 +528,8 @@ try {
 
 The WASM package exposes asynchronous `predict`, `compile`, `optimize`, and
 `runAgent` methods. Declarative `predict`, `chainOfThought`, and sequential
-`pipeline` programs are supported; pipeline candidates are step-scoped.
+`pipeline` programmes are supported; `compile` and `runCompiled` both run a pipeline
+as the same typed `Pipeline`, and pipeline candidates are step-scoped.
 `compile` routes task, reflector, judge, and repair calls to host callbacks and
 supports custom metrics, observers, and persistence callbacks. `optimize`
 provides JSON-safe evaluator, proposer, dataset-builder, merge, observer, and

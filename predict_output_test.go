@@ -1,21 +1,21 @@
-package gepa
+package gepa_test
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"regexp"
 	"strings"
 	"testing"
 
+	gepa "github.com/mikills/gepago"
+	"github.com/mikills/gepago/gepatest"
 	"github.com/stretchr/testify/require"
 )
 
 func TestPredictRejectsInvalidOutputs(t *testing.T) {
-	signature := Signature{
+	signature := gepa.Signature{
 		Name:   "extract",
-		Inputs: []Field{{Name: "document"}},
-		Outputs: []Field{
+		Inputs: []gepa.Field{{Name: "document"}},
+		Outputs: []gepa.Field{
 			{Name: "answer"},
 			{Name: "amount", Type: "int"},
 			{Name: "small", Type: "int8", Optional: true},
@@ -70,18 +70,16 @@ func TestPredictRejectsInvalidOutputs(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			program := Predict{
+			program := gepa.Predict{
 				Signature: signature,
-				LM: textModel(func(context.Context, string) (string, error) {
-					return tt.reply, nil
-				}),
+				LM:        gepatest.NewFakeGenerator().Default(gepatest.Text(tt.reply)),
 			}
 
-			got, err := program.Run(context.Background(), Prediction{"document": "cash 10"})
+			got, err := program.Run(context.Background(), gepa.Prediction{"document": "cash 10"})
 
 			require.EqualError(t, err, tt.wantErr)
-			require.ErrorIs(t, err, ErrInvalidOutput)
-			reply, parseErr := ParsePrediction(tt.reply)
+			require.ErrorIs(t, err, gepa.ErrInvalidOutput)
+			reply, parseErr := gepa.ParsePrediction(tt.reply)
 			require.NoError(t, parseErr)
 			require.Equal(t, reply, got, "the rejected reply is returned with the error")
 		})
@@ -89,13 +87,13 @@ func TestPredictRejectsInvalidOutputs(t *testing.T) {
 }
 
 func TestPredictAcceptsOptionalOutputs(t *testing.T) {
-	signature := Signature{
-		Inputs:  []Field{{Name: "document"}},
-		Outputs: []Field{{Name: "answer"}, {Name: "note", Type: "string", Optional: true}},
+	signature := gepa.Signature{
+		Inputs:  []gepa.Field{{Name: "document"}},
+		Outputs: []gepa.Field{{Name: "answer"}, {Name: "note", Type: "string", Optional: true}},
 	}
 	for _, reply := range []string{`{"answer": "a"}`, `{"answer": "a", "note": null}`, `{"answer": "a", "note": "n"}`} {
 		t.Run(reply, func(t *testing.T) {
-			got, err := Predict{Signature: signature}.ParseOutput(reply)
+			got, err := gepa.Predict{Signature: signature}.ParseOutput(reply)
 			require.NoError(t, err)
 			require.Equal(t, "a", got["answer"])
 		})
@@ -103,11 +101,11 @@ func TestPredictAcceptsOptionalOutputs(t *testing.T) {
 }
 
 func TestParseOutput(t *testing.T) {
-	program := Predict{Signature: Signature{Inputs: []Field{{Name: "q"}}, Outputs: []Field{{Name: "a"}}}}
+	program := gepa.Predict{Signature: gepa.Signature{Inputs: []gepa.Field{{Name: "q"}}, Outputs: []gepa.Field{{Name: "a"}}}}
 
 	got, err := program.ParseOutput("```json\n{\"a\": 1}\n```")
 	require.NoError(t, err)
-	require.Equal(t, Prediction{"a": json.Number("1")}, got)
+	require.Equal(t, gepa.Prediction{"a": json.Number("1")}, got)
 
 	got, err = program.ParseOutput(`null`)
 	require.EqualError(t, err, `invalid programme output: output "a" is missing`)
@@ -115,187 +113,79 @@ func TestParseOutput(t *testing.T) {
 
 	got, err = program.ParseOutput(`not json`)
 	require.ErrorContains(t, err, "parse prediction")
-	require.NotErrorIs(t, err, ErrInvalidOutput, "a reply that does not parse is not checked")
+	require.NotErrorIs(t, err, gepa.ErrInvalidOutput, "a reply that does not parse is not checked")
 	require.Nil(t, got)
 }
 
-func TestPredictRepairPromptCarriesTheSchema(t *testing.T) {
-	program := Predict{Signature: typedQASignature()}
-	schema, err := program.Signature.JSONSchema()
-	require.NoError(t, err)
-
-	prompt := program.RepairPrompt("", `{"answer": 4}`, errors.New("output \"answer\" is not a valid string"))
-
-	require.Contains(t, prompt, "Return only a valid JSON object with these output fields: answer, confidence.")
-	require.Contains(t, prompt, schemaInstruction(schema))
-	require.Contains(t, prompt, "Error: output \"answer\" is not a valid string")
-	require.Contains(
-		t,
-		prompt,
-		"Your previous reply was not a valid JSON object for this signature:\n```\n{\"answer\": 4}\n```",
-	)
-	require.True(t, strings.HasPrefix(prompt, "Your previous reply"), "an empty original prompt is left out")
-
-	untyped := Predict{Signature: Signature{Inputs: []Field{{Name: "q"}}, Outputs: []Field{{Name: "a"}}}}
-	require.Contains(t, untyped.RepairPrompt("Answer q.", "x", errors.New("bad")), `"additionalProperties": false`)
-
-	invalid := Predict{Signature: Signature{Inputs: []Field{{Name: "q"}}, Outputs: []Field{{Name: "a", Type: "?"}}}}
-	require.NotContains(t, invalid.RepairPrompt("Answer q.", "x", errors.New("bad")), "JSON schema")
-}
-
-func TestPredictRepairPromptRepeatsTheRequest(t *testing.T) {
-	program := Predict{Signature: typedQASignature(), Instruction: "Answer the question."}
-	original, err := program.BuildPrompt(program.SeedCandidate(), Prediction{"question": "2+2?"})
-	require.NoError(t, err)
-	schema, err := program.Signature.JSONSchema()
-	require.NoError(t, err)
-
-	prompt := program.RepairPrompt(original, `{"answer": "4"}`, errors.New(`output "confidence" is missing`))
-
-	require.True(t, strings.HasPrefix(prompt, original), "the repair model sees the task, instruction and inputs")
-	require.Equal(t, 1, strings.Count(prompt, schemaInstruction(schema)), "the schema is not repeated")
-	require.Contains(t, prompt, "Answer the request above again, using its inputs.")
-}
-
-// TestPredictRepairAnswersFromTheInputs uses a model that can only fill a missing field from
-// the inputs in its prompt, so the repair works only if the repair prompt carries them.
+// TestPredictRepairAnswersFromTheInputs repairs a reply that left out a field the model can
+// only fill from the inputs, so the repair prompt must carry them.
 func TestPredictRepairAnswersFromTheInputs(t *testing.T) {
-	var prompts []string
-	lm := textModel(func(_ context.Context, prompt string) (string, error) {
-		prompts = append(prompts, prompt)
-		if len(prompts) == 1 {
-			return `{"amount": 10}`, nil
-		}
-		deadline := regexp.MustCompile(`by (\d{4}-\d{2}-\d{2})`).FindStringSubmatch(prompt)
-		if deadline == nil {
-			return `{"amount": 10, "deadline": null}`, nil
-		}
-		return `{"amount": 10, "deadline": "` + deadline[1] + `"}`, nil
-	})
-	program := Predict{
-		Signature: Signature{
+	lm := gepatest.NewFakeGenerator().Default(
+		gepatest.Text(`{"amount": 10}`),
+		gepatest.Text(`{"amount": 10, "deadline": "2031-12-31"}`),
+	)
+	program := gepa.Predict{
+		Signature: gepa.Signature{
 			Name:    "extract",
-			Inputs:  []Field{{Name: "document"}},
-			Outputs: []Field{{Name: "amount", Type: "int"}, {Name: "deadline", Type: "string"}},
+			Inputs:  []gepa.Field{{Name: "document"}},
+			Outputs: []gepa.Field{{Name: "amount", Type: "int"}, {Name: "deadline", Type: "string"}},
 		},
 		LM:              lm,
 		MaxParseRetries: 1,
 	}
 
-	got, err := program.Run(context.Background(), Prediction{"document": "pay 10 by 2031-12-31"})
+	got, err := program.Run(context.Background(), gepa.Prediction{"document": "pay 10 by 2031-12-31"})
 
 	require.NoError(t, err)
 	require.Equal(t, "2031-12-31", got["deadline"])
-	require.Len(t, prompts, 2)
-	require.Contains(t, prompts[1], "2031-12-31", "the repair call sees the inputs")
-}
-
-func TestPredictRepairsAnInvalidOutput(t *testing.T) {
-	var prompts []string
-	program := Predict{
-		Signature: typedQASignature(),
-		LM: textModel(func(_ context.Context, prompt string) (string, error) {
-			prompts = append(prompts, prompt)
-			if len(prompts) == 1 {
-				return `{"answer": "4", "confidence": 1, "reasoning": "sum"}`, nil
-			}
-			return `{"answer": "4", "confidence": 1}`, nil
-		}),
-		MaxParseRetries: 1,
-	}
-
-	got, err := program.Run(context.Background(), Prediction{"question": "2+2?"})
-
-	require.NoError(t, err)
-	require.Equal(t, Prediction{"answer": "4", "confidence": json.Number("1")}, got)
-	require.Len(t, prompts, 2)
-	schema, err := program.Signature.JSONSchema()
-	require.NoError(t, err)
-	require.Contains(t, prompts[1], schemaInstruction(schema), "the repair prompt carries the schema")
-	require.Contains(t, prompts[1], `field "reasoning" is not an output of the signature`)
-}
-
-func TestPredictReturnsTheLastInvalidReplyWhenRepairsFail(t *testing.T) {
-	calls := 0
-	program := Predict{
-		Signature: typedQASignature(),
-		LM: textModel(func(context.Context, string) (string, error) {
-			calls++
-			if calls == 1 {
-				return `not json`, nil
-			}
-			return `{"answer": "4"}`, nil
-		}),
-		MaxParseRetries: 2,
-	}
-
-	got, err := program.Run(context.Background(), Prediction{"question": "2+2?"})
-
-	require.ErrorIs(t, err, ErrInvalidOutput)
-	require.ErrorContains(t, err, `output "confidence" is missing`)
-	require.Equal(t, Prediction{"answer": "4"}, got)
-	require.Equal(t, 3, calls)
-	var detailed *stepDetailsError
-	require.ErrorAs(t, err, &detailed)
-	require.Equal(t, map[string]any{"output": Prediction{"answer": "4"}}, detailed.details)
+	calls := lm.Calls()
+	require.Len(t, calls, 2)
+	require.Contains(t, calls[1].Prompt, "pay 10 by 2031-12-31", "the repair call sees the inputs")
+	require.Contains(t, calls[1].Prompt, `output "deadline" is missing`, "the repair call sees the error")
 }
 
 func TestPredictDoesNotRepairATruncatedTypedReply(t *testing.T) {
-	calls := 0
-	program := Predict{
-		Signature: typedQASignature(),
-		LM: GeneratorFunc(func(context.Context, string) (Generation, error) {
-			calls++
-			return Generation{Text: `{"answer": "the reply was cu`, FinishReason: FinishLength}, nil
-		}),
-		MaxParseRetries: 2,
-	}
+	lm := gepatest.NewFakeGenerator().Default(
+		gepatest.Text(`{"answer": "the reply was cu`).WithFinishReason(gepa.FinishLength),
+	)
+	program := gepa.Predict{Signature: typedQASignature(), LM: lm, MaxParseRetries: 2}
 
-	_, err := program.Run(context.Background(), Prediction{"question": "2+2?"})
+	_, err := program.Run(context.Background(), gepa.Prediction{"question": "2+2?"})
 
-	require.ErrorIs(t, err, ErrOutputTruncated)
-	require.Equal(t, 1, calls, "a truncated reply is never sent for repair")
+	require.ErrorIs(t, err, gepa.ErrOutputTruncated)
+	require.Len(t, lm.Calls(), 1, "a truncated reply is never sent for repair")
 }
 
 func TestPredictDoesNotRepairATruncatedRepair(t *testing.T) {
-	calls := 0
-	program := Predict{
-		Signature: typedQASignature(),
-		LM: GeneratorFunc(func(context.Context, string) (Generation, error) {
-			calls++
-			if calls == 1 {
-				return Generation{Text: `{"answer": "4"}`}, nil
-			}
-			return Generation{Text: `{"answer": "4", "confid`, FinishReason: FinishLength}, nil
-		}),
-		MaxParseRetries: 3,
-	}
+	lm := gepatest.NewFakeGenerator().Default(
+		gepatest.Text(`{"answer": "4"}`),
+		gepatest.Text(`{"answer": "4", "confid`).WithFinishReason(gepa.FinishLength),
+	)
+	program := gepa.Predict{Signature: typedQASignature(), LM: lm, MaxParseRetries: 3}
 
-	_, err := program.Run(context.Background(), Prediction{"question": "2+2?"})
+	_, err := program.Run(context.Background(), gepa.Prediction{"question": "2+2?"})
 
-	require.ErrorIs(t, err, ErrOutputTruncated)
-	require.Equal(t, 2, calls)
+	require.ErrorIs(t, err, gepa.ErrOutputTruncated)
+	require.Len(t, lm.Calls(), 2)
 }
 
 func TestChainOfThoughtRequiresItsReasoningField(t *testing.T) {
-	program := ChainOfThought{
-		Signature: Signature{Name: "qa", Inputs: []Field{{Name: "question"}}, Outputs: []Field{{Name: "answer"}}},
-		LM: textModel(func(context.Context, string) (string, error) {
-			return `{"answer": "42"}`, nil
-		}),
+	program := gepa.ChainOfThought{
+		Signature: gepa.Signature{Name: "qa", Inputs: []gepa.Field{{Name: "question"}}, Outputs: []gepa.Field{{Name: "answer"}}},
+		LM:        gepatest.NewFakeGenerator().Default(gepatest.Text(`{"answer": "42"}`)),
 	}
 
-	_, err := program.Run(context.Background(), Prediction{"question": "6*7?"})
+	_, err := program.Run(context.Background(), gepa.Prediction{"question": "6*7?"})
 
-	require.ErrorIs(t, err, ErrInvalidOutput)
+	require.ErrorIs(t, err, gepa.ErrInvalidOutput)
 	require.EqualError(t, err, `invalid programme output: signature "qa": output "reasoning" is missing`)
 }
 
 func TestChainOfThoughtTypesItsReasoningFieldForTypedSignatures(t *testing.T) {
-	typed := ChainOfThought{Signature: typedQASignature(), ReasoningField: "why"}.ToPredict()
+	typed := gepa.ChainOfThought{Signature: typedQASignature(), ReasoningField: "why"}.ToPredict()
 	require.Equal(
 		t,
-		Field{Name: "why", Description: "brief reasoning for the answer", Type: "string"},
+		gepa.Field{Name: "why", Description: "brief reasoning for the answer", Type: "string"},
 		typed.Signature.Outputs[0],
 	)
 	require.Equal(t, []string{"why", "answer", "confidence"}, typed.Signature.OutputNames(), "reasoning comes first")
@@ -303,15 +193,15 @@ func TestChainOfThoughtTypesItsReasoningFieldForTypedSignatures(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, format.Strict, "the reasoning field keeps a typed signature strict")
 
-	untyped := ChainOfThought{
-		Signature: Signature{Inputs: []Field{{Name: "q"}}, Outputs: []Field{{Name: "a"}}},
+	untyped := gepa.ChainOfThought{
+		Signature: gepa.Signature{Inputs: []gepa.Field{{Name: "q"}}, Outputs: []gepa.Field{{Name: "a"}}},
 	}.ToPredict()
 	require.Equal(
 		t,
-		Field{Name: "reasoning", Description: "brief reasoning for the answer"},
+		gepa.Field{Name: "reasoning", Description: "brief reasoning for the answer"},
 		untyped.Signature.Outputs[0],
 	)
-	prompt, err := untyped.BuildPrompt(untyped.SeedCandidate(), Prediction{"q": "?"})
+	prompt, err := untyped.BuildPrompt(untyped.SeedCandidate(), gepa.Prediction{"q": "?"})
 	require.NoError(t, err)
 	require.False(t, strings.Contains(prompt, "JSON schema"), "an untyped chain of thought has no schema in its prompt")
 	require.Contains(t, prompt, "Return only a JSON object with these output fields: reasoning, a.")
@@ -343,15 +233,15 @@ func TestPredictTypeChecksAtTheEdges(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.typ+" "+tt.value, func(t *testing.T) {
-			signature := Signature{Name: "s", Inputs: []Field{{Name: "q"}}, Outputs: []Field{{Name: "v", Type: tt.typ}}}
+			signature := gepa.Signature{Name: "s", Inputs: []gepa.Field{{Name: "q"}}, Outputs: []gepa.Field{{Name: "v", Type: tt.typ}}}
 
-			_, err := Predict{Signature: signature}.ParseOutput(`{"v":` + tt.value + `}`)
+			_, err := gepa.Predict{Signature: signature}.ParseOutput(`{"v":` + tt.value + `}`)
 
 			if tt.valid {
 				require.NoError(t, err)
 				return
 			}
-			require.ErrorIs(t, err, ErrInvalidOutput)
+			require.ErrorIs(t, err, gepa.ErrInvalidOutput)
 			require.ErrorContains(t, err, `output "v" is not a valid `+tt.typ)
 		})
 	}

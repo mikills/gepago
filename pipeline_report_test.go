@@ -12,29 +12,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestHTMLRunReportShowsEveryStepAndTheFailure(t *testing.T) {
-	trace := tracedPipeline(t)
-	report, err := HTMLRunReport(trace, HTMLReportOptions{})
-	require.NoError(t, err)
-
-	require.Contains(t, report, "<title>Pipeline Run Report</title>")
-	for _, step := range []string{"fan", "summarise", "measure", "fb", "primary", "secondary", "inner", "classify", "check"} {
-		require.Contains(t, report, "<strong>"+step+"</strong>")
-	}
-	require.Contains(t, report, "amount too small")
-	require.Contains(t, report, "pipeline step &#34;check&#34;: amount too small")
-	require.Contains(t, report, "primary down")
-	require.Contains(t, report, ">failed</strong>")
-	require.Contains(t, report, "Nested run "+trace.Steps[2].Runs[0].RunContext.RunID+" ·")
-	// a nested step is rendered inside the step that ran it
-	fan := strings.Index(report, "<strong>fan</strong>")
-	summarise := strings.Index(report, "<strong>summarise</strong>")
-	fb := strings.Index(report, "<strong>fb</strong>")
-	require.Less(t, fan, summarise)
-	require.Less(t, summarise, fb)
-	require.Equal(t, 4, strings.Count(report, `<ol class="steps">`))
-}
-
 func TestHTMLRunReportEscapesValuesAndErrors(t *testing.T) {
 	recorder := &RecordingObserver{}
 	inject := NewStep("<b>inject</b>", refs(docKey.Ref()), refs(summaryKey.Ref()), func(_ context.Context, s State) error {

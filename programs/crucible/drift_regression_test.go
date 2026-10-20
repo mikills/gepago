@@ -9,12 +9,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	gepa "github.com/mikills/gepago"
+	"github.com/mikills/gepago/gepatest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -252,21 +252,6 @@ func (revisionedEvaluator) Evaluate(context.Context, EvalInput) (Score, error) {
 
 func (e revisionedEvaluator) CrucibleEvaluationRevision() string { return e.revision }
 
-type usageLanguageModel struct {
-	response string
-	err      error
-	usage    gepa.Usage
-}
-
-func (m usageLanguageModel) Generate(context.Context, string) (gepa.Generation, error) {
-	return gepa.Generation{Text: m.response, Usage: m.usage}, m.err
-}
-
-// textJudge adapts a text-only judge function to a gepa.Generator.
-func textJudge(fn gepa.LanguageModelFunc) gepa.Generator {
-	return gepa.AdaptLanguageModel(fn)
-}
-
 func (e funcPairwiseEvaluator) Name() string { return e.name }
 
 func (e funcPairwiseEvaluator) Compare(ctx context.Context, input PairwiseInput) (PairwiseScore, error) {
@@ -343,14 +328,7 @@ func TestCancelledPairwiseWork(t *testing.T) {
 }
 
 func TestPairwiseJudgeBlinding(t *testing.T) {
-	var mu sync.Mutex
-	var prompts []string
-	judge := textJudge(func(_ context.Context, prompt string) (string, error) {
-		mu.Lock()
-		prompts = append(prompts, prompt)
-		mu.Unlock()
-		return `{"winner":"a","score_a":1,"score_b":0,"feedback":"A"}`, nil
-	})
+	judge := gepatest.NewFakeGenerator().Default(gepatest.Text(`{"winner":"a","score_a":1,"score_b":0,"feedback":"A"}`))
 	evaluator := PairwiseJudgeEvaluator{LM: judge, Rubric: "Prefer grounded answers."}
 	input := PairwiseInput{
 		Suite:    Suite{Name: "blind"},
@@ -365,19 +343,18 @@ func TestPairwiseJudgeBlinding(t *testing.T) {
 	input.Repeat = 1
 	second, err := evaluator.Compare(context.Background(), input)
 	require.NoError(t, err)
-	require.Len(t, prompts, 2)
-	for _, prompt := range prompts {
-		assert.NotContains(t, prompt, "expensive-model")
-		assert.NotContains(t, prompt, "cheap-model")
-		assert.Contains(t, prompt, "Candidate A JSON")
+	calls := judge.Calls()
+	require.Len(t, calls, 2)
+	for _, call := range calls {
+		assert.NotContains(t, call.Prompt, "expensive-model")
+		assert.NotContains(t, call.Prompt, "cheap-model")
+		assert.Contains(t, call.Prompt, "Candidate A JSON")
 	}
 	assert.NotEqual(t, first.Winner, second.Winner)
 }
 
 func TestPairwiseScoreOrientation(t *testing.T) {
-	judge := textJudge(func(context.Context, string) (string, error) {
-		return `{"winner":"a","score_a":0.9,"score_b":0.1,"feedback":"A"}`, nil
-	})
+	judge := gepatest.NewFakeGenerator().Default(gepatest.Text(`{"winner":"a","score_a":0.9,"score_b":0.1,"feedback":"A"}`))
 	evaluator := PairwiseJudgeEvaluator{LM: judge, Rubric: "Prefer A."}
 	input := PairwiseInput{
 		Suite:    Suite{Name: "orientation"},
@@ -398,9 +375,9 @@ func TestPairwiseScoreOrientation(t *testing.T) {
 }
 
 func TestPairwiseJudgeRequiresRubric(t *testing.T) {
-	evaluator := PairwiseJudgeEvaluator{LM: textJudge(func(context.Context, string) (string, error) {
-		return `{"winner":"tie","score_a":0.5,"score_b":0.5}`, nil
-	})}
+	evaluator := PairwiseJudgeEvaluator{
+		LM: gepatest.NewFakeGenerator().Default(gepatest.Text(`{"winner":"tie","score_a":0.5,"score_b":0.5}`)),
+	}
 	_, err := evaluator.Compare(context.Background(), PairwiseInput{})
 	require.EqualError(t, err, "pairwise judge requires a rubric")
 }
@@ -460,7 +437,7 @@ func TestJudgeFailuresPreserveUsage(t *testing.T) {
 		Suite:    Suite{Name: "judge-usage", Cases: []EvalCase{{ID: "case", Rubric: "Be correct"}}},
 		Subjects: []Subject{valueSubject("subject", gepa.Prediction{"answer": "ok"})},
 		Evaluators: []WeightedEvaluator{{Evaluator: RubricJudgeEvaluator{
-			LM: usageLanguageModel{response: `{"score":9}`, usage: usage}, MaxScore: 5,
+			LM: gepatest.NewFakeGenerator().Default(gepatest.Text(`{"score":9}`).WithUsage(usage)), MaxScore: 5,
 		}}},
 	})
 	require.NoError(t, err)
@@ -483,7 +460,7 @@ func TestPairwiseJudgeFailureUsage(t *testing.T) {
 		},
 		Evaluators: []WeightedEvaluator{{Evaluator: JSONValidityEvaluator{}}},
 		PairwiseEvaluators: []WeightedPairwiseEvaluator{{Evaluator: PairwiseJudgeEvaluator{
-			LM: usageLanguageModel{response: `{not-json`, usage: usage},
+			LM: gepatest.NewFakeGenerator().Default(gepatest.Text(`{not-json`).WithUsage(usage)),
 		}}},
 	})
 	require.NoError(t, err)
@@ -612,26 +589,21 @@ func TestSubjectInputsAreIsolated(t *testing.T) {
 	assert.Equal(t, 1.0, result.Results[1].AggregateScore)
 }
 
-type concurrencyTrackingLM struct {
-	active atomic.Int32
-	max    atomic.Int32
-}
-
-func (m *concurrencyTrackingLM) Generate(context.Context, string) (gepa.Generation, error) {
-	active := m.active.Add(1)
-	for {
-		current := m.max.Load()
-		if active <= current || m.max.CompareAndSwap(current, active) {
-			break
-		}
-	}
-	time.Sleep(10 * time.Millisecond)
-	m.active.Add(-1)
-	return gepa.Generation{Text: "ok"}, nil
-}
-
 func TestModelSubjectSerialization(t *testing.T) {
-	model := &concurrencyTrackingLM{}
+	// the model holds each call open and records how many calls it held at once.
+	var active, most atomic.Int32
+	model := gepatest.NewFakeGenerator().Default(gepatest.Reply{Text: "ok", Wait: func(context.Context) error {
+		now := active.Add(1)
+		for {
+			current := most.Load()
+			if now <= current || most.CompareAndSwap(current, now) {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+		active.Add(-1)
+		return nil
+	}})
 	result, err := Run(context.Background(), RunConfig{
 		Suite: Suite{Name: "shared-model", Cases: []EvalCase{{ID: "case"}}},
 		Subjects: []Subject{
@@ -643,7 +615,7 @@ func TestModelSubjectSerialization(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Len(t, result.Results, 2)
-	assert.Equal(t, int32(1), model.max.Load())
+	assert.Equal(t, int32(1), most.Load())
 }
 
 func TestDefaultResourceBounds(t *testing.T) {
@@ -743,21 +715,17 @@ func TestArtifactPermissions(t *testing.T) {
 	assert.Equal(t, os.FileMode(0o700), info.Mode().Perm())
 }
 
-type resolvedModelLM struct{}
-
-func (resolvedModelLM) Generate(context.Context, string) (gepa.Generation, error) {
-	return gepa.Generation{
-		Text:  "ok",
-		Model: "snapshot-model",
-		Usage: gepa.Usage{PromptTokens: 1_000_000, TotalTokens: 1_000_000},
-	}, nil
-}
-
 func TestResolvedModelProvenance(t *testing.T) {
 	result, err := Run(context.Background(), RunConfig{
 		Suite: Suite{Name: "resolved-model", Cases: []EvalCase{{ID: "case"}}},
 		Subjects: []Subject{RawModelSubject{
-			SubjectName: "production", LM: resolvedModelLM{}, OutputField: "answer",
+			SubjectName: "production",
+			LM: gepatest.NewFakeGenerator().Default(gepatest.Reply{
+				Text:  "ok",
+				Model: "snapshot-model",
+				Usage: gepa.Usage{PromptTokens: 1_000_000, TotalTokens: 1_000_000},
+			}),
+			OutputField: "answer",
 		}},
 		Evaluators: []WeightedEvaluator{{Evaluator: JSONValidityEvaluator{}}},
 	})

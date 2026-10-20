@@ -392,7 +392,10 @@ test("loads generated Go WASM and exposes deterministic APIs", async () => {
             kind: "predict",
             signature: {
               inputs: [{ name: "text" }],
-              outputs: [{ name: "topic" }],
+              outputs: [
+                { name: "topic" },
+                { name: "note", type: "string", optional: true },
+              ],
             },
             instruction: "Extract the topic.",
             outputPrefix: "extract.",
@@ -446,7 +449,7 @@ test("loads generated Go WASM and exposes deterministic APIs", async () => {
     const pipelineResult = await gepago.runCompiled(
       pipelineProgram,
       pipelineCompiled.candidate,
-      { text: "great" },
+      { text: "great", id: "not read" },
       async (hostRequest: PredictHostRequest): Promise<PredictModelResult> => {
         pipelineRequests.push(hostRequest);
         await new Promise((resolve) => setTimeout(resolve, 1));
@@ -471,9 +474,13 @@ test("loads generated Go WASM and exposes deterministic APIs", async () => {
             };
       },
     );
+    // as in Compile, a step without inputKeys reads only its signature's inputs, and an
+    // optional output the reply leaves out holds its type's zero value.
     assert.deepEqual(pipelineResult.prediction, {
       text: "great",
+      id: "not read",
       "extract.topic": "service",
+      "extract.note": "",
       label: "positive",
     });
     assert.deepEqual(pipelineResult.usage, {
@@ -482,6 +489,51 @@ test("loads generated Go WASM and exposes deterministic APIs", async () => {
       total_tokens: 5,
     });
     assert.equal(pipelineRequests.length, 2);
+    assert.ok(pipelineRequests[0].prompt.includes('"text": "great"'));
+    assert.ok(!pipelineRequests[0].prompt.includes("not read"));
+
+    // a model callback that fails, by throwing or by rejecting, returns its error to Go as
+    // that call's error, so the step fails with the host's message and the job is not
+    // reported as cancelled.
+    const hostFailure = /pipeline step "extract": .*host model exploded/;
+    const failingModels = [
+      (): never => {
+        throw new Error("host model exploded");
+      },
+      async (): Promise<never> => {
+        throw new Error("host model exploded");
+      },
+    ];
+    for (const failingModel of failingModels) {
+      await assert.rejects(
+        gepago.runCompiled(
+          pipelineProgram,
+          pipelineCompiled.candidate,
+          { text: "great" },
+          failingModel,
+        ),
+        hostFailure,
+      );
+      await assert.rejects(
+        gepago.compile(
+          {
+            program: pipelineProgram,
+            trainset: [
+              {
+                id: "pipeline",
+                input: { text: "great" },
+                expected: { label: "positive" },
+              },
+            ],
+            metric: { kind: "exactMatch", fields: ["label"] },
+            maxMetricCalls: 1,
+            seed: 3,
+          },
+          failingModel,
+        ),
+        hostFailure,
+      );
+    }
 
     await assert.rejects(
       gepago.compile(
@@ -514,8 +566,101 @@ test("loads generated Go WASM and exposes deterministic APIs", async () => {
         { text: "x" },
         () => "never",
       ),
-      /required input.*absent/,
+      /pipeline input "absent" is missing/,
     );
+
+    // compile reports a pipeline's key and input errors, including those found before any
+    // model call, and runCompiled accepts, rejects and prompts as compile does.
+    const countProgram = {
+      kind: "pipeline",
+      steps: [
+        {
+          name: "count",
+          program: {
+            signature: {
+              name: "count",
+              inputs: [
+                { name: "count", type: "int" },
+                { name: "weight", type: "float32" },
+              ],
+              outputs: [{ name: "label" }],
+            },
+            instruction: "Count.",
+          },
+        },
+      ],
+    } satisfies PipelineProgram;
+    const compilePrompts: string[] = [];
+    const compileCount = (input: JSONObject) =>
+      api.compile(
+        {
+          program: countProgram,
+          trainset: [{ id: "count", input, expected: { label: "three" } }],
+          metric: { kind: "exactMatch", fields: ["label"] },
+          maxMetricCalls: 1,
+        },
+        (hostRequest: CompileModelRequest) => {
+          if (hostRequest.role === "task")
+            compilePrompts.push(hostRequest.prompt);
+          return '{"label":"three"}';
+        },
+      );
+    const badCount = /invalid pipeline input: state key "count"/;
+    await assert.rejects(compileCount({ count: "3", weight: 1 }), badCount);
+    await assert.rejects(
+      gepago.runCompiled(
+        countProgram,
+        {},
+        { count: "3", weight: 1 },
+        () => "never",
+      ),
+      badCount,
+    );
+    const rewriteProgram = {
+      kind: "pipeline",
+      steps: [
+        {
+          name: "rewrite",
+          program: {
+            signature: { inputs: [{ name: "draft" }], outputs: [{ name: "text" }] },
+            inputKeys: ["text"],
+          },
+        },
+      ],
+    } satisfies PipelineProgram;
+    const writesInput =
+      /pipeline step "rewrite" writes pipeline input "text", which is read-only/;
+    await assert.rejects(
+      gepago.compile(
+        {
+          program: rewriteProgram,
+          trainset: [
+            { id: "rewrite", input: { text: "x" }, expected: { text: "y" } },
+          ],
+          metric: { kind: "exactMatch" },
+        },
+        () => "never",
+      ),
+      writesInput,
+    );
+    await assert.rejects(
+      gepago.runCompiled(rewriteProgram, {}, { text: "x" }, () => "never"),
+      writesInput,
+    );
+    await compileCount({ count: 3, weight: 16777217 });
+    const runPrompts: string[] = [];
+    const counted = await gepago.runCompiled(
+      countProgram,
+      { "count.instruction": "Count." },
+      { count: 3, weight: 16777217 },
+      (hostRequest: PredictHostRequest) => {
+        runPrompts.push(hostRequest.prompt);
+        return '{"label":"three"}';
+      },
+    );
+    assert.deepEqual(counted.prediction, { label: "three" });
+    assert.deepEqual(runPrompts, [compilePrompts[0]]);
+    assert.ok(compilePrompts[0].includes('"weight": 16777216'));
 
     const judgeRoles: CompileModelRequest["role"][] = [];
     const judged = await gepago.compile(
@@ -747,7 +892,7 @@ test("loads generated Go WASM and exposes deterministic APIs", async () => {
       api.compile(compileConfig, async () => {
         throw new Error("compile model failed");
       }),
-      /compile model failed|model callback failed|Promise rejected|cancelled/,
+      /compile model failed/,
     );
     await assert.rejects(
       api.compile({ ...compileConfig, trainset: [] }, () => "never"),

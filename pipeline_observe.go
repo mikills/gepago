@@ -116,6 +116,11 @@ type StepStartedEvent struct {
 	Attempt int
 	// Reads holds the values of the step's declared reads after redaction.
 	Reads map[string]any
+	// Lane names the step of a Parallel the execution belongs to when the execution is that step
+	// or one its step policy runs, such as a retry or an OnErrorFallback step; it is empty
+	// otherwise, for the executions nested in them too. The executions of different lanes of a
+	// Parallel run side by side, so they may start in any order.
+	Lane string
 }
 
 // StepFinishedEvent reports the end of one execution of a step.
@@ -165,11 +170,25 @@ type observeScope struct {
 	span          string
 	recording     *runObservation
 	recordingSpan string
+	// lane is the step of a Parallel the executions started in the scope belong to, or empty.
+	lane string
 }
 
 func observeScopeFrom(ctx context.Context) *observeScope {
 	scope, _ := ctx.Value(observeKey{}).(*observeScope)
 	return scope
+}
+
+// withLane returns ctx for the step named lane of a Parallel, so that the StepStarted events of
+// its executions report Lane. The executions nested in them do not inherit it.
+func withLane(ctx context.Context, lane string) context.Context {
+	scope := observeScopeFrom(ctx)
+	if scope == nil {
+		return ctx
+	}
+	laned := *scope
+	laned.lane = lane
+	return context.WithValue(ctx, observeKey{}, &laned)
 }
 
 // observerContext returns ctx, a context of the run, as observers receive it: with its values,
@@ -447,6 +466,7 @@ func observeStep(ctx context.Context, node *stepNode, attempt int, values map[st
 			Step:       node.name,
 			Attempt:    attempt,
 			Reads:      lane.reads,
+			Lane:       scope.lane,
 		}
 		observerCtx := lane.run.observerContext(ctx)
 		lane.run.deliver(func(observer PipelineObserver) {

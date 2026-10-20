@@ -16,10 +16,12 @@ unchanged; `predict.start` accepts the `predict` and `chainOfThought` program ki
 
 ## Async Compile
 
-`gepagoWasm.start(operation, payloadJSON, modelFn, onComplete)` currently
-supports only `operation === "compile"`. It returns a module-owned `job_id`
-immediately. `onComplete(job_id, resultJSON)` is called later, where
-`resultJSON` is the usual envelope:
+`gepagoWasm.start(operation, payloadJSON, modelFn, onComplete)` supports
+`operation === "compile"` and `operation === "pipeline.run"` (below). It returns
+a module-owned `job_id` immediately. `onComplete(job_id, resultJSON)` is always
+called from a later JavaScript task, even for a job that fails before its first
+model call, so the caller knows the `job_id` by then. `resultJSON` is the usual
+envelope:
 
 ```json
 {"ok":true,"value":{"candidate":{},"state":{}}}
@@ -72,8 +74,26 @@ uses named steps whose nested programs are `predict` or `chainOfThought`:
 ],"returnAll":true}
 ```
 
-Pipeline candidates are scoped (`extract.instruction`, `decide.instruction`,
-etc.) and are passed to the existing `gepa.PipelineProgram` during Compile.
+Compile runs a pipeline program as a typed `gepa.Pipeline`. Each step reads its
+`inputKeys`, or its signature's inputs when it lists none, and writes its
+signature's outputs under its `outputPrefix`. A key takes the Go type of the
+`Field.Type` that first declares it (the first step's output that writes it, or,
+for a pipeline input, the input field of the first step that reads it), and
+`any` when that field sets no type, so a typed pipeline input must convert to
+its type. An absent or null optional output holds its type's zero value. A key
+written by several steps keeps the latest value; a step that writes a pipeline
+input, or steps that write one key as different types, fail validation. The
+result is the last step's outputs, or with `returnAll` the inputs overlaid with
+every step's outputs. Pipeline candidates are scoped (`extract.instruction`,
+`decide.instruction`, etc.).
+
+`start("pipeline.run", payloadJSON, modelFn, onComplete)` runs a compiled
+pipeline program as compile runs it, with
+`{"program": {...}, "candidate": {...}, "inputs": {...}}`; a component the
+candidate leaves out keeps its seed text. Its model requests have the
+`predict.start` host request shape (`request_id`, role `task`, attempt 1 for a
+step's first call and one more for each repair), and it completes with
+`{"prediction": {...}, "usage": {...}}`.
 
 Supported metrics are `exactMatch`, `contains`, `numericMatch`,
 `classification`, and `llmJudge`. `acceptance` is `strict` (the default) or
@@ -85,7 +105,10 @@ Gepago's structured `NewIOExample` API.
 
 `gepagoWasm.cancel(job_id)` requests cancellation and returns `true`; the job
 then completes with an error envelope when its goroutine observes cancellation.
-The bridge waits for a Promise only on a worker goroutine, so the JavaScript
+A model function that throws, or whose Promise rejects, fails only that model
+call with the host's message: the job is not cancelled, and a `compile` or
+`pipeline.run` job completes with that error, named by its step for a
+pipeline. The bridge waits for a Promise only on a worker goroutine, so the JavaScript
 event loop is not blocked by model calls. An arbitrary Promise cannot be
 force-cancelled: if a host callback itself blocks synchronously or never
 settles, cleanup is necessarily best effort. A settled Promise releases its Go
