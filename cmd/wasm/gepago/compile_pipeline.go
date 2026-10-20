@@ -27,7 +27,7 @@ var anyType = reflect.TypeFor[any]()
 // steps that write one key as different types.
 func buildCompilePipeline(
 	wire *compileWireProgram,
-	taskLM, repairLM *compileLanguageModel,
+	taskLM, repairLM gepa.Generator,
 ) (compilePipelineProgram, error) {
 	types := map[string]reflect.Type{}
 	inputs := map[string]bool{}

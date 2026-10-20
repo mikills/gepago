@@ -620,7 +620,7 @@ func validateCompileMetricOptions(options compileMetricOptions) error {
 // a ChainOfThought runs as, or a pipeline (see buildCompilePipeline).
 func buildCompileProgram(
 	wire *compileWireProgram,
-	taskLM, repairLM *compileLanguageModel,
+	taskLM, repairLM gepa.Generator,
 ) (gepa.Program, error) {
 	if compileProgramKind(wire.Kind) == "pipeline" {
 		return buildCompilePipeline(wire, taskLM, repairLM)
@@ -631,7 +631,7 @@ func buildCompileProgram(
 // buildCompilePredict builds the Predict a predict or chainOfThought programme runs as.
 func buildCompilePredict(
 	wire *compileWireProgram,
-	taskLM, repairLM *compileLanguageModel,
+	taskLM, repairLM gepa.Generator,
 ) gepa.Predict {
 	if compileProgramKind(wire.Kind) == "chainOfThought" {
 		program := gepa.ChainOfThought{

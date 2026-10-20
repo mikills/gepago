@@ -523,8 +523,101 @@ test("loads generated Go WASM and exposes deterministic APIs", async () => {
         { text: "x" },
         () => "never",
       ),
-      /required input.*absent/,
+      /pipeline input "absent" is missing/,
     );
+
+    // compile reports a pipeline's key and input errors, including those found before any
+    // model call, and runCompiled accepts, rejects and prompts as compile does.
+    const countProgram = {
+      kind: "pipeline",
+      steps: [
+        {
+          name: "count",
+          program: {
+            signature: {
+              name: "count",
+              inputs: [
+                { name: "count", type: "int" },
+                { name: "weight", type: "float32" },
+              ],
+              outputs: [{ name: "label" }],
+            },
+            instruction: "Count.",
+          },
+        },
+      ],
+    } satisfies PipelineProgram;
+    const compilePrompts: string[] = [];
+    const compileCount = (input: JSONObject) =>
+      api.compile(
+        {
+          program: countProgram,
+          trainset: [{ id: "count", input, expected: { label: "three" } }],
+          metric: { kind: "exactMatch", fields: ["label"] },
+          maxMetricCalls: 1,
+        },
+        (hostRequest: CompileModelRequest) => {
+          if (hostRequest.role === "task")
+            compilePrompts.push(hostRequest.prompt);
+          return '{"label":"three"}';
+        },
+      );
+    const badCount = /invalid pipeline input: state key "count"/;
+    await assert.rejects(compileCount({ count: "3", weight: 1 }), badCount);
+    await assert.rejects(
+      gepago.runCompiled(
+        countProgram,
+        {},
+        { count: "3", weight: 1 },
+        () => "never",
+      ),
+      badCount,
+    );
+    const rewriteProgram = {
+      kind: "pipeline",
+      steps: [
+        {
+          name: "rewrite",
+          program: {
+            signature: { inputs: [{ name: "draft" }], outputs: [{ name: "text" }] },
+            inputKeys: ["text"],
+          },
+        },
+      ],
+    } satisfies PipelineProgram;
+    const writesInput =
+      /pipeline step "rewrite" writes pipeline input "text", which is read-only/;
+    await assert.rejects(
+      gepago.compile(
+        {
+          program: rewriteProgram,
+          trainset: [
+            { id: "rewrite", input: { text: "x" }, expected: { text: "y" } },
+          ],
+          metric: { kind: "exactMatch" },
+        },
+        () => "never",
+      ),
+      writesInput,
+    );
+    await assert.rejects(
+      gepago.runCompiled(rewriteProgram, {}, { text: "x" }, () => "never"),
+      writesInput,
+    );
+    await compileCount({ count: 3, weight: 16777217 });
+    const runPrompts: string[] = [];
+    const counted = await gepago.runCompiled(
+      countProgram,
+      { "count.instruction": "Count." },
+      { count: 3, weight: 16777217 },
+      (hostRequest: PredictHostRequest) => {
+        runPrompts.push(hostRequest.prompt);
+        return '{"label":"three"}';
+      },
+    );
+    assert.deepEqual(counted.prediction, { label: "three" });
+    assert.deepEqual(runPrompts, [compilePrompts[0]]);
+    assert.ok(compilePrompts[0].includes('"weight": 16777216'));
 
     const judgeRoles: CompileModelRequest["role"][] = [];
     const judged = await gepago.compile(

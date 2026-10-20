@@ -12,7 +12,6 @@ import type {
   JSONValue,
   OptimizeCapabilities,
   OptimizeConfig,
-  PipelineStep,
   PredictConfig,
   PredictModel,
   PredictResult,
@@ -20,7 +19,6 @@ import type {
   RunResult,
   Signature,
   MetricResult,
-  Usage,
 } from "./public-types.ts";
 import type {
   LoadedRuntime,
@@ -29,59 +27,6 @@ import type {
 } from "./internal-types.ts";
 
 type BrowserOptions = { wasmURL?: string | URL; wasmExecURL?: string | URL };
-
-// pipelineStepReads returns the keys a pipeline step reads, as Compile runs it: its
-// inputKeys, or its signature's inputs when it lists none.
-function pipelineStepReads(step: PipelineStep): string[] {
-  const keys = step.program.inputKeys;
-  return keys === undefined || keys.length === 0
-    ? step.program.signature.inputs.map((field) => field.name)
-    : keys;
-}
-
-// pipelineStepWrites returns a step's outputs under its outputPrefix, as Compile commits them:
-// an optional output that the reply leaves out or sets to null holds the zero value of its type.
-function pipelineStepWrites(
-  step: PipelineStep,
-  prediction: Record<string, JSONValue>,
-): Record<string, JSONValue> {
-  const prefix = (step.program.outputPrefix ?? "").trim();
-  const writes: Record<string, JSONValue> = {};
-  for (const [key, value] of Object.entries(prediction))
-    writes[`${prefix}${key}`] = value;
-  for (const field of step.program.signature.outputs) {
-    const key = `${prefix}${field.name}`;
-    if (field.optional === true && (writes[key] ?? null) === null)
-      writes[key] = zeroFieldValue(field.type);
-  }
-  return writes;
-}
-
-// zeroFieldValue returns the JSON form of the Go zero value of a Field type.
-function zeroFieldValue(type: string | undefined): JSONValue {
-  switch (type) {
-    case "bool":
-      return false;
-    case "string":
-      return "";
-    case "int":
-    case "int8":
-    case "int16":
-    case "int32":
-    case "int64":
-    case "uint":
-    case "uint8":
-    case "uint16":
-    case "uint32":
-    case "uint64":
-    case "float32":
-    case "float64":
-      return 0;
-    default:
-      return null;
-  }
-}
-
 function object(value: unknown): WireObject {
   if (value === null || typeof value !== "object" || Array.isArray(value))
     throw new Error("expected object");
@@ -342,46 +287,37 @@ function createBrowserRuntime(namespace: RuntimeNamespace): LoadedRuntime {
         },
         model,
       );
-    let stateInputs = { ...inputs };
-    let last: Record<string, JSONValue> = {};
-    let usage: Usage = {
-      prompt_tokens: 0,
-      completion_tokens: 0,
-      total_tokens: 0,
-    };
-    for (const step of program.steps) {
-      const stepInputs: Record<string, JSONValue> = {};
-      for (const key of pipelineStepReads(step)) {
-        if (!Object.hasOwn(stateInputs, key))
-          throw new Error(
-            `pipeline step "${step.name}": required input "${key}" is missing`,
+    // A pipeline runs in the Go module exactly as compile runs it, so both accept and reject
+    // the same programmes and inputs and send the same prompts.
+    return as<PredictResult>(
+      await new Promise<unknown>((resolve, reject) => {
+        let jobID = "";
+        try {
+          jobID = runtimeString(
+            namespace.start(
+              "pipeline.run",
+              jsonPayload("runCompiled", { program, candidate, inputs }),
+              (requestJSON) => model(JSON.parse(requestJSON) as never),
+              (completedJobID, resultJSON) => {
+                if (completedJobID !== jobID)
+                  reject(
+                    new Error("runCompiled completed with an unexpected job id"),
+                  );
+                else
+                  try {
+                    resolve(parseEnvelope("runCompiled", resultJSON));
+                  } catch (error) {
+                    reject(error);
+                  }
+              },
+            ),
+            "runCompiled",
           );
-        stepInputs[key] = stateInputs[key];
-      }
-      const scoped: Candidate = {};
-      const prefix = `${step.name}.`;
-      for (const [key, value] of Object.entries(candidate))
-        if (key.startsWith(prefix)) scoped[key.slice(prefix.length)] = value;
-      const result = await predict(
-        {
-          program: applyCandidate(
-            step.program,
-            scoped,
-          ) as PredictConfig["program"],
-          inputs: stepInputs,
-        },
-        model,
-      );
-      usage = {
-        prompt_tokens: usage.prompt_tokens + result.usage.prompt_tokens,
-        completion_tokens:
-          usage.completion_tokens + result.usage.completion_tokens,
-        total_tokens: usage.total_tokens + result.usage.total_tokens,
-      };
-      last = pipelineStepWrites(step, result.prediction);
-      Object.assign(stateInputs, last);
-    }
-    return { prediction: program.returnAll ? stateInputs : last, usage };
+        } catch (error) {
+          reject(error);
+        }
+      }),
+    );
   }
   return {
     invoke,

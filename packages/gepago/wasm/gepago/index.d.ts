@@ -569,7 +569,11 @@ export interface GepagoWasm {
     chat: AgentChat,
     tool: AgentTool,
   ): Promise<RunResult>;
-  /** Runs a Compile candidate for Predict, ChainOfThought, or Pipeline programs. */
+  /**
+   * Runs a Compile candidate for Predict, ChainOfThought, or Pipeline programs. A pipeline
+   * runs as the same typed pipeline Compile evaluates, so it accepts the same inputs and
+   * sends the same prompts.
+   */
   runCompiled(
     programConfig: RunProgram,
     candidate: PredictCandidate | PipelineCandidate,

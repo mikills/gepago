@@ -16,10 +16,12 @@ unchanged; `predict.start` accepts the `predict` and `chainOfThought` program ki
 
 ## Async Compile
 
-`gepagoWasm.start(operation, payloadJSON, modelFn, onComplete)` currently
-supports only `operation === "compile"`. It returns a module-owned `job_id`
-immediately. `onComplete(job_id, resultJSON)` is called later, where
-`resultJSON` is the usual envelope:
+`gepagoWasm.start(operation, payloadJSON, modelFn, onComplete)` supports
+`operation === "compile"` and `operation === "pipeline.run"` (below). It returns
+a module-owned `job_id` immediately. `onComplete(job_id, resultJSON)` is always
+called from a later JavaScript task, even for a job that fails before its first
+model call, so the caller knows the `job_id` by then. `resultJSON` is the usual
+envelope:
 
 ```json
 {"ok":true,"value":{"candidate":{},"state":{}}}
@@ -84,6 +86,14 @@ input, or steps that write one key as different types, fail validation. The
 result is the last step's outputs, or with `returnAll` the inputs overlaid with
 every step's outputs. Pipeline candidates are scoped (`extract.instruction`,
 `decide.instruction`, etc.).
+
+`start("pipeline.run", payloadJSON, modelFn, onComplete)` runs a compiled
+pipeline program as compile runs it, with
+`{"program": {...}, "candidate": {...}, "inputs": {...}}`; a component the
+candidate leaves out keeps its seed text. Its model requests have the
+`predict.start` host request shape (`request_id`, role `task`, attempt 1 for a
+step's first call and one more for each repair), and it completes with
+`{"prediction": {...}, "usage": {...}}`.
 
 Supported metrics are `exactMatch`, `contains`, `numericMatch`,
 `classification`, and `llmJudge`. `acceptance` is `strict` (the default) or

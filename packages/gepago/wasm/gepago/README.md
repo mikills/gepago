@@ -274,12 +274,15 @@ pending compile jobs.
 `runCompiled(programConfig, candidate, inputs, model)` accepts wire `predict`,
 `chainOfThought`, and `pipeline` programs. COT programs add the reasoning output
 and instruction once; compiled COT candidates are overlaid after that normalization.
-Pipeline candidates use scoped keys such as `extract.instruction`. Steps run
-sequentially through the async `predict` bridge, as Compile runs them: each step
-sees its `inputKeys`, or only its signature's inputs when it lists none, its
-outputs are stored under its `outputPrefix` (an optional output the reply leaves
-out holds its type's zero value), and the pipeline's `returnAll` setting picks
-the result.
+Pipeline candidates use scoped keys such as `extract.instruction`; a component
+the candidate leaves out keeps its seed text. A pipeline runs in the Go module
+as the same typed `gepa.Pipeline` that `compile` evaluates, so `runCompiled`
+accepts and rejects the same programs and inputs and sends the same prompts:
+each step sees its `inputKeys`, or only its signature's inputs when it lists
+none, typed inputs are converted to their types, its outputs are stored under
+its `outputPrefix` (an optional output the reply leaves out holds its type's
+zero value), and the pipeline's `returnAll` setting picks the result. Model
+requests have the `predict` host request shape.
 
 ## Async Agents
 

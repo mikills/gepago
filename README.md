@@ -528,8 +528,8 @@ try {
 
 The WASM package exposes asynchronous `predict`, `compile`, `optimize`, and
 `runAgent` methods. Declarative `predict`, `chainOfThought`, and sequential
-`pipeline` programmes are supported; `compile` runs a pipeline as a typed `Pipeline`
-and pipeline candidates are step-scoped.
+`pipeline` programmes are supported; `compile` and `runCompiled` both run a pipeline
+as the same typed `Pipeline`, and pipeline candidates are step-scoped.
 `compile` routes task, reflector, judge, and repair calls to host callbacks and
 supports custom metrics, observers, and persistence callbacks. `optimize`
 provides JSON-safe evaluator, proposer, dataset-builder, merge, observer, and

@@ -24,7 +24,6 @@ import type {
   MetricResult,
   OptimizeCapabilities,
   OptimizeConfig,
-  PipelineStep,
   PredictConfig,
   PredictHostRequest,
   PredictModel,
@@ -1421,6 +1420,46 @@ function assertPredictComplete(value: unknown): PredictResult {
   return result as unknown as PredictResult;
 }
 
+// parsePipelineRunRequest decodes a model request of a runCompiled pipeline job, which has the
+// shape of a predict host request.
+function parsePipelineRunRequest(encoded: unknown): PredictHostRequest {
+  assertString(encoded, "runCompiled model request");
+  let request;
+  try {
+    request = JSON.parse(encoded);
+  } catch (error) {
+    throw new GepagoWasmError(
+      `runCompiled model request is invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+      "runCompiled",
+    );
+  }
+  const object = assertPlainObject(request, "runCompiled model request");
+  if (
+    typeof object.request_id !== "string" ||
+    object.request_id === "" ||
+    object.kind !== "language_model.generate" ||
+    object.role !== "task" ||
+    typeof object.prompt !== "string" ||
+    !Number.isSafeInteger(object.attempt) ||
+    (object.attempt as number) < 1
+  ) {
+    throw new GepagoWasmError(
+      "runCompiled received an invalid model request",
+      "runCompiled",
+    );
+  }
+  assertJSONValue(object, "runCompiled model request");
+  return object as unknown as PredictHostRequest;
+}
+
+function assertPipelineRunResult(value: unknown): PredictResult {
+  const result = assertPlainObject(value, "runCompiled result");
+  assertPrediction(result.prediction, "runCompiled result.prediction");
+  assertUsage(result.usage, "runCompiled result.usage");
+  assertJSONValue(result, "runCompiled result");
+  return result as unknown as PredictResult;
+}
+
 function normalizeModelResult(value: unknown): PredictModelResult {
   return normalizeHostModelResult(value, "predict model result");
 }
@@ -1609,67 +1648,6 @@ function assertCompiledCandidate(
     }
   }
   return object as unknown as Candidate;
-}
-
-function candidateForStep(candidate: Candidate, stepName: string): Candidate {
-  const scoped: Candidate = {};
-  const prefix = `${stepName}.`;
-  for (const [key, value] of Object.entries(candidate)) {
-    if (key.startsWith(prefix)) scoped[key.slice(prefix.length)] = value;
-  }
-  return scoped;
-}
-
-// pipelineStepReads returns the keys a pipeline step reads, as Compile runs it: its
-// inputKeys, or its signature's inputs when it lists none.
-function pipelineStepReads(step: PipelineStep): string[] {
-  const keys = step.program.inputKeys;
-  return keys === undefined || keys.length === 0
-    ? step.program.signature.inputs.map((field) => field.name)
-    : keys;
-}
-
-// pipelineStepWrites returns a step's outputs under its outputPrefix, as Compile commits them:
-// an optional output that the reply leaves out or sets to null holds the zero value of its type.
-function pipelineStepWrites(
-  step: PipelineStep,
-  prediction: Record<string, JSONValue>,
-): Record<string, JSONValue> {
-  const prefix = (step.program.outputPrefix ?? "").trim();
-  const writes: Record<string, JSONValue> = {};
-  for (const [key, value] of Object.entries(prediction))
-    writes[`${prefix}${key}`] = value;
-  for (const field of step.program.signature.outputs) {
-    const key = `${prefix}${field.name}`;
-    if (field.optional === true && (writes[key] ?? null) === null)
-      writes[key] = zeroFieldValue(field.type);
-  }
-  return writes;
-}
-
-// zeroFieldValue returns the JSON form of the Go zero value of a Field type.
-function zeroFieldValue(type: string | undefined): JSONValue {
-  switch (type) {
-    case "bool":
-      return false;
-    case "string":
-      return "";
-    case "int":
-    case "int8":
-    case "int16":
-    case "int32":
-    case "int64":
-    case "uint":
-    case "uint8":
-    case "uint16":
-    case "uint32":
-    case "uint64":
-    case "float32":
-    case "float64":
-      return 0;
-    default:
-      return null;
-  }
 }
 
 function applyCandidateToProgram(
@@ -2071,48 +2049,105 @@ export async function createGepagoWasm(
         );
       }
 
-      let stateInputs = { ...inputs };
-      let last: Record<string, JSONValue> = {};
-      let usage: Usage = {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
+      // A pipeline runs in the Go module exactly as compile runs it, so both accept and reject
+      // the same programmes and inputs and send the same prompts.
+      if (typeof model !== "function")
+        throw new TypeError("runCompiled model must be a function");
+      return runModelJob(
+        "pipeline.run",
+        "runCompiled",
+        encodePayload("runCompiled", {
+          program,
+          candidate: compiledCandidate,
+          inputs,
+        }),
+        async (requestJSON) =>
+          normalizeModelResult(
+            await model(parsePipelineRunRequest(requestJSON)),
+          ),
+        (resultJSON) =>
+          assertPipelineRunResult(parseEnvelope("runCompiled", resultJSON)),
+      );
+    }
+
+    // runModelJob runs an async Go job whose model calls go to modelCallback and resolves with
+    // its result as parseResult reads it. A failed model callback cancels the job.
+    async function runModelJob<T>(
+      goOperation: string,
+      operation: string,
+      payloadJSON: string,
+      modelCallback: (requestJSON: string) => Promise<unknown>,
+      parseResult: (resultJSON: string) => T,
+    ): Promise<T> {
+      let jobID: string | undefined;
+      let settled = false;
+      const modelFunction = async (requestJSON: string): Promise<unknown> => {
+        try {
+          return await modelCallback(requestJSON);
+        } catch (error) {
+          // The Go bridge turns callback failures into completion errors. Cancel
+          // immediately as well, so a pending model Promise cannot keep the
+          // job alive after a host callback failure.
+          cancelAsyncJob(jobID ?? "");
+          throw error;
+        }
       };
-      for (const step of program.steps) {
-        const stepInputs: Record<string, JSONValue> = {};
-        for (const key of pipelineStepReads(step)) {
-          if (!Object.hasOwn(stateInputs, key)) {
-            throw new Error(
-              `pipeline step "${step.name}": required input "${key}" is missing`,
+      const completion = new Promise<T>((resolve, reject) => {
+        const onComplete = (
+          completedJobID: string,
+          resultJSON: string,
+        ): void => {
+          if (settled) return;
+          settled = true;
+          if (completedJobID !== jobID) {
+            cancelAsyncJob(jobID ?? "");
+            reject(
+              new GepagoWasmError(
+                `${operation} completed with an unexpected job id`,
+                operation,
+              ),
+            );
+            return;
+          }
+          try {
+            resolve(parseResult(resultJSON));
+          } catch (error) {
+            // This also covers the Go {ok:false,error} envelope. The job is
+            // normally already removed, so cancel is deliberately best effort.
+            cancelAsyncJob(jobID ?? "");
+            reject(error);
+          }
+        };
+        try {
+          jobID = unwrapRuntimeCall(
+            startFunction(goOperation, payloadJSON, modelFunction, onComplete),
+            operation,
+          );
+          if (typeof jobID !== "string" || jobID === "") {
+            throw new GepagoWasmError(
+              `${operation} start returned an invalid job id`,
+              operation,
             );
           }
-          stepInputs[key] = stateInputs[key];
+          state.pendingJobs.add(jobID);
+        } catch (error) {
+          settled = true;
+          reject(
+            error instanceof GepagoWasmError
+              ? error
+              : new GepagoWasmError(
+                  `${operation} start failed: ${error instanceof Error ? error.message : String(error)}`,
+                  operation,
+                  { cause: error },
+                ),
+          );
         }
-        const stepProgram = normalizePredictProgram(
-          step.program,
-          `runCompiled program ${step.name}`,
-        ) as unknown as RunProgram;
-        const result = await predict(
-          {
-            program: applyCandidateToProgram(
-              stepProgram,
-              candidateForStep(compiledCandidate, step.name),
-              (text) => invoke("decodeDemos", { text }) as unknown as Demo[],
-            ),
-            inputs: stepInputs,
-          } as PredictConfig,
-          model,
-        );
-        usage = {
-          prompt_tokens: usage.prompt_tokens + result.usage.prompt_tokens,
-          completion_tokens:
-            usage.completion_tokens + result.usage.completion_tokens,
-          total_tokens: usage.total_tokens + result.usage.total_tokens,
-        };
-        last = pipelineStepWrites(step, result.prediction);
-        Object.assign(stateInputs, last);
+      });
+      try {
+        return await completion;
+      } finally {
+        if (jobID) state.pendingJobs.delete(jobID);
       }
-      return { prediction: program.returnAll ? stateInputs : last, usage };
     }
 
     async function compile(
@@ -2142,79 +2177,17 @@ export async function createGepagoWasm(
           assertCompileResult,
         ) as Promise<CompileResult>;
       }
-      const payloadJSON = encodePayload("compile", request);
-      let jobID: string | undefined;
-      let settled = false;
-      const modelFunction = async (
-        requestJSON: string,
-      ): Promise<CompileModelOutput> => {
-        try {
-          const hostRequest = parseCompileModelRequest(requestJSON);
-          return normalizeCompileModelResult(await model(hostRequest));
-        } catch (error) {
-          // The Go bridge turns callback failures into completion errors. Cancel
-          // immediately as well, so a pending model Promise cannot keep the
-          // optimisation alive after a host callback failure.
-          cancelAsyncJob(jobID ?? "");
-          throw error;
-        }
-      };
-      const completion = new Promise<CompileResult>((resolve, reject) => {
-        const onComplete = (
-          completedJobID: string,
-          resultJSON: string,
-        ): void => {
-          if (settled) return;
-          settled = true;
-          if (completedJobID !== jobID) {
-            cancelAsyncJob(jobID ?? "");
-            reject(
-              new GepagoWasmError(
-                "compile completed with an unexpected job id",
-                "compile",
-              ),
-            );
-            return;
-          }
-          try {
-            resolve(assertCompileResult(parseEnvelope("compile", resultJSON)));
-          } catch (error) {
-            // This also covers the Go {ok:false,error} envelope. The job is
-            // normally already removed, so cancel is deliberately best effort.
-            cancelAsyncJob(jobID ?? "");
-            reject(error);
-          }
-        };
-        try {
-          jobID = unwrapRuntimeCall(
-            startFunction("compile", payloadJSON, modelFunction, onComplete),
-            "compile",
-          );
-          if (typeof jobID !== "string" || jobID === "") {
-            throw new GepagoWasmError(
-              "compile start returned an invalid job id",
-              "compile",
-            );
-          }
-          state.pendingJobs.add(jobID);
-        } catch (error) {
-          settled = true;
-          reject(
-            error instanceof GepagoWasmError
-              ? error
-              : new GepagoWasmError(
-                  `compile start failed: ${error instanceof Error ? error.message : String(error)}`,
-                  "compile",
-                  { cause: error },
-                ),
-          );
-        }
-      });
-      try {
-        return await completion;
-      } finally {
-        if (jobID) state.pendingJobs.delete(jobID);
-      }
+      return runModelJob(
+        "compile",
+        "compile",
+        encodePayload("compile", request),
+        async (requestJSON): Promise<CompileModelOutput> =>
+          normalizeCompileModelResult(
+            await model(parseCompileModelRequest(requestJSON)),
+          ),
+        (resultJSON) =>
+          assertCompileResult(parseEnvelope("compile", resultJSON)),
+      );
     }
 
     function invoke(operation: string, payload: unknown): JSONValue {
