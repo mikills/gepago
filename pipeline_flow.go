@@ -207,6 +207,7 @@ func (p *parallelStep) Run(ctx context.Context, s State) error {
 func (p *parallelStep) runCandidate(ctx context.Context, candidate Candidate, s State) error {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
+	ctx = withConcurrentSteps(ctx)
 	results := make([]stepResult, len(p.steps))
 	var mu sync.Mutex
 	var failures []error

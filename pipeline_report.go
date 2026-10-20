@@ -61,7 +61,7 @@ func HTMLRunReport(trace PipelineTrace, options HTMLReportOptions) (string, erro
 	}
 	countExecutions(trace.Steps, &view)
 	switch {
-	case trace.Err != "":
+	case trace.Failed || trace.Err != "":
 		view.Status = "failed"
 	case trace.EndedAt.IsZero():
 		view.Status = "running"
@@ -78,7 +78,7 @@ func HTMLRunReport(trace PipelineTrace, options HTMLReportOptions) (string, erro
 func countExecutions(steps []StepTrace, view *runReportView) {
 	walkStepTraces(steps, "", func(_ string, step StepTrace) {
 		view.Executions++
-		if step.Err != "" {
+		if step.Failed || step.Err != "" {
 			view.Failures++
 		}
 	})
@@ -155,13 +155,13 @@ var runReportTemplate = template.Must(template.New("gepa-run-report").Funcs(temp
 }).Parse(`{{define "steps"}}
 <ol class="steps">
 {{range .}}
-<li class="step{{if .Err}} failed{{end}}">
+<li class="step{{if or .Failed .Err}} failed{{end}}">
 <div class="step-head">
 <strong>{{.Step}}</strong>
 <span class="muted">attempt {{.Attempt}}</span>
 {{if .Cached}}<span class="badge">cached</span>{{end}}
 {{if .Skipped}}<span class="badge">skipped</span>{{end}}
-{{if .Err}}<span class="badge error-badge">failed{{with .ErrKind}} · {{.}}{{end}}</span>{{end}}
+{{if or .Failed .Err}}<span class="badge error-badge">failed{{with .ErrKind}} · {{.}}{{end}}</span>{{end}}
 <span class="muted">
 {{.Duration}} · {{.Usage.TotalTokens}} tokens ({{.Usage.PromptTokens}} in, {{.Usage.CompletionTokens}} out)
 </span>
@@ -194,7 +194,7 @@ var runReportTemplate = template.Must(template.New("gepa-run-report").Funcs(temp
 {{range .Runs}}
 <div class="nested-run">
 <div class="muted">
-Nested run {{runID .}} · {{.Duration}} · {{.Usage.TotalTokens}} tokens{{if .Err}} · failed{{end}}
+Nested run {{runID .}} · {{.Duration}} · {{.Usage.TotalTokens}} tokens{{if or .Failed .Err}} · failed{{end}}
 </div>
 {{template "steps" .Steps}}
 </div>

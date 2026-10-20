@@ -76,7 +76,7 @@ func ExampleAssertTrace() {
 	})
 	// Output:
 	// gepatest: trace does not match (- want, + got)
-	// step executions, sorted by path and then attempt:
+	// step executions, in the order they ran:
 	//   - answer #1 ok usage{total=5}
 	//   + answer #1 ok usage{total=7}
 	// run:

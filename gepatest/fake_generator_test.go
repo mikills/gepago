@@ -244,6 +244,54 @@ func TestFakeGeneratorFailsClearlyWithoutAScript(t *testing.T) {
 	})
 }
 
+func TestFakeGeneratorUnmatched(t *testing.T) {
+	t.Run("lists the calls no script matched", func(t *testing.T) {
+		fake := gepatest.NewFakeGenerator().OnPrompt("known", gepatest.Text("ok"))
+		require.Empty(t, fake.Unmatched())
+		ended, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err := fake.Generate(context.Background(), "a known prompt")
+		require.NoError(t, err)
+		_, err = fake.Generate(context.Background(), "a stray prompt")
+		require.ErrorIs(t, err, gepatest.ErrNoScript)
+		_, err = fake.Generate(ended, "an ended call")
+		require.ErrorIs(t, err, context.Canceled)
+		_, err = fake.Chat(context.Background(), gepa.ChatRequest{Messages: []gepa.Message{
+			{Role: gepa.RoleUser, Content: "a stray chat"},
+		}})
+		require.ErrorIs(t, err, gepatest.ErrNoScript)
+
+		calls := fake.Calls()
+		require.Len(t, calls, 4)
+		unmatched := fake.Unmatched()
+		require.Equal(t, []gepatest.Call{calls[1], calls[3]}, unmatched,
+			"the matched call and the call whose context had ended are not listed")
+		unmatched[1].Request.Messages[0].Content = "changed"
+		require.Equal(t, "a stray chat", fake.Unmatched()[1].Request.Messages[0].Content, "Unmatched returns copies")
+	})
+	t.Run("catches a call a step policy hides", func(t *testing.T) {
+		fake := gepatest.NewFakeGenerator().OnStep("other", gepatest.Text("x"))
+		draft := gepa.NewStep("draft", nil, nil, func(ctx context.Context, _ gepa.State) error {
+			_, err := fake.Generate(ctx, "draft a reply")
+			return err
+		})
+		template := gepa.NewStep("template", nil, nil, func(context.Context, gepa.State) error { return nil })
+		pipeline, err := gepa.PipelineSpec{
+			Steps: []gepa.Step{gepa.WithPolicy(draft, gepa.StepPolicy{OnError: gepa.OnErrorFallback(template)})},
+		}.Build()
+		require.NoError(t, err)
+
+		_, err = pipeline.Run(context.Background(), gepa.NewState(nil))
+
+		require.NoError(t, err, "the fallback hides the missing script")
+		unmatched := fake.Unmatched()
+		require.Len(t, unmatched, 1)
+		require.Equal(t, "draft", unmatched[0].Step)
+		require.Equal(t, "draft a reply", unmatched[0].Prompt)
+	})
+}
+
 func TestFakeGeneratorGenerateStructured(t *testing.T) {
 	fake := gepatest.NewFakeGenerator().Default(gepatest.Text(`{"answer":"4"}`).WithUsage(usage))
 	format := gepa.ResponseFormat{Name: "qa", Schema: json.RawMessage(`{"type":"object"}`), Strict: true}

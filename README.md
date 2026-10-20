@@ -339,9 +339,9 @@ Lower-level optimiser APIs remain available when you need full control.
 
 ## Test kit
 
-Package `gepatest` provides `FakeGenerator`, a model with scripted replies, usage, finish reasons and errors per call, and `AssertTrace`, which compares a recorded run's steps, errors and usage.
+Package `gepatest` provides `FakeGenerator`, a model with scripted replies, usage, finish reasons and errors per call, and `AssertTrace`, which compares a recorded run's steps, the order they ran in, their errors and usage.
 
-A call takes the next reply of the script for its step path (as `gepa.StepPathFrom` reports it), else its step name, else the first prompt substring it contains, else the default; a script repeats its last reply once used up. `Calls` returns every call the fake received, and `Plain` hides its structured and chat methods to test the prompt-only path.
+A call takes the next reply of the script for its step path (as `gepa.StepPathFrom` reports it), else its step name, else the first prompt substring it contains, else the default; a script repeats its last reply once used up. `Calls` returns every call the fake received, `Unmatched` the calls no script answered (a step policy's fallback or skip can hide their error), and `Plain` hides its structured and chat methods to test the prompt-only path.
 
 ## Key extension points
 
