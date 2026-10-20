@@ -62,6 +62,8 @@ Branch `feat/v0.8.0-flow-runtime`, started from `1e3cc7b` (v0.7.0).
 | clean worktree: `npm ci`, then `make verify` (fmt, test, vet, staticcheck, diago, wasm-test; both modules), then `git diff --exit-code` | pass, no formatting diff (diago 6/6 checks per module, TS 19/19) | c55c605 |
 | clean worktree: `npm ci`, then `make verify`, then `git diff --exit-code` | pass, no formatting diff (diago 6/6 per module, TS 22/22) | 68b712a (final) |
 | clean worktree: `npm ci`, then `make verify`, then `git diff --exit-code` | pass, no formatting diff (diago 6/6 per module, TS 24/24) | f023769, 657326c, c943353 (final) |
+| CI on PR #9 | FAIL (Check formatting: golines wrapped 78 files) | 873b8f6 |
+| golines run on every tracked Go file by name (two passes, second finds nothing), then build, vet, tests, staticcheck | pass | 2e5e58b |
 | clean worktree: same plus `npm ci`, `make diago`, `make wasm-test` | pass | 6eb19d9 |
 
 ## Decisions
@@ -215,6 +217,8 @@ A (model call contract):
 - Pi chat responses no longer carry `finish_reason: "stop"`.
 
 ## Open findings
+
+Note: `golines -w .` walks no files when the repo sits under the scratchpad or `.claude/worktrees`, so the local "no formatting diff" results above did not cover golines (CI did). Formatting was fixed in a separate commit by running golines on the tracked files by name.
 
 None in the release. Follow-ups outside it:
 
