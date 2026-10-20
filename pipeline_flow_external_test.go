@@ -24,10 +24,15 @@ func TestComposedPipelineConcurrentRuns(t *testing.T) {
 		return "odd", nil
 	}
 	label := func(name, value string) gepa.Step {
-		return gepa.NewStep(name, refs(docKey.Ref()), refs(decisionKey.Ref()), func(_ context.Context, s gepa.State) error {
-			decisionKey.Set(s, value)
-			return nil
-		})
+		return gepa.NewStep(
+			name,
+			refs(docKey.Ref()),
+			refs(decisionKey.Ref()),
+			func(_ context.Context, s gepa.State) error {
+				decisionKey.Set(s, value)
+				return nil
+			},
+		)
 	}
 	pipeline, err := gepa.PipelineSpec{
 		Inputs: refs(docKey.Ref()),
@@ -35,9 +40,16 @@ func TestComposedPipelineConcurrentRuns(t *testing.T) {
 			gepa.Parallel(
 				"fan",
 				gepa.WithCache(replyStep(lm, "a", "document", tenTokens), nil),
-				gepa.WithPolicy(replyStep(lm, "b", "document", tenTokens), gepa.StepPolicy{Retry: gepa.RetryPolicy{MaxAttempts: 2}}),
-				gepa.Branch("route", route, map[string]gepa.Step{"even": label("even", "even"), "odd": label("odd", "odd")},
-					docKey.Ref()),
+				gepa.WithPolicy(
+					replyStep(lm, "b", "document", tenTokens),
+					gepa.StepPolicy{Retry: gepa.RetryPolicy{MaxAttempts: 2}},
+				),
+				gepa.Branch(
+					"route",
+					route,
+					map[string]gepa.Step{"even": label("even", "even"), "odd": label("odd", "odd")},
+					docKey.Ref(),
+				),
 			),
 			gepa.Fallback("guard", failAmount("primary", errRateLimited), writeAmount("secondary", 1)),
 		},
@@ -145,8 +157,10 @@ func TestNestedStepsFollowTheBuildRules(t *testing.T) {
 			wantErr: `pipeline step "extract": signature outputs ["a" "b"] do not match declared writes ["a" "c"]`,
 		},
 		{
-			name:    "nested invalid step",
-			steps:   []gepa.Step{gepa.Fallback("guard", writeAmount("a", 1), gepa.NewStep("b", nil, refs(amountKey.Ref()), nil))},
+			name: "nested invalid step",
+			steps: []gepa.Step{
+				gepa.Fallback("guard", writeAmount("a", 1), gepa.NewStep("b", nil, refs(amountKey.Ref()), nil)),
+			},
 			wantErr: `pipeline step "b": run function is required`,
 		},
 		{

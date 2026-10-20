@@ -96,7 +96,10 @@ func TestFailedModelCallsAreLoggedAtWarn(t *testing.T) {
 		require.NoError(t, err)
 		ctx := gepa.WithRunContext(context.Background(), providertest.LogRunContext())
 
-		_, err = client.Chat(ctx, gepa.ChatRequest{Messages: []gepa.Message{{Role: gepa.RoleUser, Content: "secret prompt"}}})
+		_, err = client.Chat(
+			ctx,
+			gepa.ChatRequest{Messages: []gepa.Message{{Role: gepa.RoleUser, Content: "secret prompt"}}},
+		)
 
 		require.Error(t, err)
 		records := recorder.ModelCalls(t, "secret prompt", "secret-key")

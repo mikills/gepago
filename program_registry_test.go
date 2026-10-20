@@ -54,12 +54,16 @@ func TestProgramRegistryTrainAndSave(t *testing.T) {
 	lm := replyModel("```\ntrained\n```")
 
 	compiled, state, artifact, err := registry.TrainAndSave(context.Background(), gepa.ProgramTrainConfig{
-		Name:           "echo",
-		ArtifactPath:   path,
-		Version:        "v1",
-		Metadata:       map[string]any{"owner": "test"},
-		Trainset:       []gepa.Example{gepa.NewIOExample("one", gepa.Prediction{}, gepa.Prediction{"instruction": "trained"})},
-		Valset:         []gepa.Example{gepa.NewIOExample("one", gepa.Prediction{}, gepa.Prediction{"instruction": "trained"})},
+		Name:         "echo",
+		ArtifactPath: path,
+		Version:      "v1",
+		Metadata:     map[string]any{"owner": "test"},
+		Trainset: []gepa.Example{
+			gepa.NewIOExample("one", gepa.Prediction{}, gepa.Prediction{"instruction": "trained"}),
+		},
+		Valset: []gepa.Example{
+			gepa.NewIOExample("one", gepa.Prediction{}, gepa.Prediction{"instruction": "trained"}),
+		},
 		Metric:         gepa.ExactMatchMetric{Fields: []string{"instruction"}},
 		ReflectionLM:   lm,
 		MaxMetricCalls: 4,
@@ -82,9 +86,11 @@ func TestProgramRegistryLoadOrTrain(t *testing.T) {
 	registry := gepa.NewProgramRegistry()
 	require.NoError(t, registry.Register("echo", func() (gepa.Program, error) { return artifactEchoProgram{}, nil }))
 	config := gepa.ProgramTrainConfig{
-		Name:           "echo",
-		ArtifactPath:   path,
-		Trainset:       []gepa.Example{gepa.NewIOExample("one", gepa.Prediction{}, gepa.Prediction{"instruction": "trained"})},
+		Name:         "echo",
+		ArtifactPath: path,
+		Trainset: []gepa.Example{
+			gepa.NewIOExample("one", gepa.Prediction{}, gepa.Prediction{"instruction": "trained"}),
+		},
 		Metric:         gepa.ExactMatchMetric{Fields: []string{"instruction"}},
 		ReflectionLM:   replyModel("trained"),
 		MaxMetricCalls: 4,
@@ -112,9 +118,11 @@ func TestProgramRegistryVersionMismatch(t *testing.T) {
 		Name:           "echo",
 		ArtifactPath:   path,
 		ProgramVersion: "v2",
-		Trainset:       []gepa.Example{gepa.NewIOExample("one", gepa.Prediction{}, gepa.Prediction{"instruction": "trained"})},
-		Metric:         gepa.ExactMatchMetric{Fields: []string{"instruction"}},
-		ReflectionLM:   replyModel("trained"),
+		Trainset: []gepa.Example{
+			gepa.NewIOExample("one", gepa.Prediction{}, gepa.Prediction{"instruction": "trained"}),
+		},
+		Metric:       gepa.ExactMatchMetric{Fields: []string{"instruction"}},
+		ReflectionLM: replyModel("trained"),
 	})
 	require.EqualError(t, err, `program artifact "echo" has program version "v1", expected "v2"`)
 }

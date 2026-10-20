@@ -43,12 +43,19 @@ func TestFinishReasonError(t *testing.T) {
 	withheld := gepa.FinishReasonError(gepa.Generation{FinishReason: gepa.FinishContentFilter}, "reply")
 	require.ErrorContains(t, withheld, "reply: no reply text")
 
-	long := gepa.FinishReasonError(gepa.Generation{FinishReason: gepa.FinishContentFilter, Text: strings.Repeat("é", 300)}, "reply")
+	long := gepa.FinishReasonError(
+		gepa.Generation{FinishReason: gepa.FinishContentFilter, Text: strings.Repeat("é", 300)},
+		"reply",
+	)
 	require.ErrorContains(t, long, `"`+strings.Repeat("é", 200)+`..."`)
 }
 
 func refusal() gepatest.Reply {
-	return gepatest.Reply{Text: "I can't help with that.", Usage: gepa.Usage{TotalTokens: 5}, FinishReason: gepa.FinishContentFilter}
+	return gepatest.Reply{
+		Text:         "I can't help with that.",
+		Usage:        gepa.Usage{TotalTokens: 5},
+		FinishReason: gepa.FinishContentFilter,
+	}
 }
 
 func TestPredictFailsARefusedReplyWithoutRepair(t *testing.T) {
@@ -81,11 +88,19 @@ func TestPredictFailsARefusedRepair(t *testing.T) {
 
 func TestProgramEvaluatorScoresRefusedReplyZero(t *testing.T) {
 	lm := script(refusal())
-	evaluator := gepa.ProgramEvaluator{Program: qaPredict(lm, 1), Metric: gepa.ExactMatchMetric{Fields: []string{"answer"}}}
+	evaluator := gepa.ProgramEvaluator{
+		Program: qaPredict(lm, 1),
+		Metric:  gepa.ExactMatchMetric{Fields: []string{"answer"}},
+	}
 
-	result, err := evaluator.Evaluate(context.Background(), gepa.Candidate{gepa.InstructionComponent: "answer"}, []gepa.Example{
-		gepa.NewIOExample("one", gepa.Prediction{"question": "?"}, gepa.Prediction{"answer": "yes"}),
-	}, false)
+	result, err := evaluator.Evaluate(
+		context.Background(),
+		gepa.Candidate{gepa.InstructionComponent: "answer"},
+		[]gepa.Example{
+			gepa.NewIOExample("one", gepa.Prediction{"question": "?"}, gepa.Prediction{"answer": "yes"}),
+		},
+		false,
+	)
 
 	require.NoError(t, err)
 	require.Len(t, result.Items, 1)
@@ -96,7 +111,12 @@ func TestProgramEvaluatorScoresRefusedReplyZero(t *testing.T) {
 func TestReflectiveProposerRejectsRefusedReply(t *testing.T) {
 	proposer := &gepa.ReflectiveProposer{LM: script(refusal())}
 
-	patch, err := proposer.Propose(context.Background(), gepa.Candidate{"a": "x"}, gepa.ReflectiveDataset{}, []string{"a"})
+	patch, err := proposer.Propose(
+		context.Background(),
+		gepa.Candidate{"a": "x"},
+		gepa.ReflectiveDataset{},
+		[]string{"a"},
+	)
 
 	require.Nil(t, patch)
 	require.ErrorIs(t, err, gepa.ErrContentFiltered)
@@ -122,7 +142,14 @@ func TestLLMMergeProposerRejectsRefusedReply(t *testing.T) {
 func TestLLMJudgeMetricRejectsRefusedReply(t *testing.T) {
 	lm := script(refusal(), gepatest.Reply{Text: `{"score": 1}`})
 
-	_, err := gepa.LLMJudgeMetric{LM: lm, ParseRetry: true}.Score(context.Background(), gepa.Prediction{}, gepa.Prediction{})
+	_, err := gepa.LLMJudgeMetric{
+		LM:         lm,
+		ParseRetry: true,
+	}.Score(
+		context.Background(),
+		gepa.Prediction{},
+		gepa.Prediction{},
+	)
 
 	require.ErrorIs(t, err, gepa.ErrContentFiltered)
 	require.ErrorContains(t, err, "judge reply")

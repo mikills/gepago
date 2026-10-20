@@ -108,7 +108,12 @@ func stableEventText(log *eventLog) string {
 }
 
 func TestStableSpanKeepsWhatATestSearches(t *testing.T) {
-	span := NewUsageSpan("trace", "parent", UsageSpanPipelineRun, "pipeline").Finish(Usage{TotalTokens: 3}, errors.New("boom"))
+	span := NewUsageSpan(
+		"trace",
+		"parent",
+		UsageSpanPipelineRun,
+		"pipeline",
+	).Finish(Usage{TotalTokens: 3}, errors.New("boom"))
 	span.Model, span.Attributes = "m", map[string]any{"a": "b"}
 
 	require.Equal(t, UsageSpan{

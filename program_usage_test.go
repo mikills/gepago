@@ -71,12 +71,22 @@ func TestPredictRecordsUsageOncePerCall(t *testing.T) {
 }
 
 func TestProgramEvaluatorScoresTruncatedReplyZero(t *testing.T) {
-	lm := script(gepatest.Reply{Text: `{"answer": "cu`, Usage: gepa.Usage{TotalTokens: 8}, FinishReason: gepa.FinishLength})
-	evaluator := gepa.ProgramEvaluator{Program: qaPredict(lm, 1), Metric: gepa.ExactMatchMetric{Fields: []string{"answer"}}}
+	lm := script(
+		gepatest.Reply{Text: `{"answer": "cu`, Usage: gepa.Usage{TotalTokens: 8}, FinishReason: gepa.FinishLength},
+	)
+	evaluator := gepa.ProgramEvaluator{
+		Program: qaPredict(lm, 1),
+		Metric:  gepa.ExactMatchMetric{Fields: []string{"answer"}},
+	}
 
-	result, err := evaluator.Evaluate(context.Background(), gepa.Candidate{gepa.InstructionComponent: "answer"}, []gepa.Example{
-		gepa.NewIOExample("one", gepa.Prediction{"question": "?"}, gepa.Prediction{"answer": "yes"}),
-	}, false)
+	result, err := evaluator.Evaluate(
+		context.Background(),
+		gepa.Candidate{gepa.InstructionComponent: "answer"},
+		[]gepa.Example{
+			gepa.NewIOExample("one", gepa.Prediction{"question": "?"}, gepa.Prediction{"answer": "yes"}),
+		},
+		false,
+	)
 
 	require.NoError(t, err)
 	require.Len(t, result.Items, 1)
@@ -89,7 +99,10 @@ func TestLLMJudgeMetricRecordsUsage(t *testing.T) {
 	t.Run("judge and repair calls", func(t *testing.T) {
 		lm := script(
 			gepatest.Reply{Text: "not json", Usage: gepa.Usage{TotalTokens: 3}},
-			gepatest.Reply{Text: `{"score": 1, "feedback": "ok"}`, Usage: gepa.Usage{TotalTokens: 4, ReasoningTokens: 1}},
+			gepatest.Reply{
+				Text:  `{"score": 1, "feedback": "ok"}`,
+				Usage: gepa.Usage{TotalTokens: 4, ReasoningTokens: 1},
+			},
 		)
 		metric := gepa.LLMJudgeMetric{LM: lm, Rubric: "equal", ParseRetry: true}
 		ctx, collector := gepa.WithUsageCollector(context.Background())
@@ -161,7 +174,12 @@ func TestReflectiveProposerRejectsTruncatedReply(t *testing.T) {
 	})
 	proposer := &gepa.ReflectiveProposer{LM: lm}
 
-	patch, err := proposer.Propose(context.Background(), gepa.Candidate{"a": "x"}, gepa.ReflectiveDataset{}, []string{"a"})
+	patch, err := proposer.Propose(
+		context.Background(),
+		gepa.Candidate{"a": "x"},
+		gepa.ReflectiveDataset{},
+		[]string{"a"},
+	)
 
 	require.Nil(t, patch)
 	require.ErrorIs(t, err, gepa.ErrOutputTruncated)
@@ -196,7 +214,14 @@ func TestLLMJudgeMetricRejectsTruncatedRepairReply(t *testing.T) {
 		gepatest.Reply{Text: `{"score": 1`, FinishReason: gepa.FinishLength},
 	)
 
-	_, err := gepa.LLMJudgeMetric{LM: lm, ParseRetry: true}.Score(context.Background(), gepa.Prediction{}, gepa.Prediction{})
+	_, err := gepa.LLMJudgeMetric{
+		LM:         lm,
+		ParseRetry: true,
+	}.Score(
+		context.Background(),
+		gepa.Prediction{},
+		gepa.Prediction{},
+	)
 
 	require.ErrorIs(t, err, gepa.ErrOutputTruncated)
 	require.Len(t, lm.Calls(), 2)
@@ -207,7 +232,9 @@ func TestLLMMergeProposerUsage(t *testing.T) {
 	right := gepa.CandidateRecord{Candidate: gepa.Candidate{"a": "right"}}
 
 	t.Run("successful merge", func(t *testing.T) {
-		proposer := &gepa.LLMMergeProposer{LM: script(gepatest.Reply{Text: `{"a": "merged"}`, Usage: gepa.Usage{TotalTokens: 9}})}
+		proposer := &gepa.LLMMergeProposer{
+			LM: script(gepatest.Reply{Text: `{"a": "merged"}`, Usage: gepa.Usage{TotalTokens: 9}}),
+		}
 
 		patch, err := proposer.ProposeMerge(context.Background(), left, right, []string{"a"})
 
@@ -219,7 +246,9 @@ func TestLLMMergeProposerUsage(t *testing.T) {
 	})
 
 	t.Run("truncated merge reply", func(t *testing.T) {
-		proposer := &gepa.LLMMergeProposer{LM: script(gepatest.Reply{Text: `{"a": "mer`, FinishReason: gepa.FinishLength})}
+		proposer := &gepa.LLMMergeProposer{
+			LM: script(gepatest.Reply{Text: `{"a": "mer`, FinishReason: gepa.FinishLength}),
+		}
 
 		_, err := proposer.ProposeMerge(context.Background(), left, right, []string{"a"})
 

@@ -20,7 +20,11 @@ func TestNewEvaluationCaptureFindsThePipelinesOfAProgramme(t *testing.T) {
 	scoreKey := Key[float64]{Name: "score"}
 	redacting := func(name string, steps ...Step) Pipeline {
 		t.Helper()
-		pipeline, err := PipelineSpec{Inputs: refs(docKey.Ref()), Steps: steps, Redactor: hideKey(name, "["+name+"]")}.Build()
+		pipeline, err := PipelineSpec{
+			Inputs:   refs(docKey.Ref()),
+			Steps:    steps,
+			Redactor: hideKey(name, "["+name+"]"),
+		}.Build()
 		require.NoError(t, err)
 		return pipeline
 	}
@@ -40,7 +44,9 @@ func TestNewEvaluationCaptureFindsThePipelinesOfAProgramme(t *testing.T) {
 		Steps: []Step{
 			Parallel("fan", NewProgramStep("nested", parallel, refs(docKey.Ref()), refs(amountKey.Ref()))),
 			WithPolicy(writing("letter", letterKey.Ref()), StepPolicy{
-				OnError: OnErrorFallback(NewProgramStep("letter fallback", fallback, refs(docKey.Ref()), refs(letterKey.Ref()))),
+				OnError: OnErrorFallback(
+					NewProgramStep("letter fallback", fallback, refs(docKey.Ref()), refs(letterKey.Ref())),
+				),
 			}),
 			NewProgramStep("custom", programFunc(func(ctx context.Context, inputs Prediction) (Prediction, error) {
 				return hidden.RunCandidate(ctx, hidden.SeedCandidate(), inputs)
@@ -102,7 +108,11 @@ func TestNewEvaluationCaptureFindsThePipelinesOfAProgramme(t *testing.T) {
 func TestProgramEvaluatorKeepsNestedObserverEvents(t *testing.T) {
 	build := func(log *eventLog) Pipeline {
 		t.Helper()
-		inner, err := PipelineSpec{Inputs: refs(docKey.Ref()), Steps: []Step{lengthStep()}, Observers: []PipelineObserver{log}}.Build()
+		inner, err := PipelineSpec{
+			Inputs:    refs(docKey.Ref()),
+			Steps:     []Step{lengthStep()},
+			Observers: []PipelineObserver{log},
+		}.Build()
 		require.NoError(t, err)
 		outer, err := PipelineSpec{
 			Inputs:   refs(docKey.Ref()),
@@ -124,7 +134,11 @@ func TestProgramEvaluatorKeepsNestedObserverEvents(t *testing.T) {
 	for _, recordTraces := range []bool{false, true} {
 		log := &eventLog{}
 		outer := build(log)
-		evaluator := ProgramEvaluator{Program: outer, Metric: ExactMatchMetric{Fields: []string{"amount"}}, RecordTraces: recordTraces}
+		evaluator := ProgramEvaluator{
+			Program:      outer,
+			Metric:       ExactMatchMetric{Fields: []string{"amount"}},
+			RecordTraces: recordTraces,
+		}
 		result, err := evaluator.Evaluate(context.Background(), outer.SeedCandidate(), examples, true)
 		require.NoError(t, err)
 		require.Equal(t, want, log.Lines(), "recordTraces %v", recordTraces)
@@ -152,7 +166,12 @@ func TestProgramEvaluatorKeepsNestedObserverEvents(t *testing.T) {
 		require.Equal(t, map[string]any{"document": "[doc]"}, nested.Inputs)
 		require.Len(t, nested.Steps, 1)
 		require.Equal(t, "parse", nested.Steps[0].Step)
-		require.Equal(t, map[string]any{"amount": float64(7)}, nested.Steps[0].Writes, "the recorder keeps values in their JSON form")
+		require.Equal(
+			t,
+			map[string]any{"amount": float64(7)},
+			nested.Steps[0].Writes,
+			"the recorder keeps values in their JSON form",
+		)
 	}
 }
 
@@ -172,14 +191,19 @@ func TestProgramEvaluatorRecordsConcurrentNestedRuns(t *testing.T) {
 		require.NoError(t, err)
 		return NewProgramStep(step.Name()+" pipeline", pipeline, refs(docKey.Ref()), refs(writes))
 	}
-	summarise := NewStep("summarise", refs(docKey.Ref()), refs(summaryKey.Ref()), func(_ context.Context, s State) error {
-		document, err := docKey.Get(s)
-		if err != nil {
-			return err
-		}
-		summaryKey.Set(s, "about "+document)
-		return nil
-	})
+	summarise := NewStep(
+		"summarise",
+		refs(docKey.Ref()),
+		refs(summaryKey.Ref()),
+		func(_ context.Context, s State) error {
+			document, err := docKey.Get(s)
+			if err != nil {
+				return err
+			}
+			summaryKey.Set(s, "about "+document)
+			return nil
+		},
+	)
 	outer, err := PipelineSpec{
 		Inputs: refs(docKey.Ref()),
 		Steps: []Step{Parallel("fan",
@@ -192,8 +216,17 @@ func TestProgramEvaluatorRecordsConcurrentNestedRuns(t *testing.T) {
 		NewIOExample("one", Prediction{"document": "cash 10"}, Prediction{"amount": 7}),
 		NewIOExample("two", Prediction{"document": "cash 200"}, Prediction{"amount": 8}),
 	}
-	result, err := ProgramEvaluator{Program: outer, Metric: ExactMatchMetric{Fields: []string{"amount"}}, RecordTraces: true}.
-		Evaluate(context.Background(), outer.SeedCandidate(), examples, true)
+	result, err := ProgramEvaluator{
+		Program:      outer,
+		Metric:       ExactMatchMetric{Fields: []string{"amount"}},
+		RecordTraces: true,
+	}.
+		Evaluate(
+			context.Background(),
+			outer.SeedCandidate(),
+			examples,
+			true,
+		)
 	require.NoError(t, err)
 	for i, log := range logs {
 		require.Len(t, log.runsStarted, 2, "log %d", i)
@@ -231,7 +264,10 @@ func TestEvaluationCaptureRedactsWhatTheRunsLeft(t *testing.T) {
 	capture := newEvaluationCapture(pipeline).fork(nil)
 	capture.offerStep(
 		[]stateWrite{{key: "letter", value: "dear sir"}},
-		WithStepDetails(errors.New("refused"), map[string]any{"note": "classified", "values": Prediction{"note": "top secret"}}),
+		WithStepDetails(
+			errors.New("refused"),
+			map[string]any{"note": "classified", "values": Prediction{"note": "top secret"}},
+		),
 	)
 	capture.offer(map[string]any{"letter": "yours truly"})
 	item := capture.apply(EvaluationItem{SideInfo: map[string]any{
@@ -243,13 +279,21 @@ func TestEvaluationCaptureRedactsWhatTheRunsLeft(t *testing.T) {
 	require.NoError(t, err)
 	bare := newEvaluationCapture(plain).fork(nil)
 	bare.offer(map[string]any{"letter": "dear sir"})
-	bare.offerStep([]stateWrite{{key: "letter", value: "dear sir"}}, WithStepDetails(errors.New("refused"), map[string]any{"note": "x"}))
+	bare.offerStep(
+		[]stateWrite{{key: "letter", value: "dear sir"}},
+		WithStepDetails(errors.New("refused"), map[string]any{"note": "x"}),
+	)
 	require.Empty(t, bare.values, "without a Redactor nothing is kept")
 	require.Empty(t, bare.details)
 	require.Nil(t, bare.join(pipeline, false))
 	bare.offer(map[string]any{"letter": "yours truly"})
 	item = bare.apply(EvaluationItem{SideInfo: map[string]any{"feedback": "dear sir, yours truly"}})
-	require.Equal(t, "dear sir, [letter]", item.SideInfo["feedback"], "a Redactor that joins applies to values offered after it")
+	require.Equal(
+		t,
+		"dear sir, [letter]",
+		item.SideInfo["feedback"],
+		"a Redactor that joins applies to values offered after it",
+	)
 
 	var none *evaluationCapture
 	require.Nil(t, none.join(pipeline, true))
@@ -275,14 +319,19 @@ func TestProgramEvaluatorReleasesEachExamplesValues(t *testing.T) {
 					scratchKey.Set(s, large+fmt.Sprint(written))
 					return nil
 				}),
-				NewStep("shrink", refs(scratchKey.Ref()), refs(amountKey.Ref()), func(_ context.Context, s State) error {
-					scratch, err := scratchKey.Get(s)
-					if err != nil {
-						return err
-					}
-					amountKey.Set(s, len(scratch))
-					return nil
-				}),
+				NewStep(
+					"shrink",
+					refs(scratchKey.Ref()),
+					refs(amountKey.Ref()),
+					func(_ context.Context, s State) error {
+						scratch, err := scratchKey.Get(s)
+						if err != nil {
+							return err
+						}
+						amountKey.Set(s, len(scratch))
+						return nil
+					},
+				),
 			},
 			Redactor: redactor,
 		}.Build()
@@ -309,6 +358,13 @@ func TestProgramEvaluatorReleasesEachExamplesValues(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, heap, 40)
 		growth := heap[39] - heap[4]
-		require.Less(t, growth, int64(8<<20), "with a Redactor: %v; heap grew by %d bytes over 35 examples", redactor != nil, growth)
+		require.Less(
+			t,
+			growth,
+			int64(8<<20),
+			"with a Redactor: %v; heap grew by %d bytes over 35 examples",
+			redactor != nil,
+			growth,
+		)
 	}
 }

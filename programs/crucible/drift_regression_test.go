@@ -354,7 +354,8 @@ func TestPairwiseJudgeBlinding(t *testing.T) {
 }
 
 func TestPairwiseScoreOrientation(t *testing.T) {
-	judge := gepatest.NewFakeGenerator().Default(gepatest.Text(`{"winner":"a","score_a":0.9,"score_b":0.1,"feedback":"A"}`))
+	judge := gepatest.NewFakeGenerator().
+		Default(gepatest.Text(`{"winner":"a","score_a":0.9,"score_b":0.1,"feedback":"A"}`))
 	evaluator := PairwiseJudgeEvaluator{LM: judge, Rubric: "Prefer A."}
 	input := PairwiseInput{
 		Suite:    Suite{Name: "orientation"},

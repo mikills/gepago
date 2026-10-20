@@ -14,13 +14,22 @@ import (
 func TestReflectionRecordNamesTheFailingStep(t *testing.T) {
 	label := gepa.Key[string]{Name: "label"}
 	classify := gepa.NewProgramStep("classify", gepa.Predict{
-		Signature: gepa.Signature{Name: "classify", Inputs: []gepa.Field{{Name: "amount"}}, Outputs: []gepa.Field{{Name: "label"}}},
-		LM:        replyModel(`{"label": null}`),
+		Signature: gepa.Signature{
+			Name:    "classify",
+			Inputs:  []gepa.Field{{Name: "amount"}},
+			Outputs: []gepa.Field{{Name: "label"}},
+		},
+		LM: replyModel(`{"label": null}`),
 	}, refs(amountKey.Ref()), refs(label.Ref()))
-	route := gepa.NewStep("route", refs(amountKey.Ref()), refs(routeKey.Ref()), func(_ context.Context, s gepa.State) error {
-		routeKey.Set(s, "model")
-		return nil
-	})
+	route := gepa.NewStep(
+		"route",
+		refs(amountKey.Ref()),
+		refs(routeKey.Ref()),
+		func(_ context.Context, s gepa.State) error {
+			routeKey.Set(s, "model")
+			return nil
+		},
+	)
 	pipeline := fpBuild(t, gepa.PipelineSpec{
 		Inputs: refs(docKey.Ref()),
 		Steps: []gepa.Step{
@@ -30,7 +39,9 @@ func TestReflectionRecordNamesTheFailingStep(t *testing.T) {
 		},
 	})
 	evaluator := gepa.ProgramEvaluator{Program: pipeline, Metric: gepa.ExactMatchMetric{Fields: []string{"label"}}}
-	examples := []gepa.Example{gepa.NewIOExample("1", gepa.Prediction{"document": "cash"}, gepa.Prediction{"label": "large"})}
+	examples := []gepa.Example{
+		gepa.NewIOExample("1", gepa.Prediction{"document": "cash"}, gepa.Prediction{"label": "large"}),
+	}
 	candidate := pipeline.SeedCandidate()
 
 	eval, err := evaluator.Evaluate(context.Background(), candidate, examples, false)
@@ -56,15 +67,22 @@ func TestReflectionRecordNamesTheFailingStep(t *testing.T) {
 func TestReflectionRecordNamesAPolicyStepWhoseFallbackFailed(t *testing.T) {
 	label := gepa.Key[string]{Name: "label"}
 	classify := gepa.NewProgramStep("classify", gepa.Predict{
-		Signature: gepa.Signature{Name: "classify", Inputs: []gepa.Field{{Name: "amount"}}, Outputs: []gepa.Field{{Name: "label"}}},
-		LM:        replyModel(`{"label": null}`),
+		Signature: gepa.Signature{
+			Name:    "classify",
+			Inputs:  []gepa.Field{{Name: "amount"}},
+			Outputs: []gepa.Field{{Name: "label"}},
+		},
+		LM: replyModel(`{"label": null}`),
 	}, refs(amountKey.Ref()), refs(label.Ref()))
 	backup := gepa.NewStep("backup", refs(docKey.Ref()), refs(label.Ref()), func(context.Context, gepa.State) error {
 		return gepa.WithStepDetails(errors.New("no backup"), map[string]any{"backup_detail": "from backup"})
 	})
 	pipeline := fpBuild(t, gepa.PipelineSpec{
 		Inputs: refs(docKey.Ref()),
-		Steps:  []gepa.Step{amountStep(), gepa.WithPolicy(classify, gepa.StepPolicy{OnError: gepa.OnErrorFallback(backup)})},
+		Steps: []gepa.Step{
+			amountStep(),
+			gepa.WithPolicy(classify, gepa.StepPolicy{OnError: gepa.OnErrorFallback(backup)}),
+		},
 	})
 
 	_, err := pipeline.Run(context.Background(), gepa.NewState(gepa.Prediction{"document": "cash"}))
@@ -78,7 +96,9 @@ func TestReflectionRecordNamesAPolicyStepWhoseFallbackFailed(t *testing.T) {
 	require.Equal(t, map[string]any{"document": "cash"}, backupErr.Reads)
 
 	evaluator := gepa.ProgramEvaluator{Program: pipeline, Metric: gepa.ExactMatchMetric{Fields: []string{"label"}}}
-	examples := []gepa.Example{gepa.NewIOExample("1", gepa.Prediction{"document": "cash"}, gepa.Prediction{"label": "large"})}
+	examples := []gepa.Example{
+		gepa.NewIOExample("1", gepa.Prediction{"document": "cash"}, gepa.Prediction{"label": "large"}),
+	}
 	candidate := pipeline.SeedCandidate()
 	eval, err := evaluator.Evaluate(context.Background(), candidate, examples, false)
 	require.NoError(t, err)
@@ -97,8 +117,12 @@ func TestReflectionRecordNamesAPolicyStepWhoseFallbackFailed(t *testing.T) {
 // gives, and fails with ErrInvalidOutput when the reply's label is null.
 func nullLabelStep(lm gepa.Generator) gepa.ComponentStep {
 	return gepa.NewProgramStep("classify", gepa.Predict{
-		Signature: gepa.Signature{Name: "classify", Inputs: []gepa.Field{{Name: "amount"}}, Outputs: []gepa.Field{{Name: "label"}}},
-		LM:        lm,
+		Signature: gepa.Signature{
+			Name:    "classify",
+			Inputs:  []gepa.Field{{Name: "amount"}},
+			Outputs: []gepa.Field{{Name: "label"}},
+		},
+		LM: lm,
 	}, refs(amountKey.Ref()), refs(labelKey.Ref()))
 }
 
@@ -107,10 +131,15 @@ const nullLabelError = `pipeline step "classify": invalid programme output: sign
 // backupLabelStep is a fallback for nullLabelStep that reads the document, which classify does
 // not read.
 func backupLabelStep() gepa.Step {
-	return gepa.NewStep("backup", refs(docKey.Ref()), refs(labelKey.Ref()), func(_ context.Context, s gepa.State) error {
-		labelKey.Set(s, "backup")
-		return nil
-	})
+	return gepa.NewStep(
+		"backup",
+		refs(docKey.Ref()),
+		refs(labelKey.Ref()),
+		func(_ context.Context, s gepa.State) error {
+			labelKey.Set(s, "backup")
+			return nil
+		},
+	)
 }
 
 func TestPolicyStepStoppedBeforeItsFallbackKeepsItsOwnReads(t *testing.T) {
@@ -133,7 +162,9 @@ func TestPolicyStepStoppedBeforeItsFallbackKeepsItsOwnReads(t *testing.T) {
 		Steps:  []gepa.Step{amountStep(), gepa.Parallel("par", policy, sibling)},
 	})
 	evaluator := gepa.ProgramEvaluator{Program: pipeline, Metric: gepa.ExactMatchMetric{Fields: []string{"label"}}}
-	examples := []gepa.Example{gepa.NewIOExample("1", gepa.Prediction{"document": "cash"}, gepa.Prediction{"label": "large"})}
+	examples := []gepa.Example{
+		gepa.NewIOExample("1", gepa.Prediction{"document": "cash"}, gepa.Prediction{"label": "large"}),
+	}
 	candidate := pipeline.SeedCandidate()
 
 	eval, err := evaluator.Evaluate(context.Background(), candidate, examples, false)

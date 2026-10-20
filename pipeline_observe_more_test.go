@@ -17,8 +17,10 @@ func TestPipelineObserverSharedWithANestedPipelineGetsEachEventOnce(t *testing.T
 	recorder := &RecordingObserver{}
 	log := &eventLog{}
 	inner, err := PipelineSpec{
-		Inputs:    refs(docKey.Ref()),
-		Steps:     []Step{predictStep("summarise", tenTokenModel(`{"summary": "short"}`), docKey.Ref(), summaryKey.Ref())},
+		Inputs: refs(docKey.Ref()),
+		Steps: []Step{
+			predictStep("summarise", tenTokenModel(`{"summary": "short"}`), docKey.Ref(), summaryKey.Ref()),
+		},
 		Observers: []PipelineObserver{recorder, log, recorder},
 	}.Build()
 	require.NoError(t, err)
@@ -124,8 +126,10 @@ func TestPipelineObserverThatCannotBeComparedIsCalledForEachListing(t *testing.T
 	log := &eventLog{}
 	observer := hookedObserver{log: log, hook: func() {}}
 	inner, err := PipelineSpec{
-		Inputs:    refs(docKey.Ref()),
-		Steps:     []Step{predictStep("summarise", tenTokenModel(`{"summary": "short"}`), docKey.Ref(), summaryKey.Ref())},
+		Inputs: refs(docKey.Ref()),
+		Steps: []Step{
+			predictStep("summarise", tenTokenModel(`{"summary": "short"}`), docKey.Ref(), summaryKey.Ref()),
+		},
 		Observers: []PipelineObserver{observer},
 	}.Build()
 	require.NoError(t, err)
@@ -410,7 +414,10 @@ func TestPipelineObserverContextsLeakNoGoroutines(t *testing.T) {
 
 func TestPipelineObserverContextEndsWithItsRun(t *testing.T) {
 	observer := &blockingObserver{}
-	pipeline, err := PipelineSpec{Steps: []Step{writeAmount("write", 1)}, Observers: []PipelineObserver{observer}}.Build()
+	pipeline, err := PipelineSpec{
+		Steps:     []Step{writeAmount("write", 1)},
+		Observers: []PipelineObserver{observer},
+	}.Build()
 	require.NoError(t, err)
 	_, err = pipeline.Run(context.Background(), NewState(nil))
 	require.NoError(t, err)
@@ -420,7 +427,10 @@ func TestPipelineObserverContextEndsWithItsRun(t *testing.T) {
 
 func TestPipelineObserverContextEndsWithTheCallersContext(t *testing.T) {
 	observer := &blockingObserver{block: true}
-	pipeline, err := PipelineSpec{Steps: []Step{writeAmount("write", 1)}, Observers: []PipelineObserver{observer}}.Build()
+	pipeline, err := PipelineSpec{
+		Steps:     []Step{writeAmount("write", 1)},
+		Observers: []PipelineObserver{observer},
+	}.Build()
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -466,23 +476,33 @@ func TestPipelineObserverStress(t *testing.T) {
 	var calls atomic.Int32
 	branch := func(i int) Step {
 		key := Key[string]{Name: fmt.Sprintf("out%d", i)}
-		flaky := NewStep(fmt.Sprintf("s%d", i), refs(docKey.Ref()), refs(key.Ref()), func(ctx context.Context, s State) error {
-			RecordUsage(ctx, tenTokens)
-			if calls.Add(1)%3 == 0 {
-				return errRateLimited
-			}
-			document, err := docKey.Get(s)
-			if err != nil {
-				return err
-			}
-			key.Set(s, document)
-			return nil
-		})
-		spare := NewStep(fmt.Sprintf("spare%d", i), refs(docKey.Ref()), refs(key.Ref()), func(ctx context.Context, s State) error {
-			RecordUsage(ctx, tenTokens)
-			key.Set(s, "spare")
-			return nil
-		})
+		flaky := NewStep(
+			fmt.Sprintf("s%d", i),
+			refs(docKey.Ref()),
+			refs(key.Ref()),
+			func(ctx context.Context, s State) error {
+				RecordUsage(ctx, tenTokens)
+				if calls.Add(1)%3 == 0 {
+					return errRateLimited
+				}
+				document, err := docKey.Get(s)
+				if err != nil {
+					return err
+				}
+				key.Set(s, document)
+				return nil
+			},
+		)
+		spare := NewStep(
+			fmt.Sprintf("spare%d", i),
+			refs(docKey.Ref()),
+			refs(key.Ref()),
+			func(ctx context.Context, s State) error {
+				RecordUsage(ctx, tenTokens)
+				key.Set(s, "spare")
+				return nil
+			},
+		)
 		return Fallback(
 			fmt.Sprintf("f%d", i),
 			WithPolicy(WithCache(flaky, nil), StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}}),

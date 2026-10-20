@@ -16,16 +16,22 @@ import (
 
 // countingTool returns result and err for every call and counts the calls.
 func countingTool(name string, calls *atomic.Int32, result gepa.ToolResult, err error) gepa.ToolProvider {
-	return gepa.NewToolFunc(gepa.Tool{Name: name, Description: "tool " + name}, func(context.Context, gepa.ToolCall) (gepa.ToolResult, error) {
-		calls.Add(1)
-		return result, err
-	})
+	return gepa.NewToolFunc(
+		gepa.Tool{Name: name, Description: "tool " + name},
+		func(context.Context, gepa.ToolCall) (gepa.ToolResult, error) {
+			calls.Add(1)
+			return result, err
+		},
+	)
 }
 
 func echoTool(name string) gepa.ToolProvider {
-	return gepa.NewToolFunc(gepa.Tool{Name: name, Description: "echo " + name, Parameters: json.RawMessage(`{"type":"object"}`)}, func(_ context.Context, call gepa.ToolCall) (gepa.ToolResult, error) {
-		return gepa.ToolResult{Text: call.Arguments}, nil
-	})
+	return gepa.NewToolFunc(
+		gepa.Tool{Name: name, Description: "echo " + name, Parameters: json.RawMessage(`{"type":"object"}`)},
+		func(_ context.Context, call gepa.ToolCall) (gepa.ToolResult, error) {
+			return gepa.ToolResult{Text: call.Arguments}, nil
+		},
+	)
 }
 
 func tracingMiddleware(name string, trace *[]string, mu *sync.Mutex) gepa.ChatMiddleware {
@@ -155,8 +161,10 @@ func TestPredictToolLoopAdmitsEveryTurn(t *testing.T) {
 			predict := gepa.Predict{Signature: orderSignature, LM: lm, Tools: []string{"lookup_order"}}
 			pipeline, err := gepa.PipelineSpec{
 				Inputs: refs(gepa.Key[string]{Name: "question"}.Ref()),
-				Steps: []gepa.Step{gepa.NewProgramStep("answer", predict, refs(gepa.Key[string]{Name: "question"}.Ref()),
-					refs(gepa.Key[string]{Name: "status"}.Ref(), gepa.Key[string]{Name: "summary"}.Ref()))},
+				Steps: []gepa.Step{
+					gepa.NewProgramStep("answer", predict, refs(gepa.Key[string]{Name: "question"}.Ref()),
+						refs(gepa.Key[string]{Name: "status"}.Ref(), gepa.Key[string]{Name: "summary"}.Ref())),
+				},
 				Budget: gepa.RunBudget{MaxModelCalls: tt.maxCalls},
 				Tools:  registry,
 			}.Build()
@@ -299,7 +307,11 @@ func TestPredictToolLoopFailures(t *testing.T) {
 	})
 
 	t.Run("no registry", func(t *testing.T) {
-		predict := gepa.Predict{Signature: orderSignature, LM: gepatest.NewFakeGenerator(), Tools: []string{"lookup_order"}}
+		predict := gepa.Predict{
+			Signature: orderSignature,
+			LM:        gepatest.NewFakeGenerator(),
+			Tools:     []string{"lookup_order"},
+		}
 
 		_, err := predict.Run(context.Background(), gepa.Prediction{"question": "?"})
 
@@ -311,7 +323,10 @@ func TestPredictToolLoopFailures(t *testing.T) {
 		calls := &atomic.Int32{}
 		lm := script(gepatest.Text(`{"answer":"x"}`))
 		predict := orderPredict(t, lm, lookupTool(calls))
-		predict.Signature = gepa.Signature{Inputs: []gepa.Field{{Name: "question"}}, Outputs: []gepa.Field{{Name: "answer"}}}
+		predict.Signature = gepa.Signature{
+			Inputs:  []gepa.Field{{Name: "question"}},
+			Outputs: []gepa.Field{{Name: "answer"}},
+		}
 
 		_, err := predict.Run(context.Background(), gepa.Prediction{"question": "?"})
 
@@ -332,7 +347,15 @@ func TestPredictValidateWithTools(t *testing.T) {
 		predict gepa.Predict
 		wantErr string
 	}{
-		{name: "valid", predict: gepa.Predict{LM: chat, Tools: []string{"echo"}, Middleware: []string{"log"}, ToolRegistry: registry}},
+		{
+			name: "valid",
+			predict: gepa.Predict{
+				LM:           chat,
+				Tools:        []string{"echo"},
+				Middleware:   []string{"log"},
+				ToolRegistry: registry,
+			},
+		},
 		{name: "valid without a registry", predict: gepa.Predict{LM: chat, Tools: []string{"anything"}}},
 		{
 			name:    "model without Chat",
@@ -351,7 +374,11 @@ func TestPredictValidateWithTools(t *testing.T) {
 			predict: gepa.Predict{LM: chat, Tools: []string{"echo"}, MaxToolTurns: -1},
 			wantErr: "predict MaxToolTurns must not be negative",
 		},
-		{name: "empty tool name", predict: gepa.Predict{LM: chat, Tools: []string{""}}, wantErr: "tool name must not be empty"},
+		{
+			name:    "empty tool name",
+			predict: gepa.Predict{LM: chat, Tools: []string{""}},
+			wantErr: "tool name must not be empty",
+		},
 		{
 			name:    "repeated tool",
 			predict: gepa.Predict{LM: chat, Tools: []string{"echo", "echo"}},
@@ -396,7 +423,10 @@ func TestPredictValidateWithTools(t *testing.T) {
 			wantErr: "predict ToolPolicy is set without a ToolRegistry; set ToolRegistry, or in a pipeline set " +
 				"PipelineSpec.ToolPolicy instead",
 		},
-		{name: "empty per-tool limits are no policy", predict: gepa.Predict{LM: generator, ToolPolicy: gepa.ToolPolicy{MaxCallsPerTool: map[string]int{}}}},
+		{
+			name:    "empty per-tool limits are no policy",
+			predict: gepa.Predict{LM: generator, ToolPolicy: gepa.ToolPolicy{MaxCallsPerTool: map[string]int{}}},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

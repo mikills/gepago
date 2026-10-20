@@ -33,7 +33,10 @@ func TestAgentInAPipelineStepSeesTheStepsRunContext(t *testing.T) {
 	pipeline, err := gepa.PipelineSpec{Steps: []gepa.Step{
 		gepa.NewStep("ask", nil, []gepa.KeyRef{answer.Ref()}, func(ctx context.Context, s gepa.State) error {
 			step, _ = gepa.RunContextFrom(ctx)
-			result, err := agent.Run(ctx, RunRequest{Memory: NewMemory("agent-run"), Messages: []Message{{Role: RoleUser, Content: "hi"}}})
+			result, err := agent.Run(
+				ctx,
+				RunRequest{Memory: NewMemory("agent-run"), Messages: []Message{{Role: RoleUser, Content: "hi"}}},
+			)
 			if err != nil {
 				return err
 			}
@@ -42,7 +45,10 @@ func TestAgentInAPipelineStepSeesTheStepsRunContext(t *testing.T) {
 		}),
 	}}.Build()
 	require.NoError(t, err)
-	ctx := gepa.WithRunContext(context.Background(), gepa.RunContext{TraceID: "trace-1", Attributes: map[string]string{"job": "nightly"}})
+	ctx := gepa.WithRunContext(
+		context.Background(),
+		gepa.RunContext{TraceID: "trace-1", Attributes: map[string]string{"job": "nightly"}},
+	)
 
 	_, err = pipeline.Run(ctx, gepa.NewState(nil))
 

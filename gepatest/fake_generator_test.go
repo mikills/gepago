@@ -321,7 +321,9 @@ func TestFakeGeneratorChat(t *testing.T) {
 			{Role: gepa.RoleSystem, Content: "be brief"},
 			{Role: gepa.RoleUser, Content: "where is A-1?"},
 		},
-		Tools:          []gepa.Tool{{Name: "lookup", Description: "d", Parameters: json.RawMessage(`{"type":"object"}`)}},
+		Tools: []gepa.Tool{
+			{Name: "lookup", Description: "d", Parameters: json.RawMessage(`{"type":"object"}`)},
+		},
 		Temperature:    &temperature,
 		MaxTokens:      &maxTokens,
 		ResponseFormat: &gepa.ResponseFormat{Name: "f", Schema: json.RawMessage(`{"type":"object"}`)},
@@ -421,7 +423,10 @@ func TestFakeGeneratorChatFailures(t *testing.T) {
 
 func TestFakeGeneratorCallsAreCopies(t *testing.T) {
 	fake := gepatest.NewFakeGenerator().Default(gepatest.Text("ok"))
-	ctx := gepa.WithRunContext(context.Background(), gepa.RunContext{TraceID: "t", Attributes: map[string]string{"a": "1"}})
+	ctx := gepa.WithRunContext(
+		context.Background(),
+		gepa.RunContext{TraceID: "t", Attributes: map[string]string{"a": "1"}},
+	)
 	_, err := fake.Chat(ctx, gepa.ChatRequest{
 		Messages:       []gepa.Message{{Role: gepa.RoleAssistant, ToolCalls: []gepa.ToolCall{{ID: "c"}}}},
 		ResponseFormat: &gepa.ResponseFormat{Name: "f", Schema: json.RawMessage(`{}`)},
@@ -515,7 +520,8 @@ func TestFakeGeneratorWait(t *testing.T) {
 	})
 	t.Run("a nil error keeps Err", func(t *testing.T) {
 		boom := errors.New("boom")
-		fake := gepatest.NewFakeGenerator().Default(gepatest.Reply{Err: boom, Wait: func(context.Context) error { return nil }})
+		fake := gepatest.NewFakeGenerator().
+			Default(gepatest.Reply{Err: boom, Wait: func(context.Context) error { return nil }})
 
 		_, err := fake.Chat(context.Background(), gepa.ChatRequest{})
 
@@ -607,8 +613,12 @@ func TestFakeGeneratorLeavesUsageToItsCaller(t *testing.T) {
 	require.Zero(t, collector.Usage(), "the fake reports usage but does not record it")
 
 	program := gepa.Predict{
-		Signature: gepa.Signature{Name: "qa", Inputs: []gepa.Field{{Name: "q"}}, Outputs: []gepa.Field{{Name: "answer"}}},
-		LM:        fake,
+		Signature: gepa.Signature{
+			Name:    "qa",
+			Inputs:  []gepa.Field{{Name: "q"}},
+			Outputs: []gepa.Field{{Name: "answer"}},
+		},
+		LM: fake,
 	}
 	_, err = program.Run(ctx, gepa.Prediction{"q": "2+2?"})
 	require.NoError(t, err)

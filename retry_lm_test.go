@@ -32,8 +32,12 @@ func TestRetryingLanguageModelSumsUsageAcrossAttempts(t *testing.T) {
 	inner := failingThenOK(rateLimited, rateLimited)
 	lm := &gepa.RetryingLanguageModel{LM: inner, MaxAttempts: 3}
 	program := gepa.Predict{
-		Signature: gepa.Signature{Name: "qa", Inputs: []gepa.Field{{Name: "question"}}, Outputs: []gepa.Field{{Name: "answer"}}},
-		LM:        lm,
+		Signature: gepa.Signature{
+			Name:    "qa",
+			Inputs:  []gepa.Field{{Name: "question"}},
+			Outputs: []gepa.Field{{Name: "answer"}},
+		},
+		LM: lm,
 	}
 	ctx, collector := gepa.WithUsageCollector(context.Background())
 
@@ -149,7 +153,10 @@ func TestRetryingLanguageModelStopsWhenContextIsCancelled(t *testing.T) {
 
 func TestRetryingLanguageModelConsultsTheJitterSource(t *testing.T) {
 	calls := 0
-	inner := failingThenOK(gepa.TransientError(errors.New("unavailable")), gepa.TransientError(errors.New("unavailable")))
+	inner := failingThenOK(
+		gepa.TransientError(errors.New("unavailable")),
+		gepa.TransientError(errors.New("unavailable")),
+	)
 	lm := &gepa.RetryingLanguageModel{
 		LM:          inner,
 		MaxAttempts: 3,

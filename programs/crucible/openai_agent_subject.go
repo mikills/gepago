@@ -68,7 +68,11 @@ func toolBindings(tools []ToolSpec) []agents.ToolBinding {
 	for _, spec := range tools {
 		output := spec.Output
 		bindings = append(bindings, agents.ToolBinding{
-			Definition: agents.Tool{Name: spec.Name, Description: spec.Description, Parameters: toolParameters(spec.Parameters)},
+			Definition: agents.Tool{
+				Name:        spec.Name,
+				Description: spec.Description,
+				Parameters:  toolParameters(spec.Parameters),
+			},
 			Handler: func(context.Context, *agents.Memory, string) (string, error) {
 				return output, nil
 			},

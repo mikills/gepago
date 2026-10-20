@@ -114,7 +114,8 @@ func TestAgentRun(t *testing.T) {
 	})
 
 	t.Run("tool trace events are immutable snapshots", func(t *testing.T) {
-		client := gepatest.NewFakeGenerator().Default(gepatest.ToolCall("call-1", "lookup", `{}`), gepatest.Text("done"))
+		client := gepatest.NewFakeGenerator().
+			Default(gepatest.ToolCall("call-1", "lookup", `{}`), gepatest.Text("done"))
 		recorder := NewTraceRecorder()
 		agent := Agent{
 			Name:      "test",

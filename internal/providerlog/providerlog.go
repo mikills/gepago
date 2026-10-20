@@ -92,9 +92,15 @@ func Generate(
 	call Call,
 	generate func() (gepa.Generation, error),
 ) (gepa.Generation, error) {
-	return logged(ctx, logger, call, generate, func(generation gepa.Generation) (string, gepa.FinishReason, gepa.Usage) {
-		return generation.Model, generation.FinishReason, generation.Usage
-	})
+	return logged(
+		ctx,
+		logger,
+		call,
+		generate,
+		func(generation gepa.Generation) (string, gepa.FinishReason, gepa.Usage) {
+			return generation.Model, generation.FinishReason, generation.Usage
+		},
+	)
 }
 
 // Chat is Generate for a chat call: it logs the resolved model, finish reason and usage of the

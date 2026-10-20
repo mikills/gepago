@@ -19,7 +19,12 @@ var (
 
 // orderPipeline looks the order up with a ToolStep and then answers the question with a Predict
 // step that may call the same tool through lm. Its tool policy caches tool results.
-func orderPipeline(t *testing.T, lm gepa.Generator, calls *atomic.Int32, recorder *gepa.RecordingObserver) gepa.Pipeline {
+func orderPipeline(
+	t *testing.T,
+	lm gepa.Generator,
+	calls *atomic.Int32,
+	recorder *gepa.RecordingObserver,
+) gepa.Pipeline {
 	t.Helper()
 	registry, err := gepa.NewToolRegistry(lookupTool(calls))
 	require.NoError(t, err)
@@ -64,7 +69,12 @@ func TestToolStepAndPredictToolLoopAsTheTraceShows(t *testing.T) {
 	status, err := statusKey.Get(state)
 	require.NoError(t, err)
 	require.Equal(t, "shipped", status)
-	require.Equal(t, int32(1), calls.Load(), "the model's call repeats the lookup step's and is answered from the cache")
+	require.Equal(
+		t,
+		int32(1),
+		calls.Load(),
+		"the model's call repeats the lookup step's and is answered from the cache",
+	)
 	requests := chatRequests(lm)
 	require.Len(t, requests, 2)
 	require.Equal(t, []string{"lookup_order"}, toolNamesOf(requests[0].Tools))

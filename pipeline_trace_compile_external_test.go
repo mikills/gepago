@@ -28,7 +28,9 @@ func redactedSummaryPipeline(t *testing.T) gepa.Pipeline {
 	t.Helper()
 	pipeline, err := gepa.PipelineSpec{
 		Inputs: refs(docKey.Ref()),
-		Steps:  []gepa.Step{modelStep("summarise", tenTokenModel(`{"summary": "wrong"}`), docKey.Ref(), summaryKey.Ref())},
+		Steps: []gepa.Step{
+			modelStep("summarise", tenTokenModel(`{"summary": "wrong"}`), docKey.Ref(), summaryKey.Ref()),
+		},
 		Redactor: func(key string, value any) any {
 			if key == "document" {
 				return "[doc]"
@@ -52,7 +54,9 @@ func TestCompileRecordsPipelineTracesOnlyForTraceDatasetBuilder(t *testing.T) {
 		{name: "TraceDatasetBuilder", builder: gepa.TraceDatasetBuilder{}, wantTraces: true},
 		{name: "a TraceDatasetBuilder pointer", builder: &gepa.TraceDatasetBuilder{}, wantTraces: true},
 	}
-	examples := []gepa.Example{gepa.NewIOExample("one", gepa.Prediction{"document": "secret doc"}, gepa.Prediction{"summary": "short"})}
+	examples := []gepa.Example{
+		gepa.NewIOExample("one", gepa.Prediction{"document": "secret doc"}, gepa.Prediction{"summary": "short"}),
+	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			reflection := reflectionModel()
@@ -85,9 +89,14 @@ func TestCompileRecordsPipelineTracesOnlyForTraceDatasetBuilder(t *testing.T) {
 
 func TestProgramTrainConfigPassesItsDatasetBuilder(t *testing.T) {
 	registry := gepa.NewProgramRegistry()
-	require.NoError(t, registry.Register("summary", func() (gepa.Program, error) { return redactedSummaryPipeline(t), nil }))
+	require.NoError(
+		t,
+		registry.Register("summary", func() (gepa.Program, error) { return redactedSummaryPipeline(t), nil }),
+	)
 	reflection := reflectionModel()
-	examples := []gepa.Example{gepa.NewIOExample("one", gepa.Prediction{"document": "secret doc"}, gepa.Prediction{"summary": "short"})}
+	examples := []gepa.Example{
+		gepa.NewIOExample("one", gepa.Prediction{"document": "secret doc"}, gepa.Prediction{"summary": "short"}),
+	}
 	_, _, _, err := registry.TrainAndSave(context.Background(), gepa.ProgramTrainConfig{
 		Name:           "summary",
 		ArtifactPath:   filepath.Join(t.TempDir(), "summary.json"),
@@ -105,7 +114,9 @@ func TestProgramTrainConfigPassesItsDatasetBuilder(t *testing.T) {
 }
 
 func TestCompileReflectionPromptsHideRedactedValues(t *testing.T) {
-	examples := []gepa.Example{gepa.NewIOExample("one", gepa.Prediction{"document": "secret doc"}, gepa.Prediction{"summary": "short"})}
+	examples := []gepa.Example{
+		gepa.NewIOExample("one", gepa.Prediction{"document": "secret doc"}, gepa.Prediction{"summary": "short"}),
+	}
 	for _, builder := range []gepa.ReflectiveDatasetBuilder{nil, gepa.TraceDatasetBuilder{}} {
 		reflection := reflectionModel()
 		_, _, err := gepa.Compile(context.Background(), gepa.CompileConfig{
@@ -143,14 +154,26 @@ func TestProgramEvaluatorRedactsWithNestedPipelineRedactors(t *testing.T) {
 		Steps:  []gepa.Step{gepa.NewProgramStep("inner", inner, refs(docKey.Ref()), refs(summaryKey.Ref()))},
 	}.Build()
 	require.NoError(t, err)
-	evaluator := gepa.ProgramEvaluator{Program: outer, Metric: gepa.ExactMatchMetric{Fields: []string{"summary"}}, RecordTraces: true}
-	examples := []gepa.Example{gepa.NewIOExample("one", gepa.Prediction{"document": "secret doc"}, gepa.Prediction{"summary": "short"})}
+	evaluator := gepa.ProgramEvaluator{
+		Program:      outer,
+		Metric:       gepa.ExactMatchMetric{Fields: []string{"summary"}},
+		RecordTraces: true,
+	}
+	examples := []gepa.Example{
+		gepa.NewIOExample("one", gepa.Prediction{"document": "secret doc"}, gepa.Prediction{"summary": "short"}),
+	}
 
 	for _, captureTraces := range []bool{false, true} {
 		result, err := evaluator.Evaluate(context.Background(), outer.SeedCandidate(), examples, captureTraces)
 		require.NoError(t, err)
 		item := result.Items[0]
-		require.Equal(t, gepa.Prediction{"document": "[doc]"}, item.SideInfo["inputs"], "captureTraces %v", captureTraces)
+		require.Equal(
+			t,
+			gepa.Prediction{"document": "[doc]"},
+			item.SideInfo["inputs"],
+			"captureTraces %v",
+			captureTraces,
+		)
 		require.Equal(t, gepa.Prediction{"summary": "about [doc]"}, item.Output, "the output's text is scrubbed")
 		require.NotContains(t, fmt.Sprint(item), "secret doc", "captureTraces %v", captureTraces)
 		if !captureTraces {
@@ -184,9 +207,13 @@ func TestProgramEvaluatorRedactsReflectionValues(t *testing.T) {
 	var scored []gepa.Prediction
 	metric := gepa.MetricFunc(func(_ context.Context, expected, actual gepa.Prediction) (gepa.MetricResult, error) {
 		scored = append(scored, actual)
-		return gepa.MetricResult{Feedback: fmt.Sprintf("wanted %q, got %q", expected["summary"], actual["summary"])}, nil
+		return gepa.MetricResult{
+			Feedback: fmt.Sprintf("wanted %q, got %q", expected["summary"], actual["summary"]),
+		}, nil
 	})
-	examples := []gepa.Example{gepa.NewIOExample("one", gepa.Prediction{"document": "d"}, gepa.Prediction{"summary": "the gist"})}
+	examples := []gepa.Example{
+		gepa.NewIOExample("one", gepa.Prediction{"document": "d"}, gepa.Prediction{"summary": "the gist"}),
+	}
 
 	t.Run("a pipeline", func(t *testing.T) {
 		scored = nil
@@ -201,7 +228,12 @@ func TestProgramEvaluatorRedactsReflectionValues(t *testing.T) {
 		require.Equal(t, gepa.Prediction{"summary": "[summary]"}, item.SideInfo["expected"])
 		require.Equal(t, gepa.Prediction{"summary": "[summary]"}, item.SideInfo["actual"])
 		require.Equal(t, `wanted "[summary]", got "[summary]"`, item.SideInfo["feedback"])
-		require.Equal(t, gepa.Prediction{"document": "d"}, examples[0].Input.(gepa.IOExample).Inputs, "the example is unchanged")
+		require.Equal(
+			t,
+			gepa.Prediction{"document": "d"},
+			examples[0].Input.(gepa.IOExample).Inputs,
+			"the example is unchanged",
+		)
 	})
 
 	t.Run("a pipeline inside another pipeline", func(t *testing.T) {
@@ -221,12 +253,16 @@ func TestProgramEvaluatorRedactsReflectionValues(t *testing.T) {
 	t.Run("an invalid output", func(t *testing.T) {
 		ssnKey := gepa.Key[int]{Name: "ssn"}
 		pipeline, err := gepa.PipelineSpec{
-			Inputs:   refs(docKey.Ref()),
-			Steps:    []gepa.Step{modelStep("extract", tenTokenModel(`{"ssn": "123-45-6789"}`), docKey.Ref(), ssnKey.Ref())},
+			Inputs: refs(docKey.Ref()),
+			Steps: []gepa.Step{
+				modelStep("extract", tenTokenModel(`{"ssn": "123-45-6789"}`), docKey.Ref(), ssnKey.Ref()),
+			},
 			Redactor: hideKey("ssn", "[ssn]"),
 		}.Build()
 		require.NoError(t, err)
-		ssnExamples := []gepa.Example{gepa.NewIOExample("one", gepa.Prediction{"document": "d"}, gepa.Prediction{"ssn": 987654321})}
+		ssnExamples := []gepa.Example{
+			gepa.NewIOExample("one", gepa.Prediction{"document": "d"}, gepa.Prediction{"ssn": 987654321}),
+		}
 		result, err := gepa.ProgramEvaluator{Program: pipeline, Metric: metric}.
 			Evaluate(context.Background(), pipeline.SeedCandidate(), ssnExamples, false)
 		require.NoError(t, err)
@@ -243,8 +279,12 @@ func TestProgramEvaluatorRedactsReflectionValues(t *testing.T) {
 
 	t.Run("a programme without a pipeline", func(t *testing.T) {
 		predict := gepa.Predict{
-			Signature: gepa.Signature{Name: "summarise", Inputs: []gepa.Field{{Name: "document"}}, Outputs: []gepa.Field{{Name: "summary"}}},
-			LM:        tenTokenModel(`{"summary": "private words"}`),
+			Signature: gepa.Signature{
+				Name:    "summarise",
+				Inputs:  []gepa.Field{{Name: "document"}},
+				Outputs: []gepa.Field{{Name: "summary"}},
+			},
+			LM: tenTokenModel(`{"summary": "private words"}`),
 		}
 		result, err := gepa.ProgramEvaluator{Program: predict, Metric: metric}.
 			Evaluate(context.Background(), predict.SeedCandidate(), examples, false)

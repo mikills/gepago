@@ -49,7 +49,11 @@ func (p namedProgram) RunCandidate(ctx context.Context, candidate Candidate, inp
 
 func TestTraceDatasetBuilderMatchesKeysAWrappingProgrammeScopes(t *testing.T) {
 	program := namedProgram{name: "outer", program: redactedSummaryPipeline(t)}
-	evaluator := ProgramEvaluator{Program: program, Metric: ExactMatchMetric{Fields: []string{"summary"}}, RecordTraces: true}
+	evaluator := ProgramEvaluator{
+		Program:      program,
+		Metric:       ExactMatchMetric{Fields: []string{"summary"}},
+		RecordTraces: true,
+	}
 	examples := []Example{NewIOExample("one", Prediction{"document": "secret doc"}, Prediction{"summary": "short"})}
 	candidate := program.SeedCandidate()
 	component := "outer.summarise." + InstructionComponent
@@ -204,7 +208,11 @@ func TestProgramEvaluatorConvertsExampleValuesBeforeRedacting(t *testing.T) {
 	result, err := ProgramEvaluator{Program: pipeline, Metric: ExactMatchMetric{Fields: []string{"letter"}}}.
 		Evaluate(context.Background(), pipeline.SeedCandidate(), examples, false)
 	require.NoError(t, err)
-	require.Equal(t, map[string]any{"profile": map[string]any{"name": "Bob", "ssn": "***"}}, recorder.Traces()[0].Inputs)
+	require.Equal(
+		t,
+		map[string]any{"profile": map[string]any{"name": "Bob", "ssn": "***"}},
+		recorder.Traces()[0].Inputs,
+	)
 	sideInfo := result.Items[0].SideInfo
 	require.Equal(t, Prediction{"profile": profile{Name: "Bob", SSN: "***"}}, sideInfo["inputs"])
 	require.Equal(
@@ -255,7 +263,11 @@ func TestRedactEvaluationItemKeepsTheTraceShape(t *testing.T) {
 		require.Equal(t, map[string]any{"note": "about [doc]"}, redacted.Steps[0].Runs[0].Inputs)
 	}
 	require.Equal(t, "secret doc", trace.Inputs["document"], "the original trace is unchanged")
-	require.Equal(t, "not a trace", evaluationRedaction{redactors: redactors}.apply(EvaluationItem{Trace: "not a trace"}).Trace)
+	require.Equal(
+		t,
+		"not a trace",
+		evaluationRedaction{redactors: redactors}.apply(EvaluationItem{Trace: "not a trace"}).Trace,
+	)
 }
 
 func TestRedactEvaluationItemHandlesOtherOutputs(t *testing.T) {

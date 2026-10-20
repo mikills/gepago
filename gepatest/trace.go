@@ -389,7 +389,10 @@ func diffRows(expected []expectedRow, recorded []recordedRow, order []int) []str
 			i++
 			j++
 		case j == m || i < n && common[i+1][j] >= common[i][j+1]:
-			lines = append(lines, "  - "+renderExpected(label(expected[i].step.Step, expected[i].attempt), expected[i].step))
+			lines = append(
+				lines,
+				"  - "+renderExpected(label(expected[i].step.Step, expected[i].attempt), expected[i].step),
+			)
 			i++
 		default:
 			row := recorded[order[j]]

@@ -33,7 +33,10 @@ func (r *predictHostRecorder) GeneratePredict(
 			if len(replies) > 1 {
 				r.replies[name] = replies[1:]
 			}
-			return compileModelResult{Text: reply, Usage: gepa.Usage{PromptTokens: 2, CompletionTokens: 1, TotalTokens: 3}}, nil
+			return compileModelResult{
+				Text:  reply,
+				Usage: gepa.Usage{PromptTokens: 2, CompletionTokens: 1, TotalTokens: 3},
+			}, nil
 		}
 	}
 	return compileModelResult{}, errors.New("no reply for the prompt")
@@ -91,19 +94,21 @@ func TestRunCompiledPipelineMatchesCompile(t *testing.T) {
 	// the same programme, inputs and candidate, run the way compile evaluates an example.
 	compiled := map[string]bool{}
 	compileReplies := replies()
-	invoker := compileModelInvokerFunc(func(_ context.Context, request compileModelRequest) (compileModelResult, error) {
-		compiled[request.Role+":"+request.Prompt] = true
-		for name, queue := range compileReplies {
-			if strings.Contains(request.Prompt, "Task: "+name+"\n") {
-				reply := queue[0]
-				if len(queue) > 1 {
-					compileReplies[name] = queue[1:]
+	invoker := compileModelInvokerFunc(
+		func(_ context.Context, request compileModelRequest) (compileModelResult, error) {
+			compiled[request.Role+":"+request.Prompt] = true
+			for name, queue := range compileReplies {
+				if strings.Contains(request.Prompt, "Task: "+name+"\n") {
+					reply := queue[0]
+					if len(queue) > 1 {
+						compileReplies[name] = queue[1:]
+					}
+					return compileModelResult{Text: reply}, nil
 				}
-				return compileModelResult{Text: reply}, nil
 			}
-		}
-		return compileModelResult{}, errors.New("no reply for the prompt")
-	})
+			return compileModelResult{}, errors.New("no reply for the prompt")
+		},
+	)
 	program, err := buildCompilePipeline(
 		decodePipelineProgram(t, floatPipelineProgram()),
 		newCompileLanguageModel(invoker, "task"),
@@ -139,7 +144,8 @@ func TestRunCompiledPipelineMatchesCompile(t *testing.T) {
 	if !strings.Contains(run.requests[0].Prompt, `"weight": 16777216`) {
 		t.Fatalf("a float32 input must be converted as compile converts it:\n%s", run.requests[0].Prompt)
 	}
-	if strings.Contains(run.requests[0].Prompt, "dropped") || !strings.Contains(run.requests[2].Prompt, "Label trained.") {
+	if strings.Contains(run.requests[0].Prompt, "dropped") ||
+		!strings.Contains(run.requests[2].Prompt, "Label trained.") {
 		t.Fatalf("unexpected prompts:\n%s\n%s", run.requests[0].Prompt, run.requests[2].Prompt)
 	}
 }

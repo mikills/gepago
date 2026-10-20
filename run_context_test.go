@@ -142,14 +142,21 @@ func TestRunContextLogAttrs(t *testing.T) {
 		"trace_id=trace-1",
 		"attributes=[job=nightly request=req-7]",
 	}, attrStrings(full.LogAttrs()))
-	require.Equal(t, []string{"run_id=run-2", "trace_id=trace-1"}, attrStrings(RunContext{RunID: "run-2", TraceID: "trace-1"}.LogAttrs()))
+	require.Equal(
+		t,
+		[]string{"run_id=run-2", "trace_id=trace-1"},
+		attrStrings(RunContext{RunID: "run-2", TraceID: "trace-1"}.LogAttrs()),
+	)
 	require.Empty(t, RunContext{}.LogAttrs())
 	require.Empty(t, RunContext{Attributes: map[string]string{}}.LogAttrs())
 }
 
 func TestPipelineRunWithoutACallerRunContext(t *testing.T) {
 	probe := &runContextProbe{}
-	pipeline := buildPipeline(t, PipelineSpec{Steps: []Step{probe.step("first", intKey("a")), probe.step("second", intKey("b"))}})
+	pipeline := buildPipeline(
+		t,
+		PipelineSpec{Steps: []Step{probe.step("first", intKey("a")), probe.step("second", intKey("b"))}},
+	)
 
 	for range 2 {
 		_, err := pipeline.Run(context.Background(), NewState(nil))
@@ -173,7 +180,10 @@ func TestPipelineRunWithoutACallerRunContext(t *testing.T) {
 func TestPipelineRunKeepsTheCallerRunContext(t *testing.T) {
 	t.Run("trace and attributes", func(t *testing.T) {
 		probe := &runContextProbe{}
-		pipeline := buildPipeline(t, PipelineSpec{Steps: []Step{probe.step("first", intKey("a")), probe.step("second", intKey("b"))}})
+		pipeline := buildPipeline(
+			t,
+			PipelineSpec{Steps: []Step{probe.step("first", intKey("a")), probe.step("second", intKey("b"))}},
+		)
 		ctx := WithRunContext(context.Background(), callerContext())
 
 		_, err := pipeline.Run(ctx, NewState(nil))
@@ -463,8 +473,12 @@ func TestRecordingObserverStoresTheRunContext(t *testing.T) {
 
 	data, err := json.Marshal(recorder.Traces()[0])
 	require.NoError(t, err)
-	require.Contains(t, string(data), `"run_context":{"run_id":"`+outer.RunID+`","parent_run_id":"caller","trace_id":"trace-1",`+
-		`"attributes":{"request":"req-7"}}`)
+	require.Contains(
+		t,
+		string(data),
+		`"run_context":{"run_id":"`+outer.RunID+`","parent_run_id":"caller","trace_id":"trace-1",`+
+			`"attributes":{"request":"req-7"}}`,
+	)
 	var decoded PipelineTrace
 	require.NoError(t, json.Unmarshal(data, &decoded))
 	require.Equal(t, recorder.Traces()[0], decoded)
@@ -472,7 +486,10 @@ func TestRecordingObserverStoresTheRunContext(t *testing.T) {
 
 func TestRecordingObserverRoundTripsARunWithoutAttributes(t *testing.T) {
 	recorder := &RecordingObserver{}
-	pipeline := buildPipeline(t, PipelineSpec{Steps: []Step{writeAmount("write", 1)}, Observers: []PipelineObserver{recorder}})
+	pipeline := buildPipeline(
+		t,
+		PipelineSpec{Steps: []Step{writeAmount("write", 1)}, Observers: []PipelineObserver{recorder}},
+	)
 	_, err := pipeline.Run(context.Background(), NewState(nil))
 	require.NoError(t, err)
 
@@ -535,7 +552,12 @@ func TestRedactorHidesRunContextAttributes(t *testing.T) {
 	require.Equal(t, want, log.stepsStarted[0].RunContext.Attributes)
 	require.Equal(t, want, log.finished[0].RunContext.Attributes)
 	require.Equal(t, want, log.runsFinished[0].RunContext.Attributes)
-	require.Equal(t, `no account for [hidden]`, log.finished[0].Err.Error(), "the attribute's text leaves error messages")
+	require.Equal(
+		t,
+		`no account for [hidden]`,
+		log.finished[0].Err.Error(),
+		"the attribute's text leaves error messages",
+	)
 	require.NotContains(t, log.runsFinished[0].Err.Error(), secret)
 
 	trace := recorder.Traces()[0]
@@ -566,7 +588,11 @@ func TestPanickingRedactorFailsTheAttribute(t *testing.T) {
 
 	_, err := pipeline.Run(ctx, NewState(nil))
 	require.NoError(t, err)
-	require.Equal(t, map[string]string{"secret": RedactionFailed, "plain": "p"}, log.runsStarted[0].RunContext.Attributes)
+	require.Equal(
+		t,
+		map[string]string{"secret": RedactionFailed, "plain": "p"},
+		log.runsStarted[0].RunContext.Attributes,
+	)
 }
 
 func TestNestedPipelineRedactsItsRunContextWithEveryRedactor(t *testing.T) {
@@ -585,7 +611,11 @@ func TestNestedPipelineRedactsItsRunContextWithEveryRedactor(t *testing.T) {
 	_, err := outer.Run(ctx, NewState(nil))
 	require.NoError(t, err)
 	require.Equal(t, map[string]string{"inner": "i", "outer": "[outer]"}, log.runsStarted[0].RunContext.Attributes)
-	require.Equal(t, map[string]string{"inner": "[inner]", "outer": "[outer]"}, log.runsStarted[1].RunContext.Attributes)
+	require.Equal(
+		t,
+		map[string]string{"inner": "[inner]", "outer": "[outer]"},
+		log.runsStarted[1].RunContext.Attributes,
+	)
 }
 
 func TestProgramEvaluatorRedactsRunContextAttributes(t *testing.T) {
@@ -595,8 +625,15 @@ func TestProgramEvaluatorRedactsRunContextAttributes(t *testing.T) {
 		return fmt.Errorf("%w: no account for %s", ErrInvalidOutput, rc.Attributes["secret"])
 	})
 	inner := buildPipeline(t, PipelineSpec{Steps: []Step{fail}, Redactor: hideKey("attribute:secret", "[hidden]")})
-	outer := buildPipeline(t, PipelineSpec{Steps: []Step{NewProgramStep("run inner", inner, nil, refs(amountKey.Ref()))}})
-	evaluator := ProgramEvaluator{Program: outer, Metric: ExactMatchMetric{Fields: []string{"amount"}}, RecordTraces: true}
+	outer := buildPipeline(
+		t,
+		PipelineSpec{Steps: []Step{NewProgramStep("run inner", inner, nil, refs(amountKey.Ref()))}},
+	)
+	evaluator := ProgramEvaluator{
+		Program:      outer,
+		Metric:       ExactMatchMetric{Fields: []string{"amount"}},
+		RecordTraces: true,
+	}
 	examples := []Example{NewIOExample("one", Prediction{}, Prediction{"amount": 1})}
 	ctx := WithRunContext(context.Background(), RunContext{Attributes: map[string]string{"secret": secret}})
 
@@ -606,7 +643,12 @@ func TestProgramEvaluatorRedactsRunContextAttributes(t *testing.T) {
 	item := result.Items[0]
 	trace, ok := item.Trace.(PipelineTrace)
 	require.True(t, ok)
-	require.Equal(t, map[string]string{"secret": "[hidden]"}, trace.RunContext.Attributes, "the outer trace meets the inner Redactor too")
+	require.Equal(
+		t,
+		map[string]string{"secret": "[hidden]"},
+		trace.RunContext.Attributes,
+		"the outer trace meets the inner Redactor too",
+	)
 	require.Equal(t, map[string]string{"secret": "[hidden]"}, trace.Steps[0].Runs[0].RunContext.Attributes)
 	require.Contains(t, item.SideInfo["feedback"], "no account for [hidden]")
 	require.NotContains(t, fmt.Sprintf("%v", item), secret)

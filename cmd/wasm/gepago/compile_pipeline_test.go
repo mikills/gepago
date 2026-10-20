@@ -193,7 +193,8 @@ func TestCompilePipelineKeyTypes(t *testing.T) {
 	}
 
 	_, err = program.RunCandidate(context.Background(), program.SeedCandidate(), gepa.Prediction{"items": "a, b"})
-	if err == nil || !strings.Contains(err.Error(), `invalid pipeline input: state key "items": decode as []interface {}`) {
+	if err == nil ||
+		!strings.Contains(err.Error(), `invalid pipeline input: state key "items": decode as []interface {}`) {
 		t.Fatalf("an input of the wrong type must fail the run, got %v", err)
 	}
 }

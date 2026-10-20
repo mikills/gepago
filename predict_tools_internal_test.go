@@ -90,7 +90,10 @@ func TestTypedPredictWithTools(t *testing.T) {
 	calls := &atomic.Int32{}
 	registry, err := NewToolRegistry(lookupTool(calls))
 	require.NoError(t, err)
-	lm := newScriptedChat(toolCallReply("1", "lookup_order", `{"order_id":"A-1"}`, Usage{}), textReply(orderAnswer, Usage{}))
+	lm := newScriptedChat(
+		toolCallReply("1", "lookup_order", `{"order_id":"A-1"}`, Usage{}),
+		textReply(orderAnswer, Usage{}),
+	)
 	predict := TypedPredict[orderQuestion, orderAnswerFields]{
 		Signature:    Signature{Name: "order_status"},
 		LM:           lm,
@@ -134,8 +137,10 @@ func TestPredictToolsInAPipeline(t *testing.T) {
 	newSpec := func(lm Generator, predict Predict, registry *ToolRegistry, policy ToolPolicy) PipelineSpec {
 		predict.Signature, predict.LM = orderSignature, lm
 		return PipelineSpec{
-			Inputs:     refs(question.Ref()),
-			Steps:      []Step{NewProgramStep("answer", predict, refs(question.Ref()), refs(status.Ref(), summary.Ref()))},
+			Inputs: refs(question.Ref()),
+			Steps: []Step{
+				NewProgramStep("answer", predict, refs(question.Ref()), refs(status.Ref(), summary.Ref())),
+			},
 			Tools:      registry,
 			ToolPolicy: policy,
 		}
@@ -151,7 +156,12 @@ func TestPredictToolsInAPipeline(t *testing.T) {
 			textReply(orderAnswer, Usage{}),
 		)
 		before := calls.Load()
-		pipeline, err := newSpec(lm, Predict{Tools: []string{"lookup_order"}}, registry, ToolPolicy{Cache: true}).Build()
+		pipeline, err := newSpec(
+			lm,
+			Predict{Tools: []string{"lookup_order"}},
+			registry,
+			ToolPolicy{Cache: true},
+		).Build()
 		require.NoError(t, err)
 
 		state, run, err := pipeline.execute(context.Background(), nil, Prediction{"question": "?"})
@@ -354,7 +364,11 @@ func TestPredictToolsInAPipeline(t *testing.T) {
 		_, run, err := pipeline.execute(context.Background(), nil, Prediction{"question": "?"})
 
 		require.ErrorIs(t, err, ErrToolCallLimit)
-		require.ErrorContains(t, err, `tool "lookup_order" refused: the enclosing pipeline run reached its MaxCalls limit of 1`)
+		require.ErrorContains(
+			t,
+			err,
+			`tool "lookup_order" refused: the enclosing pipeline run reached its MaxCalls limit of 1`,
+		)
 		require.Equal(t, before+1, calls.Load())
 		records := run.tools.Records()
 		require.Len(t, records, 1, "the run records the call its own session did not make")

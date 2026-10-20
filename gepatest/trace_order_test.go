@@ -318,7 +318,12 @@ func TestAssertTraceKeepsTheOrderWithinAStepOfAParallel(t *testing.T) {
 		}
 		recorder := &recordingT{}
 		require.False(t, gepatest.AssertTrace(recorder, trace, gepatest.ExpectedTrace{
-			Steps: moved(t, append(slices.Clone(withoutC), gepatest.ExpectedStep{Step: "fan.c"}), "fan.backup #1", "fan.a #1"),
+			Steps: moved(
+				t,
+				append(slices.Clone(withoutC), gepatest.ExpectedStep{Step: "fan.c"}),
+				"fan.backup #1",
+				"fan.a #1",
+			),
 		}), "the fallback ran after the step it stands in for")
 		require.Contains(t, recorder.errors[0],
 			"want lists fan.backup #1 before fan.a #1, but fan.a #1 finished before fan.backup #1 started")

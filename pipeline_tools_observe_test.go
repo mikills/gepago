@@ -597,7 +597,11 @@ func TestStepErrorReadsNeverLeaveUnredacted(t *testing.T) {
 			for _, event := range log.finished {
 				require.False(t, errors.As(event.Err, &stepErr), "a StepFinished error does not unwrap to its reads")
 			}
-			require.False(t, errors.As(log.runsFinished[0].Err, &stepErr), "a RunFinished error does not unwrap to its reads")
+			require.False(
+				t,
+				errors.As(log.runsFinished[0].Err, &stepErr),
+				"a RunFinished error does not unwrap to its reads",
+			)
 			data := requireTraceRoundTrip(t, recorder.Traces()[0])
 			report, err := HTMLRunReport(recorder.Traces()[0], HTMLReportOptions{})
 			require.NoError(t, err)
@@ -815,10 +819,14 @@ func TestPolicyOnlyRunCachesNothing(t *testing.T) {
 		ToolPolicy: ToolPolicy{Cache: true},
 	}.Build()
 	require.NoError(t, err)
-	outer, err := toolPipeline(registry, ToolPolicy{}, NewStep("middle", nil, nil, func(ctx context.Context, _ State) error {
-		_, err := middle.Run(ctx, NewState(nil))
-		return err
-	}))
+	outer, err := toolPipeline(
+		registry,
+		ToolPolicy{},
+		NewStep("middle", nil, nil, func(ctx context.Context, _ State) error {
+			_, err := middle.Run(ctx, NewState(nil))
+			return err
+		}),
+	)
 	require.NoError(t, err)
 
 	_, err = outer.Run(context.Background(), NewState(Prediction{"order_id": "A-1"}))
@@ -923,7 +931,12 @@ func TestRedactorThatMasksOneArgumentFieldKeepsTheRest(t *testing.T) {
 			require.Error(t, err)
 			event := log.finishedStep(t, "answer", 1)
 			if json.Valid([]byte(tt.wantArgs)) {
-				require.JSONEq(t, tt.wantArgs, event.ToolCalls[0].Arguments, "the arguments are what the Redactor returned")
+				require.JSONEq(
+					t,
+					tt.wantArgs,
+					event.ToolCalls[0].Arguments,
+					"the arguments are what the Redactor returned",
+				)
 			} else {
 				require.Equal(t, tt.wantArgs, event.ToolCalls[0].Arguments, "the arguments are what the Redactor returned")
 			}

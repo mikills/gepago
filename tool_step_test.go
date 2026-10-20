@@ -96,9 +96,12 @@ func TestToolStepConvertsOutputFieldsStrictly(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tool := NewToolFunc(Tool{Name: "raw", Description: "raw"}, func(context.Context, ToolCall) (ToolResult, error) {
-				return ToolResult{Output: json.RawMessage(tt.output)}, nil
-			})
+			tool := NewToolFunc(
+				Tool{Name: "raw", Description: "raw"},
+				func(context.Context, ToolCall) (ToolResult, error) {
+					return ToolResult{Output: json.RawMessage(tt.output)}, nil
+				},
+			)
 			registry, err := NewToolRegistry(tool)
 			require.NoError(t, err)
 			pipeline, err := toolPipeline(registry, ToolPolicy{}, ToolStep("raw", "raw", nil, tt.writes))
@@ -143,13 +146,17 @@ func TestToolStepBuildChecksTheTool(t *testing.T) {
 	raw := NewToolFunc(Tool{
 		Name:        "raw",
 		Description: "raw",
-		Parameters: json.RawMessage(`{"type":"object","properties":{"order_id":{"type":"string"},"note":{"type":"string"}},` +
-			`"required":["order_id"],"additionalProperties":false}`),
+		Parameters: json.RawMessage(
+			`{"type":"object","properties":{"order_id":{"type":"string"},"note":{"type":"string"}},` +
+				`"required":["order_id"],"additionalProperties":false}`,
+		),
 	}, func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{}, nil })
 	open := NewToolFunc(Tool{
 		Name:        "open",
 		Description: "open",
-		Parameters:  json.RawMessage(`{"type":"object","required":["order_id"],"additionalProperties":{"type":"string"}}`),
+		Parameters: json.RawMessage(
+			`{"type":"object","required":["order_id"],"additionalProperties":{"type":"string"}}`,
+		),
 	}, func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{}, nil })
 	registry, err := NewToolRegistry(lookupTool(calls), raw, open)
 	require.NoError(t, err)
@@ -238,7 +245,12 @@ func TestToolStepBuildChecksTheTool(t *testing.T) {
 			if tt.registry != nil {
 				registry = tt.registry
 			}
-			_, err := PipelineSpec{Inputs: inputs, Steps: []Step{tt.step}, Tools: registry, ToolPolicy: tt.policy}.Build()
+			_, err := PipelineSpec{
+				Inputs:     inputs,
+				Steps:      []Step{tt.step},
+				Tools:      registry,
+				ToolPolicy: tt.policy,
+			}.Build()
 			if tt.wantErr == "" {
 				require.NoError(t, err)
 				return
@@ -296,13 +308,16 @@ func TestToolStepContainsAPanickingTool(t *testing.T) {
 }
 
 func TestToolStepMemoryWritesInAPipeline(t *testing.T) {
-	tool := NewToolFunc(Tool{Name: "remember", Description: "remember", Parameters: json.RawMessage(`{"type":"object"}`)}, func(_ context.Context, call ToolCall) (ToolResult, error) {
-		result := ToolResult{Output: json.RawMessage(`{}`), MemoryWrites: map[string]any{"last": call.Arguments}}
-		if call.Arguments == `{"order_id":"bad"}` {
-			return result, errors.New("rejected")
-		}
-		return result, nil
-	})
+	tool := NewToolFunc(
+		Tool{Name: "remember", Description: "remember", Parameters: json.RawMessage(`{"type":"object"}`)},
+		func(_ context.Context, call ToolCall) (ToolResult, error) {
+			result := ToolResult{Output: json.RawMessage(`{}`), MemoryWrites: map[string]any{"last": call.Arguments}}
+			if call.Arguments == `{"order_id":"bad"}` {
+				return result, errors.New("rejected")
+			}
+			return result, nil
+		},
+	)
 	registry, err := NewToolRegistry(tool)
 	require.NoError(t, err)
 	pipeline, err := toolPipeline(registry, ToolPolicy{}, ToolStep("s", "remember", refs(orderIDKey.Ref()), nil))
@@ -349,7 +364,12 @@ func remember(ctx context.Context, key, value string) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	result, _, err := toolEnvFrom(ctx).session.Call(ctx, ToolCall{ID: NewID(), Name: "remember", Arguments: string(arguments)})
+	result, _, err := toolEnvFrom(
+		ctx,
+	).session.Call(
+		ctx,
+		ToolCall{ID: NewID(), Name: "remember", Arguments: string(arguments)},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -444,7 +464,11 @@ func TestPipelineStagesToolMemoryWritesUntilTheStepCommits(t *testing.T) {
 
 	t.Run("a skipped step's writes are dropped", func(t *testing.T) {
 		memory := NewToolMemory()
-		err := run(t, memory, WithPolicy(rememberStep("skipped", "dropped", "1", errStep), StepPolicy{OnError: OnErrorSkip}))
+		err := run(
+			t,
+			memory,
+			WithPolicy(rememberStep("skipped", "dropped", "1", errStep), StepPolicy{OnError: OnErrorSkip}),
+		)
 		require.NoError(t, err)
 		requireMemory(t, memory, nil, "dropped")
 	})
@@ -515,9 +539,15 @@ func TestPipelineStagesToolMemoryWritesUntilTheStepCommits(t *testing.T) {
 	})
 
 	t.Run("a failed Predict step drops its tool's writes", func(t *testing.T) {
-		tool := NewToolFunc(Tool{Name: "lookup_order", Description: "d"}, func(context.Context, ToolCall) (ToolResult, error) {
-			return ToolResult{Output: json.RawMessage(`{"status":"shipped"}`), MemoryWrites: map[string]any{"charged": true}}, nil
-		})
+		tool := NewToolFunc(
+			Tool{Name: "lookup_order", Description: "d"},
+			func(context.Context, ToolCall) (ToolResult, error) {
+				return ToolResult{
+					Output:       json.RawMessage(`{"status":"shipped"}`),
+					MemoryWrites: map[string]any{"charged": true},
+				}, nil
+			},
+		)
 		registry, err := NewToolRegistry(tool)
 		require.NoError(t, err)
 		lm := newScriptedChat(toolCallReply("1", "lookup_order", `{}`, Usage{}), textReply(`not json`, Usage{}))
@@ -539,9 +569,15 @@ func TestPipelineStagesToolMemoryWritesUntilTheStepCommits(t *testing.T) {
 	})
 
 	t.Run("a standalone Predict applies its tool's writes at once", func(t *testing.T) {
-		tool := NewToolFunc(Tool{Name: "lookup_order", Description: "d"}, func(context.Context, ToolCall) (ToolResult, error) {
-			return ToolResult{Output: json.RawMessage(`{"status":"shipped"}`), MemoryWrites: map[string]any{"charged": true}}, nil
-		})
+		tool := NewToolFunc(
+			Tool{Name: "lookup_order", Description: "d"},
+			func(context.Context, ToolCall) (ToolResult, error) {
+				return ToolResult{
+					Output:       json.RawMessage(`{"status":"shipped"}`),
+					MemoryWrites: map[string]any{"charged": true},
+				}, nil
+			},
+		)
 		own, err := NewToolRegistry(tool)
 		require.NoError(t, err)
 		lm := newScriptedChat(toolCallReply("1", "lookup_order", `{}`, Usage{}), textReply(`not json`, Usage{}))
@@ -677,7 +713,11 @@ func TestPipelineStagesCachedToolResultsWithTheStep(t *testing.T) {
 			_, err := inner.Run(ctx, NewState(nil))
 			return err
 		})
-		pipeline, err := PipelineSpec{Steps: []Step{outer}, Tools: registry, ToolPolicy: ToolPolicy{Cache: true}}.Build()
+		pipeline, err := PipelineSpec{
+			Steps:      []Step{outer},
+			Tools:      registry,
+			ToolPolicy: ToolPolicy{Cache: true},
+		}.Build()
 		require.NoError(t, err)
 
 		_, err = pipeline.Run(context.Background(), NewState(nil))
@@ -703,7 +743,10 @@ func TestPipelineStagesCachedToolResultsWithTheStep(t *testing.T) {
 			return nil
 		})
 		pipeline, err := PipelineSpec{
-			Steps:      []Step{WithPolicy(outer, StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}}), rememberStep("later", "charged", "yes", nil)},
+			Steps: []Step{
+				WithPolicy(outer, StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}}),
+				rememberStep("later", "charged", "yes", nil),
+			},
 			Tools:      registry,
 			ToolPolicy: ToolPolicy{Cache: true},
 		}.Build()
@@ -747,9 +790,15 @@ func TestPipelineStagesCachedToolResultsWithTheStep(t *testing.T) {
 	})
 
 	t.Run("a retried Predict step repeats its tool call", func(t *testing.T) {
-		tool := NewToolFunc(Tool{Name: "lookup_order", Description: "d"}, func(context.Context, ToolCall) (ToolResult, error) {
-			return ToolResult{Output: json.RawMessage(`{"status":"shipped"}`), MemoryWrites: map[string]any{"looked_up": "A-1"}}, nil
-		})
+		tool := NewToolFunc(
+			Tool{Name: "lookup_order", Description: "d"},
+			func(context.Context, ToolCall) (ToolResult, error) {
+				return ToolResult{
+					Output:       json.RawMessage(`{"status":"shipped"}`),
+					MemoryWrites: map[string]any{"looked_up": "A-1"},
+				}, nil
+			},
+		)
 		registry, err := NewToolRegistry(tool)
 		require.NoError(t, err)
 		lm := newScriptedChat(
@@ -762,15 +811,26 @@ func TestPipelineStagesCachedToolResultsWithTheStep(t *testing.T) {
 		question := Key[string]{Name: "question"}
 		pipeline, err := PipelineSpec{
 			Inputs: refs(question.Ref()),
-			Steps: []Step{WithPolicy(NewProgramStep("answer", predict, refs(question.Ref()),
-				refs(statusKey.Ref(), Key[string]{Name: "summary"}.Ref())), StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}})},
+			Steps: []Step{WithPolicy(NewProgramStep(
+				"answer",
+				predict,
+				refs(question.Ref()),
+				refs(
+					statusKey.Ref(),
+					Key[string]{Name: "summary"}.Ref(),
+				),
+			), StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}})},
 			Tools:      registry,
 			ToolPolicy: ToolPolicy{Cache: true},
 		}.Build()
 		require.NoError(t, err)
 		memory := NewToolMemory()
 
-		_, pipelineRun, err := pipeline.execute(WithToolMemory(context.Background(), memory), nil, Prediction{"question": "?"})
+		_, pipelineRun, err := pipeline.execute(
+			WithToolMemory(context.Background(), memory),
+			nil,
+			Prediction{"question": "?"},
+		)
 
 		require.NoError(t, err)
 		value, ok := memory.Get("looked_up")
@@ -827,7 +887,11 @@ func TestPipelinePolicyWithoutToolsGovernsWhatItsStepsRun(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			calls.Store(0)
-			outer, err := PipelineSpec{Inputs: refs(orderIDKey.Ref()), Steps: []Step{nested}, ToolPolicy: tt.policy}.Build()
+			outer, err := PipelineSpec{
+				Inputs:     refs(orderIDKey.Ref()),
+				Steps:      []Step{nested},
+				ToolPolicy: tt.policy,
+			}.Build()
 			require.NoError(t, err)
 
 			_, run, err := outer.execute(context.Background(), nil, Prediction{"order_id": "A-1"})
@@ -862,10 +926,14 @@ func TestPipelinePolicyWithoutToolsGovernsWhatItsStepsRun(t *testing.T) {
 			ToolPolicy: ToolPolicy{MaxCalls: 1},
 		}.Build()
 		require.NoError(t, err)
-		outer, err := toolPipeline(registry, ToolPolicy{}, NewStep("middle", nil, nil, func(ctx context.Context, _ State) error {
-			_, err := middle.Run(ctx, NewState(nil))
-			return err
-		}))
+		outer, err := toolPipeline(
+			registry,
+			ToolPolicy{},
+			NewStep("middle", nil, nil, func(ctx context.Context, _ State) error {
+				_, err := middle.Run(ctx, NewState(nil))
+				return err
+			}),
+		)
 		require.NoError(t, err)
 
 		_, err = outer.Run(context.Background(), NewState(Prediction{"order_id": "A-1"}))
@@ -948,14 +1016,17 @@ func TestNestedPipelineToolCallsMeetEveryRunsPolicy(t *testing.T) {
 
 func TestPipelineParallelToolCallsShareTheRunsSession(t *testing.T) {
 	calls := &atomic.Int32{}
-	writer := NewToolFunc(Tool{Name: "writer", Description: "d"}, func(ctx context.Context, call ToolCall) (ToolResult, error) {
-		calls.Add(1)
-		ToolMemoryFrom(ctx).Get("k")
-		return ToolResult{
-			Output:       json.RawMessage(`{"status":"shipped"}`),
-			MemoryWrites: map[string]any{"k": map[string]any{"v": []any{1}}},
-		}, nil
-	})
+	writer := NewToolFunc(
+		Tool{Name: "writer", Description: "d"},
+		func(ctx context.Context, call ToolCall) (ToolResult, error) {
+			calls.Add(1)
+			ToolMemoryFrom(ctx).Get("k")
+			return ToolResult{
+				Output:       json.RawMessage(`{"status":"shipped"}`),
+				MemoryWrites: map[string]any{"k": map[string]any{"v": []any{1}}},
+			}, nil
+		},
+	)
 	registry, err := NewToolRegistry(writer)
 	require.NoError(t, err)
 	var steps []Step
@@ -963,7 +1034,12 @@ func TestPipelineParallelToolCallsShareTheRunsSession(t *testing.T) {
 		out := Key[string]{Name: fmt.Sprintf("out%d", i)}
 		steps = append(steps, NewStep(fmt.Sprintf("w%d", i), refs(orderIDKey.Ref()), refs(out.Ref()),
 			func(ctx context.Context, s State) error {
-				result, _, err := toolEnvFrom(ctx).session.Call(ctx, ToolCall{ID: "x", Name: "writer", Arguments: `{"b":1,"a":2}`})
+				result, _, err := toolEnvFrom(
+					ctx,
+				).session.Call(
+					ctx,
+					ToolCall{ID: "x", Name: "writer", Arguments: `{"b":1,"a":2}`},
+				)
 				if err != nil {
 					return err
 				}
@@ -1016,10 +1092,13 @@ func TestToolStepCachedCallMakesNoInvocation(t *testing.T) {
 
 func TestToolStepToolSeesTheBudgetAndSpendsIt(t *testing.T) {
 	var remaining BudgetRemaining
-	tool := NewToolFunc(Tool{Name: "spend", Description: "spend"}, func(ctx context.Context, _ ToolCall) (ToolResult, error) {
-		remaining = BudgetFrom(ctx).Remaining()
-		return ToolResult{Usage: Usage{TotalTokens: 30}}, nil
-	})
+	tool := NewToolFunc(
+		Tool{Name: "spend", Description: "spend"},
+		func(ctx context.Context, _ ToolCall) (ToolResult, error) {
+			remaining = BudgetFrom(ctx).Remaining()
+			return ToolResult{Usage: Usage{TotalTokens: 30}}, nil
+		},
+	)
 	registry, err := NewToolRegistry(tool)
 	require.NoError(t, err)
 	tests := []struct {
@@ -1032,7 +1111,10 @@ func TestToolStepToolSeesTheBudgetAndSpendsIt(t *testing.T) {
 			budget:  RunBudget{MaxTokens: 50, PerStepTokens: map[string]int{"b": 29}},
 			wantErr: `pipeline step "b": tool "spend": run budget PerStepTokens["b"] 29 exceeded: 30 tokens spent`,
 		},
-		{name: "tool usage at the token budget", budget: RunBudget{MaxTokens: 60, PerStepTokens: map[string]int{"b": 30}}},
+		{
+			name:   "tool usage at the token budget",
+			budget: RunBudget{MaxTokens: 60, PerStepTokens: map[string]int{"b": 30}},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

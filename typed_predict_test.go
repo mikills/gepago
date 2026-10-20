@@ -325,8 +325,10 @@ func TestTypedPredictValidate(t *testing.T) {
 		{
 			name: "given inputs that are In's fields",
 			validate: gepa.TypedPredict[typedTicket, stateObligation]{
-				Signature: gepa.Signature{Inputs: []gepa.Field{{Name: "channel"}, {Name: "text", Description: "the message"}}},
-				LM:        lm,
+				Signature: gepa.Signature{
+					Inputs: []gepa.Field{{Name: "channel"}, {Name: "text", Description: "the message"}},
+				},
+				LM: lm,
 			}.Validate,
 		},
 		{
@@ -361,7 +363,13 @@ func TestTypedPredictRunFailsBeforeCallingTheModel(t *testing.T) {
 	require.ErrorContains(t, err, "string must be a struct")
 
 	given := gepa.Signature{Inputs: []gepa.Field{{Name: "document"}}}
-	_, err = gepa.TypedPredict[[]string, stateObligation]{Signature: given, LM: lm}.Run(context.Background(), []string{"x"})
+	_, err = gepa.TypedPredict[[]string, stateObligation]{
+		Signature: given,
+		LM:        lm,
+	}.Run(
+		context.Background(),
+		[]string{"x"},
+	)
 	require.EqualError(
 		t,
 		err,
@@ -424,7 +432,11 @@ func TestTypedPredictRunCandidate(t *testing.T) {
 	require.Equal(t, "two", got["score"], "an invalid reply is returned as the model gave it")
 
 	_, err = program.RunCandidate(context.Background(), program.SeedCandidate(), gepa.Prediction{"text": 1})
-	require.ErrorContains(t, err, "typed predict inputs: decode as gepa_test.typedTicket: json: cannot unmarshal number")
+	require.ErrorContains(
+		t,
+		err,
+		"typed predict inputs: decode as gepa_test.typedTicket: json: cannot unmarshal number",
+	)
 	_, err = program.RunCandidate(context.Background(), program.SeedCandidate(), gepa.Prediction{"txt": "hi"})
 	require.EqualError(
 		t,
@@ -474,7 +486,9 @@ type typedEmbeddedOut struct {
 }
 
 func TestTypedPredictRunCandidateReturnsEmbeddedFields(t *testing.T) {
-	program := gepa.TypedPredict[typedTicket, typedEmbeddedOut]{LM: replyModel(`{"base": {"code": "c"}, "answer": "a"}`)}
+	program := gepa.TypedPredict[typedTicket, typedEmbeddedOut]{
+		LM: replyModel(`{"base": {"code": "c"}, "answer": "a"}`),
+	}
 
 	got, err := program.RunCandidate(context.Background(), program.SeedCandidate(), gepa.Prediction{"text": "hi"})
 
@@ -608,7 +622,9 @@ func TestProgramSignatureReportsInvalidProgrammes(t *testing.T) {
 	_, err := gepa.Predict{Signature: gepa.Signature{Outputs: []gepa.Field{{Name: "a"}}}}.ProgramSignature()
 	require.EqualError(t, err, "signature requires at least one input field")
 
-	_, err = gepa.ChainOfThought{Signature: gepa.Signature{Inputs: []gepa.Field{{Name: "q"}}, Outputs: []gepa.Field{{Name: "a b"}}}}.
+	_, err = gepa.ChainOfThought{
+		Signature: gepa.Signature{Inputs: []gepa.Field{{Name: "q"}}, Outputs: []gepa.Field{{Name: "a b"}}},
+	}.
 		ProgramSignature()
 	require.EqualError(t, err, `output field "a b" cannot contain whitespace`)
 

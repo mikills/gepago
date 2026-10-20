@@ -322,7 +322,11 @@ func (f *FakeGenerator) Chat(ctx context.Context, req gepa.ChatRequest) (gepa.Ch
 	}
 	resp := gepa.ChatResponse{Usage: reply.Usage, FinishReason: reply.FinishReason, ResolvedModel: reply.Model}
 	if reply.Err == nil || reply.Text != "" || len(reply.ToolCalls) > 0 {
-		resp.Message = gepa.Message{Role: gepa.RoleAssistant, Content: reply.Text, ToolCalls: slices.Clone(reply.ToolCalls)}
+		resp.Message = gepa.Message{
+			Role:      gepa.RoleAssistant,
+			Content:   reply.Text,
+			ToolCalls: slices.Clone(reply.ToolCalls),
+		}
 	}
 	return resp, reply.Err
 }

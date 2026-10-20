@@ -17,7 +17,9 @@ import (
 func flakyChat(errs ...error) *gepatest.FakeGenerator {
 	fake := gepatest.NewFakeGenerator()
 	for i, err := range errs {
-		fake.Default(gepatest.Fail(err).WithUsage(gepa.Usage{TotalTokens: i + 1}).WithModel(fmt.Sprint("attempt-", i+1)))
+		fake.Default(
+			gepatest.Fail(err).WithUsage(gepa.Usage{TotalTokens: i + 1}).WithModel(fmt.Sprint("attempt-", i+1)),
+		)
 	}
 	return fake.Default(gepatest.Text("hello").WithUsage(gepa.Usage{TotalTokens: len(errs) + 1}).WithModel("final"))
 }
@@ -187,7 +189,12 @@ func TestPredictToolLoopRetriesThroughRetryingLanguageModel(t *testing.T) {
 			_, err = pipeline.Run(ctx, gepa.NewState(gepa.Prediction{"question": "?"}))
 
 			require.Len(t, inner.Calls(), tt.wantCalls)
-			require.Equal(t, gepa.Usage{TotalTokens: tt.wantTokens}, collector.Usage(), "each attempt's usage is recorded once")
+			require.Equal(
+				t,
+				gepa.Usage{TotalTokens: tt.wantTokens},
+				collector.Usage(),
+				"each attempt's usage is recorded once",
+			)
 			if tt.wantErr != "" {
 				require.EqualError(t, err, tt.wantErr)
 				require.True(t, gepa.IsBudget(err))

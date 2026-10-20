@@ -82,7 +82,11 @@ func TestLogSkipsADisabledLevel(t *testing.T) {
 
 	Log(context.Background(), logger, Call{Provider: "p", Operation: "ok", Started: time.Now()})
 	require.Empty(t, out.String())
-	Log(context.Background(), logger, Call{Provider: "p", Operation: "failed", Started: time.Now(), Err: errors.New("boom")})
+	Log(
+		context.Background(),
+		logger,
+		Call{Provider: "p", Operation: "failed", Started: time.Now(), Err: errors.New("boom")},
+	)
 	require.Contains(t, out.String(), "level=WARN msg=\"model call\" provider=p operation=failed")
 }
 
@@ -131,9 +135,18 @@ func TestGenerateLogsTheCall(t *testing.T) {
 
 func TestChatLogsTheCall(t *testing.T) {
 	recorder := &providertest.LogRecorder{}
-	resp, err := Chat(context.Background(), slog.New(recorder), Call{Operation: "chat"}, func() (gepa.ChatResponse, error) {
-		return gepa.ChatResponse{ResolvedModel: "m-1", FinishReason: gepa.FinishToolCalls, Usage: gepa.Usage{TotalTokens: 2}}, nil
-	})
+	resp, err := Chat(
+		context.Background(),
+		slog.New(recorder),
+		Call{Operation: "chat"},
+		func() (gepa.ChatResponse, error) {
+			return gepa.ChatResponse{
+				ResolvedModel: "m-1",
+				FinishReason:  gepa.FinishToolCalls,
+				Usage:         gepa.Usage{TotalTokens: 2},
+			}, nil
+		},
+	)
 	require.NoError(t, err)
 	require.Equal(t, "m-1", resp.ResolvedModel)
 	records := recorder.ModelCalls(t)

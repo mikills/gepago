@@ -14,10 +14,15 @@ import (
 
 func TestHTMLRunReportEscapesValuesAndErrors(t *testing.T) {
 	recorder := &RecordingObserver{}
-	inject := NewStep("<b>inject</b>", refs(docKey.Ref()), refs(summaryKey.Ref()), func(_ context.Context, s State) error {
-		summaryKey.Set(s, "<script>alert(1)</script>")
-		return nil
-	})
+	inject := NewStep(
+		"<b>inject</b>",
+		refs(docKey.Ref()),
+		refs(summaryKey.Ref()),
+		func(_ context.Context, s State) error {
+			summaryKey.Set(s, "<script>alert(1)</script>")
+			return nil
+		},
+	)
 	fail := NewStep("fail", refs(summaryKey.Ref()), refs(amountKey.Ref()), func(context.Context, State) error {
 		return errors.New(`<img src=x onerror="alert(2)">`)
 	})

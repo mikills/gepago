@@ -143,5 +143,9 @@ func TestTraceDatasetBuilderMatchesNestedComponents(t *testing.T) {
 	require.Equal(t, true, stepsOf("guess.instruction", 0)[0]["skipped"])
 	require.Empty(t, stepsOf("fan.instruction", 0), "a composite with nested executions owns no component")
 	require.Empty(t, stepsOf("summarise.instruction", 0), "a nested step owns only keys scoped by its path")
-	require.Equal(t, ReflectiveDataset{"x": {}}, TraceDatasetBuilder{}.BuildReflectiveDataset(nil, EvaluationResult{}, []string{"x"}))
+	require.Equal(
+		t,
+		ReflectiveDataset{"x": {}},
+		TraceDatasetBuilder{}.BuildReflectiveDataset(nil, EvaluationResult{}, []string{"x"}),
+	)
 }

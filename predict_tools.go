@@ -104,7 +104,12 @@ func checkToolNames(registry *ToolRegistry, policy ToolPolicy, tools, middleware
 			return fmt.Errorf("%w %q: register it on the tool registry", ErrUnknownTool, name)
 		}
 		if !policy.Allows(name) {
-			return fmt.Errorf("%w: tool %q is not in the tool policy's Allow list %q", ErrToolNotAllowed, name, policy.Allow)
+			return fmt.Errorf(
+				"%w: tool %q is not in the tool policy's Allow list %q",
+				ErrToolNotAllowed,
+				name,
+				policy.Allow,
+			)
 		}
 	}
 	return registry.checkMiddleware(middleware)

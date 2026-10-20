@@ -57,13 +57,21 @@ func (artifactEchoProgram) SeedCandidate() gepa.Candidate {
 	return gepa.Candidate{gepa.InstructionComponent: "seed"}
 }
 
-func (artifactEchoProgram) RunCandidate(_ context.Context, candidate gepa.Candidate, _ gepa.Prediction) (gepa.Prediction, error) {
+func (artifactEchoProgram) RunCandidate(
+	_ context.Context,
+	candidate gepa.Candidate,
+	_ gepa.Prediction,
+) (gepa.Prediction, error) {
 	return gepa.Prediction{"instruction": candidate[gepa.InstructionComponent]}, nil
 }
 
 func qaPredict(lm gepa.Generator, retries int) gepa.Predict {
 	return gepa.Predict{
-		Signature:       gepa.Signature{Name: "qa", Inputs: []gepa.Field{{Name: "question"}}, Outputs: []gepa.Field{{Name: "answer"}}},
+		Signature: gepa.Signature{
+			Name:    "qa",
+			Inputs:  []gepa.Field{{Name: "question"}},
+			Outputs: []gepa.Field{{Name: "answer"}},
+		},
 		LM:              lm,
 		MaxParseRetries: retries,
 	}
@@ -105,13 +113,17 @@ type orderStatus struct {
 
 // lookupTool answers every order as shipped and counts its invocations.
 func lookupTool(calls *atomic.Int32) gepa.ToolProvider {
-	return gepa.NewTool("lookup_order", "Look up an order", func(_ context.Context, args lookupArgs) (orderStatus, error) {
-		calls.Add(1)
-		if args.OrderID == "missing" {
-			return orderStatus{}, errors.New("order not found")
-		}
-		return orderStatus{Status: "shipped", Carrier: "DHL"}, nil
-	})
+	return gepa.NewTool(
+		"lookup_order",
+		"Look up an order",
+		func(_ context.Context, args lookupArgs) (orderStatus, error) {
+			calls.Add(1)
+			if args.OrderID == "missing" {
+				return orderStatus{}, errors.New("order not found")
+			}
+			return orderStatus{Status: "shipped", Carrier: "DHL"}, nil
+		},
+	)
 }
 
 var orderSignature = gepa.Signature{
@@ -137,8 +149,12 @@ func tokens(n int) gepa.Usage {
 // modelStep is a Predict step named name that reads read and writes write through lm.
 func modelStep(name string, lm gepa.Generator, read, write gepa.KeyRef) gepa.ComponentStep {
 	return gepa.NewProgramStep(name, gepa.Predict{
-		Signature: gepa.Signature{Name: name, Inputs: []gepa.Field{{Name: read.Name}}, Outputs: []gepa.Field{{Name: write.Name}}},
-		LM:        lm,
+		Signature: gepa.Signature{
+			Name:    name,
+			Inputs:  []gepa.Field{{Name: read.Name}},
+			Outputs: []gepa.Field{{Name: write.Name}},
+		},
+		LM: lm,
 	}, refs(read), refs(write))
 }
 
@@ -179,14 +195,19 @@ func tenTokenModel(text string) *gepatest.FakeGenerator {
 }
 
 func lengthStep() gepa.Step {
-	return gepa.NewStep("parse", refs(docKey.Ref()), refs(amountKey.Ref()), func(_ context.Context, s gepa.State) error {
-		document, err := docKey.Get(s)
-		if err != nil {
-			return err
-		}
-		amountKey.Set(s, len(document))
-		return nil
-	})
+	return gepa.NewStep(
+		"parse",
+		refs(docKey.Ref()),
+		refs(amountKey.Ref()),
+		func(_ context.Context, s gepa.State) error {
+			document, err := docKey.Get(s)
+			if err != nil {
+				return err
+			}
+			amountKey.Set(s, len(document))
+			return nil
+		},
+	)
 }
 
 func writeAmount(name string, amount int) gepa.Step {
@@ -203,7 +224,11 @@ func (programFunc) Validate() error { return nil }
 
 func (programFunc) SeedCandidate() gepa.Candidate { return gepa.Candidate{} }
 
-func (fn programFunc) RunCandidate(ctx context.Context, _ gepa.Candidate, inputs gepa.Prediction) (gepa.Prediction, error) {
+func (fn programFunc) RunCandidate(
+	ctx context.Context,
+	_ gepa.Candidate,
+	inputs gepa.Prediction,
+) (gepa.Prediction, error) {
 	return fn(ctx, inputs)
 }
 
@@ -225,13 +250,18 @@ func writeNotes(name string, notes ...string) gepa.Step {
 }
 
 func amountStep() gepa.Step {
-	return gepa.NewStep("parse", refs(docKey.Ref()), refs(amountKey.Ref()), func(_ context.Context, s gepa.State) error {
-		if _, err := docKey.Get(s); err != nil {
-			return err
-		}
-		amountKey.Set(s, 125000)
-		return nil
-	})
+	return gepa.NewStep(
+		"parse",
+		refs(docKey.Ref()),
+		refs(amountKey.Ref()),
+		func(_ context.Context, s gepa.State) error {
+			if _, err := docKey.Get(s); err != nil {
+				return err
+			}
+			amountKey.Set(s, 125000)
+			return nil
+		},
+	)
 }
 
 func routeBy(s gepa.State) (string, error) {

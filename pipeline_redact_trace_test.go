@@ -39,7 +39,12 @@ func TestRedactorHidesValuesFromTheTraceAndTheReportButNotFromTheModel(t *testin
 
 	_, err = pipeline.Run(context.Background(), gepa.NewState(gepa.Prediction{"document": secret}))
 
-	require.EqualError(t, err, `pipeline step "check": cannot file "card 4111 1111"`, "the caller sees the error as it was")
+	require.EqualError(
+		t,
+		err,
+		`pipeline step "check": cannot file "card 4111 1111"`,
+		"the caller sees the error as it was",
+	)
 	require.Contains(t, prompts(lm)[0], secret, "the model reads the state, which the Redactor does not change")
 	trace := onlyTrace(t, recorder)
 	want := gepatest.ExpectedTrace{

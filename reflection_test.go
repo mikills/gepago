@@ -48,7 +48,8 @@ func TestReflectiveProposer(t *testing.T) {
 		if patch["prompt"] != "json improved" {
 			t.Fatalf("patch = %#v", patch)
 		}
-		if prompt := prompts(lm)[0]; !strings.Contains(prompt, "keep useful constraints") || strings.Contains(prompt, "ignored") {
+		if prompt := prompts(lm)[0]; !strings.Contains(prompt, "keep useful constraints") ||
+			strings.Contains(prompt, "ignored") {
 			t.Fatalf("prompt lesson/truncation mismatch: %s", prompt)
 		}
 	})
@@ -69,7 +70,10 @@ func TestSelectors(t *testing.T) {
 		selector := gepa.CurrentBestCandidateSelector{}
 		state := gepa.OptimizationState{
 			BestCandidateID: "best",
-			Candidates:      []gepa.CandidateRecord{{ID: "other", ValidationScore: 0}, {ID: "best", ValidationScore: 1}},
+			Candidates: []gepa.CandidateRecord{
+				{ID: "other", ValidationScore: 0},
+				{ID: "best", ValidationScore: 1},
+			},
 		}
 		selected := selector.SelectCandidate(state, nil)
 		if selected.ID != "best" {

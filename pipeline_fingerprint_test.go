@@ -191,7 +191,10 @@ func TestPipelineFingerprintChangesWithTheShape(t *testing.T) {
 		},
 		"type changed": {
 			spec(fpStep("score", refs(amountKey.Ref()), refs(fpScore.Ref()))),
-			{Inputs: refs(amountFloat.Ref()), Steps: []Step{fpStep("score", refs(amountFloat.Ref()), refs(fpScore.Ref()))}},
+			{
+				Inputs: refs(amountFloat.Ref()),
+				Steps:  []Step{fpStep("score", refs(amountFloat.Ref()), refs(fpScore.Ref()))},
+			},
 		},
 		"step renamed": {
 			spec(fpStep("score", refs(amountKey.Ref()), refs(fpScore.Ref()))),

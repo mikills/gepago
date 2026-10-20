@@ -107,7 +107,10 @@ func TestCallsAreNotTracedByDefault(t *testing.T) {
 
 	_, err := lm.Generate(context.Background(), "prompt")
 	require.NoError(t, err)
-	_, err = lm.Chat(context.Background(), gepa.ChatRequest{Messages: []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}}})
+	_, err = lm.Chat(
+		context.Background(),
+		gepa.ChatRequest{Messages: []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}}},
+	)
 	require.NoError(t, err)
 
 	require.Empty(t, provider.spanNames())

@@ -36,7 +36,9 @@ func TestTraceDatasetBuilderRecordsTheFailingModelStepAndItsReads(t *testing.T) 
 		Metric:       gepa.ExactMatchMetric{Fields: []string{"label"}},
 		RecordTraces: true,
 	}
-	examples := []gepa.Example{gepa.NewIOExample("1", gepa.Prediction{"document": "cash"}, gepa.Prediction{"label": "large"})}
+	examples := []gepa.Example{
+		gepa.NewIOExample("1", gepa.Prediction{"document": "cash"}, gepa.Prediction{"label": "large"}),
+	}
 	candidate := pipeline.SeedCandidate()
 	component := "classify.instruction"
 	require.Contains(t, candidate, component)
@@ -83,7 +85,13 @@ func TestLoadedArtifactReachesTheModelOnlyForTheProgrammeItWasTrainedFor(t *test
 	candidate := pipeline.SeedCandidate()
 	candidate["classify.instruction"] = "Label amounts under 100 as small."
 	path := filepath.Join(t.TempDir(), "triage.json")
-	require.NoError(t, gepa.SaveProgramArtifact(path, gepa.CompiledProgram{Program: pipeline, Candidate: candidate}.Artifact("triage")))
+	require.NoError(
+		t,
+		gepa.SaveProgramArtifact(
+			path,
+			gepa.CompiledProgram{Program: pipeline, Candidate: candidate}.Artifact("triage"),
+		),
+	)
 
 	compiled, artifact, err := gepa.LoadCompiledProgram(path, pipeline)
 	require.NoError(t, err)

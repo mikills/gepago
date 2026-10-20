@@ -272,7 +272,11 @@ func TestPipelineLoadsStepScopedArtifactWithoutFingerprint(t *testing.T) {
 	predict := func(name string, input, output, reply string) gepa.Predict {
 		lm.OnStep(name, gepatest.Text(reply))
 		return gepa.Predict{
-			Signature:   gepa.Signature{Name: name, Inputs: []gepa.Field{{Name: input}}, Outputs: []gepa.Field{{Name: output}}},
+			Signature: gepa.Signature{
+				Name:    name,
+				Inputs:  []gepa.Field{{Name: input}},
+				Outputs: []gepa.Field{{Name: output}},
+			},
 			Instruction: name + " seed",
 			LM:          lm.Plain(),
 		}
@@ -315,10 +319,16 @@ func TestPipelineLoadsStepScopedArtifactWithoutFingerprint(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, gepa.Prediction{"amount": 10, "decision": "approve"}, got)
 	require.Len(t, lm.Calls(), 2)
-	want, err := extract.BuildPrompt(gepa.Candidate{gepa.InstructionComponent: "extract trained"}, gepa.Prediction{"document": "cash 10"})
+	want, err := extract.BuildPrompt(
+		gepa.Candidate{gepa.InstructionComponent: "extract trained"},
+		gepa.Prediction{"document": "cash 10"},
+	)
 	require.NoError(t, err)
 	require.Equal(t, want, promptOf("extract"))
-	want, err = decide.BuildPrompt(gepa.Candidate{gepa.InstructionComponent: "decide trained"}, gepa.Prediction{"amount": 10})
+	want, err = decide.BuildPrompt(
+		gepa.Candidate{gepa.InstructionComponent: "decide trained"},
+		gepa.Prediction{"amount": 10},
+	)
 	require.NoError(t, err)
 	require.Equal(t, want, promptOf("decide"))
 }

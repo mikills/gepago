@@ -17,7 +17,12 @@ func echoPipeline(t *testing.T, output string) gepa.Pipeline {
 	return fpBuild(t, gepa.PipelineSpec{
 		Inputs: refs(docKey.Ref()),
 		Steps: []gepa.Step{
-			gepa.NewProgramStep("echo", artifactEchoProgram{}, refs(docKey.Ref()), refs(gepa.Key[string]{Name: output}.Ref())),
+			gepa.NewProgramStep(
+				"echo",
+				artifactEchoProgram{},
+				refs(docKey.Ref()),
+				refs(gepa.Key[string]{Name: output}.Ref()),
+			),
 		},
 	})
 }
@@ -25,7 +30,12 @@ func echoPipeline(t *testing.T, output string) gepa.Pipeline {
 // saveEchoArtifact saves an artefact trained for program with the given programme version.
 func saveEchoArtifact(t *testing.T, path string, program gepa.Program, programVersion string) gepa.ProgramArtifact {
 	t.Helper()
-	artifact := gepa.CompiledProgram{Program: program, Candidate: gepa.Candidate{"echo.instruction": "trained"}}.Artifact("echo")
+	artifact := gepa.CompiledProgram{
+		Program:   program,
+		Candidate: gepa.Candidate{"echo.instruction": "trained"},
+	}.Artifact(
+		"echo",
+	)
 	artifact.ProgramVersion = programVersion
 	require.NoError(t, gepa.SaveProgramArtifact(path, artifact))
 	return artifact
@@ -262,7 +272,12 @@ func TestProgramRegistryChecksTheFingerprint(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "echo.program.json")
 	original, renamed := echoPipeline(t, "instruction"), echoPipeline(t, "answer")
-	artifact := gepa.CompiledProgram{Program: original, Candidate: gepa.Candidate{"echo.instruction": "trained"}}.Artifact("echo")
+	artifact := gepa.CompiledProgram{
+		Program:   original,
+		Candidate: gepa.Candidate{"echo.instruction": "trained"},
+	}.Artifact(
+		"echo",
+	)
 	artifact.Version = "2026-10"
 	artifact.ProgramVersion = "v1"
 	require.NoError(t, gepa.SaveProgramArtifact(path, artifact))

@@ -185,7 +185,8 @@ func ExamplePipelineSpec_Build() {
 
 func ExampleLLMJudgeMetric() {
 	metric := gepa.LLMJudgeMetric{
-		LM:     gepatest.NewFakeGenerator().Default(gepatest.Text(`{"score": 1, "feedback": "equivalent", "details": {}}`)),
+		LM: gepatest.NewFakeGenerator().
+			Default(gepatest.Text(`{"score": 1, "feedback": "equivalent", "details": {}}`)),
 		Rubric: "Score semantic equivalence.",
 	}
 	result, err := metric.Score(

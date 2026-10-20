@@ -145,8 +145,16 @@ func TestRedactedErrorKeepsItsKindAndMatches(t *testing.T) {
 		kind    ErrorKind
 		matches []error
 	}{
-		{name: "invalid output", err: fmt.Errorf("%w: %q is missing", ErrInvalidOutput, secretEmail), matches: []error{ErrInvalidOutput}},
-		{name: "cancelled", err: fmt.Errorf("stopped for %s: %w", secretEmail, context.Canceled), matches: []error{context.Canceled}},
+		{
+			name:    "invalid output",
+			err:     fmt.Errorf("%w: %q is missing", ErrInvalidOutput, secretEmail),
+			matches: []error{ErrInvalidOutput},
+		},
+		{
+			name:    "cancelled",
+			err:     fmt.Errorf("stopped for %s: %w", secretEmail, context.Canceled),
+			matches: []error{context.Canceled},
+		},
 		{
 			name:    "timed out",
 			err:     TransientError(fmt.Errorf("slow %s: %w", secretEmail, context.DeadlineExceeded)),
@@ -225,17 +233,22 @@ func TestRedactorRemovesTheTextOfNonStringValues(t *testing.T) {
 		number string
 	}
 	cardKey := Key[card]{Name: "card"}
-	step := NewStep("charge", refs(cardKey.Ref(), amountKey.Ref()), refs(decisionKey.Ref()), func(_ context.Context, s State) error {
-		c, err := cardKey.Get(s)
-		if err != nil {
-			return err
-		}
-		amount, err := amountKey.Get(s)
-		if err != nil {
-			return err
-		}
-		return fmt.Errorf("card %s of %s declined %d", c.number, c.Holder, amount)
-	})
+	step := NewStep(
+		"charge",
+		refs(cardKey.Ref(), amountKey.Ref()),
+		refs(decisionKey.Ref()),
+		func(_ context.Context, s State) error {
+			c, err := cardKey.Get(s)
+			if err != nil {
+				return err
+			}
+			amount, err := amountKey.Get(s)
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("card %s of %s declined %d", c.number, c.Holder, amount)
+		},
+	)
 	log := &eventLog{}
 	pipeline, err := PipelineSpec{
 		Inputs:    refs(cardKey.Ref(), amountKey.Ref()),
@@ -274,8 +287,10 @@ func TestNestedPipelineRedactsWithItsOwnRedactorThenTheOuter(t *testing.T) {
 	}
 	innerLog := &eventLog{}
 	inner, err := PipelineSpec{
-		Inputs:    refs(docKey.Ref()),
-		Steps:     []Step{predictStep("summarise", tenTokenModel(`{"summary": "short"}`), docKey.Ref(), summaryKey.Ref())},
+		Inputs: refs(docKey.Ref()),
+		Steps: []Step{
+			predictStep("summarise", tenTokenModel(`{"summary": "short"}`), docKey.Ref(), summaryKey.Ref()),
+		},
 		Observers: []PipelineObserver{innerLog},
 		Redactor:  tag(":inner"),
 	}.Build()
@@ -358,13 +373,18 @@ func TestRedactorRemovesSecretsInsideKeptStringsAndMapKeys(t *testing.T) {
 	contactKey := Key[contact]{Name: "contact"}
 	idsKey := Key[map[string]int]{Name: "ids"}
 	log := &eventLog{}
-	send := NewStep("send", refs(contactKey.Ref(), idsKey.Ref()), refs(letterKey.Ref()), func(_ context.Context, s State) error {
-		recipient, err := contactKey.Get(s)
-		if err != nil {
-			return err
-		}
-		return errors.New("cannot send to " + recipient.Email + " for " + recipient.Name + " (id 123-45-6789)")
-	})
+	send := NewStep(
+		"send",
+		refs(contactKey.Ref(), idsKey.Ref()),
+		refs(letterKey.Ref()),
+		func(_ context.Context, s State) error {
+			recipient, err := contactKey.Get(s)
+			if err != nil {
+				return err
+			}
+			return errors.New("cannot send to " + recipient.Email + " for " + recipient.Name + " (id 123-45-6789)")
+		},
+	)
 	pipeline, err := PipelineSpec{
 		Inputs:    refs(contactKey.Ref(), idsKey.Ref()),
 		Steps:     []Step{send},

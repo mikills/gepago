@@ -57,7 +57,11 @@ func TestNestedStepsScopeTheirCandidates(t *testing.T) {
 				Branch("route", always, map[string]Step{"x": scopedStep(seen, "arm", "routed", nil)}),
 				writeNotes("plain", "no components"),
 			),
-			Fallback("guard", scopedStep(seen, "main", "guarded", errRateLimited), scopedStep(seen, "spare", "guarded", nil)),
+			Fallback(
+				"guard",
+				scopedStep(seen, "main", "guarded", errRateLimited),
+				scopedStep(seen, "spare", "guarded", nil),
+			),
 		},
 	}.Build()
 	require.NoError(t, err)
@@ -202,7 +206,10 @@ func TestCandidateKeysReachTheirLeaves(t *testing.T) {
 	inner, err := PipelineSpec{
 		Inputs: refs(docKey.Ref()),
 		Steps: []Step{
-			WithCache(WithPolicy(leaf("i1", "k1", true), StepPolicy{OnError: OnErrorFallback(leaf("i2", "k1", false))}), nil),
+			WithCache(
+				WithPolicy(leaf("i1", "k1", true), StepPolicy{OnError: OnErrorFallback(leaf("i2", "k1", false))}),
+				nil,
+			),
 			Parallel(
 				"ip",
 				WithPolicy(leaf("i3", "k3", false), StepPolicy{}),
@@ -420,7 +427,11 @@ func TestNestedStepFailsWhenItSkipsADeclaredWrite(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = pipeline.RunCandidate(context.Background(), nil, Prediction{})
-	require.EqualError(t, err, `pipeline step "fan": pipeline step "lazy": step did not write declared state key "amount"`)
+	require.EqualError(
+		t,
+		err,
+		`pipeline step "fan": pipeline step "lazy": step did not write declared state key "amount"`,
+	)
 }
 
 func TestCompositesRunOutsideAPipeline(t *testing.T) {
@@ -444,7 +455,11 @@ func TestCompositesRunOutsideAPipeline(t *testing.T) {
 		},
 		{
 			name: "Fallback with components",
-			step: Fallback("guard", scopedStep(seen, "main", "out", errRateLimited), scopedStep(seen, "spare", "out", nil)),
+			step: Fallback(
+				"guard",
+				scopedStep(seen, "main", "out", errRateLimited),
+				scopedStep(seen, "spare", "out", nil),
+			),
 			want: Prediction{"document": "doc", "out": "spare"},
 		},
 		{

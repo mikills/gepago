@@ -130,7 +130,10 @@ func TestChatResponseFormat(t *testing.T) {
 	url, requests := recordingServer(t, okReply)
 	client, err := NewChatClient(Config{APIKey: "secret", BaseURL: url, Model: "gemini-test"})
 	require.NoError(t, err)
-	format := &gepa.ResponseFormat{Name: "out", Schema: json.RawMessage(`{"type":"object","additionalProperties":false}`)}
+	format := &gepa.ResponseFormat{
+		Name:   "out",
+		Schema: json.RawMessage(`{"type":"object","additionalProperties":false}`),
+	}
 	messages := []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}}
 
 	_, err = client.Chat(context.Background(), gepa.ChatRequest{Messages: messages, ResponseFormat: format})
@@ -193,19 +196,32 @@ func TestChatKeepsFunctionCallIDs(t *testing.T) {
 	results := contents[2].(map[string]any)["parts"].([]any)
 	require.Len(t, results, 2)
 	response := results[1].(map[string]any)["functionResponse"]
-	require.Equal(t, map[string]any{"id": "fc-2", "name": "lookup", "response": map[string]any{"result": "two"}}, response)
+	require.Equal(
+		t,
+		map[string]any{"id": "fc-2", "name": "lookup", "response": map[string]any{"result": "two"}},
+		response,
+	)
 	wrapped := contents[3].(map[string]any)["parts"].([]any)[0].(map[string]any)["functionCall"]
-	require.Equal(t, map[string]any{"id": "x", "name": "lookup", "args": map[string]any{"arguments": "plain text"}}, wrapped)
+	require.Equal(
+		t,
+		map[string]any{"id": "x", "name": "lookup", "args": map[string]any{"arguments": "plain text"}},
+		wrapped,
+	)
 }
 
 func TestLanguageModelChatAppliesConfiguredDefaults(t *testing.T) {
 	url, requests := recordingServer(t, okReply)
 	temperature := 0.3
-	lm, err := NewLanguageModel(Config{APIKey: "secret", BaseURL: url, Model: "gemini-test", MaxTokens: 77, Temperature: &temperature})
+	lm, err := NewLanguageModel(
+		Config{APIKey: "secret", BaseURL: url, Model: "gemini-test", MaxTokens: 77, Temperature: &temperature},
+	)
 	require.NoError(t, err)
 	maxTokens := 5
 
-	_, err = lm.Chat(context.Background(), gepa.ChatRequest{Messages: []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}}})
+	_, err = lm.Chat(
+		context.Background(),
+		gepa.ChatRequest{Messages: []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}}},
+	)
 	require.NoError(t, err)
 	_, err = lm.Chat(context.Background(), gepa.ChatRequest{
 		Messages:  []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}},
@@ -213,6 +229,14 @@ func TestLanguageModelChatAppliesConfiguredDefaults(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	require.Equal(t, map[string]any{"maxOutputTokens": float64(77), "temperature": 0.3}, (*requests)[0]["generationConfig"])
-	require.Equal(t, map[string]any{"maxOutputTokens": float64(5), "temperature": 0.3}, (*requests)[1]["generationConfig"])
+	require.Equal(
+		t,
+		map[string]any{"maxOutputTokens": float64(77), "temperature": 0.3},
+		(*requests)[0]["generationConfig"],
+	)
+	require.Equal(
+		t,
+		map[string]any{"maxOutputTokens": float64(5), "temperature": 0.3},
+		(*requests)[1]["generationConfig"],
+	)
 }

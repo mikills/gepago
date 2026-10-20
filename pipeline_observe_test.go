@@ -372,7 +372,10 @@ func TestPipelineObserverNestedCompositeSequence(t *testing.T) {
 			route,
 			Fallback("fb", failAmount("primary", TransientError(errors.New("down"))), writeAmount("secondary", 7)),
 			WithPolicy(guess, StepPolicy{OnError: OnErrorSkip}),
-			WithPolicy(verdict("estimate", "x", errBadRequest), StepPolicy{OnError: OnErrorFallback(verdict("spare", "ok", nil))}),
+			WithPolicy(
+				verdict("estimate", "x", errBadRequest),
+				StepPolicy{OnError: OnErrorFallback(verdict("spare", "ok", nil))},
+			),
 		},
 		Defaults:  []KeyDefault{DefaultValue(notesKey, []string{"none"})},
 		Observers: []PipelineObserver{log},
@@ -419,8 +422,10 @@ func TestPipelineObserverNestedCompositeSequence(t *testing.T) {
 func TestPipelineObserverNestedPipelineSequence(t *testing.T) {
 	innerLog := &eventLog{}
 	inner, err := PipelineSpec{
-		Inputs:    refs(docKey.Ref()),
-		Steps:     []Step{predictStep("summarise", tenTokenModel(`{"summary": "short"}`), docKey.Ref(), summaryKey.Ref())},
+		Inputs: refs(docKey.Ref()),
+		Steps: []Step{
+			predictStep("summarise", tenTokenModel(`{"summary": "short"}`), docKey.Ref(), summaryKey.Ref()),
+		},
 		Observers: []PipelineObserver{innerLog},
 	}.Build()
 	require.NoError(t, err)
@@ -562,7 +567,10 @@ func TestPipelineObserverParallelCallsAreSerialised(t *testing.T) {
 	var steps []Step
 	for i := range width {
 		key := Key[string]{Name: fmt.Sprintf("out%d", i)}
-		steps = append(steps, predictStep(key.Name, tenTokenModel(fmt.Sprintf(`{%q: "v"}`, key.Name)), docKey.Ref(), key.Ref()))
+		steps = append(
+			steps,
+			predictStep(key.Name, tenTokenModel(fmt.Sprintf(`{%q: "v"}`, key.Name)), docKey.Ref(), key.Ref()),
+		)
 	}
 	detector := &overlapDetector{}
 	recorder := &RecordingObserver{}
@@ -595,7 +603,11 @@ func TestPipelineObserverParallelCallsAreSerialised(t *testing.T) {
 	for _, trace := range traces {
 		require.Len(t, trace.Steps, 1)
 		require.Len(t, trace.Steps[0].Steps, width)
-		require.Equal(t, Usage{PromptTokens: 4 * width, CompletionTokens: 6 * width, TotalTokens: 10 * width}, trace.Usage)
+		require.Equal(
+			t,
+			Usage{PromptTokens: 4 * width, CompletionTokens: 6 * width, TotalTokens: 10 * width},
+			trace.Usage,
+		)
 	}
 }
 

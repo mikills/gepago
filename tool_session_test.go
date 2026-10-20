@@ -15,10 +15,13 @@ import (
 // countingTool returns a tool named name that counts its invocations and answers with result
 // and err.
 func countingTool(name string, calls *atomic.Int32, result ToolResult, err error) ToolProvider {
-	return NewToolFunc(Tool{Name: name, Description: "tool " + name}, func(context.Context, ToolCall) (ToolResult, error) {
-		calls.Add(1)
-		return result, err
-	})
+	return NewToolFunc(
+		Tool{Name: name, Description: "tool " + name},
+		func(context.Context, ToolCall) (ToolResult, error) {
+			calls.Add(1)
+			return result, err
+		},
+	)
 }
 
 func newSession(t *testing.T, policy ToolPolicy, tools ...ToolProvider) *ToolSession {
@@ -39,7 +42,11 @@ func TestNewToolSessionErrors(t *testing.T) {
 	}{
 		{name: "nil tool", tools: []ToolProvider{nil}, wantErr: "tool session: tool is nil"},
 		{name: "duplicate tool", tools: []ToolProvider{tool, tool}, wantErr: `tool session: tool "a" is duplicated`},
-		{name: "panicking schema", tools: []ToolProvider{panickingSchema{}}, wantErr: "tool session: tool schema panicked: no schema"},
+		{
+			name:    "panicking schema",
+			tools:   []ToolProvider{panickingSchema{}},
+			wantErr: "tool session: tool schema panicked: no schema",
+		},
 		{
 			name:    "negative MaxCalls",
 			tools:   []ToolProvider{tool},
@@ -261,7 +268,11 @@ func TestToolSessionCachedCallMakesNoInvocation(t *testing.T) {
 
 func TestToolSessionCacheKeySortsKeysButKeepsNumberForms(t *testing.T) {
 	calls := &atomic.Int32{}
-	session := newSession(t, ToolPolicy{Cache: true}, countingTool("a", calls, ToolResult{Output: json.RawMessage(`{}`)}, nil))
+	session := newSession(
+		t,
+		ToolPolicy{Cache: true},
+		countingTool("a", calls, ToolResult{Output: json.RawMessage(`{}`)}, nil),
+	)
 	tests := []struct {
 		arguments  string
 		wantCached bool
@@ -420,19 +431,25 @@ func TestToolSessionMemoryWritesApplyOnlyOnSuccess(t *testing.T) {
 	memory := NewToolMemory()
 	memory.Set("count", 1)
 	var seen any
-	tool := NewToolFunc(Tool{Name: "bump", Description: "bump"}, func(ctx context.Context, call ToolCall) (ToolResult, error) {
-		seen, _ = ToolMemoryFrom(ctx).Get("count")
-		result := ToolResult{MemoryWrites: map[string]any{"count": 2, "attempt": call.ID}}
-		if call.Arguments == `{"fail":true}` {
-			return result, errors.New("refused")
-		}
-		return result, nil
-	})
+	tool := NewToolFunc(
+		Tool{Name: "bump", Description: "bump"},
+		func(ctx context.Context, call ToolCall) (ToolResult, error) {
+			seen, _ = ToolMemoryFrom(ctx).Get("count")
+			result := ToolResult{MemoryWrites: map[string]any{"count": 2, "attempt": call.ID}}
+			if call.Arguments == `{"fail":true}` {
+				return result, errors.New("refused")
+			}
+			return result, nil
+		},
+	)
 	session, err := NewToolSession([]ToolProvider{tool}, ToolPolicy{}, memory)
 	require.NoError(t, err)
 	require.Same(t, memory, session.Memory())
 
-	_, record, err := session.Call(context.Background(), ToolCall{ID: "fails", Name: "bump", Arguments: `{"fail":true}`})
+	_, record, err := session.Call(
+		context.Background(),
+		ToolCall{ID: "fails", Name: "bump", Arguments: `{"fail":true}`},
+	)
 	require.EqualError(t, err, `tool "bump": refused`)
 	require.Equal(t, `tool "bump": refused`, record.Err)
 	require.Equal(t, 1, seen, "the tool reads the session's memory")
@@ -524,8 +541,18 @@ func TestToolSessionRejectsOutputThatIsNotJSON(t *testing.T) {
 func TestToolSessionRecordsUsageAndRecords(t *testing.T) {
 	ctx, collector := WithUsageCollector(context.Background())
 	calls := &atomic.Int32{}
-	failing := countingTool("fails", calls, ToolResult{Text: "partial", Usage: Usage{TotalTokens: 3}}, errors.New("late"))
-	working := countingTool("works", calls, ToolResult{Output: json.RawMessage(`{"ok":true}`), Usage: Usage{TotalTokens: 4}}, nil)
+	failing := countingTool(
+		"fails",
+		calls,
+		ToolResult{Text: "partial", Usage: Usage{TotalTokens: 3}},
+		errors.New("late"),
+	)
+	working := countingTool(
+		"works",
+		calls,
+		ToolResult{Output: json.RawMessage(`{"ok":true}`), Usage: Usage{TotalTokens: 4}},
+		nil,
+	)
 	session := newSession(t, ToolPolicy{}, failing, working)
 
 	_, _, err := session.Call(ctx, ToolCall{ID: "1", Name: "fails", Arguments: `{}`})

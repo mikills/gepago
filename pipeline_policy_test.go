@@ -83,7 +83,11 @@ func TestWithPolicyTimeoutDropsWrites(t *testing.T) {
 
 			got, run, err := pipeline.execute(context.Background(), nil, Prediction{})
 
-			require.EqualError(t, err, `pipeline step "slow": attempt 1 timed out after 10ms: context deadline exceeded`)
+			require.EqualError(
+				t,
+				err,
+				`pipeline step "slow": attempt 1 timed out after 10ms: context deadline exceeded`,
+			)
 			require.ErrorIs(t, err, context.DeadlineExceeded)
 			require.True(t, IsTransient(err))
 			require.Empty(t, pipeline.written(got))
@@ -587,7 +591,9 @@ func TestWithPolicyBuildErrors(t *testing.T) {
 					NewStep("a", nil, refs(Key[validatedObligation]{Name: "obligation"}.Ref()), nil),
 					StepPolicy{OnError: OnErrorSkip},
 				)},
-				Defaults: []KeyDefault{DefaultValue(Key[validatedObligation]{Name: "obligation"}, validatedObligation{})},
+				Defaults: []KeyDefault{
+					DefaultValue(Key[validatedObligation]{Name: "obligation"}, validatedObligation{}),
+				},
 			},
 			wantErr: `default for "obligation": state key "obligation": currency is required`,
 		},

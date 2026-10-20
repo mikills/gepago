@@ -170,7 +170,12 @@ func TestAssertTraceComparesEveryField(t *testing.T) {
 		{"zero attempt means one", gepa.StepTrace{Step: "s", Attempt: 1}, gepatest.ExpectedStep{Step: "s"}, true},
 		{"step", gepa.StepTrace{Step: "s", Attempt: 1}, gepatest.ExpectedStep{Step: "t"}, false},
 		{"attempt", gepa.StepTrace{Step: "s", Attempt: 2}, gepatest.ExpectedStep{Step: "s", Attempt: 1}, false},
-		{"failed when ok", gepa.StepTrace{Step: "s", Attempt: 1}, gepatest.ExpectedStep{Step: "s", Failed: true}, false},
+		{
+			"failed when ok",
+			gepa.StepTrace{Step: "s", Attempt: 1},
+			gepatest.ExpectedStep{Step: "s", Failed: true},
+			false,
+		},
 		{"error when ok", gepa.StepTrace{Step: "s", Attempt: 1}, gepatest.ExpectedStep{Step: "s", Err: "no"}, false},
 		{"ok when failed", failedStep, gepatest.ExpectedStep{Step: "s"}, false},
 		{"failed", failedStep, gepatest.ExpectedStep{Step: "s", Failed: true}, true},
@@ -184,7 +189,12 @@ func TestAssertTraceComparesEveryField(t *testing.T) {
 			gepatest.ExpectedStep{Step: "s", ErrKind: gepa.Budget},
 			true,
 		},
-		{"kind when ok", gepa.StepTrace{Step: "s", Attempt: 1}, gepatest.ExpectedStep{Step: "s", ErrKind: gepa.Budget}, false},
+		{
+			"kind when ok",
+			gepa.StepTrace{Step: "s", Attempt: 1},
+			gepatest.ExpectedStep{Step: "s", ErrKind: gepa.Budget},
+			false,
+		},
 		{"cached", gepa.StepTrace{Step: "s", Attempt: 1, Cached: true}, gepatest.ExpectedStep{Step: "s"}, false},
 		{"skipped", gepa.StepTrace{Step: "s", Attempt: 1}, gepatest.ExpectedStep{Step: "s", Skipped: true}, false},
 		{"usage", gepa.StepTrace{Step: "s", Attempt: 1, Usage: small}, gepatest.ExpectedStep{Step: "s"}, false},
@@ -218,7 +228,11 @@ func TestAssertTraceComparesEveryField(t *testing.T) {
 			recorder := &recordingT{}
 			trace := gepa.PipelineTrace{Steps: []gepa.StepTrace{tt.got}}
 
-			got := gepatest.AssertTrace(recorder, trace, gepatest.ExpectedTrace{Steps: []gepatest.ExpectedStep{tt.want}})
+			got := gepatest.AssertTrace(
+				recorder,
+				trace,
+				gepatest.ExpectedTrace{Steps: []gepatest.ExpectedStep{tt.want}},
+			)
 
 			require.Equal(t, tt.match, got)
 			require.Equal(t, !tt.match, len(recorder.errors) == 1)

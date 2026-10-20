@@ -234,7 +234,12 @@ func ReplayFixture(t *testing.T, path string) *httptest.Server {
 		mu.Lock()
 		defer mu.Unlock()
 		if served >= len(fixture.Exchanges) {
-			t.Errorf("request %d to %s: the fixture has only %d exchanges", served+1, r.URL.Path, len(fixture.Exchanges))
+			t.Errorf(
+				"request %d to %s: the fixture has only %d exchanges",
+				served+1,
+				r.URL.Path,
+				len(fixture.Exchanges),
+			)
 			http.Error(w, "unexpected request", http.StatusBadRequest)
 			return
 		}

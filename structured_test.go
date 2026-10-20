@@ -61,24 +61,35 @@ func TestPredictSendsThePromptAloneToAPlainModel(t *testing.T) {
 	require.Equal(t, gepatest.MethodGenerate, calls[0].Method)
 	require.Nil(t, calls[0].Format)
 	require.Contains(t, calls[0].Prompt, "Return only a JSON object with these output fields: answer, confidence.")
-	require.Contains(t, calls[0].Prompt, "The JSON object must match this JSON schema:\n```json\n{\n  \"type\": \"object\"")
+	require.Contains(
+		t,
+		calls[0].Prompt,
+		"The JSON object must match this JSON schema:\n```json\n{\n  \"type\": \"object\"",
+	)
 	require.Contains(t, calls[0].Prompt, `"confidence": {`+"\n"+`      "type": "number"`)
 }
 
 func TestBuildPromptAddsTheSchemaOnlyForTypedOutputs(t *testing.T) {
-	untyped := gepa.Predict{Signature: gepa.Signature{Inputs: []gepa.Field{{Name: "q"}}, Outputs: []gepa.Field{{Name: "a"}}}}
+	untyped := gepa.Predict{
+		Signature: gepa.Signature{Inputs: []gepa.Field{{Name: "q"}}, Outputs: []gepa.Field{{Name: "a"}}},
+	}
 	prompt, err := untyped.BuildPrompt(gepa.Candidate{}, gepa.Prediction{"q": "?"})
 	require.NoError(t, err)
 	require.True(t, strings.HasSuffix(prompt, "Return only a JSON object with these output fields: a."))
 
 	optional := gepa.Predict{
-		Signature: gepa.Signature{Inputs: []gepa.Field{{Name: "q"}}, Outputs: []gepa.Field{{Name: "a", Optional: true}}},
+		Signature: gepa.Signature{
+			Inputs:  []gepa.Field{{Name: "q"}},
+			Outputs: []gepa.Field{{Name: "a", Optional: true}},
+		},
 	}
 	prompt, err = optional.BuildPrompt(gepa.Candidate{}, gepa.Prediction{"q": "?"})
 	require.NoError(t, err)
 	require.Contains(t, prompt, "JSON schema")
 
-	invalid := gepa.Predict{Signature: gepa.Signature{Inputs: []gepa.Field{{Name: "q"}}, Outputs: []gepa.Field{{Name: "a", Type: "text"}}}}
+	invalid := gepa.Predict{
+		Signature: gepa.Signature{Inputs: []gepa.Field{{Name: "q"}}, Outputs: []gepa.Field{{Name: "a", Type: "text"}}},
+	}
 	_, err = invalid.BuildPrompt(gepa.Candidate{}, gepa.Prediction{"q": "?"})
 	require.ErrorContains(t, err, `output field "a": type "text" is not supported`)
 }
@@ -116,7 +127,12 @@ func TestRetryingLanguageModelPassesStructuredCallsThrough(t *testing.T) {
 	calls := inner.Calls()
 	require.Len(t, calls, 2, "the transient failure is retried")
 	for _, call := range calls {
-		require.Equal(t, gepatest.MethodGenerateStructured, call.Method, "every attempt goes through GenerateStructured")
+		require.Equal(
+			t,
+			gepatest.MethodGenerateStructured,
+			call.Method,
+			"every attempt goes through GenerateStructured",
+		)
 		require.NotNil(t, call.Format)
 		require.True(t, call.Format.Strict)
 	}

@@ -20,7 +20,11 @@ func TestRetriedAndTruncatedModelCallsAsTheTraceShows(t *testing.T) {
 		OnStep("summarise", gepatest.Text(`{"summary": "seven do`).WithFinishReason(gepa.FinishLength).WithUsage(tokens(9)))
 	recorder := &gepa.RecordingObserver{}
 	summarise := gepa.Predict{
-		Signature:       gepa.Signature{Name: "summarise", Inputs: []gepa.Field{{Name: "amount"}}, Outputs: []gepa.Field{{Name: "summary"}}},
+		Signature: gepa.Signature{
+			Name:    "summarise",
+			Inputs:  []gepa.Field{{Name: "amount"}},
+			Outputs: []gepa.Field{{Name: "summary"}},
+		},
 		LM:              lm,
 		MaxParseRetries: 2,
 	}

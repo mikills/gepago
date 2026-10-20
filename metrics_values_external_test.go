@@ -53,7 +53,9 @@ func TestTypedPredictScoresWithMetrics(t *testing.T) {
 	program := gepa.TypedPredict[metricIn, metricScoreOut]{
 		LM: replyModel(`{"count": 3, "ref": "r-1"}`),
 	}
-	examples := []gepa.Example{gepa.NewIOExample("one", gepa.Prediction{"q": "x"}, gepa.Prediction{"count": 3, "ref": "r-1"})}
+	examples := []gepa.Example{
+		gepa.NewIOExample("one", gepa.Prediction{"q": "x"}, gepa.Prediction{"count": 3, "ref": "r-1"}),
+	}
 	got, err := program.RunCandidate(context.Background(), program.SeedCandidate(), gepa.Prediction{"q": "x"})
 	require.NoError(t, err)
 	require.Equal(t, gepa.Prediction{"count": int32(3), "ref": pointerTo("r-1")}, got)
@@ -74,7 +76,9 @@ func TestTypedPredictOutputsScoreWithEveryMetric(t *testing.T) {
 	program := gepa.TypedPredict[metricIn, metricTypedOut]{
 		LM: replyModel(reply),
 	}
-	examples := []gepa.Example{gepa.NewIOExample("one", gepa.Prediction{"q": "x"}, datasetExpected(t, metricExpectedJSON))}
+	examples := []gepa.Example{
+		gepa.NewIOExample("one", gepa.Prediction{"q": "x"}, datasetExpected(t, metricExpectedJSON)),
+	}
 	for name, metric := range typedMetrics() {
 		result, err := gepa.ProgramEvaluator{Program: program, Metric: metric}.
 			Evaluate(context.Background(), program.SeedCandidate(), examples, false)

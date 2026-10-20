@@ -15,7 +15,7 @@ import (
 // searchArgs has a required string, an omitempty int, a slice, a bool and a pointer, so the
 // typed tool golden covers required, optional and nullable properties.
 type searchArgs struct {
-	Query string   `json:"query" description:"Text to search for"`
+	Query string   `json:"query"           description:"Text to search for"`
 	Limit int      `json:"limit,omitempty"`
 	Tags  []string `json:"tags"`
 	Exact bool     `json:"exact"`
@@ -126,7 +126,10 @@ func TestNewToolInvoke(t *testing.T) {
 	calls := &atomic.Int32{}
 	tool := lookupTool(calls)
 
-	result, err := tool.Invoke(context.Background(), ToolCall{ID: "c1", Name: "lookup_order", Arguments: `{"order_id":"A-1"}`})
+	result, err := tool.Invoke(
+		context.Background(),
+		ToolCall{ID: "c1", Name: "lookup_order", Arguments: `{"order_id":"A-1"}`},
+	)
 
 	require.NoError(t, err)
 	require.JSONEq(t, `{"status":"shipped","carrier":"DHL"}`, string(result.Output))
@@ -147,7 +150,11 @@ func TestNewToolRejectsBadArgumentsWithoutRunning(t *testing.T) {
 		{name: "not JSON", arguments: `{"order_id":`, wantErr: "arguments are not valid JSON: unexpected EOF"},
 		{name: "not an object", arguments: `["A-1"]`, wantErr: "arguments are an array, not a JSON object"},
 		{name: "null", arguments: `null`, wantErr: "arguments are null, not a JSON object"},
-		{name: "trailing content", arguments: `{"order_id":"A-1"} {}`, wantErr: "arguments have content after the JSON value"},
+		{
+			name:      "trailing content",
+			arguments: `{"order_id":"A-1"} {}`,
+			wantErr:   "arguments have content after the JSON value",
+		},
 		{
 			name:      "unknown field",
 			arguments: `{"order_id":"A-1","extra":1}`,

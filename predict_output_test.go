@@ -101,7 +101,9 @@ func TestPredictAcceptsOptionalOutputs(t *testing.T) {
 }
 
 func TestParseOutput(t *testing.T) {
-	program := gepa.Predict{Signature: gepa.Signature{Inputs: []gepa.Field{{Name: "q"}}, Outputs: []gepa.Field{{Name: "a"}}}}
+	program := gepa.Predict{
+		Signature: gepa.Signature{Inputs: []gepa.Field{{Name: "q"}}, Outputs: []gepa.Field{{Name: "a"}}},
+	}
 
 	got, err := program.ParseOutput("```json\n{\"a\": 1}\n```")
 	require.NoError(t, err)
@@ -171,8 +173,12 @@ func TestPredictDoesNotRepairATruncatedRepair(t *testing.T) {
 
 func TestChainOfThoughtRequiresItsReasoningField(t *testing.T) {
 	program := gepa.ChainOfThought{
-		Signature: gepa.Signature{Name: "qa", Inputs: []gepa.Field{{Name: "question"}}, Outputs: []gepa.Field{{Name: "answer"}}},
-		LM:        gepatest.NewFakeGenerator().Default(gepatest.Text(`{"answer": "42"}`)),
+		Signature: gepa.Signature{
+			Name:    "qa",
+			Inputs:  []gepa.Field{{Name: "question"}},
+			Outputs: []gepa.Field{{Name: "answer"}},
+		},
+		LM: gepatest.NewFakeGenerator().Default(gepatest.Text(`{"answer": "42"}`)),
 	}
 
 	_, err := program.Run(context.Background(), gepa.Prediction{"question": "6*7?"})
@@ -233,7 +239,11 @@ func TestPredictTypeChecksAtTheEdges(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.typ+" "+tt.value, func(t *testing.T) {
-			signature := gepa.Signature{Name: "s", Inputs: []gepa.Field{{Name: "q"}}, Outputs: []gepa.Field{{Name: "v", Type: tt.typ}}}
+			signature := gepa.Signature{
+				Name:    "s",
+				Inputs:  []gepa.Field{{Name: "q"}},
+				Outputs: []gepa.Field{{Name: "v", Type: tt.typ}},
+			}
 
 			_, err := gepa.Predict{Signature: signature}.ParseOutput(`{"v":` + tt.value + `}`)
 

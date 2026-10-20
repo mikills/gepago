@@ -17,12 +17,17 @@ func ExampleFakeGenerator() {
 	lm := gepatest.NewFakeGenerator().
 		OnStep("classify",
 			gepatest.Fail(gepa.TransientError(errors.New("rate limited"))),
-			gepatest.Text(`{"label":"billing"}`).WithUsage(gepa.Usage{PromptTokens: 12, CompletionTokens: 3, TotalTokens: 15}),
+			gepatest.Text(`{"label":"billing"}`).
+				WithUsage(gepa.Usage{PromptTokens: 12, CompletionTokens: 3, TotalTokens: 15}),
 		).
 		Default(gepatest.Text(`{"label":"other"}`))
 	classify := gepa.NewProgramStep("classify", gepa.Predict{
-		Signature: gepa.Signature{Name: "classify", Inputs: []gepa.Field{{Name: "ticket"}}, Outputs: []gepa.Field{{Name: "label"}}},
-		LM:        &gepa.RetryingLanguageModel{LM: lm, MaxAttempts: 2},
+		Signature: gepa.Signature{
+			Name:    "classify",
+			Inputs:  []gepa.Field{{Name: "ticket"}},
+			Outputs: []gepa.Field{{Name: "label"}},
+		},
+		LM: &gepa.RetryingLanguageModel{LM: lm, MaxAttempts: 2},
 	}, []gepa.KeyRef{ticket.Ref()}, []gepa.KeyRef{label.Ref()})
 	pipeline, err := gepa.PipelineSpec{Inputs: []gepa.KeyRef{ticket.Ref()}, Steps: []gepa.Step{classify}}.Build()
 	if err != nil {
@@ -52,12 +57,17 @@ func (printT) Errorf(format string, args ...any) { fmt.Printf(format+"\n", args.
 func ExampleAssertTrace() {
 	recorder := &gepa.RecordingObserver{}
 	answer := gepa.Key[string]{Name: "answer"}
-	lm := gepatest.NewFakeGenerator().OnStep("answer", gepatest.Text(`{"answer":"4"}`).WithUsage(gepa.Usage{TotalTokens: 7}))
+	lm := gepatest.NewFakeGenerator().
+		OnStep("answer", gepatest.Text(`{"answer":"4"}`).WithUsage(gepa.Usage{TotalTokens: 7}))
 	pipeline, err := gepa.PipelineSpec{
 		Inputs: []gepa.KeyRef{gepa.Key[string]{Name: "question"}.Ref()},
 		Steps: []gepa.Step{gepa.NewProgramStep("answer", gepa.Predict{
-			Signature: gepa.Signature{Name: "qa", Inputs: []gepa.Field{{Name: "question"}}, Outputs: []gepa.Field{{Name: "answer"}}},
-			LM:        lm,
+			Signature: gepa.Signature{
+				Name:    "qa",
+				Inputs:  []gepa.Field{{Name: "question"}},
+				Outputs: []gepa.Field{{Name: "answer"}},
+			},
+			LM: lm,
 		}, []gepa.KeyRef{gepa.Key[string]{Name: "question"}.Ref()}, []gepa.KeyRef{answer.Ref()})},
 		Observers: []gepa.PipelineObserver{recorder},
 	}.Build()

@@ -88,7 +88,13 @@ func TestFallbackDoesNotFallBackOnAPermanentErrorAsTheTraceShows(t *testing.T) {
 }
 
 func TestRunBudgetRefusesTheCallPastMaxModelCallsAsTheTraceShows(t *testing.T) {
-	first, second, third := gepa.Key[string]{Name: "first"}, gepa.Key[string]{Name: "second"}, gepa.Key[string]{Name: "third"}
+	first, second, third := gepa.Key[string]{
+		Name: "first",
+	}, gepa.Key[string]{
+		Name: "second",
+	}, gepa.Key[string]{
+		Name: "third",
+	}
 	lm := gepatest.NewFakeGenerator().
 		OnStep("one", gepatest.Text(`{"first": "a"}`).WithUsage(tokens(5))).
 		OnStep("two", gepatest.Text(`{"second": "b"}`).WithUsage(tokens(5))).

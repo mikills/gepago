@@ -172,7 +172,10 @@ func TestMetrics(t *testing.T) {
 }
 
 func TestProgramEvaluatorUsage(t *testing.T) {
-	lm := script(gepatest.Text(`{"label":"positive"}`).WithUsage(gepa.Usage{PromptTokens: 3, CompletionTokens: 4, TotalTokens: 7}))
+	lm := script(
+		gepatest.Text(`{"label":"positive"}`).
+			WithUsage(gepa.Usage{PromptTokens: 3, CompletionTokens: 4, TotalTokens: 7}),
+	)
 	evaluator := gepa.ProgramEvaluator{
 		Program: gepa.Predict{
 			Signature: gepa.Signature{
@@ -185,9 +188,14 @@ func TestProgramEvaluatorUsage(t *testing.T) {
 		},
 		Metric: gepa.ExactMatchMetric{Fields: []string{"label"}},
 	}
-	result, err := evaluator.Evaluate(context.Background(), gepa.Candidate{gepa.InstructionComponent: "classify"}, []gepa.Example{
-		gepa.NewIOExample("one", gepa.Prediction{"text": "great"}, gepa.Prediction{"label": "positive"}),
-	}, false)
+	result, err := evaluator.Evaluate(
+		context.Background(),
+		gepa.Candidate{gepa.InstructionComponent: "classify"},
+		[]gepa.Example{
+			gepa.NewIOExample("one", gepa.Prediction{"text": "great"}, gepa.Prediction{"label": "positive"}),
+		},
+		false,
+	)
 	if err != nil {
 		t.Fatalf("Evaluate() error = %v", err)
 	}

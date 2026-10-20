@@ -52,12 +52,18 @@ func agentPipelineSpec(t *testing.T, agent *Agent, spec gepa.PipelineSpec) gepa.
 }
 
 func TestAgentInAPipelineMeetsTheRunsToolPolicy(t *testing.T) {
-	other := gepa.NewToolFunc(gepa.Tool{Name: "other", Description: "other"}, func(context.Context, ToolCall) (gepa.ToolResult, error) {
-		return gepa.ToolResult{}, nil
-	})
-	echo := gepa.NewToolFunc(gepa.Tool{Name: "echo", Description: "echo"}, func(context.Context, ToolCall) (gepa.ToolResult, error) {
-		return gepa.ToolResult{}, nil
-	})
+	other := gepa.NewToolFunc(
+		gepa.Tool{Name: "other", Description: "other"},
+		func(context.Context, ToolCall) (gepa.ToolResult, error) {
+			return gepa.ToolResult{}, nil
+		},
+	)
+	echo := gepa.NewToolFunc(
+		gepa.Tool{Name: "echo", Description: "echo"},
+		func(context.Context, ToolCall) (gepa.ToolResult, error) {
+			return gepa.ToolResult{}, nil
+		},
+	)
 	tools, err := gepa.NewToolRegistry(other, echo)
 	require.NoError(t, err)
 	tests := []struct {
@@ -313,7 +319,10 @@ func TestAgentRecordsTheUsageOfAFailedChatCallOnce(t *testing.T) {
 	agent := Agent{Name: "failing", Model: "fake", Client: client}
 	ctx, collector := gepa.WithUsageCollector(context.Background())
 
-	result, err := agent.Run(ctx, RunRequest{Memory: NewMemory("run"), Messages: []Message{{Role: RoleUser, Content: "hi"}}})
+	result, err := agent.Run(
+		ctx,
+		RunRequest{Memory: NewMemory("run"), Messages: []Message{{Role: RoleUser, Content: "hi"}}},
+	)
 
 	require.EqualError(t, err, `agent "failing" chat turn 1: connection reset mid-reply`)
 	require.True(t, gepa.IsTransient(err))

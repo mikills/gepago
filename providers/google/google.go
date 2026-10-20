@@ -88,9 +88,14 @@ func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Gener
 			{Role: gepa.RoleUser, Content: prompt},
 		},
 	}
-	return providerlog.Generate(ctx, m.client.logger, m.client.logCall("generate", req), func() (gepa.Generation, error) {
-		return m.generate(ctx, req)
-	})
+	return providerlog.Generate(
+		ctx,
+		m.client.logger,
+		m.client.logCall("generate", req),
+		func() (gepa.Generation, error) {
+			return m.generate(ctx, req)
+		},
+	)
 }
 
 // generate sends req as Generate's request and converts the reply.

@@ -104,7 +104,12 @@ func TestRunBudgetLimitsTripAtTheirBoundary(t *testing.T) {
 			wantErr:   `pipeline step "b": run budget PerStepTokens["b"] 9 exceeded: 10 tokens spent`,
 			want:      gepa.Prediction{"a": "done"},
 		},
-		{name: "PerStepTokens at", budget: gepa.RunBudget{PerStepTokens: map[string]int{"b": 10}}, wantCalls: 3, want: complete},
+		{
+			name:      "PerStepTokens at",
+			budget:    gepa.RunBudget{PerStepTokens: map[string]int{"b": 10}},
+			wantCalls: 3,
+			want:      complete,
+		},
 		{
 			name:      "PerStepTokens one above",
 			budget:    gepa.RunBudget{PerStepTokens: map[string]int{"b": 11}},
@@ -137,7 +142,13 @@ func TestRunBudgetLimitsTripAtTheirBoundary(t *testing.T) {
 func TestRunBudgetRefusedCallsNeverReachTheModel(t *testing.T) {
 	consumers := map[string]func(context.Context, gepa.Generator) error{
 		"Predict": func(ctx context.Context, lm gepa.Generator) error {
-			_, err := gepa.Predict{Signature: signatureProgram("a").Signature, LM: lm}.Run(ctx, gepa.Prediction{"document": "x"})
+			_, err := gepa.Predict{
+				Signature: signatureProgram("a").Signature,
+				LM:        lm,
+			}.Run(
+				ctx,
+				gepa.Prediction{"document": "x"},
+			)
 			return err
 		},
 		"LLMJudgeMetric": func(ctx context.Context, lm gepa.Generator) error {
@@ -146,12 +157,22 @@ func TestRunBudgetRefusedCallsNeverReachTheModel(t *testing.T) {
 		},
 		"ReflectiveProposer": func(ctx context.Context, lm gepa.Generator) error {
 			proposer := &gepa.ReflectiveProposer{LM: lm}
-			_, err := proposer.Propose(ctx, gepa.Candidate{"instruction": "x"}, gepa.ReflectiveDataset{}, []string{"instruction"})
+			_, err := proposer.Propose(
+				ctx,
+				gepa.Candidate{"instruction": "x"},
+				gepa.ReflectiveDataset{},
+				[]string{"instruction"},
+			)
 			return err
 		},
 		"LLMMergeProposer": func(ctx context.Context, lm gepa.Generator) error {
 			proposer := &gepa.LLMMergeProposer{LM: lm}
-			_, err := proposer.ProposeMerge(ctx, gepa.CandidateRecord{}, gepa.CandidateRecord{}, []string{"instruction"})
+			_, err := proposer.ProposeMerge(
+				ctx,
+				gepa.CandidateRecord{},
+				gepa.CandidateRecord{},
+				[]string{"instruction"},
+			)
 			return err
 		},
 	}
@@ -164,11 +185,18 @@ func TestRunBudgetRefusedCallsNeverReachTheModel(t *testing.T) {
 				}
 				return consume(ctx, lm)
 			})
-			pipeline, err := gepa.PipelineSpec{Steps: []gepa.Step{step}, Budget: gepa.RunBudget{MaxModelCalls: 1}}.Build()
+			pipeline, err := gepa.PipelineSpec{
+				Steps:  []gepa.Step{step},
+				Budget: gepa.RunBudget{MaxModelCalls: 1},
+			}.Build()
 			require.NoError(t, err)
 
 			_, err = pipeline.RunCandidate(context.Background(), nil, gepa.Prediction{})
-			require.EqualError(t, err, `pipeline step "consume": run budget MaxModelCalls 1 exceeded: model call 2 refused`)
+			require.EqualError(
+				t,
+				err,
+				`pipeline step "consume": run budget MaxModelCalls 1 exceeded: model call 2 refused`,
+			)
 			require.True(t, gepa.IsBudget(err))
 			require.Empty(t, lm.Calls())
 		})
@@ -268,7 +296,12 @@ func TestRunBudgetCountsEveryRetryAttempt(t *testing.T) {
 			wantTokens: 20,
 			wantErr:    `pipeline step "a": run budget PerStepTokens["a"] 19 exceeded: 20 tokens spent`,
 		},
-		{name: "PerStepTokens at", budget: gepa.RunBudget{PerStepTokens: map[string]int{"a": 30}}, wantCalls: 3, wantTokens: 30},
+		{
+			name:       "PerStepTokens at",
+			budget:     gepa.RunBudget{PerStepTokens: map[string]int{"a": 30}},
+			wantCalls:  3,
+			wantTokens: 30,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -330,8 +363,18 @@ func TestRetryPendingTokensCountAcrossSiblings(t *testing.T) {
 		Inputs: refs(docKey.Ref()),
 		Steps: []gepa.Step{gepa.Parallel(
 			"fan",
-			modelStep("a", &gepa.RetryingLanguageModel{LM: a, MaxAttempts: 3}, docKey.Ref(), gepa.Key[string]{Name: "a"}.Ref()),
-			modelStep("b", &gepa.RetryingLanguageModel{LM: b, MaxAttempts: 3}, docKey.Ref(), gepa.Key[string]{Name: "b"}.Ref()),
+			modelStep(
+				"a",
+				&gepa.RetryingLanguageModel{LM: a, MaxAttempts: 3},
+				docKey.Ref(),
+				gepa.Key[string]{Name: "a"}.Ref(),
+			),
+			modelStep(
+				"b",
+				&gepa.RetryingLanguageModel{LM: b, MaxAttempts: 3},
+				docKey.Ref(),
+				gepa.Key[string]{Name: "b"}.Ref(),
+			),
 		)},
 		Budget: gepa.RunBudget{MaxTokens: 25},
 	}.Build()
@@ -400,10 +443,15 @@ func nestRetries(lm gepa.Generator, attempts ...int) gepa.Generator {
 func nestedRetryRun(t *testing.T, lm gepa.Generator, budget gepa.RunBudget) (gepa.BudgetRemaining, gepa.Usage, error) {
 	t.Helper()
 	var after gepa.BudgetRemaining
-	probe := gepa.NewStep("probe", refs(gepa.Key[string]{Name: "a"}.Ref()), nil, func(ctx context.Context, _ gepa.State) error {
-		after = gepa.BudgetFrom(ctx).Remaining()
-		return nil
-	})
+	probe := gepa.NewStep(
+		"probe",
+		refs(gepa.Key[string]{Name: "a"}.Ref()),
+		nil,
+		func(ctx context.Context, _ gepa.State) error {
+			after = gepa.BudgetFrom(ctx).Remaining()
+			return nil
+		},
+	)
 	pipeline, err := gepa.PipelineSpec{
 		Inputs: refs(docKey.Ref()),
 		Steps:  []gepa.Step{modelStep("a", lm, docKey.Ref(), gepa.Key[string]{Name: "a"}.Ref()), probe},
@@ -433,7 +481,12 @@ func TestNestedRetryingModelsCountEachTokenOnce(t *testing.T) {
 			budget:     gepa.RunBudget{MaxTokens: 100},
 			wantCalls:  3,
 			wantTokens: 30,
-			wantLeft:   gepa.BudgetRemaining{Duration: math.MaxInt64, ModelCalls: math.MaxInt, Tokens: 70, StepTokens: math.MaxInt},
+			wantLeft: gepa.BudgetRemaining{
+				Duration:   math.MaxInt64,
+				ModelCalls: math.MaxInt,
+				Tokens:     70,
+				StepTokens: math.MaxInt,
+			},
 		},
 		{
 			name:       "two levels, inner exhausted once",
@@ -442,7 +495,12 @@ func TestNestedRetryingModelsCountEachTokenOnce(t *testing.T) {
 			budget:     gepa.RunBudget{MaxTokens: 100},
 			wantCalls:  4,
 			wantTokens: 40,
-			wantLeft:   gepa.BudgetRemaining{Duration: math.MaxInt64, ModelCalls: math.MaxInt, Tokens: 60, StepTokens: math.MaxInt},
+			wantLeft: gepa.BudgetRemaining{
+				Duration:   math.MaxInt64,
+				ModelCalls: math.MaxInt,
+				Tokens:     60,
+				StepTokens: math.MaxInt,
+			},
 		},
 		{
 			name:       "two levels, outer retry admitted below the limit",
@@ -451,7 +509,12 @@ func TestNestedRetryingModelsCountEachTokenOnce(t *testing.T) {
 			budget:     gepa.RunBudget{MaxTokens: 45},
 			wantCalls:  4,
 			wantTokens: 40,
-			wantLeft:   gepa.BudgetRemaining{Duration: math.MaxInt64, ModelCalls: math.MaxInt, Tokens: 5, StepTokens: math.MaxInt},
+			wantLeft: gepa.BudgetRemaining{
+				Duration:   math.MaxInt64,
+				ModelCalls: math.MaxInt,
+				Tokens:     5,
+				StepTokens: math.MaxInt,
+			},
 		},
 		{
 			name:       "three levels",
@@ -460,7 +523,12 @@ func TestNestedRetryingModelsCountEachTokenOnce(t *testing.T) {
 			budget:     gepa.RunBudget{MaxTokens: 100, MaxModelCalls: 10, PerStepTokens: map[string]int{"a": 100}},
 			wantCalls:  6,
 			wantTokens: 60,
-			wantLeft:   gepa.BudgetRemaining{Duration: math.MaxInt64, ModelCalls: 4, Tokens: 40, StepTokens: math.MaxInt},
+			wantLeft: gepa.BudgetRemaining{
+				Duration:   math.MaxInt64,
+				ModelCalls: 4,
+				Tokens:     40,
+				StepTokens: math.MaxInt,
+			},
 		},
 		{
 			name:       "three levels at the limit",
@@ -515,8 +583,17 @@ func TestNestedRetryingModelsUnderParallel(t *testing.T) {
 	for i := range siblings {
 		name := fmt.Sprintf("s%d", i)
 		failure := gepatest.Fail(errUnavailable).WithUsage(tenTokens)
-		provider.OnStep(name, failure, failure, failure, gepatest.Text(fmt.Sprintf(`{%q: "done"}`, name)).WithUsage(tenTokens))
-		steps = append(steps, modelStep(name, nestRetries(provider, 3, 2), docKey.Ref(), gepa.Key[string]{Name: name}.Ref()))
+		provider.OnStep(
+			name,
+			failure,
+			failure,
+			failure,
+			gepatest.Text(fmt.Sprintf(`{%q: "done"}`, name)).WithUsage(tenTokens),
+		)
+		steps = append(
+			steps,
+			modelStep(name, nestRetries(provider, 3, 2), docKey.Ref(), gepa.Key[string]{Name: name}.Ref()),
+		)
 	}
 	var after gepa.BudgetRemaining
 	probe := gepa.NewStep("probe", refs(docKey.Ref()), nil, func(ctx context.Context, _ gepa.State) error {
@@ -588,7 +665,10 @@ func TestRetryPendingTokensSettleOnEveryPath(t *testing.T) {
 			pipeline, err := gepa.PipelineSpec{
 				Inputs: refs(docKey.Ref()),
 				Steps: []gepa.Step{
-					gepa.WithPolicy(modelStep("a", nestRetries(lm, 5), docKey.Ref(), gepa.Key[string]{Name: "a"}.Ref()), policy),
+					gepa.WithPolicy(
+						modelStep("a", nestRetries(lm, 5), docKey.Ref(), gepa.Key[string]{Name: "a"}.Ref()),
+						policy,
+					),
 					probe,
 				},
 				Defaults: []gepa.KeyDefault{gepa.DefaultValue(gepa.Key[string]{Name: "a"}, "")},
@@ -609,23 +689,35 @@ func TestRetryCountsAFailedAttemptBeforeItsBackoff(t *testing.T) {
 		var once sync.Once
 		var waited atomic.Bool
 		b := gepatest.NewFakeGenerator().Default(gepatest.Fail(errUnavailable).WithUsage(gepa.Usage{TotalTokens: 20}))
-		bLM := &gepa.RetryingLanguageModel{LM: b, MaxAttempts: 2, Delay: 200 * time.Millisecond, Jitter: func() float64 {
-			waited.Store(true)
-			once.Do(func() { close(inBackoff) })
-			return 0
-		}}
+		bLM := &gepa.RetryingLanguageModel{
+			LM:          b,
+			MaxAttempts: 2,
+			Delay:       200 * time.Millisecond,
+			Jitter: func() float64 {
+				waited.Store(true)
+				once.Do(func() { close(inBackoff) })
+				return 0
+			},
+		}
 		aLM := gepatest.NewFakeGenerator().Default(gepatest.Text(`{"a": "done"}`).WithUsage(gepa.Usage{TotalTokens: 1}))
 		aPredict := modelStep("a", aLM, docKey.Ref(), gepa.Key[string]{Name: "a"}.Ref())
-		a := gepa.NewStep("a", refs(docKey.Ref()), refs(gepa.Key[string]{Name: "a"}.Ref()), func(ctx context.Context, s gepa.State) error {
-			select {
-			case <-inBackoff: // B waits to retry, having spent 20 tokens against MaxTokens 15
-			case <-ctx.Done(): // B ended the run instead
-			}
-			return aPredict.Run(ctx, s)
-		})
+		a := gepa.NewStep(
+			"a",
+			refs(docKey.Ref()),
+			refs(gepa.Key[string]{Name: "a"}.Ref()),
+			func(ctx context.Context, s gepa.State) error {
+				select {
+				case <-inBackoff: // B waits to retry, having spent 20 tokens against MaxTokens 15
+				case <-ctx.Done(): // B ended the run instead
+				}
+				return aPredict.Run(ctx, s)
+			},
+		)
 		pipeline, err := gepa.PipelineSpec{
 			Inputs: refs(docKey.Ref()),
-			Steps:  []gepa.Step{gepa.Parallel("fan", a, modelStep("b", bLM, docKey.Ref(), gepa.Key[string]{Name: "b"}.Ref()))},
+			Steps: []gepa.Step{
+				gepa.Parallel("fan", a, modelStep("b", bLM, docKey.Ref(), gepa.Key[string]{Name: "b"}.Ref())),
+			},
 			Budget: gepa.RunBudget{MaxTokens: 15},
 		}.Build()
 		require.NoError(t, err)
@@ -671,7 +763,10 @@ func TestRetryCountsAFailedAttemptBeforeItsBackoff(t *testing.T) {
 		})
 		pipeline, err := gepa.PipelineSpec{
 			Inputs: refs(docKey.Ref()),
-			Steps:  []gepa.Step{gepa.Parallel("fan", a, modelStep("b", bLM, docKey.Ref(), gepa.Key[string]{Name: "b"}.Ref())), probe},
+			Steps: []gepa.Step{
+				gepa.Parallel("fan", a, modelStep("b", bLM, docKey.Ref(), gepa.Key[string]{Name: "b"}.Ref())),
+				probe,
+			},
 			Budget: gepa.RunBudget{MaxTokens: 100},
 		}.Build()
 		require.NoError(t, err)
@@ -721,13 +816,20 @@ func TestRetryStopsWithoutWaitingWhenTheBudgetRefuses(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var waited atomic.Bool
-			provider := gepatest.NewFakeGenerator().Default(gepatest.Fail(errUnavailable).WithUsage(gepa.Usage{TotalTokens: 20}))
+			provider := gepatest.NewFakeGenerator().
+				Default(gepatest.Fail(errUnavailable).WithUsage(gepa.Usage{TotalTokens: 20}))
 			var lm gepa.Generator = provider
 			for _, n := range tt.attempts {
-				lm = &gepa.RetryingLanguageModel{LM: lm, MaxAttempts: n, Delay: time.Second, MaxDelay: time.Second, Jitter: func() float64 {
-					waited.Store(true)
-					return 0
-				}}
+				lm = &gepa.RetryingLanguageModel{
+					LM:          lm,
+					MaxAttempts: n,
+					Delay:       time.Second,
+					MaxDelay:    time.Second,
+					Jitter: func() float64 {
+						waited.Store(true)
+						return 0
+					},
+				}
 			}
 			pipeline, err := gepa.PipelineSpec{
 				Inputs: refs(docKey.Ref()),
@@ -769,10 +871,15 @@ func TestRunBudgetStepLimitStaysSpentAcrossRetries(t *testing.T) {
 
 func TestRunBudgetStepLimitCanFallBack(t *testing.T) {
 	lm := gepatest.NewFakeGenerator()
-	cheap := gepa.NewStep("cheap", refs(docKey.Ref()), refs(gepa.Key[string]{Name: "a"}.Ref()), func(_ context.Context, s gepa.State) error {
-		gepa.Key[string]{Name: "a"}.Set(s, "cheap")
-		return nil
-	})
+	cheap := gepa.NewStep(
+		"cheap",
+		refs(docKey.Ref()),
+		refs(gepa.Key[string]{Name: "a"}.Ref()),
+		func(_ context.Context, s gepa.State) error {
+			gepa.Key[string]{Name: "a"}.Set(s, "cheap")
+			return nil
+		},
+	)
 	pipeline, err := gepa.PipelineSpec{
 		Inputs: refs(docKey.Ref()),
 		Steps:  []gepa.Step{gepa.Fallback("guard", replyStep(lm, "a", "document", tenTokens), cheap)},

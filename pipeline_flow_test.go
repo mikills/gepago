@@ -252,7 +252,12 @@ func TestParallelFailureCancelsSiblingsAndCommitsNothing(t *testing.T) {
 	pipeline, err := PipelineSpec{
 		Steps: []Step{
 			writeNotes("first", "kept"),
-			Parallel("fan", sibling("left", Key[string]{Name: "left"}), fail, sibling("right", Key[string]{Name: "right"})),
+			Parallel(
+				"fan",
+				sibling("left", Key[string]{Name: "left"}),
+				fail,
+				sibling("right", Key[string]{Name: "right"}),
+			),
 		},
 	}.Build()
 	require.NoError(t, err)
@@ -311,7 +316,11 @@ func TestParallelBuildErrors(t *testing.T) {
 			wantErr: `pipeline step "fan": steps "a" and "b" both write "amount"; parallel steps must write different keys`,
 		},
 		{name: "no steps", step: Parallel("fan"), wantErr: `pipeline step "fan": parallel requires at least one step`},
-		{name: "nil step", step: Parallel("fan", writeAmount("a", 1), nil), wantErr: `pipeline step "fan": step 1 is nil`},
+		{
+			name:    "nil step",
+			step:    Parallel("fan", writeAmount("a", 1), nil),
+			wantErr: `pipeline step "fan": step 1 is nil`,
+		},
 		{
 			name:    "unnamed step",
 			step:    Parallel("fan", writeAmount("", 1)),
@@ -439,16 +448,24 @@ func TestFallbackBuildErrors(t *testing.T) {
 		},
 		{
 			name: "different types",
-			step: Fallback("guard", writeAmount("a", 1), NewStep("b", nil, refs(Key[string]{Name: "amount"}.Ref()), func(
-				context.Context,
-				State,
-			) error {
-				return nil
-			})),
+			step: Fallback(
+				"guard",
+				writeAmount("a", 1),
+				NewStep("b", nil, refs(Key[string]{Name: "amount"}.Ref()), func(
+					context.Context,
+					State,
+				) error {
+					return nil
+				}),
+			),
 			wantErr: `pipeline step "guard": secondary step "b" writes "amount" as string, but primary step "a" writes ` +
 				`it as int`,
 		},
-		{name: "nil primary", step: Fallback("guard", nil, writeAmount("b", 1)), wantErr: `pipeline step "guard": primary step is nil`},
+		{
+			name:    "nil primary",
+			step:    Fallback("guard", nil, writeAmount("b", 1)),
+			wantErr: `pipeline step "guard": primary step is nil`,
+		},
 		{
 			name:    "nil secondary",
 			step:    Fallback("guard", writeAmount("a", 1), nil),

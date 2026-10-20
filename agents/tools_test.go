@@ -49,7 +49,10 @@ func orderRegistry(t *testing.T, calls *atomic.Int32) *gepa.ToolRegistry {
 
 func runAgent(t *testing.T, agent Agent, memory *Memory) (RunResult, error) {
 	t.Helper()
-	return agent.Run(context.Background(), RunRequest{Memory: memory, Messages: []Message{{Role: RoleUser, Content: "hi"}}})
+	return agent.Run(
+		context.Background(),
+		RunRequest{Memory: memory, Messages: []Message{{Role: RoleUser, Content: "hi"}}},
+	)
 }
 
 func TestAgentRunsRegistryTools(t *testing.T) {
@@ -151,7 +154,10 @@ func TestAgentToolPolicy(t *testing.T) {
 		}
 		ctx, collector := gepa.WithUsageCollector(context.Background())
 
-		result, err := agent.Run(ctx, RunRequest{Memory: NewMemory("run"), Messages: []Message{{Role: RoleUser, Content: "hi"}}})
+		result, err := agent.Run(
+			ctx,
+			RunRequest{Memory: NewMemory("run"), Messages: []Message{{Role: RoleUser, Content: "hi"}}},
+		)
 
 		require.NoError(t, err)
 		require.EqualValues(t, 1, calls.Load())
@@ -240,7 +246,13 @@ func TestAgentMiddlewareOrderIsOutermostFirst(t *testing.T) {
 		}))
 	}
 	client := gepatest.NewFakeGenerator().Default(gepatest.Text("done"))
-	agent := Agent{Name: "test", Client: client, Model: "fake", ToolRegistry: registry, Middleware: []string{"outer", "inner"}}
+	agent := Agent{
+		Name:         "test",
+		Client:       client,
+		Model:        "fake",
+		ToolRegistry: registry,
+		Middleware:   []string{"outer", "inner"},
+	}
 
 	_, err := runAgent(t, agent, NewMemory("run"))
 
@@ -262,7 +274,10 @@ func TestAgentValidateRegistryTools(t *testing.T) {
 		agent   Agent
 		wantErr string
 	}{
-		{name: "valid", agent: Agent{ToolRegistry: registry, ToolNames: []string{"lookup_order"}, Middleware: []string{"log"}}},
+		{
+			name:  "valid",
+			agent: Agent{ToolRegistry: registry, ToolNames: []string{"lookup_order"}, Middleware: []string{"log"}},
+		},
 		{
 			name:    "an unknown tool",
 			agent:   Agent{ToolRegistry: registry, ToolNames: []string{"missing"}},
@@ -289,8 +304,12 @@ func TestAgentValidateRegistryTools(t *testing.T) {
 			wantErr: `chat middleware "trace" is not registered`,
 		},
 		{
-			name:    "a policy naming another tool",
-			agent:   Agent{ToolRegistry: registry, ToolNames: []string{"lookup_order"}, ToolPolicy: gepa.ToolPolicy{Allow: []string{"order_status"}}},
+			name: "a policy naming another tool",
+			agent: Agent{
+				ToolRegistry: registry,
+				ToolNames:    []string{"lookup_order"},
+				ToolPolicy:   gepa.ToolPolicy{Allow: []string{"order_status"}},
+			},
 			wantErr: `tool policy Allow names unknown tool "order_status"`,
 		},
 	}
@@ -308,7 +327,13 @@ func TestAgentValidateRegistryTools(t *testing.T) {
 		})
 	}
 	t.Run("an unknown tool is ErrUnknownTool", func(t *testing.T) {
-		agent := Agent{Name: "test", Client: gepatest.NewFakeGenerator(), Model: "fake", ToolRegistry: registry, ToolNames: []string{"x"}}
+		agent := Agent{
+			Name:         "test",
+			Client:       gepatest.NewFakeGenerator(),
+			Model:        "fake",
+			ToolRegistry: registry,
+			ToolNames:    []string{"x"},
+		}
 		require.ErrorIs(t, agent.Validate(), ErrUnknownTool)
 	})
 }

@@ -20,7 +20,11 @@ func TestContainsJSON(t *testing.T) {
 			want:    `{"messages":[{"role":"user"}]}`,
 			wantErr: "$.messages: got [map[content:hi role:user] map[role:tool tool_call_id:c]], want 1 elements",
 		},
-		{name: "a nested difference", want: `{"messages":[{"role":"user"},{"role":"user"}]}`, wantErr: "$.messages[1].role: got tool, want user"},
+		{
+			name:    "a nested difference",
+			want:    `{"messages":[{"role":"user"},{"role":"user"}]}`,
+			wantErr: "$.messages[1].role: got tool, want user",
+		},
 		{name: "an object where a value is", want: `{"model":{}}`, wantErr: "$.model: got m, want an object"},
 		{name: "want that is not JSON", want: `{`, wantErr: "want: unexpected end of JSON input"},
 	}
@@ -38,7 +42,8 @@ func TestContainsJSON(t *testing.T) {
 			}
 		})
 	}
-	if err := ContainsJSON([]byte(`{}`), []byte(`{`)); err == nil || err.Error() != "got: unexpected end of JSON input" {
+	if err := ContainsJSON([]byte(`{}`), []byte(`{`)); err == nil ||
+		err.Error() != "got: unexpected end of JSON input" {
 		t.Fatalf("ContainsJSON() with bad got = %v", err)
 	}
 }

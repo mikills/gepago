@@ -26,7 +26,12 @@ import (
 // have the Go type of the argument field it fills and each write the Go type of the output
 // field it takes, when the output is a struct.
 func ToolStep(name, tool string, reads, writes []KeyRef) Step {
-	return &toolStep{name: strings.TrimSpace(name), tool: tool, reads: slices.Clone(reads), writes: slices.Clone(writes)}
+	return &toolStep{
+		name:   strings.TrimSpace(name),
+		tool:   tool,
+		reads:  slices.Clone(reads),
+		writes: slices.Clone(writes),
+	}
 }
 
 type toolStep struct {

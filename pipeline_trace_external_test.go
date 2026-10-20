@@ -31,22 +31,39 @@ func tracedPipeline(t *testing.T) gepa.PipelineTrace {
 		},
 	}.Build()
 	require.NoError(t, err)
-	measure := gepa.NewStep("measure", nil, refs(scoreKey.Ref(), ratioKey.Ref()), func(_ context.Context, s gepa.State) error {
-		scoreKey.Set(s, score{Value: 0.5, Label: "half"})
-		ratioKey.Set(s, math.NaN())
-		return nil
-	})
+	measure := gepa.NewStep(
+		"measure",
+		nil,
+		refs(scoreKey.Ref(), ratioKey.Ref()),
+		func(_ context.Context, s gepa.State) error {
+			scoreKey.Set(s, score{Value: 0.5, Label: "half"})
+			ratioKey.Set(s, math.NaN())
+			return nil
+		},
+	)
 	primary := gepa.NewStep("primary", nil, refs(amountKey.Ref()), func(context.Context, gepa.State) error {
-		return gepa.WithStepDetails(gepa.TransientError(errors.New("primary down")), map[string]any{"attempted": []string{"a"}})
+		return gepa.WithStepDetails(
+			gepa.TransientError(errors.New("primary down")),
+			map[string]any{"attempted": []string{"a"}},
+		)
 	})
-	check := gepa.NewStep("check", refs(amountKey.Ref()), refs(notesKey.Ref()), func(context.Context, gepa.State) error {
-		return gepa.PermanentError(errors.New("amount too small"))
-	})
+	check := gepa.NewStep(
+		"check",
+		refs(amountKey.Ref()),
+		refs(notesKey.Ref()),
+		func(context.Context, gepa.State) error {
+			return gepa.PermanentError(errors.New("amount too small"))
+		},
+	)
 	recorder := &gepa.RecordingObserver{}
 	pipeline, err := gepa.PipelineSpec{
 		Inputs: refs(docKey.Ref()),
 		Steps: []gepa.Step{
-			gepa.Parallel("fan", modelStep("summarise", tenTokenModel(`{"summary": "short"}`), docKey.Ref(), summaryKey.Ref()), measure),
+			gepa.Parallel(
+				"fan",
+				modelStep("summarise", tenTokenModel(`{"summary": "short"}`), docKey.Ref(), summaryKey.Ref()),
+				measure,
+			),
 			gepa.Fallback("fb", primary, writeAmount("secondary", 3)),
 			gepa.NewProgramStep("inner", inner, refs(docKey.Ref()), refs(decisionKey.Ref())),
 			check,
@@ -202,15 +219,29 @@ func TestTraceDatasetBuilderOverProgramEvaluator(t *testing.T) {
 
 func TestProgramEvaluatorTracesOnlyPipelines(t *testing.T) {
 	predict := gepa.Predict{
-		Signature: gepa.Signature{Name: "summarise", Inputs: []gepa.Field{{Name: "document"}}, Outputs: []gepa.Field{{Name: "summary"}}},
-		LM:        tenTokenModel(`{"summary": "short"}`),
+		Signature: gepa.Signature{
+			Name:    "summarise",
+			Inputs:  []gepa.Field{{Name: "document"}},
+			Outputs: []gepa.Field{{Name: "summary"}},
+		},
+		LM: tenTokenModel(`{"summary": "short"}`),
 	}
-	examples := []gepa.Example{gepa.NewIOExample("one", gepa.Prediction{"document": "d"}, gepa.Prediction{"summary": "short"})}
-	evaluator := gepa.ProgramEvaluator{Program: predict, Metric: gepa.ExactMatchMetric{Fields: []string{"summary"}}, RecordTraces: true}
+	examples := []gepa.Example{
+		gepa.NewIOExample("one", gepa.Prediction{"document": "d"}, gepa.Prediction{"summary": "short"}),
+	}
+	evaluator := gepa.ProgramEvaluator{
+		Program:      predict,
+		Metric:       gepa.ExactMatchMetric{Fields: []string{"summary"}},
+		RecordTraces: true,
+	}
 	result, err := evaluator.Evaluate(context.Background(), predict.SeedCandidate(), examples, true)
 	require.NoError(t, err)
 	require.Nil(t, result.Items[0].Trace)
-	dataset := gepa.TraceDatasetBuilder{}.BuildReflectiveDataset(predict.SeedCandidate(), result, []string{gepa.InstructionComponent})
+	dataset := gepa.TraceDatasetBuilder{}.BuildReflectiveDataset(
+		predict.SeedCandidate(),
+		result,
+		[]string{gepa.InstructionComponent},
+	)
 	require.Len(t, dataset[gepa.InstructionComponent], 1)
 	require.NotContains(t, dataset[gepa.InstructionComponent][0], "steps")
 	require.Equal(t, "one", dataset[gepa.InstructionComponent][0]["example_id"])
@@ -224,8 +255,17 @@ func TestProgramEvaluatorTracesOnlyPipelines(t *testing.T) {
 		}
 		return first.RunCandidate(ctx, nil, inputs)
 	})
-	result, err = gepa.ProgramEvaluator{Program: twice, Metric: gepa.ExactMatchMetric{Fields: []string{"amount"}}, RecordTraces: true}.
-		Evaluate(context.Background(), nil, []gepa.Example{gepa.NewIOExample("one", gepa.Prediction{"document": "d"}, gepa.Prediction{"amount": 1})}, true)
+	result, err = gepa.ProgramEvaluator{
+		Program:      twice,
+		Metric:       gepa.ExactMatchMetric{Fields: []string{"amount"}},
+		RecordTraces: true,
+	}.
+		Evaluate(
+			context.Background(),
+			nil,
+			[]gepa.Example{gepa.NewIOExample("one", gepa.Prediction{"document": "d"}, gepa.Prediction{"amount": 1})},
+			true,
+		)
 	require.NoError(t, err)
 	traces, ok := result.Items[0].Trace.([]gepa.PipelineTrace)
 	require.True(t, ok)

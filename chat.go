@@ -62,13 +62,18 @@ func (t Tool) Validate() error {
 	var root map[string]any
 	_ = json.Unmarshal(t.Parameters, &root)
 	if typ, ok := root["type"]; ok && typ != "object" {
-		return fmt.Errorf("tool parameters: type is %s, want \"object\": tool arguments are a JSON object", jsonText(typ))
+		return fmt.Errorf(
+			"tool parameters: type is %s, want \"object\": tool arguments are a JSON object",
+			jsonText(typ),
+		)
 	}
 	return nil
 }
 
 // emptyToolParameters is the schema of an arguments object with no properties.
-var emptyToolParameters = json.RawMessage(`{"type":"object","properties":{},"required":[],"additionalProperties":false}`)
+var emptyToolParameters = json.RawMessage(
+	`{"type":"object","properties":{},"required":[],"additionalProperties":false}`,
+)
 
 // InputSchema returns the JSON Schema of the tool's arguments: the schema of an object with no
 // properties when Parameters is empty or null, Parameters with "type": "object" added when it

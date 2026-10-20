@@ -14,9 +14,12 @@ import (
 )
 
 func echoTool(name string) ToolProvider {
-	return NewToolFunc(Tool{Name: name, Description: "echo " + name, Parameters: json.RawMessage(`{"type":"object"}`)}, func(_ context.Context, call ToolCall) (ToolResult, error) {
-		return ToolResult{Text: call.Arguments}, nil
-	})
+	return NewToolFunc(
+		Tool{Name: name, Description: "echo " + name, Parameters: json.RawMessage(`{"type":"object"}`)},
+		func(_ context.Context, call ToolCall) (ToolResult, error) {
+			return ToolResult{Text: call.Arguments}, nil
+		},
+	)
 }
 
 // plainProvider is a ToolProvider without a Validate method.
@@ -69,8 +72,10 @@ func TestToolRegistryRegister(t *testing.T) {
 		{
 			name:     "invalid schema",
 			registry: registry,
-			provider: NewToolFunc(Tool{Name: "bad", Description: "bad", Parameters: json.RawMessage(`{"type":"array"}`)},
-				func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{}, nil }),
+			provider: NewToolFunc(
+				Tool{Name: "bad", Description: "bad", Parameters: json.RawMessage(`{"type":"array"}`)},
+				func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{}, nil },
+			),
 			wantErr: `register tool: tool parameters: type is "array", want "object": tool arguments are a JSON object`,
 		},
 		{

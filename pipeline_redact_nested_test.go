@@ -40,14 +40,19 @@ func TestOuterRedactorReachesNestedObservers(t *testing.T) {
 					accountKey.Set(s, account)
 					return nil
 				})
-				check := NewStep("check", refs(amountKey.Ref()), refs(decisionKey.Ref()), func(ctx context.Context, s State) error {
-					rc, _ := RunContextFrom(ctx)
-					value, err := amountKey.Get(s)
-					if err != nil {
-						return err
-					}
-					return fmt.Errorf("bad tenant %s for amount %d on %s", rc.Attributes["secret"], value, written)
-				})
+				check := NewStep(
+					"check",
+					refs(amountKey.Ref()),
+					refs(decisionKey.Ref()),
+					func(ctx context.Context, s State) error {
+						rc, _ := RunContextFrom(ctx)
+						value, err := amountKey.Get(s)
+						if err != nil {
+							return err
+						}
+						return fmt.Errorf("bad tenant %s for amount %d on %s", rc.Attributes["secret"], value, written)
+					},
+				)
 				innerLog := &eventLog{}
 				nested := buildPipeline(t, PipelineSpec{
 					Inputs:    refs(amountKey.Ref()),
@@ -57,13 +62,18 @@ func TestOuterRedactorReachesNestedObservers(t *testing.T) {
 				if depth == 2 {
 					nested = buildPipeline(t, PipelineSpec{
 						Inputs: refs(amountKey.Ref()),
-						Steps:  []Step{NewProgramStep("run inner", nested, refs(amountKey.Ref()), refs(decisionKey.Ref()))},
+						Steps: []Step{
+							NewProgramStep("run inner", nested, refs(amountKey.Ref()), refs(decisionKey.Ref())),
+						},
 					})
 				}
 				outerLog := &eventLog{}
 				spec := PipelineSpec{
-					Inputs:   refs(amountKey.Ref()),
-					Steps:    []Step{lookup, NewProgramStep("run nested", nested, refs(amountKey.Ref()), refs(decisionKey.Ref()))},
+					Inputs: refs(amountKey.Ref()),
+					Steps: []Step{
+						lookup,
+						NewProgramStep("run nested", nested, refs(amountKey.Ref()), refs(decisionKey.Ref())),
+					},
 					Redactor: redactor,
 				}
 				if observed {
@@ -74,13 +84,22 @@ func TestOuterRedactorReachesNestedObservers(t *testing.T) {
 
 				_, err := outer.Run(ctx, NewState(Prediction{"amount": amount}))
 
-				require.ErrorContains(t, err, "bad tenant s3cr3t for amount 4242 on acct-991", "the run's own error is not redacted")
+				require.ErrorContains(
+					t,
+					err,
+					"bad tenant s3cr3t for amount 4242 on acct-991",
+					"the run's own error is not redacted",
+				)
 				require.Len(t, innerLog.runsStarted, 1)
 				started := innerLog.runsStarted[0]
 				require.Equal(t, map[string]string{"secret": "[hidden]"}, started.RunContext.Attributes)
 				require.Equal(t, map[string]any{"amount": "[amount]"}, started.Inputs)
 				require.Equal(t, map[string]any{"amount": "[amount]"}, innerLog.stepsStarted[0].Reads)
-				require.Equal(t, "bad tenant [hidden] for amount [amount] on [account]", innerLog.finished[0].Err.Error())
+				require.Equal(
+					t,
+					"bad tenant [hidden] for amount [amount] on [account]",
+					innerLog.finished[0].Err.Error(),
+				)
 				require.Equal(
 					t,
 					`pipeline step "check": bad tenant [hidden] for amount [amount] on [account]`,
@@ -91,7 +110,11 @@ func TestOuterRedactorReachesNestedObservers(t *testing.T) {
 				require.NotContains(t, text, fmt.Sprint(amount))
 				require.NotContains(t, text, account)
 				if observed {
-					require.Equal(t, map[string]string{"secret": "[hidden]"}, outerLog.runsStarted[0].RunContext.Attributes)
+					require.Equal(
+						t,
+						map[string]string{"secret": "[hidden]"},
+						outerLog.runsStarted[0].RunContext.Attributes,
+					)
 					text := stableEventText(outerLog)
 					require.NotContains(t, text, secret)
 					require.NotContains(t, text, fmt.Sprint(amount))
@@ -107,8 +130,14 @@ func TestOuterRedactorReachesNestedObservers(t *testing.T) {
 // starts its own.
 func TestRunWithoutRedactorOrObserversIsNotObserved(t *testing.T) {
 	innerLog := &eventLog{}
-	inner := buildPipeline(t, PipelineSpec{Steps: []Step{writeAmount("write", 1)}, Observers: []PipelineObserver{innerLog}})
-	outer := buildPipeline(t, PipelineSpec{Steps: []Step{NewProgramStep("run inner", inner, nil, refs(amountKey.Ref()))}})
+	inner := buildPipeline(
+		t,
+		PipelineSpec{Steps: []Step{writeAmount("write", 1)}, Observers: []PipelineObserver{innerLog}},
+	)
+	outer := buildPipeline(
+		t,
+		PipelineSpec{Steps: []Step{NewProgramStep("run inner", inner, nil, refs(amountKey.Ref()))}},
+	)
 
 	ctx, observed := outer.observeRun(context.Background(), context.Background(), nil, RunContext{RunID: "r"})
 	require.Nil(t, observed)

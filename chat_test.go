@@ -14,10 +14,19 @@ func TestToolValidate(t *testing.T) {
 		tool    Tool
 		wantErr string
 	}{
-		{name: "valid", tool: Tool{Name: "lookup", Description: "look up", Parameters: json.RawMessage(`{"type":"object"}`)}},
+		{
+			name: "valid",
+			tool: Tool{Name: "lookup", Description: "look up", Parameters: json.RawMessage(`{"type":"object"}`)},
+		},
 		{name: "no parameters", tool: Tool{Name: "lookup", Description: "look up"}},
-		{name: "null parameters", tool: Tool{Name: "lookup", Description: "look up", Parameters: json.RawMessage(`null`)}},
-		{name: "untyped parameters", tool: Tool{Name: "lookup", Description: "look up", Parameters: json.RawMessage(`{}`)}},
+		{
+			name: "null parameters",
+			tool: Tool{Name: "lookup", Description: "look up", Parameters: json.RawMessage(`null`)},
+		},
+		{
+			name: "untyped parameters",
+			tool: Tool{Name: "lookup", Description: "look up", Parameters: json.RawMessage(`{}`)},
+		},
 		{name: "missing name", tool: Tool{Name: " ", Description: "look up"}, wantErr: "tool name is required"},
 		{name: "missing description", tool: Tool{Name: "lookup"}, wantErr: "tool description is required"},
 		{

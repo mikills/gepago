@@ -342,7 +342,11 @@ func (TraceDatasetBuilder) BuildReflectiveDataset(
 	}
 	for _, item := range eval.Items {
 		traces, trace := pipelineTraces(item.Trace)
-		records := DefaultReflectiveDatasetBuilder(candidate, EvaluationResult{Items: []EvaluationItem{item}}, components)
+		records := DefaultReflectiveDatasetBuilder(
+			candidate,
+			EvaluationResult{Items: []EvaluationItem{item}},
+			components,
+		)
 		for _, component := range components {
 			for _, record := range records[component] {
 				if traces != nil {

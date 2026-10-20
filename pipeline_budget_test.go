@@ -60,7 +60,11 @@ func TestRunBudgetMaxDurationTripsAtItsBoundary(t *testing.T) {
 				require.Equal(t, int32(1), calls.Load())
 				return
 			}
-			require.EqualError(t, err, `pipeline step "a": run budget MaxDuration 1m0s exceeded: context deadline exceeded`)
+			require.EqualError(
+				t,
+				err,
+				`pipeline step "a": run budget MaxDuration 1m0s exceeded: context deadline exceeded`,
+			)
 			require.True(t, IsBudget(err))
 			require.ErrorIs(t, err, context.DeadlineExceeded)
 			require.Equal(t, int32(0), calls.Load())
@@ -182,7 +186,11 @@ func TestBudgetFromRemaining(t *testing.T) {
 		require.NoError(t, err)
 
 		_, err = pipeline.RunCandidate(context.Background(), nil, Prediction{})
-		require.EqualError(t, err, `pipeline step "probe": run budget PerStepTokens["probe"] 5 exceeded: 20 tokens spent`)
+		require.EqualError(
+			t,
+			err,
+			`pipeline step "probe": run budget PerStepTokens["probe"] 5 exceeded: 20 tokens spent`,
+		)
 		require.Equal(t, 0, got.Tokens)
 		require.Equal(t, 0, got.StepTokens)
 	})
@@ -205,20 +213,23 @@ func (f *meteredFan) step(after bool) Step {
 	for i := range 4 {
 		name := fmt.Sprintf("s%d", i)
 		model := replyStep(name, "document", tenTokens, &f.calls)
-		steps = append(steps, NewStep(name, refs(docKey.Ref()), model.Writes(), func(ctx context.Context, s State) error {
-			f.before[i] = BudgetFrom(ctx).Remaining()
-			read.Done()
-			read.Wait()
-			if err := model.Run(ctx, s); err != nil {
-				return err
-			}
-			if after {
-				called.Done()
-				called.Wait()
-				f.after[i] = BudgetFrom(ctx).Remaining()
-			}
-			return nil
-		}))
+		steps = append(
+			steps,
+			NewStep(name, refs(docKey.Ref()), model.Writes(), func(ctx context.Context, s State) error {
+				f.before[i] = BudgetFrom(ctx).Remaining()
+				read.Done()
+				read.Wait()
+				if err := model.Run(ctx, s); err != nil {
+					return err
+				}
+				if after {
+					called.Done()
+					called.Wait()
+					f.after[i] = BudgetFrom(ctx).Remaining()
+				}
+				return nil
+			}),
+		)
 	}
 	return Parallel("fan", steps...)
 }
@@ -303,19 +314,34 @@ func TestOnErrorFallbackHasItsOwnStepBudget(t *testing.T) {
 			budget: RunBudget{PerStepTokens: map[string]int{"fallback": 5}},
 			wantErr: `pipeline step "a": flaky; fallback failed: pipeline step "fallback": ` +
 				`run budget PerStepTokens["fallback"] 5 exceeded: 10 tokens spent`,
-			wantRemaining: BudgetRemaining{Duration: math.MaxInt64, ModelCalls: math.MaxInt, Tokens: math.MaxInt, StepTokens: 5},
+			wantRemaining: BudgetRemaining{
+				Duration:   math.MaxInt64,
+				ModelCalls: math.MaxInt,
+				Tokens:     math.MaxInt,
+				StepTokens: 5,
+			},
 		},
 		{
-			name:          "not limited by the failed step's entry",
-			budget:        RunBudget{PerStepTokens: map[string]int{"a": 5}},
-			wantRemaining: BudgetRemaining{Duration: math.MaxInt64, ModelCalls: math.MaxInt, Tokens: math.MaxInt, StepTokens: math.MaxInt},
+			name:   "not limited by the failed step's entry",
+			budget: RunBudget{PerStepTokens: map[string]int{"a": 5}},
+			wantRemaining: BudgetRemaining{
+				Duration:   math.MaxInt64,
+				ModelCalls: math.MaxInt,
+				Tokens:     math.MaxInt,
+				StepTokens: math.MaxInt,
+			},
 		},
 		{
 			name:   "limited by the run",
 			budget: RunBudget{MaxTokens: 5},
 			wantErr: `pipeline step "a": flaky; fallback failed: pipeline step "fallback": ` +
 				`run budget MaxTokens 5 exceeded: 10 tokens spent`,
-			wantRemaining: BudgetRemaining{Duration: math.MaxInt64, ModelCalls: math.MaxInt, Tokens: 5, StepTokens: math.MaxInt},
+			wantRemaining: BudgetRemaining{
+				Duration:   math.MaxInt64,
+				ModelCalls: math.MaxInt,
+				Tokens:     5,
+				StepTokens: math.MaxInt,
+			},
 		},
 	}
 	for _, tt := range tests {
@@ -326,10 +352,15 @@ func TestOnErrorFallbackHasItsOwnStepBudget(t *testing.T) {
 			})
 			model := replyStep("out", "document", tenTokens, calls)
 			var remaining BudgetRemaining
-			fallback := NewStep("fallback", refs(docKey.Ref()), refs(out.Ref()), func(ctx context.Context, s State) error {
-				remaining = BudgetFrom(ctx).Remaining()
-				return model.Run(ctx, s)
-			})
+			fallback := NewStep(
+				"fallback",
+				refs(docKey.Ref()),
+				refs(out.Ref()),
+				func(ctx context.Context, s State) error {
+					remaining = BudgetFrom(ctx).Remaining()
+					return model.Run(ctx, s)
+				},
+			)
 			pipeline, err := PipelineSpec{
 				Inputs: refs(docKey.Ref()),
 				Steps:  []Step{WithPolicy(failing, StepPolicy{OnError: OnErrorFallback(fallback)})},
@@ -354,10 +385,15 @@ func TestOnErrorFallbackHasItsOwnStepBudget(t *testing.T) {
 
 	t.Run("stands in for a step that spent its own tokens", func(t *testing.T) {
 		calls := &atomic.Int32{}
-		cheap := NewStep("cheap", refs(docKey.Ref()), refs(Key[string]{Name: "a"}.Ref()), func(_ context.Context, s State) error {
-			Key[string]{Name: "a"}.Set(s, "cheap")
-			return nil
-		})
+		cheap := NewStep(
+			"cheap",
+			refs(docKey.Ref()),
+			refs(Key[string]{Name: "a"}.Ref()),
+			func(_ context.Context, s State) error {
+				Key[string]{Name: "a"}.Set(s, "cheap")
+				return nil
+			},
+		)
 		pipeline, err := PipelineSpec{
 			Inputs: refs(docKey.Ref()),
 			Steps: []Step{WithPolicy(replyStep("a", "document", tenTokens, calls), StepPolicy{
@@ -413,13 +449,21 @@ func TestRunBudgetBuildErrors(t *testing.T) {
 		budget  RunBudget
 		wantErr string
 	}{
-		{name: "negative duration", budget: RunBudget{MaxDuration: -1}, wantErr: "run budget MaxDuration must not be negative"},
+		{
+			name:    "negative duration",
+			budget:  RunBudget{MaxDuration: -1},
+			wantErr: "run budget MaxDuration must not be negative",
+		},
 		{
 			name:    "negative calls",
 			budget:  RunBudget{MaxModelCalls: -1},
 			wantErr: "run budget MaxModelCalls must not be negative",
 		},
-		{name: "negative tokens", budget: RunBudget{MaxTokens: -1}, wantErr: "run budget MaxTokens must not be negative"},
+		{
+			name:    "negative tokens",
+			budget:  RunBudget{MaxTokens: -1},
+			wantErr: "run budget MaxTokens must not be negative",
+		},
 		{
 			name:    "zero step tokens",
 			budget:  RunBudget{PerStepTokens: map[string]int{"parse": 0}},

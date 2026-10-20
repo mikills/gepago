@@ -206,7 +206,12 @@ func TestBuildFixesOptionalOutputs(t *testing.T) {
 func TestTypedPredictStepWithLateModel(t *testing.T) {
 	note := gepa.Key[string]{Name: "note"}
 	program := &gepa.TypedPredict[typedStepIn, typedStepOut]{}
-	step := gepa.NewProgramStep("s", program, refs(stepQuestion.Ref()), refs(stepAnswer.Ref(), note.Ref(), stepScore.Ref()))
+	step := gepa.NewProgramStep(
+		"s",
+		program,
+		refs(stepQuestion.Ref()),
+		refs(stepAnswer.Ref(), note.Ref(), stepScore.Ref()),
+	)
 	program.LM = replyModel(`{"answer": "a", "note": null, "ref": null, "score": 2}`)
 	pipeline, err := gepa.PipelineSpec{Inputs: refs(stepQuestion.Ref()), Steps: []gepa.Step{step}}.Build()
 	require.NoError(t, err)
@@ -253,8 +258,12 @@ func TestChainOfThoughtStepMayDeclareItsReasoning(t *testing.T) {
 	reasoning := gepa.Key[string]{Name: "reasoning"}
 	answer := gepa.Key[string]{Name: "answer"}
 	program := gepa.ChainOfThought{
-		Signature: gepa.Signature{Name: "qa", Inputs: []gepa.Field{{Name: "document"}}, Outputs: []gepa.Field{{Name: "answer"}}},
-		LM:        replyModel(`{"reasoning": "because", "answer": "a"}`),
+		Signature: gepa.Signature{
+			Name:    "qa",
+			Inputs:  []gepa.Field{{Name: "document"}},
+			Outputs: []gepa.Field{{Name: "answer"}},
+		},
+		LM: replyModel(`{"reasoning": "because", "answer": "a"}`),
 	}
 	for _, writes := range [][]gepa.KeyRef{refs(answer.Ref()), refs(answer.Ref(), reasoning.Ref())} {
 		_, err := gepa.PipelineSpec{
@@ -265,7 +274,9 @@ func TestChainOfThoughtStepMayDeclareItsReasoning(t *testing.T) {
 	}
 	_, err := gepa.PipelineSpec{
 		Inputs: refs(docKey.Ref()),
-		Steps:  []gepa.Step{gepa.NewProgramStep("think", program, refs(docKey.Ref()), refs(answer.Ref(), answer.Ref()))},
+		Steps: []gepa.Step{
+			gepa.NewProgramStep("think", program, refs(docKey.Ref()), refs(answer.Ref(), answer.Ref())),
+		},
 	}.Build()
 	require.EqualError(
 		t,
@@ -307,7 +318,12 @@ func TestPredictOptionalOutputsCommitZeroValues(t *testing.T) {
 		{
 			name:  "optional outputs set",
 			reply: `{"amount": 10, "note": "late", "ref": "r-1", "extra": [1]}`,
-			want:  gepa.Prediction{"amount": 10, "note": "late", "ref": pointerTo("r-1"), "extra": []any{json.Number("1")}},
+			want: gepa.Prediction{
+				"amount": 10,
+				"note":   "late",
+				"ref":    pointerTo("r-1"),
+				"extra":  []any{json.Number("1")},
+			},
 		},
 		{
 			name:  "optional outputs null",

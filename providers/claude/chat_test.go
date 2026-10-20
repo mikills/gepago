@@ -222,7 +222,10 @@ func TestChatReplies(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			lm := testModel(t, messageServer(t, tt.body).URL)
 
-			resp, err := lm.Chat(context.Background(), gepa.ChatRequest{Messages: []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}}})
+			resp, err := lm.Chat(
+				context.Background(),
+				gepa.ChatRequest{Messages: []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}}},
+			)
 
 			require.Equal(t, 7, resp.Usage.TotalTokens, "the usage comes back even with an error")
 			require.Equal(t, tt.wantFinish, resp.FinishReason)

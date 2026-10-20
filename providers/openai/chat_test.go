@@ -134,10 +134,16 @@ func TestChatRequestShape(t *testing.T) {
 		Messages: []gepa.Message{
 			{Role: gepa.RoleSystem, Content: "be brief"},
 			{Role: gepa.RoleUser, Content: "hi"},
-			{Role: gepa.RoleAssistant, Content: "thinking", ToolCalls: []gepa.ToolCall{{ID: "c", Name: "t", Arguments: "{}"}}},
+			{
+				Role:      gepa.RoleAssistant,
+				Content:   "thinking",
+				ToolCalls: []gepa.ToolCall{{ID: "c", Name: "t", Arguments: "{}"}},
+			},
 			{Role: gepa.RoleTool, Content: "out", ToolCallID: "c"},
 		},
-		Tools:          []gepa.Tool{{Name: "open", Description: "open schema", Parameters: json.RawMessage(`{"type":"object"}`)}},
+		Tools: []gepa.Tool{
+			{Name: "open", Description: "open schema", Parameters: json.RawMessage(`{"type":"object"}`)},
+		},
 		ResponseFormat: &gepa.ResponseFormat{Schema: json.RawMessage(`{"type":"object"}`)},
 	})
 	require.NoError(t, err)
@@ -212,8 +218,10 @@ func TestChatReplies(t *testing.T) {
 		},
 		{
 			name: "a custom tool call is an error",
-			body: reply(`{"role":"assistant","tool_calls":[{"id":"c1","type":"custom","custom":{"name":"x","input":"y"}}]}`,
-				"tool_calls"),
+			body: reply(
+				`{"role":"assistant","tool_calls":[{"id":"c1","type":"custom","custom":{"name":"x","input":"y"}}]}`,
+				"tool_calls",
+			),
 			wantErr:    `openai chat completion: unsupported "custom" tool call "c1"`,
 			wantFinish: gepa.FinishToolCalls,
 		},
@@ -227,7 +235,10 @@ func TestChatReplies(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			lm := testModel(t, completionServer(t, tt.body).URL)
 
-			resp, err := lm.Chat(context.Background(), gepa.ChatRequest{Messages: []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}}})
+			resp, err := lm.Chat(
+				context.Background(),
+				gepa.ChatRequest{Messages: []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}}},
+			)
 
 			require.Equal(t, 7, resp.Usage.TotalTokens, "the usage comes back even with an error")
 			require.Equal(t, tt.wantFinish, resp.FinishReason)
