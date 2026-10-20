@@ -20,6 +20,7 @@ import type {
   Signature,
   MetricResult,
 } from "./public-types.ts";
+import { assertWasmAPIVersion } from "./api-version.ts";
 import type {
   LoadedRuntime,
   RuntimeNamespace,
@@ -418,5 +419,6 @@ export async function loadBrowserRuntime(
   await Promise.resolve();
   if (!global.gepagoWasm)
     throw new Error("Gepago WASM module did not register the expected API");
+  assertWasmAPIVersion(global.gepagoWasm.version);
   return createBrowserRuntime(global.gepagoWasm);
 }

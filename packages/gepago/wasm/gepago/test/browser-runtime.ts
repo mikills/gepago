@@ -23,7 +23,7 @@ test("browser runtime reports a failing model callback's message", async () => {
       wasmURL: new URL("gepago.wasm", dist),
       wasmExecURL: new URL("wasm_exec.js", dist),
     });
-    assert.equal(runtime.version(), "2");
+    assert.equal(runtime.version(), "3");
 
     const program = {
       kind: "pipeline",
@@ -103,5 +103,44 @@ test("browser runtime reports a failing model callback's message", async () => {
     assert.equal(result.prediction.label, "positive");
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("browser runtime rejects a module that reports another API version", async () => {
+  const global = globalThis as typeof globalThis & {
+    Go?: unknown;
+    gepagoWasm?: unknown;
+  };
+  const [originalFetch, originalGo, originalNamespace] = [
+    globalThis.fetch,
+    global.Go,
+    global.gepagoWasm,
+  ];
+  // an empty WASM module, run by a Go shim that registers a version-2 API.
+  globalThis.fetch = async () =>
+    new Response(
+      new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]),
+      { headers: { "content-type": "application/wasm" } },
+    );
+  const shim = `const job = () => "";
+globalThis.Go = class {
+  importObject = {};
+  run() {
+    globalThis.gepagoWasm = { version: "2", invoke: job, start: job, startAgent: job, startCapabilities: job, cancel: job };
+    return new Promise(() => {});
+  }
+};`;
+  try {
+    await assert.rejects(
+      loadBrowserRuntime({
+        wasmURL: "https://gepago.invalid/gepago.wasm",
+        wasmExecURL: `data:text/javascript,${encodeURIComponent(shim)}`,
+      }),
+      /reports API version "2", but this wrapper needs version "3"/,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    global.Go = originalGo;
+    global.gepagoWasm = originalNamespace;
   }
 });

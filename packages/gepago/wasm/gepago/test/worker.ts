@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { createGepagoWasmWorker } from "@mikills/wasm/gepago";
 import type { Signature } from "@mikills/wasm/gepago";
@@ -17,8 +20,8 @@ test("worker factory provides independent WASM instances", async () => {
   ]);
   try {
     assert.deepEqual(await Promise.all([first.version(), second.version()]), [
-      "2",
-      "2",
+      "3",
+      "3",
     ]);
     const [a, b] = await Promise.all([
       first.predict(
@@ -85,9 +88,39 @@ test("worker factory provides independent WASM instances", async () => {
   // can be created without relying on the legacy in-process close semantics.
   const replacement = await createGepagoWasmWorker();
   try {
-    assert.equal(await replacement.version(), "2");
+    assert.equal(await replacement.version(), "3");
   } finally {
     replacement.close();
+  }
+});
+
+test("worker rejects a module that reports another API version", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "gepago-version-"));
+  try {
+    const wasmPath = join(directory, "gepago.wasm");
+    const wasmExecPath = join(directory, "wasm_exec.js");
+    // an empty WASM module, run by a Go shim that registers a version-2 API.
+    await writeFile(
+      wasmPath,
+      new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]),
+    );
+    await writeFile(
+      wasmExecPath,
+      `const job = () => "";
+globalThis.Go = class {
+  importObject = {};
+  run() {
+    globalThis.gepagoWasm = { version: "2", invoke: job, start: job, startAgent: job, startCapabilities: job, cancel: job };
+    return new Promise(() => {});
+  }
+};`,
+    );
+    await assert.rejects(
+      createGepagoWasmWorker({ wasmPath, wasmExecPath }),
+      /reports API version "2", but this wrapper needs version "3"/,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
 });
 

@@ -4,6 +4,7 @@ import { readFile as readFileAsync } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
+import { assertWasmAPIVersion } from "./api-version.ts";
 import { connectWorker } from "./worker-client.ts";
 import type {
   AgentChat,
@@ -1740,6 +1741,7 @@ export async function createGepagoWasm(
         "Gepago WASM module did not register the expected gepagoWasm API",
       );
     }
+    assertWasmAPIVersion(namespace.version);
     const invokeFunction = namespace.invoke.bind(namespace);
     const startFunction = namespace.start.bind(namespace);
     const startAgentFunction = namespace.startAgent.bind(namespace);

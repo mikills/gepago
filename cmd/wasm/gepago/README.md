@@ -1,7 +1,7 @@
 # Gepago WASM host API
 
 This command exposes one global `gepagoWasm` namespace. Its `version` is the
-JSON protocol version (`"2"`). The existing `invoke(operation, payloadJSON)`
+JSON protocol version (`"3"`). The existing `invoke(operation, payloadJSON)`
 API returns a JSON envelope:
 
 ```json

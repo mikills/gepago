@@ -96,6 +96,10 @@ For a development command at another path, use
 `wasm_exec.js`; otherwise the package copy is preferred, followed by Go's
 `GOROOT/lib/wasm/wasm_exec.js`.
 
+`version()` returns the WASM API version, `"3"`. Loading fails when a module
+reports another version, so build the WASM from the same release as this
+package.
+
 ## Installation and usage
 
 ```bash
@@ -307,7 +311,7 @@ cancellation. `close()` cancels pending agent and compile jobs.
 
 ## Resumable Predict and limitations
 
-`predict(config, model)` implements the version-2 resumable host protocol. The
+`predict(config, model)` implements the version-3 resumable host protocol. The
 config is `{ program: { kind?: "predict" | "chainOfThought", signature,
 instruction?, demos?, maxParseRetries?, reasoningField? }, inputs }`.
 Chain-of-thought normalization adds the reasoning output and instruction before

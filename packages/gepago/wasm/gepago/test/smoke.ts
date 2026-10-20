@@ -47,7 +47,7 @@ test("loads generated Go WASM and exposes deterministic APIs", async () => {
       sentinelGo,
       "wasm_exec Go constructor must be restored",
     );
-    assert.equal(gepago.version(), "2");
+    assert.equal(gepago.version(), "3");
     assert.equal(
       gepago.parsePrediction('```json\n{"label":"positive"}\n```').label,
       "positive",

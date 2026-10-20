@@ -4,3 +4,5 @@ use (
 	.
 	./programs/crucible
 )
+
+replace github.com/mikills/gepago v0.8.0 => ./

@@ -110,6 +110,13 @@ The project follows semantic versioning once public tags are published.
 - A WASM async job (`compile`, `runAgent`, capability jobs) that fails before its first host call reports its error instead of "completed with an unexpected job id": the module now calls `onComplete` from a later JavaScript task, after `start` has returned the job id.
 - In Node, a `compile` model callback that throws or rejects fails that model call with its message, as in the browser, so `compile` rejects with the host's error instead of `WASM job "job-1" cancelled`; only `close()` cancels a pending job. A pipeline's `runCompiled` reports host errors the same way.
 
+### Dependencies
+
+- Go modules move to their newest releases that support Go 1.25: `anthropic-sdk-go` v1.82.0, `openai-go/v3` v3.74.0, `testify` v1.12.1, `golang.org/x/sync` v0.22.0 and, in crucible, `jsonschema/v6` v6.0.3. The Makefile pins modernize v0.49.0.
+- Crucible requires `github.com/mikills/gepago` v0.8.0.
+- The npm package `@mikills/wasm` is 0.2.0 and builds with TypeScript 7.
+- The WASM API version is `"3"`, and the JS loaders reject a module that reports another version: a module and JS wrapper must come from the same release.
+
 ## v0.7.0
 
 ### Breaking changes
