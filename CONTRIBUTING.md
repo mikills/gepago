@@ -32,6 +32,19 @@ ANTHROPIC_API_KEY=... go test -tags=e2e ./providers/claude -run TestProposerE2E 
 
 Never commit API keys, reports, `.diago` output, or local notes.
 
+## Releases
+
+The root module and `programs/crucible` are tagged separately, as `vX.Y.Z` and
+`programs/crucible/vX.Y.Z`. When crucible requires a root version that is not tagged yet,
+`go.work` replaces that version with the workspace module so the workspace builds. Release in
+this order:
+
+1. Tag the root module: `make release VERSION=vX.Y.Z`.
+2. In `programs/crucible`, run `GOWORK=off go mod tidy` to add the new version's `go.sum`
+   lines, remove the `replace` for it from `go.work`, and commit both.
+3. Tag crucible: `make release-crucible VERSION=vA.B.C`. The target and the release-crucible
+   workflow test crucible with `GOWORK=off` on that commit, so they fail until step 2 is in.
+
 ## Design guidelines
 
 - Keep the root package provider-neutral and independent of the optional agent runtime.

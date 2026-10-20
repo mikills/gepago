@@ -36,7 +36,7 @@ The project follows semantic versioning once public tags are published.
 
 #### Pipelines and evaluation
 
-- These structs gain fields, so unkeyed struct literals of them break: `Usage` (`ReasoningTokens`, `CachedInputTokens`, `CacheCreationTokens`), `Field` (`Type`, `Schema`, `Optional`), `Predict` (`Tools`, `MaxToolTurns`, `Middleware`, `ToolRegistry`, `ToolPolicy`), `PipelineSpec` (`Defaults`, `Budget`, `Tools`, `ToolPolicy`, `Observers`, `Redactor`), `CompileConfig` and `ProgramTrainConfig` (`DatasetBuilder`), `ProgramEvaluator` (`RecordTraces`), `StepError` (`Reads`), `ProgramArtifact` (`Fingerprint`), `agents.Agent` (`Middleware`, `ToolNames`, `ToolPolicy`, `ToolRegistry`), `agents.ToolCallRecord` (`Cached`), and the provider `Config`s (`Logger`, and `Client` on OpenAI's).
+- These structs gain fields, so unkeyed struct literals of them break: `Usage` (`ReasoningTokens`, `CachedInputTokens`, `CacheCreationTokens`), `Field` (`Type`, `Schema`, `Optional`), `Predict` (`Tools`, `MaxToolTurns`, `Middleware`, `ToolRegistry`, `ToolPolicy`), `PipelineSpec` (`Defaults`, `Budget`, `Tools`, `ToolPolicy`, `Observers`, `Redactor`), `CompileConfig` and `ProgramTrainConfig` (`DatasetBuilder`), `ProgramEvaluator` (`RecordTraces`), `StepError` (`Reads`), `ProgramArtifact` (`Fingerprint`), `agents.Agent` (`Middleware`, `ToolNames`, `ToolPolicy`, `ToolRegistry`), `agents.ToolCallRecord` (`Cached`), and the provider `Config`s (`Logger`, `Client` on OpenAI's and `OpenTelemetry` on Claude's).
 - `StepError.Err` is the step's own error, not a one-element `errors.Join`; messages and `errors.Is` are unchanged.
 - A failing top-level merge is a failed step execution.
 - The `ProgramEvaluator` record for an invalid output gains `step` and `reads` keys, which `DefaultReflectiveDatasetBuilder` passes to reflection.
@@ -57,6 +57,7 @@ The project follows semantic versioning once public tags are published.
 - Errors are classified: 4xx is permanent except 429; 429, 5xx, network errors, HTTP/2 stream resets and GOAWAY are transient; TLS, unknown-host, bad-URL and bad-address errors are permanent; other unrecognised transport errors are unclassified. Context errors are returned bare, and pi's error text changed.
 - Google `CompletionTokens` includes `thoughtsTokenCount`, its error text shows `REDACTED` in place of the API key, and its chat sends `parametersJsonSchema` and `responseJsonSchema`, drops the response format when tools are present, merges consecutive tool results and sends function-call ids.
 - Claude's `model_context_window_exceeded` maps to `length`.
+- OpenAI no longer follows a redirect to another origin: openai-go refuses it with "request URL origin must match the configured base URL", which the provider classifies as permanent.
 
 #### Artefacts
 
@@ -113,6 +114,8 @@ The project follows semantic versioning once public tags are published.
 ### Dependencies
 
 - Go modules move to their newest releases that support Go 1.25: `anthropic-sdk-go` v1.82.0, `openai-go/v3` v3.74.0, `testify` v1.12.1, `golang.org/x/sync` v0.22.0 and, in crucible, `jsonschema/v6` v6.0.3. The Makefile pins modernize v0.49.0.
+- The SDKs bring new indirect dependencies into the build: OpenTelemetry (`go.opentelemetry.io/otel`, `otel/metric`, `otel/trace`, `auto/sdk`), `go-logr/logr` and `go-logr/stdr`, `cespare/xxhash/v2`, `pb33f/go-yaml` and `pb33f/ordered-map/v2`, `coder/websocket` and `go.yaml.in/yaml/v3`, while `mailru/easyjson` and `wk8/go-ordered-map/v2` drop out. The module graph also gains modules the build never loads, such as `otel/sdk` and `creack/pty`. The library adds no direct dependency; the Claude provider's tests import the OpenTelemetry API.
+- `anthropic-sdk-go` traces every call through the global OpenTelemetry provider by default. The Claude provider turns that off, as in v0.7; `Config.OpenTelemetry` turns it on, and the SDK's content mode then puts prompts and replies in spans, past the `Redactor`.
 - Crucible requires `github.com/mikills/gepago` v0.8.0.
 - The npm package `@mikills/wasm` is 0.2.0 and builds with TypeScript 7.
 - The WASM API version is `"3"`, and the JS loaders reject a module that reports another version: a module and JS wrapper must come from the same release.

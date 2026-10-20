@@ -210,6 +210,24 @@ func TestGenerateClassifiesErrors(t *testing.T) {
 		defer server.Close()
 		require.ErrorContains(t, generate(context.Background(), server.URL, nil), "openai reflection completion")
 	})
+	t.Run("a redirect to another origin is permanent", func(t *testing.T) {
+		var redirected atomic.Int32
+		elsewhere := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			redirected.Add(1)
+		}))
+		defer elsewhere.Close()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, elsewhere.URL+r.URL.Path, http.StatusTemporaryRedirect)
+		}))
+		defer server.Close()
+
+		err := generate(context.Background(), server.URL, nil)
+
+		require.True(t, gepa.IsPermanent(err), "err = %v", err)
+		require.ErrorContains(t, err, "openai reflection completion: ")
+		require.ErrorContains(t, err, "request URL origin must match the configured base URL")
+		require.Zero(t, redirected.Load(), "the SDK does not follow the redirect")
+	})
 }
 
 func TestRetryingLanguageModelIsTheOnlyRetryLayer(t *testing.T) {

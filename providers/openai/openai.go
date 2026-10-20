@@ -93,8 +93,9 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 
 // Generate sends a prompt and returns the model's reply with its usage, resolved model and
 // finish reason. Failures are classified: 429, 5xx, dropped connections and network
-// timeouts are transient; other 4xx and TLS, host or URL misconfiguration are permanent; a
-// cancelled or expired ctx returns ctx.Err() unwrapped. A reply that fails after the API
+// timeouts are transient; other 4xx, TLS, host or URL misconfiguration and a redirect to
+// another origin, which the SDK refuses to follow, are permanent; a cancelled or expired ctx
+// returns ctx.Err() unwrapped. A reply that fails after the API
 // reported usage returns that usage with the error. A refusal is not an error: it returns the
 // refusal as the text with FinishContentFilter. An empty reply is an error unless it stopped at
 // the token limit or under a content policy.
@@ -201,13 +202,23 @@ func classifyError(ctx context.Context, err error) error {
 	return classifyErrorAs(ctx, "openai reflection completion", err)
 }
 
+// originRejection is the SDK's message for a request, such as a followed redirect, that leaves
+// the configured base URL's origin. Its error type is internal to the SDK, so the text is
+// matched.
+const originRejection = "request URL origin must match the configured base URL"
+
 func classifyErrorAs(ctx context.Context, operation string, err error) error {
 	status := 0
 	var apiErr *openai.Error
 	if errors.As(err, &apiErr) {
 		status = apiErr.StatusCode
 	}
-	return providererr.Classify(ctx, status, fmt.Errorf("%s: %w", operation, err))
+	wrapped := fmt.Errorf("%s: %w", operation, err)
+	if status == 0 && ctx.Err() == nil && strings.Contains(err.Error(), originRejection) {
+		// the base URL redirects elsewhere, which a retry cannot fix.
+		return gepa.PermanentError(wrapped)
+	}
+	return providererr.Classify(ctx, status, wrapped)
 }
 
 // Chat sends one chat completion with the request's messages, tools and response format,

@@ -460,6 +460,8 @@ lm, err := gepaclaude.NewLanguageModel(gepaclaude.Config{
 })
 ```
 
+The Anthropic SDK's OpenTelemetry tracing is off. `OpenTelemetry: true` turns it on: a span per call through the global tracer provider and a `traceparent` header, with prompts and replies in the spans when `ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE=content`, which bypasses a pipeline's `Redactor`.
+
 Google/Gemini supports both `Generator` and `ChatClient` for tool-calling agents and steps:
 
 ```go

@@ -692,12 +692,14 @@ func TestAgentSubjectUsageBreakdown(t *testing.T) {
 			decode: decodeAnthropicResponse,
 			body: `{"model":"m","content":[{"type":"text","text":"x"}],"stop_reason":"end_turn",
 				"usage":{"input_tokens":10,"output_tokens":30,
-				"cache_read_input_tokens":200,"cache_creation_input_tokens":50}}`,
+				"cache_read_input_tokens":200,"cache_creation_input_tokens":50,
+				"output_tokens_details":{"thinking_tokens":12}}}`,
 			// input_tokens excludes the cached part, so PromptTokens adds it back.
 			want: gepa.Usage{
 				PromptTokens:        260,
 				CompletionTokens:    30,
 				TotalTokens:         290,
+				ReasoningTokens:     12,
 				CachedInputTokens:   200,
 				CacheCreationTokens: 50,
 			},

@@ -135,17 +135,21 @@ type anthropicUsage struct {
 	OutputTokens             int `json:"output_tokens"`
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	OutputTokensDetails      struct {
+		ThinkingTokens int `json:"thinking_tokens"`
+	} `json:"output_tokens_details"`
 }
 
 // gepaUsage maps Anthropic usage as the claude provider does: input_tokens excludes the
-// cached part, so PromptTokens adds cache reads and writes back. Anthropic does not report
-// reasoning tokens apart from output_tokens.
+// cached part, so PromptTokens adds cache reads and writes back, and ReasoningTokens is
+// output_tokens_details.thinking_tokens, the part of output_tokens spent on extended thinking.
 func (u anthropicUsage) gepaUsage() gepa.Usage {
 	prompt := u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
 	return gepa.Usage{
 		PromptTokens:        prompt,
 		CompletionTokens:    u.OutputTokens,
 		TotalTokens:         prompt + u.OutputTokens,
+		ReasoningTokens:     u.OutputTokensDetails.ThinkingTokens,
 		CachedInputTokens:   u.CacheReadInputTokens,
 		CacheCreationTokens: u.CacheCreationInputTokens,
 	}

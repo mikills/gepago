@@ -87,19 +87,20 @@ func TestGenerateMapsUsageBreakdown(t *testing.T) {
 		"content":[{"type":"text","text":"ok"}],
 		"usage":{
 			"input_tokens":10,"output_tokens":30,
-			"cache_read_input_tokens":200,"cache_creation_input_tokens":50
+			"cache_read_input_tokens":200,"cache_creation_input_tokens":50,
+			"output_tokens_details":{"thinking_tokens":12}
 		}
 	}`)
 
 	got, err := testModel(t, server.URL).Generate(context.Background(), "prompt")
 
 	require.NoError(t, err)
-	// ReasoningTokens stays zero: Claude counts extended-thinking tokens inside output_tokens
-	// and does not report them separately.
+	// output_tokens includes the thinking tokens, which ReasoningTokens breaks out.
 	require.Equal(t, gepa.Usage{
 		PromptTokens:        260,
 		CompletionTokens:    30,
 		TotalTokens:         290,
+		ReasoningTokens:     12,
 		CachedInputTokens:   200,
 		CacheCreationTokens: 50,
 	}, got.Usage)

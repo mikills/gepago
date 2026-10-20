@@ -32,6 +32,13 @@ type Config struct {
 	// reply. A call that panics, such as in a custom transport, is logged as a failure before
 	// the panic continues. Nil logs nothing.
 	Logger *slog.Logger
+	// OpenTelemetry turns on the Anthropic SDK's tracing: a client span for each call, through
+	// the TracerProvider and propagator registered with the OpenTelemetry API, and a traceparent
+	// header on the request, subject to the SDK's ANTHROPIC_OPEN_TELEMETRY* environment
+	// variables. With ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE=content the spans carry the
+	// prompts and replies, which bypasses a pipeline's Redactor. False, the default, sends no
+	// spans and no trace headers, whatever the environment says.
+	OpenTelemetry bool
 }
 
 // Validate checks the provider configuration.
@@ -66,6 +73,9 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 		option.WithoutEnvironmentDefaults(),
 		option.WithAPIKey(config.APIKey),
 		option.WithMaxRetries(0),
+	}
+	if !config.OpenTelemetry {
+		opts = append(opts, option.WithoutOpenTelemetry())
 	}
 	if strings.TrimSpace(config.BaseURL) != "" {
 		opts = append(opts, option.WithBaseURL(config.BaseURL))
@@ -392,14 +402,15 @@ func claudeInputSchema(schema json.RawMessage) (anthropic.ToolInputSchemaParam, 
 }
 
 // claudeUsage maps message usage. Claude reports input_tokens without the cached part, so
-// PromptTokens adds cache reads and writes back. ReasoningTokens stays zero: Claude counts
-// extended-thinking tokens inside output_tokens and does not report them separately.
+// PromptTokens adds cache reads and writes back. ReasoningTokens is
+// output_tokens_details.thinking_tokens, the part of output_tokens spent on extended thinking.
 func claudeUsage(usage anthropic.Usage) gepa.Usage {
 	prompt := usage.InputTokens + usage.CacheCreationInputTokens + usage.CacheReadInputTokens
 	return gepa.Usage{
 		PromptTokens:        int(prompt),
 		CompletionTokens:    int(usage.OutputTokens),
 		TotalTokens:         int(prompt + usage.OutputTokens),
+		ReasoningTokens:     int(usage.OutputTokensDetails.ThinkingTokens),
 		CachedInputTokens:   int(usage.CacheReadInputTokens),
 		CacheCreationTokens: int(usage.CacheCreationInputTokens),
 	}
