@@ -42,9 +42,11 @@ func WithUsageCollector(ctx context.Context) (context.Context, *UsageCollector) 
 
 // RecordUsage adds usage to the collector carried by ctx, if there is one, and counts it
 // against the RunBudget of the pipeline run in ctx. Predict, LLMJudgeMetric and other model
-// consumers call it once for every model call, failed calls included; a custom Program or
-// Metric that calls a Generator directly should do the same so its usage reaches
-// CompiledProgram.RunWithUsage, ProgramEvaluator and the run budget.
+// consumers call it once for every model call, failed calls included, and a ToolSession once
+// for every call that invokes its tool, with ToolResult.Usage; a custom Program or Metric that
+// calls a Generator directly should do the same so its usage reaches
+// CompiledProgram.RunWithUsage, ProgramEvaluator and the run budget. Usage that must not count
+// against the budget is recorded with RecordUnbudgetedUsage instead.
 func RecordUsage(ctx context.Context, usage Usage) {
 	collector, _ := ctx.Value(usageCollectorKey{}).(*UsageCollector)
 	collector.Add(usage)
@@ -170,8 +172,8 @@ const (
 )
 
 // UsageSpan records timing and usage for one measured operation. Unbudgeted is the usage the
-// operation recorded with RecordUnbudgetedUsage, which Usage does not include; only pipeline
-// run and step spans report it.
+// operation recorded with RecordUnbudgetedUsage, which Usage does not include; pipeline run
+// and step spans and an agent's run and tool call spans report it.
 type UsageSpan struct {
 	ID         string         `json:"id"`
 	ParentID   string         `json:"parent_id,omitempty"`

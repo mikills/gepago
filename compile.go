@@ -50,8 +50,9 @@ func (p CompiledProgram) Run(ctx context.Context, inputs Prediction) (Prediction
 	return prediction, err
 }
 
-// RunWithUsage executes the compiled programme and returns the usage its model calls recorded
-// with RecordUsage, failed calls included.
+// RunWithUsage executes the compiled programme and returns its usage: what its model and tool
+// calls recorded with RecordUsage, which counts against a budget, plus what its tool calls
+// recorded with RecordUnbudgetedUsage, which does not, failed calls included.
 func (p CompiledProgram) RunWithUsage(ctx context.Context, inputs Prediction) (Prediction, Usage, error) {
 	runCtx, collector := WithUsageCollector(ctx)
 	prediction, err := p.Program.RunCandidate(runCtx, p.Candidate, inputs)
@@ -157,7 +158,10 @@ func (c CompileConfig) Validate() error {
 // An example whose run fails with ErrInvalidOutput scores zero instead of failing the
 // evaluation; when a pipeline step produced the output, the item's SideInfo names the step
 // under "step" and holds its StepError.Details under "details" and copies of the values it
-// read under "reads", so DefaultReflectiveDatasetBuilder passes them to reflection.
+// read under "reads", so DefaultReflectiveDatasetBuilder passes them to reflection. The
+// result's Usage sums what the programme's and the Metric's calls recorded with RecordUsage
+// and RecordUnbudgetedUsage, budgeted and unbudgeted together, as CompiledProgram.RunWithUsage
+// does.
 type ProgramEvaluator struct {
 	Program Program
 	Metric  Metric

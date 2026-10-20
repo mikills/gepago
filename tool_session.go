@@ -341,7 +341,7 @@ func (s *ToolSession) Call(ctx context.Context, call ToolCall) (ToolResult, Tool
 	if stage != nil {
 		memory = stage
 	}
-	call.Scope = toolScopeFrom(ctx)
+	call.Scope = ToolScopeFrom(ctx)
 	start := time.Now()
 	result, err := s.invoke(WithToolMemory(ctx, memory), call)
 	record.Duration = time.Since(start)

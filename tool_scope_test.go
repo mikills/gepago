@@ -348,3 +348,68 @@ func TestToolScopeJSONForm(t *testing.T) {
 	require.NoError(t, err)
 	require.JSONEq(t, `{"id":"1","name":"t","arguments":"{}","scope":{"tenant":"acme"}}`, string(data))
 }
+
+func TestToolScopeFrom(t *testing.T) {
+	require.Nil(t, ToolScopeFrom(context.Background()), "a context without a scope")
+	scoped := WithToolScope(context.Background(), tenantScope{Tenant: "acme"})
+	require.Equal(t, tenantScope{Tenant: "acme"}, ToolScopeFrom(scoped))
+	require.Equal(t, "other", ToolScopeFrom(WithToolScope(scoped, "other")), "a scope replaces the one before")
+	require.Nil(t, ToolScopeFrom(WithToolScope(scoped, nil)), "a nil scope removes it")
+}
+
+func TestToolScopeReachesATypedToolsContext(t *testing.T) {
+	tests := []struct {
+		name string
+		ctx  context.Context
+		want any
+	}{
+		{
+			name: "a run with a scope",
+			ctx:  WithToolScope(context.Background(), tenantScope{Tenant: "acme"}),
+			want: tenantScope{Tenant: "acme"},
+		},
+		{name: "a run without a scope", ctx: context.Background()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var scopes []any
+			lookup := func(ctx context.Context, _ lookupArgs) (orderStatus, error) {
+				scopes = append(scopes, ToolScopeFrom(ctx))
+				return orderStatus{Status: "shipped", Carrier: "DHL"}, nil
+			}
+			registry, err := NewToolRegistry(NewTool("lookup_order", "Look up an order", lookup))
+			require.NoError(t, err)
+			pipeline, err := toolPipeline(registry, ToolPolicy{},
+				ToolStep("lookup", "lookup_order", refs(orderIDKey.Ref()), refs(statusKey.Ref(), carrierKey.Ref())))
+			require.NoError(t, err)
+
+			_, err = pipeline.Run(tt.ctx, NewState(Prediction{"order_id": "A-1"}))
+
+			require.NoError(t, err)
+			require.Equal(t, []any{tt.want}, scopes, "the ToolStep's typed tool reads the run's scope")
+		})
+	}
+}
+
+func TestNewToolContextCarriesTheCallsScope(t *testing.T) {
+	got := any("unset")
+	tool := NewTool("lookup_order", "Look up an order", func(ctx context.Context, _ lookupArgs) (orderStatus, error) {
+		got = ToolScopeFrom(ctx)
+		return orderStatus{Status: "shipped"}, nil
+	})
+	decoded := map[string]any{"tenant": "acme"}
+
+	_, err := tool.Invoke(
+		context.Background(),
+		ToolCall{Name: "lookup_order", Arguments: `{"order_id":"A-1"}`, Scope: decoded},
+	)
+	require.NoError(t, err)
+	require.Equal(t, decoded, got, "a remote host's decoded call gives fn its scope")
+
+	_, err = tool.Invoke(
+		WithToolScope(context.Background(), "stale"),
+		ToolCall{Name: "lookup_order", Arguments: `{"order_id":"A-1"}`},
+	)
+	require.NoError(t, err)
+	require.Nil(t, got, "fn sees the call's scope, never one the call does not carry")
+}

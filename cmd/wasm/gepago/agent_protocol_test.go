@@ -134,6 +134,44 @@ func TestAgentHostToolCallScopeIsIgnored(t *testing.T) {
 	}
 }
 
+func TestAgentHostInitialToolCallScopeIsIgnored(t *testing.T) {
+	messages := `[{"role":"user","content":"hi"},{"role":"assistant","tool_calls":[{"id":"call-0",` +
+		`"name":"lookup","arguments":"{}","scope":{"tenant":"host-scope"}}]},` +
+		`{"role":"tool","content":"found","tool_call_id":"call-0"}]`
+	for _, key := range []string{"messages", "initial_messages"} {
+		t.Run(key, func(t *testing.T) {
+			payload := `{"name":"a","model":"m","run_id":"r","` + key + `":` + messages + `,` +
+				`"tools":[{"name":"lookup","description":"look up a value","parameters":{"type":"object"}}]}`
+			var requests []string
+			callbacks := agentHostCallbacks{
+				chat: func(_ context.Context, requestJSON string) (string, error) {
+					requests = append(requests, requestJSON)
+					return `{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}`, nil
+				},
+			}
+
+			result, err := runAgentOperation(context.Background(), payload, callbacks)
+			if err != nil {
+				t.Fatalf("runAgentOperation error = %v", err)
+			}
+
+			if len(requests) != 1 {
+				t.Fatalf("sent %d chat requests, want 1", len(requests))
+			}
+			if !strings.Contains(requests[0], `"id":"call-0"`) || strings.Contains(requests[0], "host-scope") {
+				t.Fatalf("request = %s, want the initial tool call without the host's scope", requests[0])
+			}
+			encoded, err := json.Marshal(result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(encoded), "host-scope") {
+				t.Fatalf("result = %s, want a transcript without the host's scope", encoded)
+			}
+		})
+	}
+}
+
 func TestAgentHostChatRequestToolSchemas(t *testing.T) {
 	payload := `{"name":"a","model":"m","run_id":"r","messages":[{"role":"user","content":"hi"}],"tools":[` +
 		`{"name":"now","description":"current time","parameters":{}},` +

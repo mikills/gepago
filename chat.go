@@ -33,9 +33,10 @@ type Message struct {
 //
 // Scope is the caller's scope for the run, set with WithToolScope, such as the tenant or user
 // a tool must act for. A ToolSession sets it on the call it passes to ToolProvider.Invoke, so
-// the call stays plain data that a remote tool host can serve; read it with ScopeAs. The model
-// never sees it: a transcript's tool calls, the session's cache keys, ToolCallRecords, traces
-// and reports leave it out.
+// the call stays plain data that a remote tool host can serve; read it with ScopeAs, or with
+// ToolScopeFrom in a NewTool function or an agent's ToolBinding handler. The model never sees
+// it: a transcript's tool calls, the session's cache keys, ToolCallRecords, traces and reports
+// leave it out.
 type ToolCall struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`

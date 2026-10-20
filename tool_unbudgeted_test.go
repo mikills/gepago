@@ -290,6 +290,30 @@ func TestUnbudgetedUsageInAPredictToolLoop(t *testing.T) {
 	require.Equal(t, Usage{TotalTokens: 81}, usage)
 }
 
+func TestProgramEvaluatorUsageIncludesUnbudgetedUsage(t *testing.T) {
+	calls := &atomic.Int32{}
+	registry, err := NewToolRegistry(
+		billedTool("lookup_order", calls, Usage{TotalTokens: 1}, Usage{TotalTokens: 50}, nil),
+	)
+	require.NoError(t, err)
+	predict := Predict{
+		Signature: orderSignature,
+		LM: newScriptedChat(
+			toolCallReply("call-1", "lookup_order", `{}`, Usage{TotalTokens: 10}),
+			textReply(orderAnswer, Usage{TotalTokens: 20}),
+		),
+		Tools:        []string{"lookup_order"},
+		ToolRegistry: registry,
+	}
+	evaluator := ProgramEvaluator{Program: predict, Metric: ExactMatchMetric{Fields: []string{"status"}}}
+	examples := []Example{NewIOExample("1", Prediction{"question": "?"}, Prediction{"status": "shipped"})}
+
+	eval, err := evaluator.Evaluate(context.Background(), predict.SeedCandidate(), examples, false)
+
+	require.NoError(t, err)
+	require.Equal(t, Usage{TotalTokens: 81}, eval.Usage, "budgeted and unbudgeted together")
+}
+
 func TestRecordUnbudgetedUsage(t *testing.T) {
 	t.Run("without a collector or a run", func(t *testing.T) {
 		require.NotPanics(t, func() { RecordUnbudgetedUsage(context.Background(), Usage{TotalTokens: 5}) })

@@ -116,7 +116,9 @@ func (p Provenance) Validate() error {
 // rules Key.Get uses, and arguments that do not decode, or that Args' Validate method rejects,
 // fail the call with ErrInvalidToolArguments without running fn. fn's Out is encoded as JSON
 // into ToolResult.Output; the transcript text is that JSON, or the string itself when Out is
-// a string.
+// a string. fn's context carries the call's Scope in place of any scope it had, so
+// ToolScopeFrom(ctx) returns the run's scope (see WithToolScope), or the decoded scope of a
+// call a remote tool host serves.
 //
 // A schema that cannot be derived, an empty name or description, or a nil fn is reported by
 // the tool's Validate method, so ToolRegistry.Register rejects the tool.
@@ -159,7 +161,8 @@ func (t *typedTool[Args, Out]) Validate() error {
 	return t.schema.Validate()
 }
 
-// Invoke decodes the arguments into Args, runs the function and encodes its result.
+// Invoke decodes the arguments into Args, runs the function with a context that carries the
+// call's scope and encodes its result.
 func (t *typedTool[Args, Out]) Invoke(ctx context.Context, call ToolCall) (ToolResult, error) {
 	if err := t.Validate(); err != nil {
 		return ToolResult{}, err
@@ -168,7 +171,7 @@ func (t *typedTool[Args, Out]) Invoke(ctx context.Context, call ToolCall) (ToolR
 	if err != nil {
 		return ToolResult{}, PermanentError(fmt.Errorf("%w: %w", ErrInvalidToolArguments, err))
 	}
-	out, err := t.fn(ctx, args)
+	out, err := t.fn(WithToolScope(ctx, call.Scope), args)
 	if err != nil {
 		return ToolResult{}, err
 	}

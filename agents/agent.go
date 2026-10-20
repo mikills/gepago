@@ -21,7 +21,8 @@ const defaultMaxTurns = 10
 // ToolPolicy applies to all of them, a panicking tool fails the run with an error instead of
 // crashing it, and every call is recorded in RunResult.ToolCalls. The memory writes of a
 // registry tool's successful call are stored in the run's Memory; a failed call's are dropped.
-// The tool's usage is added to the run's and recorded with gepa.RecordUsage.
+// A tool's usage is recorded with gepa.RecordUsage and its gepa.ToolResult.UnbudgetedUsage with
+// gepa.RecordUnbudgetedUsage, which counts against no budget; both are added to the run's.
 //
 // Every chat call is admitted with gepa.AdmitModelCall before it is made and its usage, a
 // failed call's included, recorded once with gepa.RecordUsage, so an agent run inside a
@@ -137,7 +138,8 @@ func (a *Agent) toolNames() []string {
 	return slices.DeleteFunc(names, func(name string) bool { return !a.ToolPolicy.Allows(name) })
 }
 
-// bindingTool runs a ToolBinding as a gepa.ToolProvider; its handler gets the run's Memory.
+// bindingTool runs a ToolBinding as a gepa.ToolProvider; its handler gets the run's Memory and
+// a context that carries the call's scope.
 type bindingTool struct {
 	binding ToolBinding
 }
@@ -148,17 +150,20 @@ func (t bindingTool) Schema() Tool {
 
 func (t bindingTool) Invoke(ctx context.Context, call ToolCall) (gepa.ToolResult, error) {
 	memory, _ := MemoryFromContext(ctx)
-	output, err := t.binding.Handler(ctx, memory, call.Arguments)
+	output, err := t.binding.Handler(gepa.WithToolScope(ctx, call.Scope), memory, call.Arguments)
 	return gepa.ToolResult{Text: output}, err
 }
 
-// ToolBinding pairs a tool schema with its Go handler.
+// ToolBinding pairs a tool schema with its Go handler. The handler's context carries the scope
+// of the call it serves, which is the run's scope (see gepa.WithToolScope); read it with
+// gepa.ToolScopeFrom.
 type ToolBinding struct {
 	Definition Tool
 	Handler    ToolHandler
 }
 
-// ToolHandler executes a tool call with JSON arguments and returns text output.
+// ToolHandler executes a tool call with JSON arguments and returns text output. Its context
+// carries the run's tool scope; see ToolBinding.
 type ToolHandler func(ctx context.Context, mem *Memory, arguments string) (string, error)
 
 // RunRequest configures one agent run.
@@ -179,6 +184,11 @@ func (r RunRequest) Validate() error {
 }
 
 // RunResult is the transcript, stop reason, usage, and tool calls from an agent run.
+//
+// Usage and Ledger count the usage of the run's successful chat calls and of its tool calls,
+// their unbudgeted usage included, as gepa.CompiledProgram.RunWithUsage does; Ledger counts
+// failed chat calls too. The run span and each tool call span report the unbudgeted usage in
+// Unbudgeted, apart from Usage.
 type RunResult struct {
 	Final          Message          `json:"final"`
 	Transcript     []Message        `json:"transcript"`
@@ -240,6 +250,11 @@ type agentRun struct {
 	runSpan  gepa.UsageSpan
 	result   RunResult
 	maxTurns int
+	// budgeted and unbudgeted are the parts of result.Usage that the run span reports apart:
+	// what the run's successful chat calls and its tool calls spent against a budget, and what
+	// its tool calls reported as ToolResult.UnbudgetedUsage.
+	budgeted   Usage
+	unbudgeted Usage
 }
 
 func (a *Agent) newRun(ctx context.Context, req RunRequest) (*agentRun, error) {
@@ -388,7 +403,7 @@ func (r *agentRun) chatRequest(turn int) ChatRequest {
 
 func (r *agentRun) recordChatResponse(turn int, resp ChatResponse) {
 	r.result.Turns = turn
-	r.result.Usage = r.result.Usage.Add(resp.Usage)
+	r.addUsage(resp.Usage, Usage{})
 	r.result.Transcript = append(r.result.Transcript, resp.Message)
 	if model := strings.TrimSpace(resp.ResolvedModel); model != "" && !slices.Contains(r.result.ResolvedModels, model) {
 		r.result.ResolvedModels = append(r.result.ResolvedModels, model)
@@ -438,24 +453,25 @@ func (r *agentRun) executeToolCall(turn int, call ToolCall, final Message) error
 	record.Duration = called.Duration
 	record.Output = called.Text
 	record.Cached = called.Cached
-	r.result.Usage = r.result.Usage.Add(called.Usage)
-	r.result.Ledger = r.result.Ledger.AddUsage(called.Usage)
+	r.addUsage(called.Usage, called.UnbudgetedUsage)
+	r.result.Ledger = r.result.Ledger.AddUsage(called.Usage).AddUsage(called.UnbudgetedUsage)
 	if callErr != nil {
 		return r.finishToolError(
 			toolErrorDetails{
-				turn:     turn,
-				final:    final,
-				record:   record,
-				span:     toolSpan,
-				usage:    called.Usage,
-				cause:    callErr,
-				returned: fmt.Errorf("agent %q %w", r.agent.Name, callErr),
+				turn:       turn,
+				final:      final,
+				record:     record,
+				span:       toolSpan,
+				usage:      called.Usage,
+				unbudgeted: called.UnbudgetedUsage,
+				cause:      callErr,
+				returned:   fmt.Errorf("agent %q %w", r.agent.Name, callErr),
 			},
 		)
 	}
 	r.result.ToolCalls = append(r.result.ToolCalls, record)
 	r.result.Ledger.ToolCalls++
-	r.result.Spans = append(r.result.Spans, toolSpan.Finish(called.Usage, nil))
+	r.result.Spans = append(r.result.Spans, finishSpan(toolSpan, called.Usage, called.UnbudgetedUsage, nil))
 	r.result.Transcript = append(
 		r.result.Transcript,
 		Message{Role: RoleTool, Content: called.Text, ToolCallID: call.ID},
@@ -475,13 +491,14 @@ func (r *agentRun) executeToolCall(turn int, call ToolCall, final Message) error
 }
 
 type toolErrorDetails struct {
-	turn     int
-	final    Message
-	record   ToolCallRecord
-	span     gepa.UsageSpan
-	usage    Usage
-	cause    error
-	returned error
+	turn       int
+	final      Message
+	record     ToolCallRecord
+	span       gepa.UsageSpan
+	usage      Usage
+	unbudgeted Usage
+	cause      error
+	returned   error
 }
 
 func (r *agentRun) finishToolError(details toolErrorDetails) error {
@@ -490,7 +507,10 @@ func (r *agentRun) finishToolError(details toolErrorDetails) error {
 	r.result.Ledger.ToolCalls++
 	r.result.StopReason = StopToolError
 	r.result.Final = details.final
-	r.result.Spans = append(r.result.Spans, details.span.Finish(details.usage, details.cause))
+	r.result.Spans = append(
+		r.result.Spans,
+		finishSpan(details.span, details.usage, details.unbudgeted, details.cause),
+	)
 	r.finishRun(details.turn, details.cause)
 	r.agent.fireToolCallEvent(
 		r.ctx,
@@ -517,9 +537,27 @@ func (r *agentRun) finishMaxTurns() {
 	r.finishRun(r.result.Turns, nil)
 }
 
+// addUsage adds a call's usage to the run's: budgeted is what counted against a budget and
+// unbudgeted what was recorded with gepa.RecordUnbudgetedUsage. RunResult.Usage holds both.
+func (r *agentRun) addUsage(budgeted, unbudgeted Usage) {
+	r.budgeted = r.budgeted.Add(budgeted)
+	r.unbudgeted = r.unbudgeted.Add(unbudgeted)
+	r.result.Usage = r.budgeted.Add(r.unbudgeted)
+}
+
 func (r *agentRun) finishRun(turn int, err error) {
-	finishRunUsage(&r.result, r.runSpan, err)
+	r.result.Ledger.Turns = r.result.Turns
+	finished := finishSpan(r.runSpan, r.budgeted, r.unbudgeted, err)
+	r.result.Ledger.TotalDuration = finished.Duration
+	r.result.Spans = append(r.result.Spans, finished)
 	fireRunEnd(r.ctx, runEndEvent{agent: r.agent, logger: r.logger, result: &r.result, turn: turn, err: err})
+}
+
+// finishSpan returns span finished with its budgeted usage and its unbudgeted usage apart.
+func finishSpan(span gepa.UsageSpan, usage, unbudgeted Usage, err error) gepa.UsageSpan {
+	span = span.Finish(usage, err)
+	span.Unbudgeted = unbudgeted
+	return span
 }
 
 func (a *Agent) fireRunStart(ctx context.Context, logger *slog.Logger, runID string, timestamp time.Time) {
@@ -627,13 +665,6 @@ func (a *Agent) fireToolCallEvent(ctx context.Context, logger *slog.Logger, even
 			Err:       event.record.Err,
 		},
 	)
-}
-
-func finishRunUsage(result *RunResult, runSpan gepa.UsageSpan, err error) {
-	result.Ledger.Turns = result.Turns
-	finished := runSpan.Finish(result.Usage, err)
-	result.Ledger.TotalDuration = finished.Duration
-	result.Spans = append(result.Spans, finished)
 }
 
 type runEndEvent struct {
