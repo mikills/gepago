@@ -21,6 +21,7 @@ import (
 //   - a pointer, slice, map or interface admits null, as Get does; other types do not;
 //   - a type with its own UnmarshalJSON, UnmarshalJSONFrom or UnmarshalText, an interface, and
 //     a struct that contains itself are unconstrained ({}), since their JSON form is not known;
+//     json.Number is a string, as before Go 1.27 gave it UnmarshalJSONFrom;
 //   - []byte is a (base64) string, a map is an object whose additionalProperties hold the
 //     element schema, and an array [N]T has exactly N items (minItems and maxItems);
 //   - a field with the ",string" tag option is a string with a pattern for the JSON encoding
@@ -36,7 +37,9 @@ import (
 // Channels, functions, complex numbers and maps whose keys cannot come from a JSON object key
 // have no JSON form and return an error. So does a struct whose definition encoding/json/v2
 // refuses, such as one with an unexported field that has a json tag or a malformed tag option,
-// since Get refuses every object for it.
+// or with a ",string" field that is not a boolean, number or string (or an unnamed pointer to
+// one) or whose type has its own unmarshal method, at any depth, since Get refuses every object
+// for it.
 func JSONSchemaFor[T any]() (json.RawMessage, error) {
 	typ := reflect.TypeFor[T]()
 	node, nullable, err := newSchemaBuilder().typeSchema(typ, "")
@@ -323,6 +326,34 @@ func jsonFieldOrder(fields map[string]jsonField) []string {
 		return strings.Compare(a, b)
 	})
 	return names
+}
+
+// reachableDefinitionError returns structDefinitionError for the first struct type, in field
+// order, that a value of typ can hold through pointers, slices, arrays, map values and struct
+// fields and that does not decode, worded as JSONSchemaFor words it with path naming typ. Types
+// with their own unmarshal method and interfaces are not followed, nor is a type in seen.
+func reachableDefinitionError(typ reflect.Type, path string, seen map[reflect.Type]bool) error {
+	if seen[typ] || customJSON(typ) {
+		return nil
+	}
+	seen[typ] = true
+	switch typ.Kind() {
+	case reflect.Pointer:
+		return reachableDefinitionError(typ.Elem(), path, seen)
+	case reflect.Slice, reflect.Array, reflect.Map:
+		return reachableDefinitionError(typ.Elem(), path+"[]", seen)
+	case reflect.Struct:
+		if err := structDefinitionError(typ); err != nil {
+			return fmt.Errorf("%s%w", pathPrefix(path), err)
+		}
+		fields := jsonFields(typ)
+		for _, name := range jsonFieldOrder(fields) {
+			if err := reachableDefinitionError(fields[name].typ, joinJSONPath(path, name), seen); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func pathPrefix(path string) string {

@@ -6,8 +6,10 @@ import (
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
 	"errors"
+	"fmt"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -409,7 +411,7 @@ func TestDecodeTimeDurationNumberAndBytes(t *testing.T) {
 			name:    "a string that is not a JSON number",
 			field:   "amount",
 			value:   "x",
-			wantErr: `json: cannot unmarshal string "x" into Go struct field decodedKinds.amount of type json.Number: invalid syntax`,
+			wantErr: `json: invalid number literal, trying to unmarshal "\"x\"" into Number`,
 		},
 		{
 			name:    "a boolean as a JSON number",
@@ -538,10 +540,12 @@ func TestDecodeDiffersFromV080(t *testing.T) {
 		},
 		{
 			// v0.8.0 ignored ",string" on a field that is not a boolean, number or string.
-			name:    `",string" on a slice`,
-			typ:     stringSlice,
-			value:   map[string]any{"a": []any{1}},
-			wantErr: "json: cannot unmarshal JSON into Go struct field .a of type []int: invalid use of `string` tag option",
+			name:  `",string" on a slice`,
+			typ:   stringSlice,
+			value: map[string]any{"a": []any{1}},
+			wantErr: "json: cannot unmarshal object into Go value of type " + stringSlice.String() +
+				": struct field A of type []int cannot have the `string` tag option, " +
+				"which applies only to booleans, numbers and strings",
 		},
 		{
 			// v0.8.0 returned the method's error alone.
@@ -654,6 +658,10 @@ type stateIntMap struct {
 	M map[int]string `json:"m"`
 }
 
+type stateAnything struct {
+	V any `json:"v"`
+}
+
 // TestDecodeErrorNamesTheInnermostStruct checks that a type error names the innermost struct
 // and the JSON names of the struct fields that lead to it, without indexes or map keys, as
 // v0.8.0 did, whatever the root.
@@ -725,6 +733,12 @@ func TestDecodeErrorNamesTheInnermostStruct(t *testing.T) {
 			data:    `{"m":{"1.0":"a"}}`,
 			wantErr: `json: cannot unmarshal number 1.0 into Go struct field stateIntMap.m of type int`,
 		},
+		{
+			name:    "number inside an interface",
+			typ:     reflect.TypeFor[stateAnything](),
+			data:    `{"v":{"a":[1e400]}}`,
+			wantErr: `json: cannot unmarshal number 1e400 into Go struct field stateAnything.v of type float64`,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -747,40 +761,77 @@ func (c *stateCode) UnmarshalText(text []byte) error {
 	return err
 }
 
+type stateFloatMap struct {
+	Labels map[float64]string `json:"labels"`
+}
+
 // TestDecodeRefusesMapKeysV080Refused checks that Get refuses the object keys v0.8.0 refused
-// and encoding/json/v2 decodes: "null" for an integer key, which v2 decodes as 0, and any key
-// of a type that is not a string, an integer or a text unmarshaler, such as a float.
+// and encoding/json/v2 decodes, with the *json.UnmarshalTypeError v0.8.0 returned: "null" for
+// an integer key, which v2 decodes as 0, and any object for a map whose key type is not a
+// string, an integer or a text unmarshaler, such as a float or a bool.
 func TestDecodeRefusesMapKeysV080Refused(t *testing.T) {
 	floats := reflect.TypeFor[map[float64]string]()
-	const floatKeys = `value: map key type float64 cannot be decoded from a JSON object key`
 	tests := []struct {
 		name    string
 		typ     reflect.Type
 		data    string
+		want    json.UnmarshalTypeError
 		wantErr string
 	}{
 		{
 			name:    "null for an int key",
 			typ:     reflect.TypeFor[map[int]string](),
 			data:    `{"null":"a"}`,
-			wantErr: `value has the key "null", which is not a number for int`,
+			want:    json.UnmarshalTypeError{Value: "number null", Type: reflect.TypeFor[int]()},
+			wantErr: `json: cannot unmarshal number null into Go value of type int`,
 		},
 		{
 			name:    "null for a uint key",
 			typ:     reflect.TypeFor[map[uint8]string](),
 			data:    `{"1":"a","null":"b"}`,
-			wantErr: `value has the key "null", which is not a number for uint8`,
+			want:    json.UnmarshalTypeError{Value: "number null", Type: reflect.TypeFor[uint8]()},
+			wantErr: `json: cannot unmarshal number null into Go value of type uint8`,
 		},
 		{
-			name:    "null for an int key in a struct",
-			typ:     reflect.TypeFor[stateIntMap](),
-			data:    `{"m":{"null":"a"}}`,
-			wantErr: `field "m" has the key "null", which is not a number for int`,
+			name: "null for an int key in a struct",
+			typ:  reflect.TypeFor[stateIntMap](),
+			data: `{"m":{"null":"a"}}`,
+			want: json.UnmarshalTypeError{
+				Value:  "number null",
+				Type:   reflect.TypeFor[int](),
+				Struct: "stateIntMap",
+				Field:  "m",
+			},
+			wantErr: `json: cannot unmarshal number null into Go struct field stateIntMap.m of type int`,
 		},
-		{name: "hexadecimal float key", typ: floats, data: `{"0x1p-2":"a"}`, wantErr: floatKeys},
-		{name: "NaN key", typ: floats, data: `{"NaN":"a"}`, wantErr: floatKeys},
-		{name: "decimal float key", typ: floats, data: `{"1.5":"a"}`, wantErr: floatKeys},
-		{name: "no keys for a float key", typ: floats, data: `{}`, wantErr: floatKeys},
+		{
+			name:    "hexadecimal float key",
+			typ:     floats,
+			data:    `{"0x1p-2":"a"}`,
+			want:    json.UnmarshalTypeError{Value: "object", Type: floats},
+			wantErr: `json: cannot unmarshal object into Go value of type map[float64]string`,
+		},
+		{
+			name:    "NaN key",
+			typ:     floats,
+			data:    `{"NaN":"a"}`,
+			want:    json.UnmarshalTypeError{Value: "object", Type: floats},
+			wantErr: `json: cannot unmarshal object into Go value of type map[float64]string`,
+		},
+		{
+			name:    "no keys for a float key",
+			typ:     floats,
+			data:    `{}`,
+			want:    json.UnmarshalTypeError{Value: "object", Type: floats},
+			wantErr: `json: cannot unmarshal object into Go value of type map[float64]string`,
+		},
+		{
+			name:    "float keys in a struct",
+			typ:     reflect.TypeFor[stateFloatMap](),
+			data:    `{"labels":{"1.5":"a"}}`,
+			want:    json.UnmarshalTypeError{Value: "object", Type: floats, Struct: "stateFloatMap", Field: "labels"},
+			wantErr: `json: cannot unmarshal object into Go struct field stateFloatMap.labels of type map[float64]string`,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -791,11 +842,23 @@ func TestDecodeRefusesMapKeysV080Refused(t *testing.T) {
 			)
 			_, err := decodeJSONValue(tt.typ, json.RawMessage(tt.data))
 			require.EqualError(t, err, tt.wantErr)
+			var typeErr *json.UnmarshalTypeError
+			require.ErrorAs(t, err, &typeErr)
+			require.Equal(t, tt.want.Value, typeErr.Value)
+			require.Equal(t, tt.want.Type, typeErr.Type)
+			require.Equal(t, tt.want.Struct, typeErr.Struct)
+			require.Equal(t, tt.want.Field, typeErr.Field)
 		})
 	}
 
 	_, err := decodeJSONValue(reflect.TypeFor[map[bool]string](), json.RawMessage(`{"true":"a"}`))
-	require.EqualError(t, err, `value: map key type bool cannot be decoded from a JSON object key`)
+	require.EqualError(t, err, `json: cannot unmarshal object into Go value of type map[bool]string`)
+	var typeErr *json.UnmarshalTypeError
+	require.ErrorAs(t, err, &typeErr)
+	require.Equal(t, reflect.TypeFor[map[bool]string](), typeErr.Type)
+
+	_, err = decodeJSONValue(floats, json.RawMessage(`{"1.5":null}`))
+	require.EqualError(t, err, `field "1.5" is null`, "the values are checked before the keys, as in v0.8.0")
 
 	accepted := []struct {
 		name string
@@ -1059,4 +1122,611 @@ func TestDecodeRefusesStructsJSONV2Refuses(t *testing.T) {
 			require.EqualError(t, tt.validate(), tt.wantErr)
 		})
 	}
+}
+
+// rawCount decodes itself from a bare JSON number with UnmarshalJSON, so a quoted number is an
+// error.
+type rawCount int
+
+func (c *rawCount) UnmarshalJSON(data []byte) error {
+	n, err := strconv.Atoi(string(data))
+	*c = rawCount(n)
+	return err
+}
+
+// rawSize decodes itself from a bare JSON number with UnmarshalJSON.
+type rawSize uint8
+
+func (s *rawSize) UnmarshalJSON(data []byte) error {
+	n, err := strconv.ParseUint(string(data), 10, 8)
+	*s = rawSize(n)
+	return err
+}
+
+// rawKey decodes itself with UnmarshalJSON, keeping the JSON text, quotes and all.
+type rawKey string
+
+func (k *rawKey) UnmarshalJSON(data []byte) error {
+	*k = rawKey(data)
+	return nil
+}
+
+// rawLabel decodes itself with UnmarshalJSON or UnmarshalText, saying which one ran.
+type rawLabel string
+
+func (l *rawLabel) UnmarshalJSON(data []byte) error {
+	*l = rawLabel("json " + string(data))
+	return nil
+}
+
+func (l *rawLabel) UnmarshalText(text []byte) error {
+	*l = rawLabel("text " + string(text))
+	return nil
+}
+
+// fromLevel decodes itself with encoding/json/v2's UnmarshalJSONFrom, as ten times the number.
+type fromLevel int
+
+func (l *fromLevel) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	var n int
+	if err := jsonv2.UnmarshalDecode(dec, &n); err != nil {
+		return err
+	}
+	*l = fromLevel(n * 10)
+	return nil
+}
+
+// stateQuotedNumber has a ",string" json.Number, which encoding/json unquoted and v2 decodes
+// with json.Number's own method, ignoring the option.
+type stateQuotedNumber struct {
+	N json.Number `json:"n,string"`
+}
+
+type stateHoldsQuoted struct {
+	Quoted *stateQuotedNumber `json:"quoted"`
+}
+
+// TestDecodeRefusesStringOptionV2DoesNotApply checks that a struct with a ",string" field that
+// encoding/json/v2 does not decode as v0.8.0 did is refused up front by JSONSchemaFor, NewTool
+// and TypedPredict, and for every object by Get: a field that is not a boolean, number or
+// string, which v0.8.0 decoded ignoring the option and v2 refuses only when the field is
+// present, and a field whose type has its own unmarshal method, which v0.8.0 unquoted before
+// calling the method and v2 decodes with the method, ignoring the option.
+func TestDecodeRefusesStringOptionV2DoesNotApply(t *testing.T) {
+	const notScalar = "which applies only to booleans, numbers and strings"
+	tests := []struct {
+		name string
+		typ  reflect.Type
+		tag  reflect.StructTag
+		// value is a field value v0.8.0 decoded; nil leaves the field out.
+		value  any
+		reason string
+	}{
+		{"slice", reflect.TypeFor[[]string](), `json:"v,string"`, []any{"a"}, notScalar},
+		{"array", reflect.TypeFor[[2]int](), `json:"v,string"`, []any{1, 2}, notScalar},
+		{"map", reflect.TypeFor[map[string]int](), `json:"v,string"`, map[string]any{"a": 1}, notScalar},
+		{"struct", reflect.TypeFor[stateRef](), `json:"v,string"`, map[string]any{"ref": "r"}, notScalar},
+		{"bytes", reflect.TypeFor[[]byte](), `json:"v,string"`, "aGk=", notScalar},
+		{"double pointer", reflect.TypeFor[**int](), `json:"v,string"`, 1, notScalar},
+		{"interface", reflect.TypeFor[any](), `json:"v,string"`, "x", notScalar},
+		{"time", reflect.TypeFor[time.Time](), `json:"v,string"`, "2026-06-30T10:00:00Z", notScalar},
+		{"slice left out", reflect.TypeFor[[]string](), `json:"v,omitempty,string"`, nil, notScalar},
+		{
+			"json.Number",
+			reflect.TypeFor[json.Number](),
+			`json:"v,string"`,
+			"1",
+			"since json.Number has its own unmarshal method",
+		},
+		{
+			"UnmarshalJSON",
+			reflect.TypeFor[rawCount](),
+			`json:"v,string"`,
+			"5",
+			"since gepa.rawCount has its own unmarshal method",
+		},
+		{
+			"pointer to UnmarshalJSON",
+			reflect.TypeFor[*rawCount](),
+			`json:"v,omitempty,string"`,
+			"5",
+			"since gepa.rawCount has its own unmarshal method",
+		},
+		{
+			"UnmarshalText",
+			reflect.TypeFor[refusingLabel](),
+			`json:"v,string"`,
+			`"x"`,
+			"since gepa.refusingLabel has its own unmarshal method",
+		},
+		{
+			"UnmarshalJSONFrom",
+			reflect.TypeFor[fromLevel](),
+			`json:"v,string"`,
+			"5",
+			"since gepa.fromLevel has its own unmarshal method",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			typ := structWithTag("V", tt.typ, tt.tag)
+			reason := fmt.Sprintf(
+				"struct field V of type %s cannot have the `string` tag option, %s",
+				tt.typ,
+				tt.reason,
+			)
+			object := map[string]any{}
+			if tt.value != nil {
+				object["v"] = tt.value
+			}
+
+			_, err := decodeJSONValue(typ, object)
+			require.EqualError(t, err, "json: cannot unmarshal object into Go value of type "+typ.String()+": "+reason)
+
+			_, _, err = newSchemaBuilder().typeSchema(typ, "")
+			require.EqualError(t, err, typ.String()+" cannot be decoded from JSON: "+reason)
+		})
+	}
+
+	const reason = "struct field N of type json.Number cannot have the `string` tag option, " +
+		"since json.Number has its own unmarshal method"
+	const quoted = "gepa.stateQuotedNumber cannot be decoded from JSON: " + reason
+	_, err := JSONSchemaFor[stateQuotedNumber]()
+	require.EqualError(t, err, "json schema for gepa.stateQuotedNumber: "+quoted)
+	_, err = JSONSchemaFor[stateHoldsQuoted]()
+	require.EqualError(t, err, `json schema for gepa.stateHoldsQuoted: field "quoted": `+quoted)
+
+	tool := NewTool("t", "d", func(context.Context, stateQuotedNumber) (string, error) { return "", nil })
+	_, err = NewToolRegistry(tool)
+	require.EqualError(t, err, `register tool: tool "t": json schema for gepa.stateQuotedNumber: `+quoted)
+
+	lm := textModel(nil)
+	require.EqualError(
+		t,
+		TypedPredict[stateObligation, stateQuotedNumber]{LM: lm}.Validate(),
+		"typed predict outputs: "+quoted,
+	)
+	require.EqualError(
+		t,
+		TypedPredict[stateQuotedNumber, stateObligation]{LM: lm}.Validate(),
+		"typed predict inputs: "+quoted,
+	)
+
+	state := NewState(Prediction{
+		"bare":   map[string]any{"n": "1"},
+		"held":   map[string]any{"quoted": map[string]any{"n": "1"}},
+		"absent": map[string]any{"quoted": nil},
+	})
+	_, err = Key[stateQuotedNumber]{Name: "bare"}.Get(state)
+	require.EqualError(
+		t,
+		err,
+		`state key "bare": decode as gepa.stateQuotedNumber: `+
+			"json: cannot unmarshal object into Go value of type gepa.stateQuotedNumber: "+reason,
+	)
+	_, err = Key[stateHoldsQuoted]{Name: "held"}.Get(state)
+	require.EqualError(
+		t,
+		err,
+		`state key "held": decode as gepa.stateHoldsQuoted: json: cannot unmarshal object into Go struct field `+
+			"stateHoldsQuoted.quoted of type gepa.stateQuotedNumber: "+reason,
+	)
+	got, err := Key[stateHoldsQuoted]{Name: "absent"}.Get(state)
+	require.NoError(t, err, "a struct that holds no such object decodes, as v2 checks definitions lazily")
+	require.Nil(t, got.Quoted)
+}
+
+type stateAmount struct {
+	Amount json.Number  `json:"amount"`
+	Maybe  *json.Number `json:"maybe,omitempty"`
+}
+
+type stateAmounts struct {
+	Amount json.Number            `json:"amount"`
+	Maybe  *json.Number           `json:"maybe,omitempty"`
+	List   []json.Number          `json:"list"`
+	ByName map[string]json.Number `json:"by_name"`
+}
+
+// TestDecodeJSONNumberAsV080 checks that json.Number, which Go 1.27 gave an UnmarshalJSONFrom
+// method, keeps the schema and decoding it had in v0.8.0: a string in its schema, so a struct
+// that holds one stays strict for TypedPredict and NewTool, and a JSON number or a string that
+// holds one decoded to the number's text, plain and inside structs, slices and maps.
+func TestDecodeJSONNumberAsV080(t *testing.T) {
+	schema, err := JSONSchemaFor[json.Number]()
+	require.NoError(t, err)
+	require.JSONEq(t, `{"type":"string"}`, string(schema))
+
+	schema, err = JSONSchemaFor[stateAmount]()
+	require.NoError(t, err)
+	require.JSONEq(t, `{
+		"type": "object",
+		"properties": {
+			"amount": {"type": "string"},
+			"maybe": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+		},
+		"required": ["amount", "maybe"],
+		"additionalProperties": false
+	}`, string(schema))
+	require.True(t, StrictJSONSchema(schema))
+
+	signature, err := TypedPredict[stateRef, stateAmount]{LM: textModel(nil)}.ProgramSignature()
+	require.NoError(t, err)
+	format, err := signature.Signature.ResponseFormat()
+	require.NoError(t, err)
+	require.True(t, format.Strict)
+
+	tool := NewTool("t", "d", func(context.Context, stateAmount) (string, error) { return "", nil })
+	require.True(t, StrictJSONSchema(tool.Schema().Parameters))
+
+	maybe := json.Number("1e3")
+	want := stateAmounts{
+		Amount: "3.50",
+		Maybe:  &maybe,
+		List:   []json.Number{"1", "-2.5"},
+		ByName: map[string]json.Number{"a": "0", "b": "7"},
+	}
+	for name, value := range map[string]any{
+		"raw JSON": json.RawMessage(`{"amount":3.50,"maybe":"1e3","list":[1,"-2.5"],"by_name":{"a":0,"b":"7"}}`),
+		"model reply": map[string]any{
+			"amount":  json.Number("3.50"),
+			"maybe":   "1e3",
+			"list":    []any{json.Number("1"), "-2.5"},
+			"by_name": map[string]any{"a": json.Number("0"), "b": "7"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := Key[stateAmounts]{Name: "k"}.Get(NewState(Prediction{"k": value}))
+			require.NoError(t, err)
+			require.Equal(t, want, got)
+		})
+	}
+	for value, want := range map[any]json.Number{2.5: "2.5", "7": "7", json.Number("-0"): "-0"} {
+		got, err := Key[json.Number]{Name: "k"}.Get(NewState(Prediction{"k": value}))
+		require.NoError(t, err)
+		require.Equal(t, want, got)
+	}
+
+	refused := []struct {
+		name    string
+		value   string
+		wantErr string
+	}{
+		{
+			name:    "a string that is not a number",
+			value:   `{"amount":"01","list":null,"by_name":null}`,
+			wantErr: `json: invalid number literal, trying to unmarshal "\"01\"" into Number`,
+		},
+		{
+			name:    "an element that is not a number",
+			value:   `{"amount":1,"list":["x"],"by_name":null}`,
+			wantErr: `json: invalid number literal, trying to unmarshal "\"x\"" into Number`,
+		},
+		{
+			name:    "a boolean",
+			value:   `{"amount":true,"list":null,"by_name":null}`,
+			wantErr: `json: cannot unmarshal bool into Go struct field stateAmounts.amount of type json.Number`,
+		},
+	}
+	for _, tt := range refused {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := decodeJSONValue(reflect.TypeFor[stateAmounts](), json.RawMessage(tt.value))
+			require.EqualError(t, err, tt.wantErr)
+		})
+	}
+}
+
+// stateHolder holds a value of T as the JSON field "v".
+type stateHolder[T any] struct {
+	V T `json:"v"`
+}
+
+// stateTree contains itself.
+type stateTree struct {
+	Children []stateTree `json:"children"`
+}
+
+// TestTypedPredictChecksStructsGivenInputsHold checks that TypedPredict with given inputs, like
+// one whose inputs are derived and like JSONSchemaFor, refuses an In that holds a struct that
+// does not decode, behind a pointer, a slice, an array, a map or another struct, since
+// RunCandidate decodes its inputs into In.
+func TestTypedPredictChecksStructsGivenInputsHold(t *testing.T) {
+	lm := textModel(nil)
+	given := Signature{Inputs: []Field{{Name: "v"}}}
+	const opaque = "gepa.stateOpaque cannot be decoded from JSON: Go struct has no exported fields"
+	tests := []struct {
+		name     string
+		validate func() error
+		schema   func() (json.RawMessage, error)
+		wantErr  string
+	}{
+		{
+			name:     "pointer",
+			validate: TypedPredict[stateHolder[*stateOpaque], stateObligation]{Signature: given, LM: lm}.Validate,
+			schema:   JSONSchemaFor[stateHolder[*stateOpaque]],
+			wantErr:  `field "v": ` + opaque,
+		},
+		{
+			name:     "slice",
+			validate: TypedPredict[stateHolder[[]stateOpaque], stateObligation]{Signature: given, LM: lm}.Validate,
+			schema:   JSONSchemaFor[stateHolder[[]stateOpaque]],
+			wantErr:  `field "v[]": ` + opaque,
+		},
+		{
+			name:     "array",
+			validate: TypedPredict[stateHolder[[1]stateOpaque], stateObligation]{Signature: given, LM: lm}.Validate,
+			schema:   JSONSchemaFor[stateHolder[[1]stateOpaque]],
+			wantErr:  `field "v[]": ` + opaque,
+		},
+		{
+			name: "map value",
+			validate: TypedPredict[stateHolder[map[string]stateOpaque], stateObligation]{
+				Signature: given,
+				LM:        lm,
+			}.Validate,
+			schema:  JSONSchemaFor[stateHolder[map[string]stateOpaque]],
+			wantErr: `field "v[]": ` + opaque,
+		},
+		{
+			name: "struct in a struct",
+			validate: TypedPredict[stateHolder[stateHoldsOpaque], stateObligation]{
+				Signature: given,
+				LM:        lm,
+			}.Validate,
+			schema:  JSONSchemaFor[stateHolder[stateHoldsOpaque]],
+			wantErr: `field "v.opaque": ` + opaque,
+		},
+		{
+			name: "map In",
+			validate: TypedPredict[map[string]*stateOpaque, stateObligation]{
+				Signature: Signature{Inputs: []Field{{Name: "k"}}},
+				LM:        lm,
+			}.Validate,
+			schema:  JSONSchemaFor[map[string]*stateOpaque],
+			wantErr: `field "[]": ` + opaque,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.EqualError(t, tt.validate(), "typed predict inputs: "+tt.wantErr)
+			_, err := tt.schema()
+			require.ErrorContains(t, err, ": "+tt.wantErr)
+		})
+	}
+
+	for name, validate := range map[string]func() error{
+		"structs that decode": TypedPredict[stateHolder[*stateObligation], stateObligation]{
+			Signature: given,
+			LM:        lm,
+		}.Validate,
+		"a struct that contains itself": TypedPredict[stateHolder[stateTree], stateObligation]{
+			Signature: given,
+			LM:        lm,
+		}.Validate,
+		"a type that decodes itself": TypedPredict[stateHolder[celsius], stateObligation]{
+			Signature: given,
+			LM:        lm,
+		}.Validate,
+		"an interface": TypedPredict[stateHolder[any], stateObligation]{Signature: given, LM: lm}.Validate,
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.NoError(t, validate())
+		})
+	}
+}
+
+// StateTerms is exported so encoding/json can set a nil embedded pointer to it.
+type StateTerms struct {
+	Days int `json:"days"`
+}
+
+type stateEmbedsObligation struct {
+	stateObligation
+	Note string `json:"note"`
+}
+
+type stateEmbedsTerms struct {
+	*StateTerms
+	Note string `json:"note"`
+}
+
+type stateEmbedsTwice struct {
+	stateEmbedsObligation
+}
+
+type stateEmbedsHolder struct {
+	stateHolder[stateObligation]
+}
+
+// TestDecodeErrorNamesEmbeddedStructs checks that a type error in a field promoted from an
+// embedded struct names the embedded structs on the way to it, as v0.8.0 did, and that the
+// field stops at a type that decodes itself, whose JSON form is its own.
+func TestDecodeErrorNamesEmbeddedStructs(t *testing.T) {
+	tests := []struct {
+		name    string
+		typ     reflect.Type
+		data    string
+		want    json.UnmarshalTypeError
+		wantErr string
+	}{
+		{
+			name: "embedded struct",
+			typ:  reflect.TypeFor[stateEmbedsObligation](),
+			data: `{"amount":"ten","deadline":"d","note":"n"}`,
+			want: json.UnmarshalTypeError{Struct: "stateEmbedsObligation", Field: "stateObligation.amount"},
+			wantErr: "json: cannot unmarshal string into Go struct field " +
+				"stateEmbedsObligation.stateObligation.amount of type int",
+		},
+		{
+			name:    "embedded pointer",
+			typ:     reflect.TypeFor[stateEmbedsTerms](),
+			data:    `{"days":"x","note":"n"}`,
+			want:    json.UnmarshalTypeError{Struct: "stateEmbedsTerms", Field: "StateTerms.days"},
+			wantErr: `json: cannot unmarshal string into Go struct field stateEmbedsTerms.StateTerms.days of type int`,
+		},
+		{
+			name: "embedded twice",
+			typ:  reflect.TypeFor[stateEmbedsTwice](),
+			data: `{"amount":"ten","deadline":"d","note":"n"}`,
+			want: json.UnmarshalTypeError{
+				Struct: "stateEmbedsTwice",
+				Field:  "stateEmbedsObligation.stateObligation.amount",
+			},
+			wantErr: "json: cannot unmarshal string into Go struct field " +
+				"stateEmbedsTwice.stateEmbedsObligation.stateObligation.amount of type int",
+		},
+		{
+			name:    "struct in an embedded struct",
+			typ:     reflect.TypeFor[stateEmbedsHolder](),
+			data:    `{"v":{"amount":"ten","deadline":"d"}}`,
+			want:    json.UnmarshalTypeError{Struct: "stateObligation", Field: "stateHolder.v.amount"},
+			wantErr: `json: cannot unmarshal string into Go struct field stateObligation.stateHolder.v.amount of type int`,
+		},
+		{
+			name:    "type that decodes itself",
+			typ:     reflect.TypeFor[celsiusReadings](),
+			data:    `{"readings":[{"c":"warm"}]}`,
+			want:    json.UnmarshalTypeError{Struct: "celsiusReadings", Field: "readings"},
+			wantErr: `json: cannot unmarshal string into Go struct field celsiusReadings.readings of type float64`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := decodeJSONValue(tt.typ, json.RawMessage(tt.data))
+			require.EqualError(t, err, tt.wantErr)
+			var typeErr *json.UnmarshalTypeError
+			require.ErrorAs(t, err, &typeErr)
+			require.Equal(t, tt.want.Struct, typeErr.Struct)
+			require.Equal(t, tt.want.Field, typeErr.Field)
+		})
+	}
+}
+
+// TestDecodeMapKeysAsV080 checks that map keys decode as v0.8.0 decoded them: a text
+// unmarshaler with UnmarshalJSON, given the quoted key, or else UnmarshalText; any other key by
+// its kind, as a string or a base-10 integer, whatever other unmarshal method its type has. Such
+// a type still decodes values with its method.
+func TestDecodeMapKeysAsV080(t *testing.T) {
+	tests := []struct {
+		name string
+		typ  reflect.Type
+		data string
+		want any
+	}{
+		{
+			name: "json.Number keys hold any text",
+			typ:  reflect.TypeFor[map[json.Number]int](),
+			data: `{"abc":1,"01":2,"":3}`,
+			want: map[json.Number]int{"abc": 1, "01": 2, "": 3},
+		},
+		{
+			name: "a string key with UnmarshalJSON",
+			typ:  reflect.TypeFor[map[rawKey]int](),
+			data: `{"a":1}`,
+			want: map[rawKey]int{"a": 1},
+		},
+		{
+			name: "an int key with UnmarshalJSON",
+			typ:  reflect.TypeFor[map[rawCount]int](),
+			data: `{"1":1,"-2":2}`,
+			want: map[rawCount]int{1: 1, -2: 2},
+		},
+		{
+			name: "a uint key with UnmarshalJSON",
+			typ:  reflect.TypeFor[map[rawSize]int](),
+			data: `{"7":1}`,
+			want: map[rawSize]int{7: 1},
+		},
+		{
+			name: "an int key with UnmarshalJSONFrom",
+			typ:  reflect.TypeFor[map[fromLevel]int](),
+			data: `{"3":1}`,
+			want: map[fromLevel]int{3: 1},
+		},
+		{
+			name: "a text unmarshaler with UnmarshalJSON",
+			typ:  reflect.TypeFor[map[rawLabel]int](),
+			data: `{"a":1}`,
+			want: map[rawLabel]int{`json "a"`: 1},
+		},
+		{
+			name: "a text unmarshaler",
+			typ:  reflect.TypeFor[map[stateCode]int](),
+			data: `{"4":1}`,
+			want: map[stateCode]int{4: 1},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := decodeJSONValue(tt.typ, json.RawMessage(tt.data))
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+		})
+	}
+
+	key, err := decodeJSONValue(reflect.TypeFor[rawKey](), "a")
+	require.NoError(t, err)
+	require.Equal(t, rawKey(`"a"`), key, "a value still decodes with the method")
+	level, err := decodeJSONValue(reflect.TypeFor[fromLevel](), 3)
+	require.NoError(t, err)
+	require.Equal(t, fromLevel(30), level)
+
+	refused := []struct {
+		name    string
+		typ     reflect.Type
+		data    string
+		wantErr string
+	}{
+		{
+			name:    "null for an int key with UnmarshalJSON",
+			typ:     reflect.TypeFor[map[rawCount]int](),
+			data:    `{"null":1}`,
+			wantErr: `json: cannot unmarshal number null into Go value of type gepa.rawCount`,
+		},
+		{
+			name:    "a fraction for an int key with UnmarshalJSONFrom",
+			typ:     reflect.TypeFor[map[fromLevel]int](),
+			data:    `{"1.5":1}`,
+			wantErr: `json: cannot unmarshal number 1.5 into Go value of type gepa.fromLevel`,
+		},
+		{
+			name:    "a number too big for a uint key",
+			typ:     reflect.TypeFor[map[rawSize]int](),
+			data:    `{"256":1}`,
+			wantErr: `json: cannot unmarshal number 256 into Go value of type gepa.rawSize`,
+		},
+		{
+			name:    "a negative uint key",
+			typ:     reflect.TypeFor[map[rawSize]int](),
+			data:    `{"-1":1}`,
+			wantErr: `json: cannot unmarshal number -1 into Go value of type gepa.rawSize`,
+		},
+		{
+			name:    "a key its UnmarshalText refuses",
+			typ:     reflect.TypeFor[map[refusingLabel]int](),
+			data:    `{"bad":1}`,
+			wantErr: `json: cannot unmarshal string into Go value of type gepa.refusingLabel: label refused`,
+		},
+		{
+			name:    "a struct key with UnmarshalJSONFrom",
+			typ:     reflect.TypeFor[map[celsius]int](),
+			data:    `{"a":1}`,
+			wantErr: `json: cannot unmarshal object into Go value of type map[gepa.celsius]int`,
+		},
+	}
+	for _, tt := range refused {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := decodeJSONValue(tt.typ, json.RawMessage(tt.data))
+			require.EqualError(t, err, tt.wantErr)
+		})
+	}
+
+	dec := jsontext.NewDecoder(strings.NewReader("{\"a\xff\":1}"))
+	_, err = dec.ReadToken()
+	require.NoError(t, err)
+	var named rawKey
+	require.ErrorContains(t, decodeMethodMapKey[json.Unmarshaler](dec, &named), "invalid UTF-8")
+
+	dec = jsontext.NewDecoder(strings.NewReader(`"a"`))
+	require.ErrorIs(t, decodeMethodMapKey[json.Unmarshaler](dec, &named), errors.ErrUnsupported)
 }

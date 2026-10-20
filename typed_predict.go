@@ -18,7 +18,9 @@ import (
 //
 // The signature's inputs are Signature.Inputs when given; otherwise In must be a struct and the
 // inputs are its JSON fields. Given inputs must name exactly In's JSON fields when In is a
-// struct. An In value is encoded to JSON to make the prompt's inputs.
+// struct, and every struct In holds must decode, as JSONSchemaFor requires of derived inputs:
+// RunCandidate decodes its inputs into In. An In value is encoded to JSON to make the prompt's
+// inputs.
 //
 // The reply is decoded into Out with the strict rules Key.Get uses: unknown fields, fields that
 // match only by case, missing fields not tagged omitempty or omitzero, nulls in non-nullable
@@ -237,13 +239,15 @@ func typedSignature(base Signature, in, out reflect.Type) (Signature, error) {
 	return signature, nil
 }
 
-// checkGivenInputs checks that inputs given for a struct In name exactly its JSON fields.
+// checkGivenInputs checks that inputs given for a struct In name exactly its JSON fields, and
+// that every struct In holds decodes, as JSONSchemaFor checks the structs of derived inputs:
+// RunCandidate decodes its inputs into In.
 func checkGivenInputs(inputs []Field, in reflect.Type) error {
+	if err := reachableDefinitionError(in, "", map[reflect.Type]bool{}); err != nil {
+		return fmt.Errorf("typed predict inputs: %w", err)
+	}
 	if !structType(in) {
 		return nil
-	}
-	if err := structDefinitionError(in); err != nil {
-		return fmt.Errorf("typed predict inputs: %w", err)
 	}
 	want := jsonFieldOrder(jsonFields(in))
 	given := fieldNames(inputs)
