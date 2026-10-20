@@ -116,6 +116,9 @@ type StepStartedEvent struct {
 	Attempt int
 	// Reads holds the values of the step's declared reads after redaction.
 	Reads map[string]any
+	// Concurrent reports that the execution runs beside its siblings, as each step of a Parallel
+	// does, so it may start before or after them whatever their order in the Parallel.
+	Concurrent bool
 }
 
 // StepFinishedEvent reports the end of one execution of a step.
@@ -165,11 +168,25 @@ type observeScope struct {
 	span          string
 	recording     *runObservation
 	recordingSpan string
+	// concurrent marks the executions started in the scope as running beside their siblings.
+	concurrent bool
 }
 
 func observeScopeFrom(ctx context.Context) *observeScope {
 	scope, _ := ctx.Value(observeKey{}).(*observeScope)
 	return scope
+}
+
+// withConcurrentSteps returns ctx for the steps a composite step runs side by side, so that
+// their StepStarted events report Concurrent. The executions nested in them do not inherit it.
+func withConcurrentSteps(ctx context.Context) context.Context {
+	scope := observeScopeFrom(ctx)
+	if scope == nil {
+		return ctx
+	}
+	concurrent := *scope
+	concurrent.concurrent = true
+	return context.WithValue(ctx, observeKey{}, &concurrent)
 }
 
 // observerContext returns ctx, a context of the run, as observers receive it: with its values,
@@ -447,6 +464,7 @@ func observeStep(ctx context.Context, node *stepNode, attempt int, values map[st
 			Step:       node.name,
 			Attempt:    attempt,
 			Reads:      lane.reads,
+			Concurrent: scope.concurrent,
 		}
 		observerCtx := lane.run.observerContext(ctx)
 		lane.run.deliver(func(observer PipelineObserver) {

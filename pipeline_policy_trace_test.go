@@ -166,10 +166,10 @@ func TestWithCacheAnswersARetriedStepFromTheCacheAsTheTraceShows(t *testing.T) {
 	gepatest.AssertTrace(t, onlyTrace(t, recorder), gepatest.ExpectedTrace{
 		Steps: []gepatest.ExpectedStep{
 			{Step: "both", Attempt: 1, Err: "rate limited", ErrKind: gepa.Transient, Usage: tokens(10)},
-			{Step: "both", Attempt: 2},
 			{Step: "both.summarise", Attempt: 1, Usage: tokens(10)},
-			{Step: "both.summarise", Attempt: 2, Cached: true},
 			{Step: "both.flaky", Attempt: 1, Err: "rate limited", ErrKind: gepa.Transient},
+			{Step: "both", Attempt: 2},
+			{Step: "both.summarise", Attempt: 2, Cached: true},
 			{Step: "both.flaky", Attempt: 2},
 		},
 		Usage: tokens(10),

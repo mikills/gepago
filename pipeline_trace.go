@@ -28,8 +28,10 @@ type PipelineTrace struct {
 	Duration   time.Duration  `json:"duration"`
 	Inputs     map[string]any `json:"inputs,omitempty"`
 	Usage      Usage          `json:"usage"`
-	Err        string         `json:"err,omitempty"`
-	ErrKind    ErrorKind      `json:"err_kind,omitempty"`
+	// Failed reports that the run failed. Err is its error's message, which may be empty.
+	Failed  bool      `json:"failed,omitempty"`
+	Err     string    `json:"err,omitempty"`
+	ErrKind ErrorKind `json:"err_kind,omitempty"`
 	// Steps holds the executions of the run's top-level steps in the order they started.
 	Steps []StepTrace `json:"steps,omitempty"`
 }
@@ -37,21 +39,26 @@ type PipelineTrace struct {
 // StepTrace is the record of one execution of a step in a PipelineTrace. An execution that has
 // not finished has a zero EndedAt.
 type StepTrace struct {
-	SpanID    string         `json:"span_id"`
-	ParentID  string         `json:"parent_id"`
-	Step      string         `json:"step"`
-	Attempt   int            `json:"attempt"`
-	StartedAt time.Time      `json:"started_at"`
-	EndedAt   time.Time      `json:"ended_at,omitzero"`
-	Duration  time.Duration  `json:"duration"`
-	Usage     Usage          `json:"usage"`
-	Err       string         `json:"err,omitempty"`
-	ErrKind   ErrorKind      `json:"err_kind,omitempty"`
-	Details   map[string]any `json:"details,omitempty"`
-	Reads     map[string]any `json:"reads,omitempty"`
-	Writes    map[string]any `json:"writes,omitempty"`
-	Cached    bool           `json:"cached,omitempty"`
-	Skipped   bool           `json:"skipped,omitempty"`
+	SpanID    string        `json:"span_id"`
+	ParentID  string        `json:"parent_id"`
+	Step      string        `json:"step"`
+	Attempt   int           `json:"attempt"`
+	StartedAt time.Time     `json:"started_at"`
+	EndedAt   time.Time     `json:"ended_at,omitzero"`
+	Duration  time.Duration `json:"duration"`
+	Usage     Usage         `json:"usage"`
+	// Failed reports that the execution failed. Err is its error's message, which may be empty.
+	Failed  bool           `json:"failed,omitempty"`
+	Err     string         `json:"err,omitempty"`
+	ErrKind ErrorKind      `json:"err_kind,omitempty"`
+	Details map[string]any `json:"details,omitempty"`
+	Reads   map[string]any `json:"reads,omitempty"`
+	Writes  map[string]any `json:"writes,omitempty"`
+	Cached  bool           `json:"cached,omitempty"`
+	Skipped bool           `json:"skipped,omitempty"`
+	// Concurrent reports that the execution ran beside its siblings, as each step of a Parallel
+	// does, so it may have started before or after them whatever their order in the trace.
+	Concurrent bool `json:"concurrent,omitempty"`
 	// ToolCalls holds the tool calls the execution made, as StepFinishedEvent reported them,
 	// with each Output compacted as encoding/json writes it, or stored as a JSON string when it
 	// is not JSON.
@@ -115,12 +122,13 @@ func (r *RecordingObserver) StepStarted(_ context.Context, event StepStartedEven
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	step := &recordedStep{trace: StepTrace{
-		SpanID:    event.Span.ID,
-		ParentID:  event.Span.ParentID,
-		Step:      event.Step,
-		Attempt:   event.Attempt,
-		StartedAt: event.Span.StartedAt,
-		Reads:     traceValues(event.Reads),
+		SpanID:     event.Span.ID,
+		ParentID:   event.Span.ParentID,
+		Step:       event.Step,
+		Attempt:    event.Attempt,
+		StartedAt:  event.Span.StartedAt,
+		Reads:      traceValues(event.Reads),
+		Concurrent: event.Concurrent,
 	}}
 	if run, ok := r.runs[event.Span.ParentID]; ok {
 		run.steps = append(run.steps, step)
@@ -143,6 +151,7 @@ func (r *RecordingObserver) StepFinished(_ context.Context, event StepFinishedEv
 	step.trace.EndedAt = event.Span.EndedAt
 	step.trace.Duration = event.Duration
 	step.trace.Usage = event.Usage
+	step.trace.Failed = event.Err != nil
 	step.trace.Err = errorString(event.Err)
 	step.trace.ErrKind = ErrorKindOf(event.Err)
 	step.trace.Details = traceValues(event.Details)
@@ -165,6 +174,7 @@ func (r *RecordingObserver) RunFinished(_ context.Context, event RunFinishedEven
 	run.trace.EndedAt = event.Span.EndedAt
 	run.trace.Duration = event.Duration
 	run.trace.Usage = event.Usage
+	run.trace.Failed = event.Err != nil
 	run.trace.Err = errorString(event.Err)
 	run.trace.ErrKind = ErrorKindOf(event.Err)
 	if _, nested := r.steps[run.trace.ParentID]; !nested {
@@ -437,7 +447,7 @@ func stepRecord(traceID string, step StepTrace) ReflectiveRecord {
 		"writes":   step.Writes,
 		"usage":    step.Usage,
 	}
-	if step.Err != "" {
+	if step.Failed || step.Err != "" {
 		record["error"] = step.Err
 		if step.Details != nil {
 			record["details"] = step.Details

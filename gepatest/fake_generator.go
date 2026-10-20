@@ -19,7 +19,10 @@ import (
 )
 
 // ErrNoScript marks a call that no script of a FakeGenerator answers. It is a Permanent error
-// (see gepa.IsPermanent), so a retrying model or a fallback does not hide it.
+// (see gepa.IsPermanent), so gepa.RetryingLanguageModel does not retry it and a gepa.Fallback
+// step does not fall back on it. Other error handling can still hide it: a step policy with
+// OnErrorFallback or OnErrorSkip, a RetryIf that accepts it, an evaluator that scores a failed
+// example as zero. Check Unmatched to catch such calls.
 var ErrNoScript = errors.New("gepatest: no scripted reply")
 
 // ErrToolCallsInGenerate marks a Generate or GenerateStructured call whose scripted reply has
@@ -138,8 +141,8 @@ type Call struct {
 // Each call takes the script's next reply; once a script's replies are used up, its last reply
 // answers every further call it matches, so a one-reply script answers any number of calls. A
 // call that no script matches fails with an error that matches ErrNoScript and names the step
-// and the start of the prompt. A call whose context has already ended returns the context's
-// error and takes no reply.
+// and the start of the prompt, and Unmatched lists it. A call whose context has already ended
+// returns the context's error and takes no reply.
 //
 // It records every call (see Calls) and reports each reply's usage in the Generation or
 // ChatResponse it returns, so the caller records it, as callers of a provider do: it never
@@ -152,6 +155,8 @@ type FakeGenerator struct {
 	prompts  []*script
 	fallback *script
 	calls    []Call
+	// unmatched holds the indices in calls of the calls no script matched.
+	unmatched []int
 }
 
 var (
@@ -267,6 +272,20 @@ func (f *FakeGenerator) Calls() []Call {
 	return calls
 }
 
+// Unmatched returns a copy of the calls no script of f matched, which failed with ErrNoScript,
+// in the order they reached it. Calls whose context had already ended are not among them. Code
+// under test may hide such a failure, for example behind a step policy's fallback, so a test
+// that scripts every call it expects can require Unmatched to be empty.
+func (f *FakeGenerator) Unmatched() []Call {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	calls := make([]Call, len(f.unmatched))
+	for i, index := range f.unmatched {
+		calls[i] = cloneCall(f.calls[index])
+	}
+	return calls
+}
+
 // Generate answers prompt with the next reply of the script that matches it.
 func (f *FakeGenerator) Generate(ctx context.Context, prompt string) (gepa.Generation, error) {
 	return f.generate(ctx, Call{Method: MethodGenerate, Prompt: prompt})
@@ -348,6 +367,8 @@ func (f *FakeGenerator) answer(ctx context.Context, call *Call) (Reply, error) {
 	if matched != nil {
 		call.Script = matched.key
 		reply = matched.next()
+	} else if ended == nil {
+		f.unmatched = append(f.unmatched, len(f.calls))
 	}
 	f.calls = append(f.calls, *call)
 	f.mu.Unlock()

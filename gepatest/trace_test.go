@@ -37,7 +37,8 @@ var (
 )
 
 // sampleTrace has a retried step, a Parallel whose second step started first, and a step that
-// ran a nested pipeline twice.
+// ran a nested pipeline twice. It has no times, so AssertTrace fixes the order of none of its
+// executions.
 func sampleTrace() gepa.PipelineTrace {
 	return gepa.PipelineTrace{
 		Usage: large,
@@ -74,7 +75,7 @@ func sampleExpectation() gepatest.ExpectedTrace {
 	}
 }
 
-func TestAssertTracePassesWhateverTheOrderOfDistinctExecutions(t *testing.T) {
+func TestAssertTraceDoesNotOrderExecutionsWithoutTimes(t *testing.T) {
 	recorder := &recordingT{}
 
 	ok := gepatest.AssertTrace(recorder, sampleTrace(), sampleExpectation())
@@ -122,12 +123,12 @@ func TestAssertTraceReportsADiff(t *testing.T) {
 	require.False(t, gepatest.AssertTrace(recorder, trace, want))
 
 	require.Equal(t, []string{`gepatest: trace does not match (- want, + got)
-step executions, sorted by path and then attempt:
+step executions, in the order they ran:
+    extract #1 ok usage{prompt=1 completion=2 total=3}
   - decide #1 failed, error containing "kaboom"
   + decide #1 failed: "boom" (permanent)
-  + extra #1 ok
-    extract #1 ok usage{prompt=1 completion=2 total=3}
   - missing #2 failed cached skipped tools[x]
+  + extra #1 ok
 run:
   - run ok usage{prompt=10 completion=20 total=30 cached_input=4}
   + run failed: "pipeline step \"decide\": boom" (permanent) usage{prompt=1 completion=2 total=3}`},
@@ -141,7 +142,7 @@ func TestAssertTraceReportsAMatchingRunAndNoSteps(t *testing.T) {
 		ErrKind: gepa.Budget}))
 
 	require.Equal(t, []string{`gepatest: trace does not match (- want, + got)
-step executions, sorted by path and then attempt:
+step executions, in the order they ran:
     (none)
 run:
   - run failed (budget)
@@ -152,7 +153,7 @@ run:
 		Steps: []gepa.StepTrace{{Step: "a", Attempt: 1}},
 	}, gepatest.ExpectedTrace{}))
 	require.Equal(t, []string{`gepatest: trace does not match (- want, + got)
-step executions, sorted by path and then attempt:
+step executions, in the order they ran:
   + a #1 ok
 run:
     run ok`}, recorder.errors)
