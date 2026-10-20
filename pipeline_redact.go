@@ -561,8 +561,11 @@ func (r *runObservation) scrubToolCalls(records []ToolCallRecord) []ToolCallReco
 		record.Text = scrubJSONText(record.Text, r.trace.scrub)
 		record.Err = r.trace.scrub(record.Err)
 		for j := range record.Provenance {
-			record.Provenance[j].Source = r.trace.scrub(record.Provenance[j].Source)
-			record.Provenance[j].Detail = r.trace.scrub(record.Provenance[j].Detail)
+			provenance := &record.Provenance[j]
+			provenance.Kind = r.trace.scrub(provenance.Kind)
+			provenance.ID = r.trace.scrub(provenance.ID)
+			provenance.Source = r.trace.scrub(provenance.Source)
+			provenance.Detail = r.trace.scrub(provenance.Detail)
 		}
 	}
 	return records

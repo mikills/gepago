@@ -134,15 +134,17 @@ type budgetClockKey struct{}
 // its enclosing steps and runs, including the runs of pipelines that run this one as a step.
 // returned lists the retried calls made with this frame's context that have returned with
 // pending tokens their callers have yet to record, and toolCalls the tool calls a step
-// execution made itself.
+// execution made itself. unbudgeted is the usage RecordUnbudgetedUsage recorded against the
+// frame, which no limit counts.
 type usageFrame struct {
-	parent    *usageFrame
-	budget    *runBudget
-	step      string
-	cancel    context.CancelCauseFunc
-	usage     Usage
-	returned  []returnedCall
-	toolCalls []ToolCallRecord
+	parent     *usageFrame
+	budget     *runBudget
+	step       string
+	cancel     context.CancelCauseFunc
+	usage      Usage
+	unbudgeted Usage
+	returned   []returnedCall
+	toolCalls  []ToolCallRecord
 }
 
 // returnedCall is a retried call that has returned: the tokens of the usage it returned, which
@@ -266,6 +268,19 @@ func (f *usageFrame) add(usage Usage) {
 		budget.stepPending[frame.step] -= settled
 		budget.stepTokens[frame.step] += tokens
 		frame.checkStepTokens(frame.spent())
+	}
+}
+
+// addUnbudgeted records usage against f and every frame around it as unbudgeted usage, which
+// no limit counts.
+func (f *usageFrame) addUnbudgeted(usage Usage) {
+	if f == nil {
+		return
+	}
+	f.budget.mu.Lock()
+	defer f.budget.mu.Unlock()
+	for frame := f; frame != nil; frame = frame.parent {
+		frame.unbudgeted = frame.unbudgeted.Add(usage)
 	}
 }
 
@@ -487,6 +502,16 @@ func (f *usageFrame) total() Usage {
 	f.budget.mu.Lock()
 	defer f.budget.mu.Unlock()
 	return f.usage
+}
+
+// unbudgetedTotal returns the unbudgeted usage recorded against f.
+func (f *usageFrame) unbudgetedTotal() Usage {
+	if f == nil {
+		return Usage{}
+	}
+	f.budget.mu.Lock()
+	defer f.budget.mu.Unlock()
+	return f.unbudgeted
 }
 
 // fail records the run's first budget error and cancels the run with it. It returns the error

@@ -28,6 +28,8 @@ type PipelineTrace struct {
 	Duration   time.Duration  `json:"duration"`
 	Inputs     map[string]any `json:"inputs,omitempty"`
 	Usage      Usage          `json:"usage"`
+	// Unbudgeted is the run's unbudgeted usage, apart from Usage; see RunFinishedEvent.
+	Unbudgeted Usage `json:"unbudgeted,omitzero"`
 	// Failed reports that the run failed. Err is its error's message, which may be empty.
 	Failed  bool      `json:"failed,omitempty"`
 	Err     string    `json:"err,omitempty"`
@@ -47,6 +49,8 @@ type StepTrace struct {
 	EndedAt   time.Time     `json:"ended_at,omitzero"`
 	Duration  time.Duration `json:"duration"`
 	Usage     Usage         `json:"usage"`
+	// Unbudgeted is the execution's unbudgeted usage, apart from Usage; see StepFinishedEvent.
+	Unbudgeted Usage `json:"unbudgeted,omitzero"`
 	// Failed reports that the execution failed. Err is its error's message, which may be empty.
 	Failed  bool           `json:"failed,omitempty"`
 	Err     string         `json:"err,omitempty"`
@@ -153,6 +157,7 @@ func (r *RecordingObserver) StepFinished(_ context.Context, event StepFinishedEv
 	step.trace.EndedAt = event.Span.EndedAt
 	step.trace.Duration = event.Duration
 	step.trace.Usage = event.Usage
+	step.trace.Unbudgeted = event.Unbudgeted
 	step.trace.Failed = event.Err != nil
 	step.trace.Err = errorString(event.Err)
 	step.trace.ErrKind = ErrorKindOf(event.Err)
@@ -176,6 +181,7 @@ func (r *RecordingObserver) RunFinished(_ context.Context, event RunFinishedEven
 	run.trace.EndedAt = event.Span.EndedAt
 	run.trace.Duration = event.Duration
 	run.trace.Usage = event.Usage
+	run.trace.Unbudgeted = event.Unbudgeted
 	run.trace.Failed = event.Err != nil
 	run.trace.Err = errorString(event.Err)
 	run.trace.ErrKind = ErrorKindOf(event.Err)

@@ -35,17 +35,19 @@ type stepCacheKey struct {
 // stepOutcome records one execution of a step, top-level or nested: each retry attempt, each
 // cache hit and each skip on error is an execution of its own. Attempt counts the step's
 // executions in the run from one. Usage is what the execution's model calls recorded, nested
-// steps included. Err is the step's own error, before any enclosing step wraps it. ToolCalls
-// holds the tool calls the execution made itself, not those of the executions nested in it.
+// steps included, and Unbudgeted what RecordUnbudgetedUsage recorded. Err is the step's own
+// error, before any enclosing step wraps it. ToolCalls holds the tool calls the execution made
+// itself, not those of the executions nested in it.
 type stepOutcome struct {
-	Step      string
-	Attempt   int
-	Duration  time.Duration
-	Usage     Usage
-	Cached    bool
-	Skipped   bool
-	Err       error
-	ToolCalls []ToolCallRecord
+	Step       string
+	Attempt    int
+	Duration   time.Duration
+	Usage      Usage
+	Unbudgeted Usage
+	Cached     bool
+	Skipped    bool
+	Err        error
+	ToolCalls  []ToolCallRecord
 }
 
 func newPipelineRun(defaults map[string]any, optional map[string]map[string]bool) *pipelineRun {
@@ -406,12 +408,13 @@ func beginExecution(ctx context.Context, node *stepNode, values map[string]any) 
 	return ctx, func(result stepResult, err error, attempted []stateWrite) {
 		release()
 		outcome := stepOutcome{
-			Step:      node.name,
-			Attempt:   attempt,
-			Duration:  time.Since(start),
-			Usage:     frame.total(),
-			Err:       err,
-			ToolCalls: frame.toolCallRecords(),
+			Step:       node.name,
+			Attempt:    attempt,
+			Duration:   time.Since(start),
+			Usage:      frame.total(),
+			Unbudgeted: frame.unbudgetedTotal(),
+			Err:        err,
+			ToolCalls:  frame.toolCallRecords(),
 		}
 		run.record(outcome)
 		capture.offerStep(attempted, err)

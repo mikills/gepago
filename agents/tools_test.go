@@ -89,6 +89,34 @@ func TestAgentRunsRegistryTools(t *testing.T) {
 	require.Equal(t, 2, result.Ledger.ToolCalls)
 }
 
+func TestAgentToolCallsCarryTheToolScope(t *testing.T) {
+	var scopes []any
+	scoped := gepa.NewToolFunc(
+		gepa.Tool{Name: "scoped", Description: "record the scope"},
+		func(_ context.Context, call ToolCall) (gepa.ToolResult, error) {
+			scopes = append(scopes, call.Scope)
+			return gepa.ToolResult{Text: "ok"}, nil
+		},
+	)
+	registry, err := gepa.NewToolRegistry(scoped)
+	require.NoError(t, err)
+	client := gepatest.NewFakeGenerator().Default(gepatest.ToolCall("call-1", "scoped", `{}`), gepatest.Text("done"))
+	agent := Agent{Name: "orders", Client: client, Model: "fake", ToolRegistry: registry, ToolNames: []string{"scoped"}}
+
+	_, err = agent.Run(
+		gepa.WithToolScope(context.Background(), "tenant-7"),
+		RunRequest{Memory: NewMemory("run"), Messages: []Message{{Role: RoleUser, Content: "hi"}}},
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, []any{"tenant-7"}, scopes)
+	for _, message := range chatRequests(client)[1].Messages {
+		for _, call := range message.ToolCalls {
+			require.Nil(t, call.Scope, "the model's transcript carries no scope")
+		}
+	}
+}
+
 func TestAgentDropsMemoryWritesOfAFailedTool(t *testing.T) {
 	calls := &atomic.Int32{}
 	client := gepatest.NewFakeGenerator().Default(gepatest.ToolCall("call-1", "lookup_order", `{"order_id":"missing"}`))

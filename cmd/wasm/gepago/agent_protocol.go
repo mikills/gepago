@@ -180,6 +180,11 @@ func (c *declarativeChatClient) Chat(ctx context.Context, request agents.ChatReq
 	if err := decodeObject(responseJSON, &response); err != nil {
 		return agents.ChatResponse{}, fmt.Errorf("chat callback response: %w", err)
 	}
+	// a model gives no tool scope; the bridge ignores one, as before ToolCall had a Scope, so
+	// it never returns to the host in a later request's transcript.
+	for i := range response.Message.ToolCalls {
+		response.Message.ToolCalls[i].Scope = nil
+	}
 	if response.Message.Role != agents.RoleAssistant {
 		return agents.ChatResponse{}, fmt.Errorf(
 			"chat callback response: message.role must be %q",

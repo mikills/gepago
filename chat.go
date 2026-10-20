@@ -30,10 +30,17 @@ type Message struct {
 }
 
 // ToolCall is a model-requested tool invocation. Arguments is the JSON object the model gave.
+//
+// Scope is the caller's scope for the run, set with WithToolScope, such as the tenant or user
+// a tool must act for. A ToolSession sets it on the call it passes to ToolProvider.Invoke, so
+// the call stays plain data that a remote tool host can serve; read it with ScopeAs. The model
+// never sees it: a transcript's tool calls, the session's cache keys, ToolCallRecords, traces
+// and reports leave it out.
 type ToolCall struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"`
+	Scope     any    `json:"scope,omitempty"`
 }
 
 // Tool describes a callable tool exposed to a model. Parameters is the JSON Schema of the

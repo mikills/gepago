@@ -92,14 +92,18 @@ type RunStartedEvent struct {
 
 // RunFinishedEvent reports the end of a pipeline run.
 type RunFinishedEvent struct {
-	// Span is the run's finished span; its Duration and Usage are the event's, and its Err is
-	// the message of the event's Err.
+	// Span is the run's finished span; its Duration, Usage and Unbudgeted are the event's, and
+	// its Err is the message of the event's Err.
 	Span UsageSpan
 	// RunContext is the run's, as RunStarted reported it.
 	RunContext RunContext
 	Duration   time.Duration
 	// Usage is what the model calls of the run recorded, nested steps and pipelines included.
 	Usage Usage
+	// Unbudgeted is the usage the run recorded with RecordUnbudgetedUsage, such as its tool
+	// calls' ToolResult.UnbudgetedUsage, nested steps and pipelines included. Usage does not
+	// include it, and no budget counts it.
+	Unbudgeted Usage
 	// Err is the run's error, a *StepError without a Redactor; see Redactor.
 	Err error
 }
@@ -125,8 +129,8 @@ type StepStartedEvent struct {
 
 // StepFinishedEvent reports the end of one execution of a step.
 type StepFinishedEvent struct {
-	// Span is the execution's finished span; its Duration and Usage are the event's, and its
-	// Err is the message of the event's Err.
+	// Span is the execution's finished span; its Duration, Usage and Unbudgeted are the event's,
+	// and its Err is the message of the event's Err.
 	Span UsageSpan
 	// RunContext is the RunContext of the run the step belongs to, as RunStarted reported it.
 	RunContext RunContext
@@ -135,6 +139,9 @@ type StepFinishedEvent struct {
 	Duration   time.Duration
 	// Usage is what the execution's model calls recorded, nested steps included.
 	Usage Usage
+	// Unbudgeted is the usage the execution recorded with RecordUnbudgetedUsage, nested steps
+	// included. Usage does not include it, and no budget counts it.
+	Unbudgeted Usage
 	// Err is the step's own error, before any enclosing step wraps it; see Redactor.
 	Err error
 	// Details holds the diagnostics the step attached to Err with WithStepDetails, after
@@ -154,7 +161,8 @@ type StepFinishedEvent struct {
 	// ToolCalls holds the tool calls the execution made, through the run's ToolSession or any
 	// other, such as an agent's, in the order they finished, after redaction (see Redactor). The
 	// calls of the executions nested in it are in their own events. Each call's usage is part of
-	// Usage already, and a call answered from a ToolPolicy cache is marked Cached and has none.
+	// Usage already and its unbudgeted usage part of Unbudgeted, and a call answered from a
+	// ToolPolicy cache is marked Cached and has neither.
 	ToolCalls []ToolCallRecord
 }
 
@@ -384,16 +392,18 @@ func (r *runObservation) finish(ctx context.Context, err error) {
 		return
 	}
 	duration := time.Since(r.start)
-	usage := usageFrameFrom(ctx).total()
+	frame := usageFrameFrom(ctx)
+	usage, unbudgeted := frame.total(), frame.unbudgetedTotal()
 	r.trace.mu.Lock()
 	defer r.trace.mu.Unlock()
 	for lane := r; lane != nil; lane = lane.recording {
 		laneErr := lane.redactError(err)
 		event := RunFinishedEvent{
-			Span:       finishSpan(lane.span, duration, usage, laneErr),
+			Span:       finishSpan(lane.span, duration, usage, unbudgeted, laneErr),
 			RunContext: lane.runContext,
 			Duration:   duration,
 			Usage:      usage,
+			Unbudgeted: unbudgeted,
 			Err:        laneErr,
 		}
 		observerCtx := lane.observerContext(ctx)
@@ -514,6 +524,7 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 			Attempt:    outcome.Attempt,
 			Duration:   outcome.Duration,
 			Usage:      outcome.Usage,
+			Unbudgeted: outcome.Unbudgeted,
 			Writes:     run.redactValues(writes),
 			Details:    run.redactDetails(details),
 			Reads:      lane.reads,
@@ -522,7 +533,7 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 		}
 		event.ToolCalls = run.scrubToolCalls(toolCalls)
 		event.Err = run.redactError(outcome.Err)
-		event.Span = finishSpan(lane.span, outcome.Duration, outcome.Usage, event.Err)
+		event.Span = finishSpan(lane.span, outcome.Duration, outcome.Usage, outcome.Unbudgeted, event.Err)
 		observerCtx := run.observerContext(lane.ctx)
 		run.deliver(func(observer PipelineObserver) {
 			event := event
@@ -547,10 +558,11 @@ func (r *runObservation) deliver(call func(PipelineObserver)) {
 	}
 }
 
-func finishSpan(span UsageSpan, duration time.Duration, usage Usage, err error) UsageSpan {
+func finishSpan(span UsageSpan, duration time.Duration, usage, unbudgeted Usage, err error) UsageSpan {
 	span.EndedAt = span.StartedAt.Add(duration)
 	span.Duration = duration
 	span.Usage = usage
+	span.Unbudgeted = unbudgeted
 	span.Err = errorString(err)
 	return span
 }
