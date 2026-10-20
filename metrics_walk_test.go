@@ -2,6 +2,7 @@ package gepa
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand/v2"
@@ -72,6 +73,46 @@ func TestMetricTextSeparatesCollidingMapKeys(t *testing.T) {
 			"keys that write the same text are ordered by their values",
 		)
 	}
+}
+
+// duplicateNames is an empty struct whose MarshalJSON writes one object name twice.
+type duplicateNames struct{}
+
+func (duplicateNames) MarshalJSON() ([]byte, error) { return []byte(`{"a":1,"a":2}`), nil }
+
+// rawBehindDash holds JSON in a field JSON cannot see, so its text is its Go syntax.
+type rawBehindDash struct {
+	Raw json.RawMessage `json:"-"`
+}
+
+// TestMetricTextKeepsTheLastOfDuplicateNames checks that JSON written by a json.RawMessage or a
+// MarshalJSON method with one object name twice compares by the last value, as encoding/json
+// decodes it, and that Go syntax shows it as written.
+func TestMetricTextKeepsTheLastOfDuplicateNames(t *testing.T) {
+	raw := json.RawMessage(`{"a":1,"a":2}`)
+	for _, tt := range []struct {
+		name  string
+		value any
+		want  string
+	}{
+		{"raw JSON", raw, `{"a":2}`},
+		{"MarshalJSON on an empty struct", duplicateNames{}, `{"a":2}`},
+		{"raw JSON in a map", map[string]any{"v": raw}, `{"v":{"a":2}}`},
+		{"MarshalJSON in a slice", []any{duplicateNames{}, 1}, `[{"a":2},1]`},
+		{"raw JSON in Go syntax", rawBehindDash{Raw: raw}, `gepa.rawBehindDash{Raw:{"a":1,"a":2}}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, mustMetricText(t, tt.value))
+		})
+	}
+
+	result, err := ExactMatchMetric{Fields: []string{"f"}}.Score(
+		context.Background(),
+		Prediction{"f": json.RawMessage(`{"a":2}`)},
+		Prediction{"f": raw},
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1.0, result.Score)
 }
 
 // fuzzNode and fuzzHidden are the structs randomValue builds: one with JSON fields and one

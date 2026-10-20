@@ -242,6 +242,9 @@ func checkGivenInputs(inputs []Field, in reflect.Type) error {
 	if !structType(in) {
 		return nil
 	}
+	if err := structDefinitionError(in); err != nil {
+		return fmt.Errorf("typed predict inputs: %w", err)
+	}
 	want := jsonFieldOrder(jsonFields(in))
 	given := fieldNames(inputs)
 	if slices.Equal(slices.Sorted(slices.Values(given)), slices.Sorted(slices.Values(want))) {
@@ -279,6 +282,9 @@ func structFields(typ reflect.Type, outputs bool) ([]Field, error) {
 	}
 	if len(result) == 0 {
 		return nil, fmt.Errorf("%s has no JSON fields", typ)
+	}
+	if err := structDefinitionError(typ); err != nil {
+		return nil, err
 	}
 	return result, nil
 }

@@ -215,12 +215,18 @@ func (w *metricWalker) goSyntax(v reflect.Value) goSyntax {
 }
 
 // fieldText writes a form as JSON, or a goSyntax form as it is. A form that does not encode,
-// which only a walk that is not thorough leaves, marks the walk failed.
+// which only a walk that is not thorough leaves, marks the walk failed. A thorough form has
+// duplicate object names only inside JSON that a method or json.RawMessage wrote, which is
+// written as it is.
 func (w *metricWalker) fieldText(form any) string {
 	if syntax, ok := form.(goSyntax); ok {
 		return string(syntax)
 	}
-	encoded, err := encodeMetricJSON(form)
+	encode := encodeMetricJSON
+	if w.thorough {
+		encode = marshalMetricJSON
+	}
+	encoded, err := encode(form)
 	if err != nil {
 		w.failed = true
 		return ""
@@ -254,7 +260,8 @@ func (w *metricWalker) mapKey(key reflect.Value) string {
 // selfEncoded returns the form of a value encoding/json encodes with its own MarshalJSON or
 // MarshalText, if v has one: v itself, or its address when the method has a pointer receiver
 // and v is addressable, as encoding/json requires. A thorough walk encodes it now and uses the
-// JSON, or, when that fails, walks v as if it had no such method.
+// JSON, keeping duplicate object names for the decoding to settle, or, when that fails, walks v
+// as if it had no such method.
 func (w *metricWalker) selfEncoded(v reflect.Value) (any, bool) {
 	var self any
 	typ := v.Type()
@@ -270,11 +277,11 @@ func (w *metricWalker) selfEncoded(v reflect.Value) (any, bool) {
 	if !w.thorough {
 		return self, true
 	}
-	encoded, err := encodeMetricJSON(self)
+	encoded, err := marshalMetricJSON(self)
 	if err != nil {
 		return nil, false
 	}
-	return json.RawMessage(encoded), true
+	return encoded, true
 }
 
 // hiddenFieldTypes caches mayHideFields for each type it has seen.

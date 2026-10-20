@@ -178,9 +178,10 @@ func (s State) store(key string, typ reflect.Type, value any, fresh bool) {
 // through its JSON form and encoding/json/v2: unknown fields, fields that match only by case,
 // duplicate object names, missing fields not tagged omitempty or omitzero, nulls in
 // non-nullable positions, arrays with too few or too many elements, non-zero numbers too small
-// for a float type, times that are not RFC 3339 and base64 with line breaks are errors rather
-// than zero values. Types with their own UnmarshalJSON or UnmarshalText are decoded as they
-// define.
+// for a float type, objects for a map whose key type is not a string, an integer or a text
+// unmarshaler, times that are not RFC 3339 and base64 with line breaks are errors rather than
+// zero values. Types with their own UnmarshalJSON, UnmarshalJSONFrom or UnmarshalText are
+// decoded as they define.
 //
 // If T or *T has a Validate() error method, Get calls it on every value it returns (except a
 // nil pointer) and returns its error, so a value that decodes but breaks T's invariants is
@@ -265,6 +266,22 @@ var decodeOptions = jsonv2.JoinOptions(
 	json.FormatBytesWithLegacySemantics(true),
 )
 
+// structDefinitionError returns the error encoding/json/v2 gives for every JSON object decoded
+// into the struct type typ when it refuses typ's definition, which encoding/json accepted: an
+// unexported field with a json tag, an embedded non-struct type without a JSON name, an
+// embedded struct with tag options or marshal methods, a malformed, repeated or unsupported tag
+// option, two fields with one JSON name, or no exported fields at all. It returns nil when v2
+// accepts typ. v2 itself is asked, by decoding {} into typ: that reads no member, so it fails
+// only on the definition of typ and the structs it embeds, not of the types of its fields.
+func structDefinitionError(typ reflect.Type) error {
+	err := jsonv2.Unmarshal([]byte("{}"), reflect.New(typ).Interface(), decodeOptions)
+	var semantic *jsonv2.SemanticError
+	if errors.As(err, &semantic) && semantic.GoType != nil && semantic.Err != nil {
+		return fmt.Errorf("%s cannot be decoded from JSON: %w", semantic.GoType, semantic.Err)
+	}
+	return err
+}
+
 func decodeJSONValue(typ reflect.Type, value any) (any, error) {
 	data, err := json.Marshal(value)
 	if err != nil {
@@ -293,9 +310,9 @@ func decodeJSONValue(typ reflect.Type, value any) (any, error) {
 
 // decodeError words an error from decoding into typ as gepago did before encoding/json/v2: an
 // unknown member is `field "a.b" is not in T`, and any other error about a Go type reads as the
-// *json.UnmarshalTypeError encoding/json reports, wrapping v2's underlying error. This also
-// keeps the text stable: v2 words its own errors with "cannot" or "unable to" at random. A
-// syntax error keeps v2's wording.
+// *json.UnmarshalTypeError encoding/json reported, naming the field as legacyErrorField does
+// and wrapping v2's underlying error. This also keeps the text stable: v2 words its own errors
+// with "cannot" or "unable to" at random. A syntax error keeps v2's wording.
 func decodeError(typ reflect.Type, err error) error {
 	var semantic *jsonv2.SemanticError
 	if !errors.As(err, &semantic) || semantic.GoType == nil {
@@ -315,14 +332,7 @@ func decodeError(typ reflect.Type, err error) error {
 		Offset: semantic.ByteOffset,
 		Err:    semantic.Err,
 	}
-	if semantic.JSONPointer != "" {
-		root := typ
-		if root.Kind() == reflect.Pointer {
-			root = root.Elem()
-		}
-		typeErr.Struct = root.Name()
-		typeErr.Field = strings.Join(slices.Collect(semantic.JSONPointer.Tokens()), ".")
-	}
+	typeErr.Struct, typeErr.Field = legacyErrorField(typ, semantic.JSONPointer)
 	literal := semantic.JSONValue
 	switch {
 	case len(literal) == 0:
@@ -376,6 +386,33 @@ func jsonPointerPath(typ reflect.Type, pointer jsontext.Pointer) string {
 	return path
 }
 
+// legacyErrorField returns the Struct and Field of the *json.UnmarshalTypeError encoding/json
+// reported before v2 for an error at pointer inside a value of typ: the name of the innermost
+// struct type on the path, and the JSON names of the struct fields on it, without array
+// indexes or map keys. "/items/k/1/x" in a struct whose items map holds slices of bInner is
+// bInner and "items.x", and a path through no struct is neither.
+func legacyErrorField(typ reflect.Type, pointer jsontext.Pointer) (structName, field string) {
+	var names []string
+	for token := range pointer.Tokens() {
+		for typ != nil && typ.Kind() == reflect.Pointer {
+			typ = typ.Elem()
+		}
+		if typ == nil || customJSON(typ) {
+			break
+		}
+		switch typ.Kind() {
+		case reflect.Slice, reflect.Array, reflect.Map:
+			typ = typ.Elem()
+		case reflect.Struct:
+			structName, names = typ.Name(), append(names, token)
+			typ = jsonFields(typ)[token].typ
+		default:
+			typ = nil
+		}
+	}
+	return structName, strings.Join(names, ".")
+}
+
 func nillable(typ reflect.Type) bool {
 	switch typ.Kind() {
 	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Interface:
@@ -387,19 +424,32 @@ func nillable(typ reflect.Type) bool {
 var (
 	jsonUnmarshalerType = reflect.TypeFor[json.Unmarshaler]()
 	textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
+	// unmarshalerTypes are the interfaces encoding/json/v2 decodes a type with instead of its
+	// JSON fields.
+	unmarshalerTypes = []reflect.Type{
+		jsonUnmarshalerType,
+		reflect.TypeFor[jsonv2.UnmarshalerFrom](),
+		textUnmarshalerType,
+	}
 )
 
+// customJSON reports whether encoding/json/v2 decodes typ with its own method: UnmarshalJSON,
+// UnmarshalJSONFrom or UnmarshalText, on typ or *typ.
 func customJSON(typ reflect.Type) bool {
 	ptr := reflect.PointerTo(typ)
-	return typ.Implements(jsonUnmarshalerType) || ptr.Implements(jsonUnmarshalerType) ||
-		typ.Implements(textUnmarshalerType) || ptr.Implements(textUnmarshalerType)
+	for _, method := range unmarshalerTypes {
+		if typ.Implements(method) || ptr.Implements(method) {
+			return true
+		}
+	}
+	return false
 }
 
 // checkJSONShape reports drift that encoding/json/v2 accepts silently: required struct fields
 // that are missing, nulls decoded into values that cannot hold them, floats that underflow to
-// zero, and in a ",string" field the string "null" or a number outside the JSON grammar. It
-// also refuses arrays of the wrong length, which v2 refuses without saying how many elements
-// it found.
+// zero, map keys encoding/json refused, and in a ",string" field the string "null" or a number
+// outside the JSON grammar. It also refuses arrays of the wrong length, which v2 refuses
+// without saying how many elements it found.
 func checkJSONShape(typ reflect.Type, value any, path string) error {
 	if value == nil {
 		if path != "" && !nillable(typ) {
@@ -437,12 +487,31 @@ func checkJSONShape(typ reflect.Type, value any, path string) error {
 			)
 		}
 	case reflect.Map:
-		object, _ := value.(map[string]any)
+		object, isObject := value.(map[string]any)
+		if isObject {
+			if err := checkJSONMapKeys(typ.Key(), object, path); err != nil {
+				return err
+			}
+		}
 		for _, key := range slices.Sorted(maps.Keys(object)) {
 			if err := checkJSONShape(typ.Elem(), object[key], joinJSONPath(path, key)); err != nil {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+// checkJSONMapKeys refuses an object for a map whose keys are of type key where encoding/json
+// refused it and v2, under the ",string" semantics decodeOptions keeps, decodes it: an object
+// of any keys for a key type that is not a string, an integer or a text unmarshaler, such as a
+// float, and the key "null" for an integer, which v2 decodes as 0.
+func checkJSONMapKeys(key reflect.Type, object map[string]any, path string) error {
+	if !jsonMapKey(key) {
+		return fmt.Errorf("%s: map key type %s cannot be decoded from a JSON object key", describeJSONPath(path), key)
+	}
+	if _, ok := object["null"]; ok && numberKind(key) && !reflect.PointerTo(key).Implements(textUnmarshalerType) {
+		return fmt.Errorf("%s has the key \"null\", which is not a number for %s", describeJSONPath(path), key)
 	}
 	return nil
 }

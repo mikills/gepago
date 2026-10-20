@@ -1,6 +1,7 @@
 package gepa
 
 import (
+	"context"
 	"encoding/json"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
@@ -189,50 +190,84 @@ type bytesField struct {
 }
 
 // TestDecodeOptionsKeepEncodingJSONForms proves that each encoding/json option in decodeOptions
-// is needed: without it v2 refuses a form that json.Marshal writes and gepago's JSON Schema
-// describes.
+// is needed: turned off, v2 refuses a form that json.Marshal writes and gepago's JSON Schema
+// describes, or accepts a form encoding/json refused.
 func TestDecodeOptionsKeepEncodingJSONForms(t *testing.T) {
 	tests := []struct {
 		name string
 		data string
-		out  any
+		// without turns off the option under test.
+		without jsonv2.Options
+		out     any
+		// want is nil when decodeOptions refuses data.
 		want any
 	}{
 		{
-			name: `",string" on string and bool fields`,
-			data: `{"s":"\"x\"","b":"true"}`,
-			out:  &quotedScalars{},
-			want: &quotedScalars{S: "x", B: true},
+			name:    `",string" on string and bool fields`,
+			data:    `{"s":"\"x\"","b":"true"}`,
+			without: json.StringifyWithLegacySemantics(false),
+			out:     &quotedScalars{},
+			want:    &quotedScalars{S: "x", B: true},
 		},
 		{
-			name: "time.Duration as nanoseconds",
-			data: `{"d":1500}`,
-			out:  &durationField{},
-			want: &durationField{D: 1500},
+			name:    "time.Duration as nanoseconds",
+			data:    `{"d":1500}`,
+			without: json.FormatDurationAsNano(false),
+			out:     &durationField{},
+			want:    &durationField{D: 1500},
 		},
 		{
-			name: "[N]byte as an array",
-			data: `{"b":[1,2,3,4]}`,
-			out:  &byteArrayField{},
-			want: &byteArrayField{B: [4]byte{1, 2, 3, 4}},
+			// either byte option keeps this form.
+			name:    "[N]byte as an array",
+			data:    `{"b":[1,2,3,4]}`,
+			without: jsonv2.JoinOptions(json.FormatByteArrayAsArray(false), json.FormatBytesWithLegacySemantics(false)),
+			out:     &byteArrayField{},
+			want:    &byteArrayField{B: [4]byte{1, 2, 3, 4}},
 		},
 		{
-			name: "[]~byte as base64",
-			data: `{"b":"aGk="}`,
-			out:  &namedBytesField{},
-			want: &namedBytesField{B: []namedByte{'h', 'i'}},
+			name:    "[N]byte not as base64",
+			data:    `{"b":"AQIDBA=="}`,
+			without: json.FormatByteArrayAsArray(false),
+			out:     &byteArrayField{},
 		},
-		{name: "[]byte as an array", data: `{"b":[104,105]}`, out: &bytesField{}, want: &bytesField{B: []byte("hi")}},
+		{
+			name:    "[]~byte as base64",
+			data:    `{"b":"aGk="}`,
+			without: json.FormatBytesWithLegacySemantics(false),
+			out:     &namedBytesField{},
+			want:    &namedBytesField{B: []namedByte{'h', 'i'}},
+		},
+		{
+			name:    "[]byte as an array",
+			data:    `{"b":[104,105]}`,
+			without: json.FormatBytesWithLegacySemantics(false),
+			out:     &bytesField{},
+			want:    &bytesField{B: []byte("hi")},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fresh := reflect.New(reflect.TypeOf(tt.out).Elem()).Interface()
-			require.Error(t, jsonv2.Unmarshal([]byte(tt.data), fresh, jsonv2.RejectUnknownMembers(true)))
-
-			require.NoError(t, jsonv2.Unmarshal([]byte(tt.data), tt.out, decodeOptions))
+			errWithout := jsonv2.Unmarshal([]byte(tt.data), fresh, jsonv2.JoinOptions(decodeOptions, tt.without))
+			err := jsonv2.Unmarshal([]byte(tt.data), tt.out, decodeOptions)
+			if tt.want == nil {
+				require.Error(t, err)
+				require.NoError(t, errWithout, "without the option v2 accepts the form")
+				return
+			}
+			require.NoError(t, err)
 			require.Equal(t, tt.want, tt.out)
+			require.Error(t, errWithout, "without the option v2 refuses the form")
 		})
 	}
+
+	_, err := Key[byteArrayField]{Name: "k"}.Get(NewState(Prediction{"k": json.RawMessage(`{"b":"AQIDBA=="}`)}))
+	require.EqualError(
+		t,
+		err,
+		`state key "k": decode as gepa.byteArrayField: `+
+			`json: cannot unmarshal string into Go struct field byteArrayField.b of type [4]uint8`,
+	)
 }
 
 type decodedKinds struct {
@@ -516,14 +551,6 @@ func TestDecodeDiffersFromV080(t *testing.T) {
 			wantErr: `json: cannot unmarshal string into Go struct field labelled.label of type gepa.refusingLabel: label refused`,
 		},
 		{
-			// v0.8.0 named the innermost struct and left out indexes: stateObligation.items.amount.
-			name:  "a value of the wrong type in a list",
-			typ:   reflect.TypeFor[nestedObligations](),
-			value: map[string]any{"items": []any{map[string]any{"amount": "ten", "deadline": "d"}}},
-			wantErr: `json: cannot unmarshal string into Go struct field ` +
-				`nestedObligations.items.0.amount of type int`,
-		},
-		{
 			// v0.8.0 reported the unknown member first.
 			name:    "a value of the wrong type before an unknown member",
 			typ:     reflect.TypeFor[stateObligation](),
@@ -611,6 +638,425 @@ func TestDecodeErrorWording(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			require.EqualError(t, decodeError(typ, tt.err), tt.wantErr)
+		})
+	}
+}
+
+type obligationsByKey struct {
+	Items map[string][]*stateObligation `json:"items"`
+}
+
+type stateCounts struct {
+	Counts map[string]int `json:"counts"`
+}
+
+type stateIntMap struct {
+	M map[int]string `json:"m"`
+}
+
+// TestDecodeErrorNamesTheInnermostStruct checks that a type error names the innermost struct
+// and the JSON names of the struct fields that lead to it, without indexes or map keys, as
+// v0.8.0 did, whatever the root.
+func TestDecodeErrorNamesTheInnermostStruct(t *testing.T) {
+	bad := `{"amount":"ten","deadline":"d"}`
+	tests := []struct {
+		name    string
+		typ     reflect.Type
+		data    string
+		wantErr string
+	}{
+		{
+			name:    "slice root",
+			typ:     reflect.TypeFor[[]stateObligation](),
+			data:    `[{"amount":1,"deadline":"d"},` + bad + `]`,
+			wantErr: `json: cannot unmarshal string into Go struct field stateObligation.amount of type int`,
+		},
+		{
+			name:    "pointer to a slice root",
+			typ:     reflect.TypeFor[*[]stateObligation](),
+			data:    `[` + bad + `]`,
+			wantErr: `json: cannot unmarshal string into Go struct field stateObligation.amount of type int`,
+		},
+		{
+			name:    "map root",
+			typ:     reflect.TypeFor[map[string]stateObligation](),
+			data:    `{"k":` + bad + `}`,
+			wantErr: `json: cannot unmarshal string into Go struct field stateObligation.amount of type int`,
+		},
+		{
+			name:    "slice root without a struct",
+			typ:     reflect.TypeFor[[]int](),
+			data:    `[1,"s"]`,
+			wantErr: `json: cannot unmarshal string into Go value of type int`,
+		},
+		{
+			name:    "map root without a struct",
+			typ:     reflect.TypeFor[map[string]int](),
+			data:    `{"a":"s"}`,
+			wantErr: `json: cannot unmarshal string into Go value of type int`,
+		},
+		{
+			name:    "map key",
+			typ:     reflect.TypeFor[map[int]string](),
+			data:    `{"1.0":"a"}`,
+			wantErr: `json: cannot unmarshal number 1.0 into Go value of type int`,
+		},
+		{
+			name:    "list in a struct",
+			typ:     reflect.TypeFor[nestedObligations](),
+			data:    `{"items":[` + bad + `]}`,
+			wantErr: `json: cannot unmarshal string into Go struct field stateObligation.items.amount of type int`,
+		},
+		{
+			name:    "map of lists of pointers in a struct",
+			typ:     reflect.TypeFor[obligationsByKey](),
+			data:    `{"items":{"k":[{"amount":1,"deadline":"d"},` + bad + `]}}`,
+			wantErr: `json: cannot unmarshal string into Go struct field stateObligation.items.amount of type int`,
+		},
+		{
+			name:    "map value in a struct",
+			typ:     reflect.TypeFor[stateCounts](),
+			data:    `{"counts":{"a":"s"}}`,
+			wantErr: `json: cannot unmarshal string into Go struct field stateCounts.counts of type int`,
+		},
+		{
+			name:    "map key in a struct",
+			typ:     reflect.TypeFor[stateIntMap](),
+			data:    `{"m":{"1.0":"a"}}`,
+			wantErr: `json: cannot unmarshal number 1.0 into Go struct field stateIntMap.m of type int`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := decodeJSONValue(tt.typ, json.RawMessage(tt.data))
+			require.EqualError(t, err, tt.wantErr)
+		})
+	}
+}
+
+// stateCode is a map key that decodes itself from text, "null" included.
+type stateCode int
+
+func (c *stateCode) UnmarshalText(text []byte) error {
+	if string(text) == "null" {
+		*c = -1
+		return nil
+	}
+	n, err := strconv.Atoi(string(text))
+	*c = stateCode(n)
+	return err
+}
+
+// TestDecodeRefusesMapKeysV080Refused checks that Get refuses the object keys v0.8.0 refused
+// and encoding/json/v2 decodes: "null" for an integer key, which v2 decodes as 0, and any key
+// of a type that is not a string, an integer or a text unmarshaler, such as a float.
+func TestDecodeRefusesMapKeysV080Refused(t *testing.T) {
+	floats := reflect.TypeFor[map[float64]string]()
+	const floatKeys = `value: map key type float64 cannot be decoded from a JSON object key`
+	tests := []struct {
+		name    string
+		typ     reflect.Type
+		data    string
+		wantErr string
+	}{
+		{
+			name:    "null for an int key",
+			typ:     reflect.TypeFor[map[int]string](),
+			data:    `{"null":"a"}`,
+			wantErr: `value has the key "null", which is not a number for int`,
+		},
+		{
+			name:    "null for a uint key",
+			typ:     reflect.TypeFor[map[uint8]string](),
+			data:    `{"1":"a","null":"b"}`,
+			wantErr: `value has the key "null", which is not a number for uint8`,
+		},
+		{
+			name:    "null for an int key in a struct",
+			typ:     reflect.TypeFor[stateIntMap](),
+			data:    `{"m":{"null":"a"}}`,
+			wantErr: `field "m" has the key "null", which is not a number for int`,
+		},
+		{name: "hexadecimal float key", typ: floats, data: `{"0x1p-2":"a"}`, wantErr: floatKeys},
+		{name: "NaN key", typ: floats, data: `{"NaN":"a"}`, wantErr: floatKeys},
+		{name: "decimal float key", typ: floats, data: `{"1.5":"a"}`, wantErr: floatKeys},
+		{name: "no keys for a float key", typ: floats, data: `{}`, wantErr: floatKeys},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.NoError(
+				t,
+				jsonv2.Unmarshal([]byte(tt.data), reflect.New(tt.typ).Interface(), decodeOptions),
+				"v2 decodes it on its own",
+			)
+			_, err := decodeJSONValue(tt.typ, json.RawMessage(tt.data))
+			require.EqualError(t, err, tt.wantErr)
+		})
+	}
+
+	_, err := decodeJSONValue(reflect.TypeFor[map[bool]string](), json.RawMessage(`{"true":"a"}`))
+	require.EqualError(t, err, `value: map key type bool cannot be decoded from a JSON object key`)
+
+	accepted := []struct {
+		name string
+		typ  reflect.Type
+		data string
+		want any
+	}{
+		{"int keys", reflect.TypeFor[map[int]string](), `{"1":"a","-2":"b"}`, map[int]string{1: "a", -2: "b"}},
+		{"null for a string key", reflect.TypeFor[map[string]int](), `{"null":1}`, map[string]int{"null": 1}},
+		{
+			"null for a key that decodes itself",
+			reflect.TypeFor[map[stateCode]string](),
+			`{"null":"a","2":"b"}`,
+			map[stateCode]string{-1: "a", 2: "b"},
+		},
+		{"null for float keys", reflect.TypeFor[*map[float64]string](), `null`, (*map[float64]string)(nil)},
+	}
+	for _, tt := range accepted {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := decodeJSONValue(tt.typ, json.RawMessage(tt.data))
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// celsius decodes itself from {"c": degrees} with UnmarshalJSONFrom, so its JSON form is not
+// its fields'.
+type celsius struct {
+	Deg float64 `json:"deg"`
+}
+
+func (c *celsius) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	var reading struct {
+		C float64 `json:"c"`
+	}
+	if err := jsonv2.UnmarshalDecode(dec, &reading); err != nil {
+		return err
+	}
+	c.Deg = reading.C
+	return nil
+}
+
+type celsiusReadings struct {
+	Readings []celsius `json:"readings"`
+}
+
+// TestDecodeUsesUnmarshalJSONFrom checks that a type with encoding/json/v2's UnmarshalJSONFrom
+// method decodes as the method defines, as one with UnmarshalJSON does, and that its schema is
+// unconstrained.
+func TestDecodeUsesUnmarshalJSONFrom(t *testing.T) {
+	got, err := Key[celsius]{Name: "t"}.Get(NewState(Prediction{"t": map[string]any{"c": 21.5}}))
+	require.NoError(t, err)
+	require.Equal(t, celsius{Deg: 21.5}, got)
+
+	readings, err := Key[celsiusReadings]{Name: "r"}.Get(
+		NewState(Prediction{"r": map[string]any{"readings": []any{map[string]any{"c": 1}}}}),
+	)
+	require.NoError(t, err)
+	require.Equal(t, celsiusReadings{Readings: []celsius{{Deg: 1}}}, readings)
+
+	_, err = Key[celsius]{Name: "t"}.Get(NewState(Prediction{"t": map[string]any{"deg": 21.5}}))
+	require.EqualError(
+		t,
+		err,
+		`state key "t": decode as gepa.celsius: field "deg" is not in struct { C float64 "json:\"c\"" }`,
+		"the method refuses the form of celsius' fields",
+	)
+
+	schema, err := JSONSchemaFor[celsius]()
+	require.NoError(t, err)
+	require.JSONEq(t, `{}`, string(schema))
+}
+
+type stateKind string
+
+// stateKinded embeds a type that is not a struct without giving it a JSON name.
+type stateKinded struct {
+	stateKind
+	Name string `json:"name"`
+}
+
+type stateRef struct {
+	Ref string `json:"ref"`
+}
+
+// stateEmbedsWithOptions embeds a struct with a tag option.
+type stateEmbedsWithOptions struct {
+	stateRef `       json:",omitempty"`
+	Name     string `json:"name"`
+}
+
+// stamp writes itself as text, so a struct that embeds it cannot take its fields in v2.
+type stamp struct {
+	At string `json:"at"`
+}
+
+func (s stamp) MarshalText() ([]byte, error) { return []byte(s.At), nil }
+
+type stamped struct {
+	stamp
+	Name string `json:"name"`
+}
+
+// stateOpaque has no exported fields.
+type stateOpaque struct{ n int }
+
+type stateHoldsOpaque struct {
+	Opaque stateOpaque `json:"opaque"`
+}
+
+// structWithTag returns a struct of one field, built at run time because vet or staticcheck
+// refuse the tags under test.
+func structWithTag(name string, typ reflect.Type, tag reflect.StructTag) reflect.Type {
+	return reflect.StructOf([]reflect.StructField{{Name: name, Type: typ, Tag: tag}})
+}
+
+// TestDecodeRefusesStructsJSONV2Refuses pins each kind of struct that v0.8.0 decoded and
+// encoding/json/v2 refuses by its definition: Get refuses every object for it, naming the
+// field and the type, and JSONSchemaFor, NewTool and TypedPredict refuse it before any call.
+func TestDecodeRefusesStructsJSONV2Refuses(t *testing.T) {
+	require.Empty(t, stateKinded{}.stateKind)
+	require.Zero(t, stateOpaque{}.n)
+	unexportedTagged := reflect.StructOf([]reflect.StructField{
+		{Name: "Name", Type: reflect.TypeFor[string](), Tag: `json:"name"`},
+		{Name: "secret", PkgPath: "github.com/mikills/gepago", Type: reflect.TypeFor[string](), Tag: `json:"secret"`},
+	})
+	str, at := reflect.TypeFor[string](), reflect.TypeFor[time.Time]()
+	id := map[string]any{"id": "x"}
+	tests := []struct {
+		name  string
+		typ   reflect.Type
+		value map[string]any
+		// reason is v2's error for the type.
+		reason string
+	}{
+		{
+			name:   "unexported field with a json tag",
+			typ:    unexportedTagged,
+			value:  map[string]any{"name": "n"},
+			reason: "unexported Go struct field secret cannot have non-ignored `json:\"secret\"` tag",
+		},
+		{
+			name:   "embedded non-struct without a JSON name",
+			typ:    reflect.TypeFor[stateKinded](),
+			value:  map[string]any{"name": "n"},
+			reason: "embedded Go struct field stateKind of non-struct type must be explicitly given a JSON name",
+		},
+		{
+			name:   "embedded struct with omitempty",
+			typ:    reflect.TypeFor[stateEmbedsWithOptions](),
+			value:  map[string]any{"ref": "r", "name": "n"},
+			reason: "Go struct field stateRef cannot have any options other than `embed` specified",
+		},
+		{
+			name:  "space before an option",
+			typ:   structWithTag("ID", str, `json:"id, omitempty"`),
+			value: id,
+			reason: "Go struct field ID has malformed `json` tag: " +
+				"invalid character ' ' at start of option (expecting Unicode letter)",
+		},
+		{
+			name:   "option in the wrong case",
+			typ:    structWithTag("ID", str, `json:"id,omitEmpty"`),
+			value:  id,
+			reason: "Go struct field ID has invalid appearance of `omitEmpty` tag option; specify `omitempty` instead",
+		},
+		{
+			name:   "repeated option",
+			typ:    structWithTag("ID", str, `json:"id,omitempty,omitempty"`),
+			value:  id,
+			reason: "Go struct field ID has duplicate appearance of `omitempty` tag option",
+		},
+		{
+			name:   "trailing comma",
+			typ:    structWithTag("ID", str, `json:"id,"`),
+			value:  id,
+			reason: "Go struct field ID has malformed `json` tag: invalid trailing ',' character",
+		},
+		{
+			name:   "format option",
+			typ:    structWithTag("At", at, `json:"at,format:RFC3339"`),
+			value:  map[string]any{"at": "2026-06-30T10:00:00Z"},
+			reason: "Go struct field At has unsupported `format` tag option",
+		},
+		{
+			name:   "two fields with one JSON name",
+			typ:    conflictingNames,
+			value:  map[string]any{"c": 1},
+			reason: `Go struct fields A and B conflict over JSON object name "x"`,
+		},
+		{
+			name:   "embedded struct with a marshal method",
+			typ:    reflect.TypeFor[stamped](),
+			value:  map[string]any{"at": "a", "name": "n"},
+			reason: "embedded Go struct field stamp of type gepa.stamp must not implement marshal or unmarshal methods",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := decodeJSONValue(tt.typ, tt.value)
+			require.EqualError(
+				t,
+				err,
+				"json: cannot unmarshal object into Go value of type "+tt.typ.String()+": "+tt.reason,
+			)
+
+			_, _, err = newSchemaBuilder().typeSchema(tt.typ, "")
+			require.EqualError(t, err, tt.typ.String()+" cannot be decoded from JSON: "+tt.reason)
+		})
+	}
+
+	const noExportedFields = "gepa.stateOpaque cannot be decoded from JSON: Go struct has no exported fields"
+	t.Run("nested struct with no exported fields", func(t *testing.T) {
+		_, err := decodeJSONValue(reflect.TypeFor[stateHoldsOpaque](), map[string]any{"opaque": map[string]any{}})
+		require.EqualError(
+			t,
+			err,
+			"json: cannot unmarshal object into Go struct field stateHoldsOpaque.opaque of type gepa.stateOpaque: "+
+				"Go struct has no exported fields",
+		)
+
+		_, err = JSONSchemaFor[stateHoldsOpaque]()
+		require.EqualError(t, err, `json schema for gepa.stateHoldsOpaque: field "opaque": `+noExportedFields)
+	})
+
+	embeds := "gepa.stateEmbedsWithOptions cannot be decoded from JSON: " +
+		"Go struct field stateRef cannot have any options other than `embed` specified"
+	kinded := "gepa.stateKinded cannot be decoded from JSON: " +
+		"embedded Go struct field stateKind of non-struct type must be explicitly given a JSON name"
+	t.Run("tool", func(t *testing.T) {
+		tool := NewTool("t", "d", func(context.Context, stateEmbedsWithOptions) (string, error) { return "", nil })
+		_, err := NewToolRegistry(tool)
+		require.EqualError(t, err, `register tool: tool "t": json schema for gepa.stateEmbedsWithOptions: `+embeds)
+	})
+
+	lm := textModel(nil)
+	givenInputs := Signature{Inputs: []Field{{Name: "name"}}}
+	for name, tt := range map[string]struct {
+		validate func() error
+		wantErr  string
+	}{
+		"typed predict output": {
+			validate: TypedPredict[stateObligation, stateKinded]{LM: lm}.Validate,
+			wantErr:  "typed predict outputs: " + kinded,
+		},
+		"typed predict output field": {
+			validate: TypedPredict[stateObligation, stateHoldsOpaque]{LM: lm}.Validate,
+			wantErr:  `typed predict outputs: field "opaque": ` + noExportedFields,
+		},
+		"typed predict input": {
+			validate: TypedPredict[stateEmbedsWithOptions, stateObligation]{LM: lm}.Validate,
+			wantErr:  "typed predict inputs: " + embeds,
+		},
+		"typed predict input with given names": {
+			validate: TypedPredict[stateKinded, stateObligation]{Signature: givenInputs, LM: lm}.Validate,
+			wantErr:  "typed predict inputs: " + kinded,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.EqualError(t, tt.validate(), tt.wantErr)
 		})
 	}
 }

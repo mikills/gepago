@@ -375,24 +375,37 @@ func metricJSON(value any) json.RawMessage {
 // with duplicate object names, which encoding/json writes since Go 1.27 for map keys that write
 // the same text, such as two pointers to equal values, where it used to refuse such keys.
 func encodeMetricJSON(value any) (json.RawMessage, error) {
-	var buffer bytes.Buffer
-	encoder := json.NewEncoder(&buffer)
-	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(value); err != nil {
+	encoded, err := marshalMetricJSON(value)
+	if err != nil {
 		return nil, err
 	}
-	encoded := bytes.TrimSpace(buffer.Bytes())
 	if !jsontext.Value(encoded).IsValid(jsontext.AllowInvalidUTF8(true)) {
 		return nil, errors.New("encoding/json wrote duplicate object names")
 	}
 	return encoded, nil
 }
 
+// marshalMetricJSON encodes value as compact JSON without escaping HTML, keeping any duplicate
+// object names, such as those a json.RawMessage or a MarshalJSON method writes.
+func marshalMetricJSON(value any) (json.RawMessage, error) {
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSpace(buffer.Bytes()), nil
+}
+
 // writeMetricJSON writes a thorough walk's form as encodeMetricJSON encodes it, writing arrays
 // and objects itself so that no nesting limit applies: encoding/json refuses to write a value
-// nested deeper than 10000 levels since Go 1.27. Every other value in such a form encodes.
+// nested deeper than 10000 levels since Go 1.27. A json.RawMessage in such a form is the
+// compact JSON a thorough walk encoded, written as it is, duplicate names and all, so that
+// decoding it keeps the last of each as encoding/json always has. Every other value encodes.
 func writeMetricJSON(buffer *bytes.Buffer, form any) {
 	switch form := form.(type) {
+	case json.RawMessage:
+		buffer.Write(form)
 	case []any:
 		buffer.WriteByte('[')
 		for i, item := range form {
