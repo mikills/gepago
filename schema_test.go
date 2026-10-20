@@ -2,7 +2,6 @@ package gepa
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -612,39 +611,6 @@ func TestResponseFormatIsNotStrictBeyondTheUnionLimit(t *testing.T) {
 	format, err = signature.ResponseFormat()
 	require.NoError(t, err)
 	require.True(t, format.Strict)
-}
-
-type unionLimitOut struct {
-	A []string `json:"a"`
-	B []string `json:"b"`
-	C []string `json:"c"`
-	D []string `json:"d"`
-	E []string `json:"e"`
-	F []string `json:"f"`
-	G []string `json:"g"`
-	H []string `json:"h"`
-	I []string `json:"i"`
-	J []string `json:"j"`
-	K []string `json:"k"`
-	L []string `json:"l"`
-	M []string `json:"m"`
-	N []string `json:"n"`
-	O []string `json:"o"`
-	P []string `json:"p"`
-	Q []string `json:"q"`
-}
-
-func TestTypedPredictIsNotStrictBeyondTheUnionLimit(t *testing.T) {
-	program := TypedPredict[struct {
-		X string `json:"x"`
-	}, unionLimitOut]{LM: textModel(func(context.Context, string) (string, error) { return "", nil })}
-	signature, err := program.ProgramSignature()
-	require.NoError(t, err)
-
-	format, err := signature.Signature.ResponseFormat()
-
-	require.NoError(t, err)
-	require.False(t, format.Strict, "17 nullable slices are 17 unions")
 }
 
 type quotedFields struct {

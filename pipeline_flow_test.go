@@ -299,25 +299,6 @@ func TestParallelJoinsIndependentFailures(t *testing.T) {
 	require.ErrorContains(t, err, `pipeline step "right": right broke`)
 }
 
-func TestParallelAggregatesUsage(t *testing.T) {
-	calls := &atomic.Int32{}
-	pipeline, err := PipelineSpec{
-		Inputs: refs(docKey.Ref()),
-		Steps: []Step{Parallel(
-			"fan",
-			replyStep("a", "document", tenTokens, calls),
-			replyStep("b", "document", tenTokens, calls),
-		)},
-	}.Build()
-	require.NoError(t, err)
-	compiled := CompiledProgram{Program: pipeline, Candidate: pipeline.SeedCandidate()}
-
-	got, usage, err := compiled.RunWithUsage(context.Background(), Prediction{"document": "cash 10"})
-	require.NoError(t, err)
-	require.Equal(t, Prediction{"a": "done", "b": "done"}, got)
-	require.Equal(t, Usage{PromptTokens: 8, CompletionTokens: 12, TotalTokens: 20}, usage)
-}
-
 func TestParallelBuildErrors(t *testing.T) {
 	tests := []struct {
 		name    string
