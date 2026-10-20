@@ -59,7 +59,7 @@ func TestRedactorHidesValuesFromTheTraceAndTheReportButNotFromTheModel(t *testin
 
 	encoded, err := json.Marshal(trace)
 	require.NoError(t, err)
-	require.NotContains(t, string(encoded), "4111")
+	require.NotContains(t, string(encoded), secret, "the whole secret: its digits alone can occur in a time or an id")
 	var decoded gepa.PipelineTrace
 	require.NoError(t, json.Unmarshal(encoded, &decoded))
 	gepatest.AssertTrace(t, decoded, want)
@@ -69,7 +69,7 @@ func TestRedactorHidesValuesFromTheTraceAndTheReportButNotFromTheModel(t *testin
 	for _, text := range []string{"classify", "check", "cannot file &#34;[redacted]&#34;"} {
 		require.Contains(t, report, text)
 	}
-	require.NotContains(t, report, "4111")
+	require.NotContains(t, report, secret)
 }
 
 func TestRecordingObserverTracesAPanickingRedactorAsRedactionFailed(t *testing.T) {

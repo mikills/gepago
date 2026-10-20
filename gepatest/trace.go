@@ -25,8 +25,9 @@ type ExpectedTrace struct {
 	// runs started by a step included, in the order they ran: an execution that finished before
 	// another started comes first. Executions that could run in either order may be listed in
 	// either: those whose times overlap, those in different steps of a Parallel (see
-	// gepa.StepTrace.Concurrent), and an execution and those nested in it. An execution without
-	// an end time, such as one still running, is ordered with none.
+	// gepa.StepTrace.Lane), and an execution and those nested in it. An execution without an end
+	// time, such as one still running, comes after those that finished before it started and may
+	// be listed anywhere after them.
 	Steps []ExpectedStep `json:"steps,omitempty"`
 	// Failed reports that the run failed, whatever its error's message. Err and ErrKind, when
 	// set, imply it.
@@ -154,13 +155,12 @@ type recordedRow struct {
 
 func (r recordedRow) label() string { return label(r.path, r.step.Attempt) }
 
-// traceNode is an execution or a nested run as order checks see it: its name, empty for a run,
-// its place among its siblings, its times and whether it ran beside its siblings.
+// traceNode is an execution or a nested run as order checks see it: its place among its
+// siblings, its times and the step of a Parallel it belongs to, if any.
 type traceNode struct {
-	name       string
 	index      int
 	start, end time.Time
-	concurrent bool
+	lane       string
 }
 
 func expectedRows(steps []ExpectedStep) []expectedRow {
@@ -180,11 +180,10 @@ func recordedRows(trace gepa.PipelineTrace) []recordedRow {
 		for i, step := range steps {
 			path := prefix + step.Step
 			node := &traceNode{
-				name:       step.Step,
-				index:      i,
-				start:      step.StartedAt,
-				end:        step.EndedAt,
-				concurrent: step.Concurrent,
+				index: i,
+				start: step.StartedAt,
+				end:   step.EndedAt,
+				lane:  step.Lane,
 			}
 			own := append(slices.Clip(chain), node)
 			rows = append(rows, recordedRow{path: path, step: step, chain: own, match: -1})
@@ -221,8 +220,8 @@ func pair(expected []expectedRow, recorded []recordedRow) {
 }
 
 // precedes reports whether a ran before b in a way that fixes their order: neither is nested in
-// the other, and the nodes that contain them where their paths part are not different steps of
-// a Parallel, and the first of those ended before the second started.
+// the other, the nodes that contain them where their paths part do not belong to different
+// steps of a Parallel, and the first of those nodes ended before the second started.
 func precedes(a, b recordedRow) bool {
 	n := 0
 	for n < len(a.chain) && n < len(b.chain) && a.chain[n] == b.chain[n] {
@@ -233,7 +232,7 @@ func precedes(a, b recordedRow) bool {
 	}
 	x, y := a.chain[n], b.chain[n]
 	switch {
-	case x.concurrent && y.concurrent && x.name != y.name:
+	case x.lane != "" && y.lane != "" && x.lane != y.lane:
 		return false
 	case x.end.IsZero() || x.end.After(y.start):
 		return false

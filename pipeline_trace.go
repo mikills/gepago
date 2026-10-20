@@ -56,9 +56,11 @@ type StepTrace struct {
 	Writes  map[string]any `json:"writes,omitempty"`
 	Cached  bool           `json:"cached,omitempty"`
 	Skipped bool           `json:"skipped,omitempty"`
-	// Concurrent reports that the execution ran beside its siblings, as each step of a Parallel
-	// does, so it may have started before or after them whatever their order in the trace.
-	Concurrent bool `json:"concurrent,omitempty"`
+	// Lane names the step of a Parallel the execution belongs to when the execution is that step
+	// or one its step policy ran, such as a retry or an OnErrorFallback step; it is empty
+	// otherwise, for the executions nested in them too. The executions of different lanes of a
+	// Parallel ran side by side, so they may have started in any order.
+	Lane string `json:"lane,omitempty"`
 	// ToolCalls holds the tool calls the execution made, as StepFinishedEvent reported them,
 	// with each Output compacted as encoding/json writes it, or stored as a JSON string when it
 	// is not JSON.
@@ -122,13 +124,13 @@ func (r *RecordingObserver) StepStarted(_ context.Context, event StepStartedEven
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	step := &recordedStep{trace: StepTrace{
-		SpanID:     event.Span.ID,
-		ParentID:   event.Span.ParentID,
-		Step:       event.Step,
-		Attempt:    event.Attempt,
-		StartedAt:  event.Span.StartedAt,
-		Reads:      traceValues(event.Reads),
-		Concurrent: event.Concurrent,
+		SpanID:    event.Span.ID,
+		ParentID:  event.Span.ParentID,
+		Step:      event.Step,
+		Attempt:   event.Attempt,
+		StartedAt: event.Span.StartedAt,
+		Reads:     traceValues(event.Reads),
+		Lane:      event.Lane,
 	}}
 	if run, ok := r.runs[event.Span.ParentID]; ok {
 		run.steps = append(run.steps, step)

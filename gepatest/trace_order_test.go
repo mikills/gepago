@@ -37,11 +37,12 @@ func timedRun(start, end int, steps ...gepa.StepTrace) gepa.PipelineTrace {
 }
 
 // orderedTrace has sequential steps, a Parallel whose steps did not overlap and nest steps of
-// their own, a Fallback, a retried step, two nested runs that overlap and an unfinished step.
+// their own, one of them failing over to its policy's fallback, a Fallback, a retried step, two
+// nested runs that overlap and an unfinished step.
 func orderedTrace() gepa.PipelineTrace {
 	step := func(name string, attempt int) gepa.StepTrace { return gepa.StepTrace{Step: name, Attempt: attempt} }
-	concurrent := func(step gepa.StepTrace) gepa.StepTrace {
-		step.Concurrent = true
+	inLane := func(lane string, step gepa.StepTrace) gepa.StepTrace {
+		step.Lane = lane
 		return step
 	}
 	failed := func(step gepa.StepTrace) gepa.StepTrace {
@@ -49,11 +50,11 @@ func orderedTrace() gepa.PipelineTrace {
 		return step
 	}
 	fan := timed(step("fan", 1), 20, 50)
-	branchA := concurrent(timed(step("a", 1), 21, 30))
+	branchA := inLane("a", timed(step("a", 1), 21, 30))
 	branchA.Steps = []gepa.StepTrace{timed(step("a1", 1), 22, 25), timed(step("a2", 1), 26, 29)}
-	branchB := concurrent(timed(step("b", 1), 31, 40))
+	branchB := inLane("b", failed(timed(step("b", 1), 31, 40)))
 	branchB.Steps = []gepa.StepTrace{timed(step("b1", 1), 32, 35)}
-	fan.Steps = []gepa.StepTrace{branchA, branchB}
+	fan.Steps = []gepa.StepTrace{branchA, branchB, inLane("b", timed(step("spare", 1), 41, 45))}
 	fb := timed(step("fb", 1), 50, 60)
 	fb.Steps = []gepa.StepTrace{failed(timed(step("primary", 1), 51, 54)), timed(step("secondary", 1), 55, 59)}
 	custom := timed(step("custom", 1), 70, 90)
@@ -83,8 +84,9 @@ func orderedSteps() []gepatest.ExpectedStep {
 		{Step: "fan.a"},
 		{Step: "fan.a.a1"},
 		{Step: "fan.a.a2"},
-		{Step: "fan.b"},
+		{Step: "fan.b", Failed: true},
 		{Step: "fan.b.b1"},
+		{Step: "fan.spare"},
 		{Step: "fb"},
 		{Step: "fb.primary", Failed: true},
 		{Step: "fb.secondary"},
@@ -124,6 +126,8 @@ func TestAssertTraceChecksTheOrderExecutionsRanIn(t *testing.T) {
 		{"steps of a Parallel", "fan.b #1", "fan.a #1", true},
 		{"steps nested in different steps of a Parallel", "fan.b.b1 #1", "fan.a.a1 #1", true},
 		{"sequential steps in one step of a Parallel", "fan.a.a2 #1", "fan.a.a1 #1", false},
+		{"a policy's fallback before the step of a Parallel it stands in for", "fan.spare #1", "fan.b #1", false},
+		{"a step of a Parallel after another step's fallback", "fan.a #1", "fb #1", true},
 		{"a Fallback's second step before its first", "fb.secondary #1", "fb.primary #1", false},
 		{"a retry before its first attempt", "flaky #2", "flaky #1", false},
 		{"steps of overlapping runs", "custom.y #1", "custom.x #1", true},
@@ -283,6 +287,41 @@ func TestAssertTraceChecksTheOrderOfARecordedRun(t *testing.T) {
 				Steps: moved(t, inOrder, swap[0], swap[1]),
 			}), "%s listed before %s", swap[0], swap[1])
 		}
+	}
+}
+
+func TestAssertTraceKeepsTheOrderWithinAStepOfAParallel(t *testing.T) {
+	recorder := &gepa.RecordingObserver{}
+	noop := func(name string) gepa.Step {
+		return gepa.NewStep(name, nil, nil, func(context.Context, gepa.State) error { return nil })
+	}
+	down := gepa.NewStep("a", nil, nil, func(context.Context, gepa.State) error { return errors.New("a down") })
+	pipeline, err := gepa.PipelineSpec{
+		Steps: []gepa.Step{gepa.Parallel("fan",
+			gepa.WithPolicy(down, gepa.StepPolicy{OnError: gepa.OnErrorFallback(noop("backup"))}),
+			noop("c"),
+		)},
+		Observers: []gepa.PipelineObserver{recorder},
+	}.Build()
+	require.NoError(t, err)
+	for range 20 {
+		_, err := pipeline.Run(context.Background(), gepa.NewState(nil))
+		require.NoError(t, err)
+	}
+	withoutC := []gepatest.ExpectedStep{{Step: "fan"}, {Step: "fan.a", Err: "a down"}, {Step: "fan.backup"}}
+
+	for _, trace := range recorder.Traces() {
+		for i := range len(withoutC) + 1 {
+			want := slices.Insert(slices.Clone(withoutC), i, gepatest.ExpectedStep{Step: "fan.c"})
+			require.True(t, gepatest.AssertTrace(t, trace, gepatest.ExpectedTrace{Steps: want}),
+				"fan.c, in another step of the Parallel, may be listed anywhere: %d", i)
+		}
+		recorder := &recordingT{}
+		require.False(t, gepatest.AssertTrace(recorder, trace, gepatest.ExpectedTrace{
+			Steps: moved(t, append(slices.Clone(withoutC), gepatest.ExpectedStep{Step: "fan.c"}), "fan.backup #1", "fan.a #1"),
+		}), "the fallback ran after the step it stands in for")
+		require.Contains(t, recorder.errors[0],
+			"want lists fan.backup #1 before fan.a #1, but fan.a #1 finished before fan.backup #1 started")
 	}
 }
 

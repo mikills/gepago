@@ -14,10 +14,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// startedSteps records whether each StepStarted event reported its execution as concurrent.
+// startedSteps records the lane each StepStarted event reported, by step name.
 type startedSteps struct {
-	mu         sync.Mutex
-	concurrent map[string]bool
+	mu    sync.Mutex
+	lanes map[string]string
 }
 
 func (s *startedSteps) RunStarted(context.Context, gepa.RunStartedEvent)     {}
@@ -27,10 +27,10 @@ func (s *startedSteps) RunFinished(context.Context, gepa.RunFinishedEvent)   {}
 func (s *startedSteps) StepStarted(_ context.Context, event gepa.StepStartedEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.concurrent[event.Step] = event.Concurrent
+	s.lanes[event.Step] = event.Lane
 }
 
-func TestRecordingObserverRecordsFailuresAndStepsRunSideBySide(t *testing.T) {
+func TestRecordingObserverRecordsFailuresAndParallelLanes(t *testing.T) {
 	noop := func(name string) gepa.Step {
 		return gepa.NewStep(name, nil, nil, func(context.Context, gepa.State) error { return nil })
 	}
@@ -38,12 +38,13 @@ func TestRecordingObserverRecordsFailuresAndStepsRunSideBySide(t *testing.T) {
 		return gepa.NewStep(name, nil, nil, func(context.Context, gepa.State) error { return errors.New("") })
 	}
 	recorder := &gepa.RecordingObserver{}
-	started := &startedSteps{concurrent: map[string]bool{}}
+	started := &startedSteps{lanes: map[string]string{}}
 	pipeline, err := gepa.PipelineSpec{
 		Steps: []gepa.Step{
 			gepa.Parallel("fan",
 				gepa.WithPolicy(noop("left"), gepa.StepPolicy{Retry: gepa.RetryPolicy{MaxAttempts: 2}}),
 				gepa.Fallback("guard", silent("quiet"), noop("backup")),
+				gepa.WithPolicy(silent("shaky"), gepa.StepPolicy{OnError: gepa.OnErrorFallback(noop("spare"))}),
 			),
 			silent("last"),
 		},
@@ -54,29 +55,36 @@ func TestRecordingObserverRecordsFailuresAndStepsRunSideBySide(t *testing.T) {
 	_, err = pipeline.Run(context.Background(), gepa.NewState(nil))
 
 	require.Error(t, err)
-	require.Equal(t, map[string]bool{
-		"fan": false, "left": true, "guard": true, "quiet": false, "backup": false, "last": false,
-	}, started.concurrent, "the steps of a Parallel run side by side, and those nested in them do not")
+	require.Equal(t, map[string]string{
+		"fan": "", "left": "left", "guard": "guard", "quiet": "", "backup": "", "shaky": "shaky", "spare": "shaky",
+		"last": "",
+	}, started.lanes, "a step of a Parallel and its policy's fallback share a lane, and the steps nested in them have none")
 	trace := onlyTrace(t, recorder)
 	require.True(t, trace.Failed)
 	fan, last := trace.Steps[0], trace.Steps[1]
 	require.False(t, fan.Failed)
-	require.False(t, fan.Concurrent)
-	guard := fan.Steps[slices.IndexFunc(fan.Steps, func(step gepa.StepTrace) bool { return step.Step == "guard" })]
-	require.True(t, guard.Concurrent)
+	require.Empty(t, fan.Lane)
+	byName := func(name string) gepa.StepTrace {
+		return fan.Steps[slices.IndexFunc(fan.Steps, func(step gepa.StepTrace) bool { return step.Step == name })]
+	}
+	guard := byName("guard")
+	require.Equal(t, "guard", guard.Lane)
 	require.False(t, guard.Failed)
 	quiet := guard.Steps[0]
 	require.Equal(t, "quiet", quiet.Step)
 	require.True(t, quiet.Failed, "a step that fails with an empty message failed")
 	require.Empty(t, quiet.Err)
-	require.False(t, quiet.Concurrent)
+	require.Empty(t, quiet.Lane)
+	require.Equal(t, "shaky", byName("shaky").Lane)
+	require.True(t, byName("shaky").Failed)
+	require.Equal(t, "shaky", byName("spare").Lane)
 	require.True(t, last.Failed)
 	require.Empty(t, last.Err)
 
 	data, err := json.Marshal(trace)
 	require.NoError(t, err)
 	require.Contains(t, string(data), `"failed":true`)
-	require.Contains(t, string(data), `"concurrent":true`)
+	require.Contains(t, string(data), `"lane":"shaky"`)
 	var decoded gepa.PipelineTrace
 	require.NoError(t, json.Unmarshal(data, &decoded))
 	require.Equal(t, trace, decoded)
@@ -87,6 +95,8 @@ func TestRecordingObserverRecordsFailuresAndStepsRunSideBySide(t *testing.T) {
 			{Step: "fan.guard"},
 			{Step: "fan.guard.quiet", Failed: true},
 			{Step: "fan.guard.backup"},
+			{Step: "fan.shaky", Failed: true},
+			{Step: "fan.spare"},
 			{Step: "last", Failed: true},
 		},
 		Failed: true,
