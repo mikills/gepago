@@ -140,7 +140,7 @@ type OptimizationConfig struct {
 	Evaluator           Evaluator
 	DatasetBuilder      ReflectiveDatasetBuilder
 	Proposer            Proposer
-	ReflectionLM        LanguageModel
+	ReflectionLM        Generator
 	Objective           string
 	Background          string
 	PromptTemplates     map[string]string
@@ -365,7 +365,13 @@ func (o *Optimizer) configFingerprint(valset []Example) string {
 	return hex.EncodeToString(digest[:])
 }
 
+// optimizationTypeName names a configured component's type for the config fingerprint. A
+// legacy model wrapped by AdaptLanguageModel is named by the type it wraps, so runs saved
+// before Generator existed still resume and swapping one legacy model for another is caught.
 func optimizationTypeName(value any) string {
+	if adapted, ok := value.(languageModelGenerator); ok {
+		value = adapted.lm
+	}
 	if value == nil {
 		return ""
 	}
@@ -516,15 +522,11 @@ func (o *Optimizer) proposeForIteration(
 	if lessonAware, ok := o.config.Proposer.(LessonAwareProposer); ok {
 		lessonAware.SetLessons(state.Lessons)
 	}
+	span := NewUsageSpan(state.RunID, "", "llm.reflect", "proposer")
 	proposed, err := o.config.Proposer.Propose(ctx, CloneCandidate(parent.Candidate), dataset, components)
+	recordProposerUsage(state, o.config.Proposer, span, err)
 	if err != nil {
 		return proposalAttempt{}, false, err
-	}
-	if reporter, ok := o.config.Proposer.(UsageReporter); ok {
-		usage := reporter.LastUsage()
-		state.Ledger = state.Ledger.AddUsage(usage)
-		state.Ledger.ModelCalls++
-		state.Spans = append(state.Spans, NewUsageSpan(state.RunID, "", "llm.reflect", "proposer").Finish(usage, nil))
 	}
 	proposed = MergeCandidate(parent.Candidate, proposed)
 	if err := o.emit(ctx, OptimizationEvent{
@@ -581,7 +583,9 @@ func (o *Optimizer) evaluateMerge(
 	right CandidateRecord,
 ) (CandidateRecord, bool, error) {
 	components := componentsForProposal(o.config.Components, left.Candidate)
+	span := NewUsageSpan(state.RunID, "", "llm.merge", "merge proposer")
 	patch, err := o.config.MergeProposer.ProposeMerge(ctx, left, right, components)
+	recordProposerUsage(state, o.config.MergeProposer, span, err)
 	if err != nil {
 		return CandidateRecord{}, false, err
 	}
@@ -607,6 +611,31 @@ func (o *Optimizer) evaluateMerge(
 		ScoresByExample:          scoresByExample(valEval),
 		ObjectiveScoresByExample: objectiveScoresByExample(valEval),
 	}, true, nil
+}
+
+// recordProposerUsage adds the model calls and usage a proposer reports for its latest call to
+// the ledger, after failed calls too. Proposers that report neither are skipped, and so is a
+// call that made no model call, such as one rejected before reaching the model.
+func recordProposerUsage(state *OptimizationState, proposer any, span UsageSpan, err error) {
+	usageReporter, reportsUsage := proposer.(UsageReporter)
+	callReporter, reportsCalls := proposer.(ModelCallReporter)
+	if !reportsUsage && !reportsCalls {
+		return
+	}
+	calls := 1
+	if reportsCalls {
+		calls = callReporter.LastModelCalls()
+	}
+	if calls <= 0 {
+		return
+	}
+	var usage Usage
+	if reportsUsage {
+		usage = usageReporter.LastUsage()
+	}
+	state.Ledger = state.Ledger.AddUsage(usage)
+	state.Ledger.ModelCalls += calls
+	state.Spans = append(state.Spans, span.Finish(usage, err))
 }
 
 func (o *Optimizer) evaluateBeforeProposal(
@@ -944,6 +973,8 @@ func MergeCandidate(base Candidate, patch Candidate) Candidate {
 }
 
 // DefaultReflectiveDatasetBuilder turns evaluation items into reflection records for each component.
+// Each record holds the item's SideInfo under "side_info"; for an invalid output from a
+// pipeline step, ProgramEvaluator puts the step's name, details and reads there.
 func DefaultReflectiveDatasetBuilder(
 	candidate Candidate,
 	eval EvaluationResult,

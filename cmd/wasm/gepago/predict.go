@@ -66,8 +66,10 @@ type predictStartRequest struct {
 }
 
 type predictModelResult struct {
-	Text  *string     `json:"text"`
-	Usage *gepa.Usage `json:"usage"`
+	Text         *string     `json:"text"`
+	Usage        *gepa.Usage `json:"usage"`
+	FinishReason *string     `json:"finishReason"`
+	Model        *string     `json:"model"`
 }
 
 type predictResumeRequest struct {
@@ -81,11 +83,12 @@ type predictCancelRequest struct {
 }
 
 type predictHostRequest struct {
-	RequestID string `json:"request_id"`
-	Kind      string `json:"kind"`
-	Role      string `json:"role"`
-	Prompt    string `json:"prompt"`
-	Attempt   int    `json:"attempt"`
+	RequestID      string              `json:"request_id"`
+	Kind           string              `json:"kind"`
+	Role           string              `json:"role"`
+	Prompt         string              `json:"prompt"`
+	Attempt        int                 `json:"attempt"`
+	ResponseFormat *hostResponseFormat `json:"response_format,omitempty"`
 }
 
 type predictPendingResponse struct {
@@ -106,6 +109,8 @@ type predictCompleteResponse struct {
 
 type predictJob struct {
 	signature       gepa.Signature
+	prompt          string
+	format          *hostResponseFormat
 	maxParseRetries int
 	parseRetries    int
 	usage           gepa.Usage
@@ -148,20 +153,27 @@ func predictStartOperation(payloadJSON string) (predictPendingResponse, error) {
 	if err != nil {
 		return predictPendingResponse{}, fmt.Errorf("predict.start prompt: %w", err)
 	}
+	format, err := program.Signature.ResponseFormat()
+	if err != nil {
+		return predictPendingResponse{}, fmt.Errorf("predict.start response format: %w", err)
+	}
 
 	predictState.Lock()
 	defer predictState.Unlock()
 	jobID := nextPredictID("job", &predictState.nextJobID)
 	requestID := nextPredictID("request", &predictState.nextRequestID)
 	pending := predictHostRequest{
-		RequestID: requestID,
-		Kind:      "language_model.generate",
-		Role:      "task",
-		Prompt:    prompt,
-		Attempt:   1,
+		RequestID:      requestID,
+		Kind:           "language_model.generate",
+		Role:           "task",
+		Prompt:         prompt,
+		Attempt:        1,
+		ResponseFormat: newHostResponseFormat(format),
 	}
 	predictState.jobs[jobID] = &predictJob{
 		signature:       program.Signature,
+		prompt:          prompt,
+		format:          pending.ResponseFormat,
 		maxParseRetries: program.MaxParseRetries,
 		pending:         pending,
 	}
@@ -203,6 +215,11 @@ func validatePredictResumeRequest(request predictResumeRequest) error {
 	if request.Result.Text == nil {
 		return errors.New("predict.resume payload: result.text is required")
 	}
+	if request.Result.FinishReason != nil {
+		if _, err := parseHostFinishReason(*request.Result.FinishReason); err != nil {
+			return fmt.Errorf("predict.resume payload: result.%w", err)
+		}
+	}
 	if request.Result.Usage == nil {
 		return nil
 	}
@@ -216,9 +233,24 @@ func transitionPredictResume(request predictResumeRequest) (any, error) {
 		return nil, err
 	}
 	addPredictUsage(job, request.Result.Usage)
+	if request.Result.FinishReason != nil {
+		// as in gepa.Predict, a reply cut at the token limit or refused under a content policy
+		// is not sent for repair.
+		generation := gepa.Generation{
+			Text:         *request.Result.Text,
+			FinishReason: gepa.FinishReason(*request.Result.FinishReason),
+		}
+		if request.Result.Usage != nil {
+			generation.Usage = *request.Result.Usage
+		}
+		if err := gepa.FinishReasonError(generation, fmt.Sprintf("signature %q", job.signature.Name)); err != nil {
+			delete(predictState.jobs, request.JobID)
+			return nil, fmt.Errorf("predict job %q: %w", request.JobID, err)
+		}
+	}
 
 	raw := *request.Result.Text
-	prediction, parseErr := parsePredictResult(raw)
+	prediction, parseErr := parsePredictResult(job.signature, raw)
 	return transitionPredictJob(request.JobID, job, raw, prediction, parseErr)
 }
 
@@ -239,7 +271,9 @@ func addPredictUsage(job *predictJob, usage *gepa.Usage) {
 	}
 }
 
-func parsePredictResult(raw string) (gepa.Prediction, error) {
+// parsePredictResult parses and checks a host reply as gepa.Predict does, so a reply with a
+// missing, null or extra output is repaired or rejected here too.
+func parsePredictResult(signature gepa.Signature, raw string) (gepa.Prediction, error) {
 	prediction, err := gepa.ParsePrediction(raw)
 	if err != nil {
 		return nil, err
@@ -247,7 +281,7 @@ func parsePredictResult(raw string) (gepa.Prediction, error) {
 	if prediction == nil {
 		return nil, errors.New("parse prediction: result must be a JSON object")
 	}
-	return prediction, nil
+	return gepa.Predict{Signature: signature}.ParseOutput(raw)
 }
 
 func transitionPredictJob(
@@ -280,11 +314,12 @@ func queuePredictRepair(jobID string, job *predictJob, raw string, parseErr erro
 	job.parseRetries++
 	program := gepa.Predict{Signature: job.signature}
 	job.pending = predictHostRequest{
-		RequestID: nextPredictID("request", &predictState.nextRequestID),
-		Kind:      "language_model.generate",
-		Role:      "task",
-		Prompt:    program.RepairPrompt(raw, parseErr),
-		Attempt:   job.parseRetries + 1,
+		RequestID:      nextPredictID("request", &predictState.nextRequestID),
+		Kind:           "language_model.generate",
+		Role:           "task",
+		Prompt:         program.RepairPrompt(job.prompt, raw, parseErr),
+		Attempt:        job.parseRetries + 1,
+		ResponseFormat: job.format,
 	}
 	return predictPendingResponse{Status: "pending", JobID: jobID, HostRequest: job.pending}
 }
@@ -320,7 +355,7 @@ func validatePredictDemos(demos []gepa.Demo) error {
 }
 
 func validatePredictUsage(usage gepa.Usage) error {
-	if usage.PromptTokens < 0 || usage.CompletionTokens < 0 || usage.TotalTokens < 0 {
+	if negativeUsage(usage) {
 		return errors.New("predict.resume result.usage token counts must not be negative")
 	}
 	return nil

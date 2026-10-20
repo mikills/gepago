@@ -1,104 +1,52 @@
 package agents
 
-import (
-	"context"
-	"errors"
-	"strings"
+import gepa "github.com/mikills/gepago"
 
-	gepa "github.com/mikills/gepago"
-)
+// Role identifies the speaker for a chat message. It is an alias of gepa.Role.
+type Role = gepa.Role
 
-// Role identifies the speaker for a chat message.
-type Role string
-
+// Chat roles; they are the gepa constants of the same names.
 const (
-	RoleSystem    Role = "system"
-	RoleUser      Role = "user"
-	RoleAssistant Role = "assistant"
-	RoleTool      Role = "tool"
+	RoleSystem    = gepa.RoleSystem
+	RoleUser      = gepa.RoleUser
+	RoleAssistant = gepa.RoleAssistant
+	RoleTool      = gepa.RoleTool
 )
 
-// FinishReason describes why a chat completion stopped.
-type FinishReason string
+// FinishReason describes why a chat completion stopped. It is an alias of gepa.FinishReason.
+type FinishReason = gepa.FinishReason
 
+// Finish reasons a chat client reports; they are the gepa constants of the same names.
 const (
-	FinishStop      FinishReason = "stop"
-	FinishLength    FinishReason = "length"
-	FinishToolCalls FinishReason = "tool_calls"
+	FinishStop          = gepa.FinishStop
+	FinishLength        = gepa.FinishLength
+	FinishToolCalls     = gepa.FinishToolCalls
+	FinishContentFilter = gepa.FinishContentFilter
 )
 
-// Message is one chat transcript entry.
-type Message struct {
-	Role       Role       `json:"role"`
-	Content    string     `json:"content,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-}
+// Message is one chat transcript entry. It is an alias of gepa.Message.
+type Message = gepa.Message
 
-// ToolCall is a model-requested tool invocation.
-type ToolCall struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
-}
+// ToolCall is a model-requested tool invocation. It is an alias of gepa.ToolCall.
+type ToolCall = gepa.ToolCall
 
-// Tool describes a callable tool exposed to the model.
-type Tool struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Parameters  map[string]any `json:"parameters,omitempty"`
-}
+// Tool describes a callable tool exposed to the model. It is an alias of gepa.Tool, whose
+// Parameters is a JSON Schema as json.RawMessage.
+type Tool = gepa.Tool
 
-// Validate checks that the tool has a name and description.
-func (t Tool) Validate() error {
-	if strings.TrimSpace(t.Name) == "" {
-		return errors.New("tool name is required")
-	}
-	if strings.TrimSpace(t.Description) == "" {
-		return errors.New("tool description is required")
-	}
-	return nil
-}
+// JSONSchemaResponseFormat requests JSON-schema-constrained model output. It is an alias of
+// gepa.ResponseFormat, whose Schema is a JSON Schema as json.RawMessage.
+type JSONSchemaResponseFormat = gepa.ResponseFormat
 
-// JSONSchemaResponseFormat requests JSON-schema-constrained model output.
-type JSONSchemaResponseFormat struct {
-	Name   string         `json:"name"`
-	Schema map[string]any `json:"schema"`
-	Strict bool           `json:"strict"`
-}
-
-// Validate checks that the response format has a name and schema.
-func (f JSONSchemaResponseFormat) Validate() error {
-	if strings.TrimSpace(f.Name) == "" {
-		return errors.New("response format name is required")
-	}
-	if len(f.Schema) == 0 {
-		return errors.New("response format schema is required")
-	}
-	return nil
-}
-
+// Usage records model token counts. It is an alias of gepa.Usage.
 type Usage = gepa.Usage
 
-// ChatRequest is sent to an agent chat client.
-type ChatRequest struct {
-	Model          string                    `json:"model"`
-	Messages       []Message                 `json:"messages"`
-	Tools          []Tool                    `json:"tools,omitempty"`
-	Temperature    *float64                  `json:"temperature,omitempty"`
-	MaxTokens      *int                      `json:"max_tokens,omitempty"`
-	ResponseFormat *JSONSchemaResponseFormat `json:"response_format,omitempty"`
-}
+// ChatRequest is sent to an agent chat client. It is an alias of gepa.ChatRequest.
+type ChatRequest = gepa.ChatRequest
 
-// ChatResponse is returned by an agent chat client.
-type ChatResponse struct {
-	Message       Message      `json:"message"`
-	Usage         Usage        `json:"usage"`
-	FinishReason  FinishReason `json:"finish_reason"`
-	ResolvedModel string       `json:"resolved_model,omitempty"`
-}
+// ChatResponse is returned by an agent chat client. It is an alias of gepa.ChatResponse.
+type ChatResponse = gepa.ChatResponse
 
-// ChatClient is the provider-neutral chat interface used by Agent.
-type ChatClient interface {
-	Chat(ctx context.Context, req ChatRequest) (ChatResponse, error)
-}
+// ChatClient is the provider-neutral chat interface used by Agent. It is an alias of
+// gepa.ChatClient.
+type ChatClient = gepa.ChatClient

@@ -5,7 +5,7 @@ GOFILES := $(shell find . -name '*.go' \
 	-not -path './usecases/*' \
 	-not -path './programs/kiln/train/repos/quote/v3/*')
 GOLINES := go run github.com/segmentio/golines@v0.13.0
-MODERNIZE := go run golang.org/x/tools/go/analysis/passes/modernize/cmd/modernize@v0.45.0
+MODERNIZE := go run golang.org/x/tools/go/analysis/passes/modernize/cmd/modernize@v0.49.0
 STATICCHECK := go run honnef.co/go/tools/cmd/staticcheck@v0.7.0
 MAX_LEN ?= 120
 DIAGO_OUTPUT ?= .diago/audit.txt

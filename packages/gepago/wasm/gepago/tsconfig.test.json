@@ -2,7 +2,6 @@
   "extends": "./tsconfig.build.json",
   "compilerOptions": {
     "outDir": ".test-dist",
-    "baseUrl": ".",
     "paths": {
       "@mikills/wasm/gepago": ["./dist/index.d.ts"],
       "@mikills/wasm/gepago/*": ["./dist/*.d.ts"]

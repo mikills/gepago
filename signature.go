@@ -1,16 +1,59 @@
 package gepa
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"regexp"
+	"slices"
 	"strings"
 )
 
 // Field describes one named input or output in a programme signature.
+//
+// Type and Schema constrain the field's value. Type is a Go kind name and maps to a JSON Schema
+// type: "bool" to boolean; "int", "int8", "int16", "int32", "int64", "uint", "uint8",
+// "uint16", "uint32" and "uint64" to integer; "float32" and "float64" to number; "string" to
+// string; "slice" to an array of any values; "map" to an object of any values. Predict checks
+// an output's value against its Type as Key.Get would decode it into that Go type, so 2.5 is
+// not an int and 300 is not an int8. Schema is an explicit JSON Schema for the value; Predict
+// passes it to the model but does not check values against it. Set one or neither: a field
+// with neither accepts any JSON value.
+//
+// An output is required: Predict fails when the reply omits it or sets it to null. Optional
+// lets the reply set it to null or leave it out; strict providers need every property listed
+// as required, so Signature.JSONSchema lists an optional output as required but nullable.
+// Optional applies to outputs only.
+//
+// On an input, Type and Schema describe the value but Predict does not check them.
 type Field struct {
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-	Required    bool   `json:"required,omitempty"`
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Type        string          `json:"type,omitempty"`
+	Schema      json.RawMessage `json:"schema,omitempty"`
+	Optional    bool            `json:"optional,omitempty"`
+}
+
+// fieldTypes maps the values Field.Type accepts to the Go type each one checks against.
+var fieldTypes = map[string]reflect.Type{
+	"bool":    reflect.TypeFor[bool](),
+	"int":     reflect.TypeFor[int](),
+	"int8":    reflect.TypeFor[int8](),
+	"int16":   reflect.TypeFor[int16](),
+	"int32":   reflect.TypeFor[int32](),
+	"int64":   reflect.TypeFor[int64](),
+	"uint":    reflect.TypeFor[uint](),
+	"uint8":   reflect.TypeFor[uint8](),
+	"uint16":  reflect.TypeFor[uint16](),
+	"uint32":  reflect.TypeFor[uint32](),
+	"uint64":  reflect.TypeFor[uint64](),
+	"float32": reflect.TypeFor[float32](),
+	"float64": reflect.TypeFor[float64](),
+	"string":  reflect.TypeFor[string](),
+	"slice":   reflect.TypeFor[[]any](),
+	"map":     reflect.TypeFor[map[string]any](),
 }
 
 // Signature describes the input/output contract a Predict programme must satisfy.
@@ -21,7 +64,8 @@ type Signature struct {
 	Outputs     []Field `json:"outputs"`
 }
 
-// Validate checks that a signature has unique input and output field names.
+// Validate checks that a signature has unique input and output field names and that every
+// field's Type, Schema and Optional settings are usable.
 func (s Signature) Validate() error {
 	if len(s.Inputs) == 0 {
 		return errors.New("signature requires at least one input field")
@@ -33,6 +77,9 @@ func (s Signature) Validate() error {
 	for _, field := range s.Inputs {
 		if err := validateField(field, "input"); err != nil {
 			return err
+		}
+		if field.Optional {
+			return fmt.Errorf("input field %q cannot be optional; Optional applies to outputs", field.Name)
 		}
 		seen[field.Name] = "input"
 	}
@@ -85,12 +132,130 @@ func (s Signature) OutputNames() []string {
 	return names
 }
 
+// JSONSchema returns the JSON Schema of a reply to the signature: an object with one property
+// per output in signature order, every output listed in required, and additionalProperties
+// false. A property is the field's Schema as given, the schema of its Type, or {} for a field
+// with neither; a Type or untyped field carries its description. An optional output's
+// property also admits null.
+func (s Signature) JSONSchema() (json.RawMessage, error) {
+	properties := make(schemaNode, 0, len(s.Outputs))
+	required := make([]string, 0, len(s.Outputs))
+	for _, field := range s.Outputs {
+		property, err := field.propertySchema()
+		if err != nil {
+			return nil, fmt.Errorf("output field %q: %w", field.Name, err)
+		}
+		properties = append(properties, schemaKeyword{key: field.Name, value: property})
+		required = append(required, field.Name)
+	}
+	return json.Marshal(schemaNode{
+		{key: "type", value: "object"},
+		{key: "properties", value: properties},
+		{key: "required", value: required},
+		{key: "additionalProperties", value: false},
+	})
+}
+
+// ResponseFormat returns the format Predict passes to a StructuredGenerator: the signature's
+// JSONSchema, named after the signature, and Strict when the schema stays within the subset
+// that OpenAI and Claude strict modes enforce (see StrictJSONSchema).
+func (s Signature) ResponseFormat() (ResponseFormat, error) {
+	schema, err := s.JSONSchema()
+	if err != nil {
+		return ResponseFormat{}, err
+	}
+	return ResponseFormat{Name: schemaName(s.Name), Schema: schema, Strict: StrictJSONSchema(schema)}, nil
+}
+
+var schemaNameUnsafe = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
+
+// schemaName turns a signature name into a response format name: letters, digits, '_' and
+// '-', at most 64 characters, "output" when nothing is left.
+func schemaName(name string) string {
+	name = strings.Trim(schemaNameUnsafe.ReplaceAllString(strings.TrimSpace(name), "_"), "_")
+	if len(name) > 64 {
+		name = name[:64]
+	}
+	if name == "" {
+		return "output"
+	}
+	return name
+}
+
+// typed reports whether any output sets Type, Schema or Optional, so the reply's shape is more
+// than a set of required fields.
+func (s Signature) typed() bool {
+	return slices.ContainsFunc(s.Outputs, func(field Field) bool {
+		return field.Type != "" || len(field.Schema) > 0 || field.Optional
+	})
+}
+
+// propertySchema returns the field's schema as a reply property.
+func (f Field) propertySchema() (any, error) {
+	if len(f.Schema) > 0 {
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, f.Schema); err != nil {
+			return nil, fmt.Errorf("schema: %w", err)
+		}
+		schema := json.RawMessage(compact.Bytes())
+		if f.Optional && !unconstrainedJSON(schema) {
+			return schemaNode{{key: "anyOf", value: []any{schema, typeNode("null")}}}, nil
+		}
+		return schema, nil
+	}
+	node := schemaNode{}
+	if f.Type != "" {
+		typ := fieldTypes[f.Type]
+		if typ == nil {
+			return nil, unknownFieldType(f.Type)
+		}
+		var err error
+		if node, _, err = newSchemaBuilder().typeSchema(typ, ""); err != nil {
+			return nil, err
+		}
+	}
+	if f.Description != "" {
+		node = node.with("description", f.Description)
+	}
+	if f.Optional {
+		node = nullableSchema(node)
+	}
+	return node, nil
+}
+
+// GoType returns the Go type f's Type names, the type Predict checks an output's value against
+// and so the type a pipeline key for the field holds, or nil when Type is empty or not one
+// Signature.Validate accepts.
+func (f Field) GoType() reflect.Type {
+	return fieldTypes[f.Type]
+}
+
+func unknownFieldType(name string) error {
+	names := make([]string, 0, len(fieldTypes))
+	for typeName := range fieldTypes {
+		names = append(names, typeName)
+	}
+	slices.Sort(names)
+	return fmt.Errorf("type %q is not supported; use one of %s", name, strings.Join(names, ", "))
+}
+
 func validateField(field Field, kind string) error {
 	if strings.TrimSpace(field.Name) == "" {
 		return fmt.Errorf("%s field name is required", kind)
 	}
 	if strings.ContainsAny(field.Name, " \t\n\r") {
 		return fmt.Errorf("%s field %q cannot contain whitespace", kind, field.Name)
+	}
+	if field.Type != "" && len(field.Schema) > 0 {
+		return fmt.Errorf("%s field %q sets both Type and Schema; set one", kind, field.Name)
+	}
+	if field.Type != "" && fieldTypes[field.Type] == nil {
+		return fmt.Errorf("%s field %q: %w", kind, field.Name, unknownFieldType(field.Type))
+	}
+	if len(field.Schema) > 0 {
+		if err := checkSchemaJSON(field.Schema); err != nil {
+			return fmt.Errorf("%s field %q schema: %w", kind, field.Name, err)
+		}
 	}
 	return nil
 }

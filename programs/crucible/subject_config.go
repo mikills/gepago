@@ -177,13 +177,14 @@ func buildAgentSubject(spec SubjectSpec, _ SubjectBuildOptions) (Subject, error)
 	return nil, fmt.Errorf("unsupported agent provider %q", spec.Provider)
 }
 
-// BuildLanguageModel constructs a language model from a serialized model subject spec.
-func BuildLanguageModel(spec SubjectSpec) (gepa.LanguageModel, error) {
+// BuildLanguageModel constructs an OpenAI-compatible generator from a serialised model subject
+// spec.
+func BuildLanguageModel(spec SubjectSpec) (gepa.Generator, error) {
 	apiKey := strings.TrimSpace(spec.APIKey)
 	if apiKey == "" && strings.TrimSpace(spec.APIKeyEnv) != "" {
 		apiKey = os.Getenv(spec.APIKeyEnv)
 	}
-	return openailm.NewLanguageModel(openailm.Config{
+	lm, err := openailm.NewLanguageModel(openailm.Config{
 		APIKey:      apiKey,
 		BaseURL:     spec.BaseURL,
 		Model:       spec.Model,
@@ -191,6 +192,10 @@ func BuildLanguageModel(spec SubjectSpec) (gepa.LanguageModel, error) {
 		MaxTokens:   spec.MaxTokens,
 		Temperature: spec.Temperature,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return lm, nil
 }
 
 func buildHTTPSubjectFactory(spec SubjectSpec, _ SubjectBuildOptions) (Subject, error) {

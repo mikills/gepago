@@ -68,13 +68,30 @@ func toolBindings(tools []ToolSpec) []agents.ToolBinding {
 	for _, spec := range tools {
 		output := spec.Output
 		bindings = append(bindings, agents.ToolBinding{
-			Definition: agents.Tool{Name: spec.Name, Description: spec.Description, Parameters: spec.Parameters},
+			Definition: agents.Tool{
+				Name:        spec.Name,
+				Description: spec.Description,
+				Parameters:  toolParameters(spec.Parameters),
+			},
 			Handler: func(context.Context, *agents.Memory, string) (string, error) {
 				return output, nil
 			},
 		})
 	}
 	return bindings
+}
+
+// toolParameters encodes a configured parameter schema as the JSON Schema an agents.Tool
+// carries; no schema, or one JSON cannot encode, gives none.
+func toolParameters(parameters map[string]any) json.RawMessage {
+	if parameters == nil {
+		return nil
+	}
+	data, err := json.Marshal(parameters)
+	if err != nil {
+		return nil
+	}
+	return data
 }
 
 func (c openAIChatClient) Chat(ctx context.Context, req agents.ChatRequest) (agents.ChatResponse, error) {
@@ -196,6 +213,7 @@ type openAIChatRequest struct {
 type openAIMessage struct {
 	Role       string           `json:"role"`
 	Content    string           `json:"content,omitempty"`
+	Refusal    string           `json:"refusal,omitempty"`
 	ToolCallID string           `json:"tool_call_id,omitempty"`
 	ToolCalls  []openAIToolCall `json:"tool_calls,omitempty"`
 }
@@ -206,16 +224,16 @@ type openAIFunctionTool struct {
 }
 
 type openAIResponsesTool struct {
-	Type        string         `json:"type"`
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Parameters  map[string]any `json:"parameters,omitempty"`
+	Type        string          `json:"type"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
 }
 
 type openAIFunctionDef struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Parameters  map[string]any `json:"parameters,omitempty"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
 }
 
 type openAIResponseFormatDef struct {
@@ -224,9 +242,9 @@ type openAIResponseFormatDef struct {
 }
 
 type openAIJSONSchemaFormat struct {
-	Name   string         `json:"name"`
-	Schema map[string]any `json:"schema"`
-	Strict bool           `json:"strict"`
+	Name   string          `json:"name"`
+	Schema json.RawMessage `json:"schema"`
+	Strict bool            `json:"strict"`
 }
 
 type openAIToolCall struct {
@@ -246,7 +264,31 @@ type openAIChatResponse struct {
 		Message      openAIMessage `json:"message"`
 		FinishReason string        `json:"finish_reason"`
 	} `json:"choices"`
-	Usage gepa.Usage `json:"usage"`
+	Usage openAIChatUsage `json:"usage"`
+}
+
+type openAIChatUsage struct {
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	TotalTokens         int `json:"total_tokens"`
+	PromptTokensDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+	CompletionTokensDetails struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details"`
+}
+
+// gepaUsage maps chat completion usage as the openai provider does. OpenAI reports no cache
+// writes, so CacheCreationTokens stays zero.
+func (u openAIChatUsage) gepaUsage() gepa.Usage {
+	return gepa.Usage{
+		PromptTokens:      u.PromptTokens,
+		CompletionTokens:  u.CompletionTokens,
+		TotalTokens:       u.TotalTokens,
+		ReasoningTokens:   u.CompletionTokensDetails.ReasoningTokens,
+		CachedInputTokens: u.PromptTokensDetails.CachedTokens,
+	}
 }
 
 type openAIResponsesRequest struct {
@@ -280,9 +322,15 @@ type openAIResponsesResponse struct {
 	Model  string                      `json:"model"`
 	Output []openAIResponsesOutputItem `json:"output"`
 	Usage  struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
-		TotalTokens  int `json:"total_tokens"`
+		InputTokens        int `json:"input_tokens"`
+		OutputTokens       int `json:"output_tokens"`
+		TotalTokens        int `json:"total_tokens"`
+		InputTokensDetails struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"input_tokens_details"`
+		OutputTokensDetails struct {
+			ReasoningTokens int `json:"reasoning_tokens"`
+		} `json:"output_tokens_details"`
 	} `json:"usage"`
 	IncompleteDetails struct {
 		Reason string `json:"reason"`
@@ -300,8 +348,9 @@ type openAIResponsesOutputItem struct {
 }
 
 type openAIResponsesContentBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text,omitempty"`
+	Type    string `json:"type"`
+	Text    string `json:"text,omitempty"`
+	Refusal string `json:"refusal,omitempty"`
 }
 
 type openAIResponsesOutputToolCall struct {
@@ -426,16 +475,32 @@ func decodeOpenAIChatResponse(data []byte) (agents.ChatResponse, error) {
 		return agents.ChatResponse{}, errors.New("openai agent chat returned no choices")
 	}
 	choice := response.Choices[0]
-	return agents.ChatResponse{
+	chat := agents.ChatResponse{
 		Message: agents.Message{
 			Role:      agents.RoleAssistant,
 			Content:   choice.Message.Content,
 			ToolCalls: agentsToolCalls(choice.Message.ToolCalls),
 		},
-		Usage:         response.Usage,
+		Usage:         response.Usage.gepaUsage(),
 		FinishReason:  finishReason(choice.FinishReason),
 		ResolvedModel: response.Model,
-	}, nil
+	}
+	applyOpenAIRefusal(&chat, choice.Message.Refusal)
+	return chat, nil
+}
+
+// applyOpenAIRefusal marks a reply the model refused as FinishContentFilter, as the openai
+// provider does: OpenAI reports a refusal in its own field with an ordinary finish reason. The
+// refusal becomes the content when the reply has no other text.
+func applyOpenAIRefusal(chat *agents.ChatResponse, refusal string) {
+	refusal = strings.TrimSpace(refusal)
+	if refusal == "" {
+		return
+	}
+	if strings.TrimSpace(chat.Message.Content) == "" {
+		chat.Message.Content = refusal
+	}
+	chat.FinishReason = agents.FinishContentFilter
 }
 
 func decodeOpenAIResponsesResponse(data []byte) (agents.ChatResponse, error) {
@@ -447,13 +512,16 @@ func decodeOpenAIResponsesResponse(data []byte) (agents.ChatResponse, error) {
 		return agents.ChatResponse{}, errors.New("openai agent responses returned no output")
 	}
 	message := agents.Message{Role: agents.RoleAssistant}
+	var refusal strings.Builder
 	for _, item := range response.Output {
-		applyOpenAIResponsesOutput(&message, item)
+		applyOpenAIResponsesOutput(&message, &refusal, item)
 	}
 	usage := gepa.Usage{
-		PromptTokens:     response.Usage.InputTokens,
-		CompletionTokens: response.Usage.OutputTokens,
-		TotalTokens:      response.Usage.TotalTokens,
+		PromptTokens:      response.Usage.InputTokens,
+		CompletionTokens:  response.Usage.OutputTokens,
+		TotalTokens:       response.Usage.TotalTokens,
+		ReasoningTokens:   response.Usage.OutputTokensDetails.ReasoningTokens,
+		CachedInputTokens: response.Usage.InputTokensDetails.CachedTokens,
 	}
 	if usage.TotalTokens == 0 {
 		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
@@ -462,18 +530,28 @@ func decodeOpenAIResponsesResponse(data []byte) (agents.ChatResponse, error) {
 	if len(message.ToolCalls) > 0 {
 		finish = agents.FinishToolCalls
 	}
-	if response.IncompleteDetails.Reason == "max_output_tokens" {
+	switch response.IncompleteDetails.Reason {
+	case "max_output_tokens":
 		finish = agents.FinishLength
+	case "content_filter":
+		finish = agents.FinishContentFilter
 	}
-	return agents.ChatResponse{Message: message, Usage: usage, FinishReason: finish, ResolvedModel: response.Model}, nil
+	chat := agents.ChatResponse{Message: message, Usage: usage, FinishReason: finish, ResolvedModel: response.Model}
+	applyOpenAIRefusal(&chat, refusal.String())
+	return chat, nil
 }
 
-func applyOpenAIResponsesOutput(message *agents.Message, item openAIResponsesOutputItem) {
+// applyOpenAIResponsesOutput adds an output item's text and tool calls to message and its
+// refusal blocks to refusal.
+func applyOpenAIResponsesOutput(message *agents.Message, refusal *strings.Builder, item openAIResponsesOutputItem) {
 	switch item.Type {
 	case "message":
 		for _, block := range item.Content {
-			if block.Type == "output_text" || block.Type == "text" {
+			switch block.Type {
+			case "output_text", "text":
 				message.Content += block.Text
+			case "refusal":
+				refusal.WriteString(block.Refusal)
 			}
 		}
 		for _, call := range item.ToolCalls {
@@ -504,14 +582,21 @@ func agentsToolCalls(calls []openAIToolCall) []agents.ToolCall {
 	return out
 }
 
+// finishReason maps a chat completion finish reason; a missing or unknown one maps to the
+// empty FinishReason.
 func finishReason(reason string) agents.FinishReason {
-	if reason == toolCallsKey {
+	switch reason {
+	case "stop":
+		return agents.FinishStop
+	case toolCallsKey:
 		return agents.FinishToolCalls
-	}
-	if reason == "length" {
+	case "length":
 		return agents.FinishLength
+	case "content_filter":
+		return agents.FinishContentFilter
+	default:
+		return ""
 	}
-	return agents.FinishStop
 }
 
 func firstNonEmpty(values ...string) string {

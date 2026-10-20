@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 )
 
 // State holds the values passed between Pipeline steps. Outside a run it is unrestricted;
@@ -27,18 +30,70 @@ type State struct {
 }
 
 // stepScope restricts a State to one step's declared keys and buffers its writes until the
-// step succeeds.
+// step succeeds. skipped holds the declared writes a skipped step may leave unwritten, and
+// rejected copies of the values the step tried to write but was refused, which the observer
+// events of a failed step redact.
 type stepScope struct {
-	reads   map[string]reflect.Type
-	writes  map[string]reflect.Type
-	pending map[string]any
-	err     error
+	reads    map[string]reflect.Type
+	writes   map[string]reflect.Type
+	pending  map[string]any
+	skipped  map[string]bool
+	rejected []stateWrite
+	err      error
+	// stage holds what the step stages for tools until it commits.
+	stage *stepStage
+}
+
+// stateWrite is a value written under a state key.
+type stateWrite struct {
+	key   string
+	value any
 }
 
 func (s *stepScope) fail(err error) {
 	if s.err == nil {
 		s.err = err
 	}
+}
+
+// reject fails the step with err and keeps a copy of the value it refused.
+func (s *stepScope) reject(key string, value any, err error) {
+	s.rejected = append(s.rejected, stateWrite{key: key, value: deepCopy(value)})
+	s.fail(err)
+}
+
+// attempted returns every value the step wrote or tried to write.
+func (s *stepScope) attempted() []stateWrite {
+	if s == nil {
+		return nil
+	}
+	writes := slices.Clone(s.rejected)
+	for key, value := range s.pending {
+		writes = append(writes, stateWrite{key: key, value: value})
+	}
+	return writes
+}
+
+// readOnlyView returns a State over values that exposes only reads and refuses every write.
+func readOnlyView(values map[string]any, reads map[string]reflect.Type) State {
+	return State{values: values, scope: &stepScope{reads: reads, pending: map[string]any{}}}
+}
+
+// skip marks a declared write that a step skipped on error leaves unwritten. Outside a step
+// there is nothing to mark.
+func (s State) skip(key string) {
+	scope := s.scope
+	if scope == nil {
+		return
+	}
+	if _, ok := scope.writes[key]; !ok {
+		scope.fail(fmt.Errorf("state key %q is not a declared write", key))
+		return
+	}
+	if scope.skipped == nil {
+		scope.skipped = map[string]bool{}
+	}
+	scope.skipped[key] = true
 }
 
 // NewState creates a State holding a copy of values.
@@ -99,14 +154,14 @@ func (s State) store(key string, typ reflect.Type, value any, fresh bool) {
 	declared, ok := scope.writes[key]
 	switch {
 	case !ok:
-		scope.fail(fmt.Errorf("state key %q is not a declared write", key))
+		scope.reject(key, value, fmt.Errorf("state key %q is not a declared write", key))
 	case typ != declared:
-		scope.fail(fmt.Errorf("state key %q is declared as %s but set as %s", key, declared, typ))
+		scope.reject(key, value, fmt.Errorf("state key %q is declared as %s but set as %s", key, declared, typ))
 	default:
 		if !fresh {
 			value = deepCopy(value)
 			if err := validateStateValue(value); err != nil {
-				scope.fail(fmt.Errorf("state key %q: %w", key, err))
+				scope.reject(key, value, fmt.Errorf("state key %q: %w", key, err))
 				return
 			}
 		}
@@ -118,7 +173,8 @@ func (s State) store(key string, typ reflect.Type, value any, fresh bool) {
 //
 // A value stored as another type, such as a model's JSON output, is converted to T strictly:
 // unknown fields, fields that match only by case, missing fields not tagged omitempty or
-// omitzero, and nulls in non-nullable positions are errors rather than zero values. Types
+// omitzero, nulls in non-nullable positions, arrays with too few or too many elements, and
+// non-zero numbers too small for a float type are errors rather than zero values. Types
 // with their own UnmarshalJSON or UnmarshalText are decoded as they define.
 //
 // If T or *T has a Validate() error method, Get calls it on every value it returns (except a
@@ -234,8 +290,9 @@ func customJSON(typ reflect.Type) bool {
 }
 
 // checkJSONShape reports drift that encoding/json accepts silently: object keys that match a
-// struct field only by case, required struct fields that are missing, and nulls decoded into
-// values that cannot hold them.
+// struct field only by case, required struct fields that are missing, nulls decoded into
+// values that cannot hold them, arrays of the wrong length, floats that underflow to zero and
+// the string "null" in a ",string" field.
 func checkJSONShape(typ reflect.Type, value any, path string) error {
 	if value == nil {
 		if path != "" && !nillable(typ) {
@@ -254,11 +311,23 @@ func checkJSONShape(typ reflect.Type, value any, path string) error {
 			return checkJSONObject(typ, object, path)
 		}
 	case reflect.Slice, reflect.Array:
-		items, _ := value.([]any)
+		items, isArray := value.([]any)
+		if isArray && typ.Kind() == reflect.Array && len(items) != typ.Len() {
+			return fmt.Errorf("%s has %d elements, want %d", describeJSONPath(path), len(items), typ.Len())
+		}
 		for i, item := range items {
 			if err := checkJSONShape(typ.Elem(), item, fmt.Sprintf("%s[%d]", path, i)); err != nil {
 				return err
 			}
+		}
+	case reflect.Float32, reflect.Float64:
+		if number, ok := value.(json.Number); ok && underflows(number, typ.Bits()) {
+			return fmt.Errorf(
+				"%s: number %s is too small for %s and would decode as 0",
+				describeJSONPath(path),
+				number,
+				typ,
+			)
 		}
 	case reflect.Map:
 		object, _ := value.(map[string]any)
@@ -287,12 +356,62 @@ func checkJSONObject(typ reflect.Type, object map[string]any, path string) error
 			return fmt.Errorf("required field %q is missing", fieldPath)
 		case !ok, value == nil && field.optional:
 		default:
-			if err := checkJSONShape(field.typ, value, fieldPath); err != nil {
+			if err := checkJSONField(field, value, fieldPath); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// jsonNumber matches the JSON number grammar.
+var jsonNumber = regexp.MustCompile(jsonNumberPattern)
+
+// checkJSONField checks the value of one struct field. A field with the ",string" option holds
+// the JSON encoding of a boolean, number or string inside a string. encoding/json silently
+// decodes the string "null" there as no value, leaving a zero or a nil pointer, parses a number
+// there with strconv, which admits text JSON does not, such as "01", "1." or "-Inf", and
+// decodes a float in it that underflows as 0. All three are rejected, as the field's schema
+// pattern rejects the first two and Get rejects an unquoted underflow.
+func checkJSONField(field jsonField, value any, path string) error {
+	text, isString := value.(string)
+	if !isString || !field.quoted || !quotable(field.typ) {
+		return checkJSONShape(field.typ, value, path)
+	}
+	if text == "null" {
+		return fmt.Errorf("field %q is the string \"null\", which a \",string\" field decodes as no value", path)
+	}
+	typ := field.typ
+	if typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	switch typ.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64:
+		if !jsonNumber.MatchString(text) {
+			return fmt.Errorf("field %q is %q, which is not a JSON number", path, text)
+		}
+	}
+	return checkJSONShape(typ, json.Number(text), path)
+}
+
+// underflows reports whether a non-zero JSON number rounds to zero at the given float size,
+// which encoding/json accepts silently.
+func underflows(number json.Number, bits int) bool {
+	parsed, err := strconv.ParseFloat(number.String(), bits)
+	if err != nil || parsed != 0 {
+		return false
+	}
+	mantissa, _, _ := strings.Cut(strings.ToLower(number.String()), "e")
+	return strings.Trim(mantissa, "-+0.") != ""
+}
+
+func describeJSONPath(path string) string {
+	if path == "" {
+		return "value"
+	}
+	return fmt.Sprintf("field %q", path)
 }
 
 func joinJSONPath(path, key string) string {
@@ -302,9 +421,15 @@ func joinJSONPath(path, key string) string {
 	return path + "." + key
 }
 
+// jsonField is one JSON object key of a struct. index is the path of the struct field it
+// resolves to, quoted reports the ",string" tag option, and description holds the field's
+// description tag for JSON Schema.
 type jsonField struct {
-	typ      reflect.Type
-	optional bool
+	typ         reflect.Type
+	optional    bool
+	quoted      bool
+	description string
+	index       []int
 }
 
 type jsonFieldCandidate struct {
@@ -313,12 +438,26 @@ type jsonFieldCandidate struct {
 	tagged bool
 }
 
+// jsonFieldCache holds the result of jsonFields for each type it has seen.
+var jsonFieldCache sync.Map
+
 // jsonFields lists the JSON object keys encoding/json decodes into typ, following its rules
 // for embedded structs: the shallowest field wins, a tagged field wins a tie at the same
-// depth, and fields that still tie cancel out and are not decoded at all.
+// depth, and fields that still tie cancel out and are not decoded at all. The result is
+// cached per type and shared, so callers must not change it.
 func jsonFields(typ reflect.Type) map[string]jsonField {
+	if cached, ok := jsonFieldCache.Load(typ); ok {
+		return cached.(map[string]jsonField)
+	}
+	cached, _ := jsonFieldCache.LoadOrStore(typ, findJSONFields(typ))
+	return cached.(map[string]jsonField)
+}
+
+// findJSONFields computes jsonFields.
+func findJSONFields(typ reflect.Type) map[string]jsonField {
 	candidates := map[string][]jsonFieldCandidate{}
 	visited := map[reflect.Type]bool{}
+	indexes := map[reflect.Type][]int{typ: nil}
 	level := []reflect.Type{typ}
 	for depth := 0; len(level) > 0; depth++ {
 		counts := map[reflect.Type]int{}
@@ -331,7 +470,7 @@ func jsonFields(typ reflect.Type) map[string]jsonField {
 				continue
 			}
 			visited[structType] = true
-			next = append(next, addJSONFieldCandidates(structType, depth, counts[structType], candidates)...)
+			next = append(next, addJSONFieldCandidates(structType, indexes, depth, counts[structType], candidates)...)
 		}
 		level = next
 	}
@@ -346,9 +485,11 @@ func jsonFields(typ reflect.Type) map[string]jsonField {
 
 // addJSONFieldCandidates records the fields of one struct and returns the embedded structs to
 // explore at the next depth. A struct embedded more than once at the same depth adds each
-// field twice, so its fields cancel out as they do in encoding/json.
+// field twice, so its fields cancel out as they do in encoding/json. indexes holds the index
+// path of each struct's first embedding, which is the one explored.
 func addJSONFieldCandidates(
 	structType reflect.Type,
+	indexes map[reflect.Type][]int,
 	depth int,
 	count int,
 	candidates map[string][]jsonFieldCandidate,
@@ -371,7 +512,11 @@ func addJSONFieldCandidates(
 			continue
 		}
 		name, options, _ := strings.Cut(tag, ",")
+		index := append(slices.Clone(indexes[structType]), i)
 		if name == "" && field.Anonymous && inner.Kind() == reflect.Struct {
+			if _, ok := indexes[inner]; !ok {
+				indexes[inner] = index
+			}
 			embedded = append(embedded, inner)
 			continue
 		}
@@ -382,8 +527,11 @@ func addJSONFieldCandidates(
 		opts := strings.Split(options, ",")
 		candidate := jsonFieldCandidate{
 			field: jsonField{
-				typ:      field.Type,
-				optional: slices.Contains(opts, "omitempty") || slices.Contains(opts, "omitzero"),
+				typ:         field.Type,
+				optional:    slices.Contains(opts, "omitempty") || slices.Contains(opts, "omitzero"),
+				quoted:      slices.Contains(opts, "string"),
+				description: field.Tag.Get("description"),
+				index:       index,
 			},
 			depth:  depth,
 			tagged: tagged,

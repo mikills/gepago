@@ -17,16 +17,47 @@ const compileModelRequestKind = "language_model.generate"
 // The callback receives the JSON encoding of this value, rather than a Go or
 // JavaScript object, so the protocol is independent of the host wrapper.
 type compileModelRequest struct {
-	Kind    string `json:"kind"`
-	Role    string `json:"role"`
-	Prompt  string `json:"prompt"`
-	Attempt int    `json:"attempt,omitempty"`
+	Kind           string              `json:"kind"`
+	Role           string              `json:"role"`
+	Prompt         string              `json:"prompt"`
+	Attempt        int                 `json:"attempt,omitempty"`
+	ResponseFormat *hostResponseFormat `json:"response_format,omitempty"`
 }
 
-// compileModelResult is the normalized result returned by a host model.
+// hostResponseFormat is the wire form of a gepa.ResponseFormat in a host model request. A host
+// with structured output should constrain its reply to Schema when Strict is true, and may send
+// the prompt alone otherwise, as the Go providers do.
+type hostResponseFormat struct {
+	Name   string          `json:"name"`
+	Schema json.RawMessage `json:"schema"`
+	Strict bool            `json:"strict"`
+}
+
+func newHostResponseFormat(format gepa.ResponseFormat) *hostResponseFormat {
+	return &hostResponseFormat{Name: format.Name, Schema: format.Schema, Strict: format.Strict}
+}
+
+// compileModelResult is the normalised result returned by a host model. FinishReason and
+// Model are optional: hosts that report them let Predict detect a truncated reply.
 type compileModelResult struct {
-	Text  string
-	Usage gepa.Usage
+	Text         string
+	Usage        gepa.Usage
+	FinishReason gepa.FinishReason
+	Model        string
+}
+
+// parseHostFinishReason validates the optional finish reason a host model reports. Empty
+// means the host did not report one.
+func parseHostFinishReason(value string) (gepa.FinishReason, error) {
+	switch reason := gepa.FinishReason(value); reason {
+	case "", gepa.FinishStop, gepa.FinishLength, gepa.FinishToolCalls, gepa.FinishContentFilter:
+		return reason, nil
+	default:
+		return "", fmt.Errorf(
+			"finishReason %q must be one of stop, length, tool_calls or content_filter",
+			value,
+		)
+	}
 }
 
 // compileModelInvoker is the small host boundary used by the common compile
@@ -45,31 +76,47 @@ func (fn compileModelInvokerFunc) GenerateModel(
 	return fn(ctx, request)
 }
 
-// compileLanguageModel adapts the role-aware host callback to Gepago's
-// provider-neutral LanguageModel interface. Each role has an independent
-// attempt counter and reports the most recent host usage to the optimizer.
+// compileLanguageModel adapts the role-aware host callback to Gepago's provider-neutral
+// Generator interface. Each role has an independent attempt counter, and every result carries
+// the host-reported usage so the optimiser records it once per call. The type keeps its name
+// because the optimiser's config fingerprint includes it: renaming it would stop runs saved by
+// earlier releases from resuming.
 type compileLanguageModel struct {
 	invoker compileModelInvoker
 	role    string
 
 	mu          sync.Mutex
 	nextAttempt int
-	lastUsage   gepa.Usage
 }
 
 func newCompileLanguageModel(invoker compileModelInvoker, role string) *compileLanguageModel {
 	return &compileLanguageModel{invoker: invoker, role: role}
 }
 
-func (m *compileLanguageModel) Generate(ctx context.Context, prompt string) (string, error) {
+func (m *compileLanguageModel) Generate(ctx context.Context, prompt string) (gepa.Generation, error) {
+	return m.generate(ctx, prompt, nil)
+}
+
+// GenerateStructured makes compileLanguageModel a gepa.StructuredGenerator: the host request
+// carries the response format, so a host with structured output can enforce it.
+func (m *compileLanguageModel) GenerateStructured(
+	ctx context.Context,
+	prompt string,
+	format gepa.ResponseFormat,
+) (gepa.Generation, error) {
+	return m.generate(ctx, prompt, newHostResponseFormat(format))
+}
+
+func (m *compileLanguageModel) generate(
+	ctx context.Context,
+	prompt string,
+	format *hostResponseFormat,
+) (gepa.Generation, error) {
 	if m == nil || m.invoker == nil {
-		return "", errors.New("compile host model is required")
+		return gepa.Generation{}, errors.New("compile host model is required")
 	}
-	m.mu.Lock()
-	m.lastUsage = gepa.Usage{}
-	m.mu.Unlock()
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return gepa.Generation{}, err
 	}
 
 	m.mu.Lock()
@@ -78,30 +125,25 @@ func (m *compileLanguageModel) Generate(ctx context.Context, prompt string) (str
 	m.mu.Unlock()
 
 	result, err := m.invoker.GenerateModel(ctx, compileModelRequest{
-		Kind:    compileModelRequestKind,
-		Role:    m.role,
-		Prompt:  prompt,
-		Attempt: attempt,
+		Kind:           compileModelRequestKind,
+		Role:           m.role,
+		Prompt:         prompt,
+		Attempt:        attempt,
+		ResponseFormat: format,
 	})
 	if err != nil {
-		return "", err
+		return gepa.Generation{}, err
 	}
-	m.mu.Lock()
-	m.lastUsage = result.Usage
-	m.mu.Unlock()
 	if err := ctx.Err(); err != nil {
-		return "", err
+		// the host already spent the tokens, so report them with the cancellation.
+		return gepa.Generation{Usage: result.Usage}, err
 	}
-	return result.Text, nil
-}
-
-func (m *compileLanguageModel) LastUsage() gepa.Usage {
-	if m == nil {
-		return gepa.Usage{}
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.lastUsage
+	return gepa.Generation{
+		Text:         result.Text,
+		Usage:        result.Usage,
+		Model:        result.Model,
+		FinishReason: result.FinishReason,
+	}, nil
 }
 
 // compileWireConfig is the JSON-only compile protocol. It intentionally does
@@ -250,7 +292,11 @@ func validateCompilePipeline(program *compileWireProgram) error {
 			return err
 		}
 	}
-	return nil
+	// building the pipeline checks how its steps' keys fit together; the placeholder model is
+	// never called.
+	placeholder := newCompileLanguageModel(nil, "task")
+	_, err := buildCompilePipeline(program, placeholder, placeholder)
+	return err
 }
 
 func validateCompilePipelineStep(step compileWireStep, index int, seen map[string]struct{}) error {
@@ -532,7 +578,10 @@ func buildCompileConfigWithMetric(
 	taskLM := newCompileLanguageModel(invoker, "task")
 	repairLM := newCompileLanguageModel(invoker, "repair")
 	reflectionLM := newCompileLanguageModel(invoker, "reflector")
-	program := buildCompileProgram(wire.Program, taskLM, repairLM)
+	program, err := buildCompileProgram(wire.Program, taskLM, repairLM)
+	if err != nil {
+		return gepa.CompileConfig{}, err
+	}
 	metric, err := buildCompileMetric(wire.Metric, options, invoker, customMetric)
 	if err != nil {
 		return gepa.CompileConfig{}, err
@@ -567,10 +616,23 @@ func validateCompileMetricOptions(options compileMetricOptions) error {
 	return validateCompileMetricFields(options.Fields)
 }
 
+// buildCompileProgram builds the programme a wire programme describes: a Predict, the Predict
+// a ChainOfThought runs as, or a pipeline (see buildCompilePipeline).
 func buildCompileProgram(
 	wire *compileWireProgram,
-	taskLM, repairLM *compileLanguageModel,
-) gepa.Program {
+	taskLM, repairLM gepa.Generator,
+) (gepa.Program, error) {
+	if compileProgramKind(wire.Kind) == "pipeline" {
+		return buildCompilePipeline(wire, taskLM, repairLM)
+	}
+	return buildCompilePredict(wire, taskLM, repairLM), nil
+}
+
+// buildCompilePredict builds the Predict a predict or chainOfThought programme runs as.
+func buildCompilePredict(
+	wire *compileWireProgram,
+	taskLM, repairLM gepa.Generator,
+) gepa.Predict {
 	if compileProgramKind(wire.Kind) == "chainOfThought" {
 		program := gepa.ChainOfThought{
 			Signature:      wire.Signature,
@@ -587,19 +649,6 @@ func buildCompileProgram(
 		// for the augmented signature and reasoning instruction.
 		return program.ToPredict()
 	}
-	if compileProgramKind(wire.Kind) == "pipeline" {
-		steps := make([]gepa.PipelineStep, 0, len(wire.Steps))
-		for _, wireStep := range wire.Steps {
-			steps = append(steps, gepa.PipelineStep{
-				Name:         wireStep.Name,
-				Program:      buildCompileProgram(wireStep.Program, taskLM, repairLM),
-				InputKeys:    append([]string(nil), wireStep.Program.InputKeys...),
-				OutputPrefix: wireStep.Program.OutputPrefix,
-			})
-		}
-		return gepa.PipelineProgram{Steps: steps, ReturnAll: wire.ReturnAll}
-	}
-
 	program := gepa.Predict{
 		Signature:   wire.Signature,
 		LM:          taskLM,

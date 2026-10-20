@@ -6,6 +6,7 @@ export const PROGRAM_ARTIFACT_FORMAT_VERSION = 1 as const;
 interface ProgramArtifactValue extends WireObject {
   format_version?: unknown;
   name?: unknown;
+  fingerprint?: unknown;
   candidate?: unknown;
   created_at?: unknown;
 }
@@ -33,6 +34,7 @@ export interface ProgramArtifact {
   name: string;
   version?: string;
   program_version?: string;
+  fingerprint?: string;
   candidate: Candidate;
   metadata?: Record<string, unknown>;
   created_at: string;
@@ -86,6 +88,11 @@ export function parseProgramArtifact(value: unknown): ProgramArtifact {
   if (typeof object.version === "string") result.version = object.version;
   if (typeof object.program_version === "string")
     result.program_version = object.program_version;
+  if (object.fingerprint !== undefined && object.fingerprint !== null) {
+    if (typeof object.fingerprint !== "string")
+      throw new TypeError("artifact fingerprint must be a string");
+    result.fingerprint = object.fingerprint;
+  }
   if (
     object.metadata !== undefined &&
     object.metadata !== null &&

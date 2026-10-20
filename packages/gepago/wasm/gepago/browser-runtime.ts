@@ -19,8 +19,8 @@ import type {
   RunResult,
   Signature,
   MetricResult,
-  Usage,
 } from "./public-types.ts";
+import { assertWasmAPIVersion } from "./api-version.ts";
 import type {
   LoadedRuntime,
   RuntimeNamespace,
@@ -288,52 +288,37 @@ function createBrowserRuntime(namespace: RuntimeNamespace): LoadedRuntime {
         },
         model,
       );
-    let stateInputs = { ...inputs };
-    let last: Record<string, JSONValue> = {};
-    let usage: Usage = {
-      prompt_tokens: 0,
-      completion_tokens: 0,
-      total_tokens: 0,
-    };
-    for (const step of program.steps) {
-      const stepInputs: Record<string, JSONValue> = {};
-      for (const key of step.program.inputKeys === undefined ||
-      step.program.inputKeys.length === 0
-        ? Object.keys(stateInputs)
-        : step.program.inputKeys) {
-        if (!Object.hasOwn(stateInputs, key))
-          throw new Error(
-            `pipeline step "${step.name}": required input "${key}" is missing`,
+    // A pipeline runs in the Go module exactly as compile runs it, so both accept and reject
+    // the same programmes and inputs and send the same prompts.
+    return as<PredictResult>(
+      await new Promise<unknown>((resolve, reject) => {
+        let jobID = "";
+        try {
+          jobID = runtimeString(
+            namespace.start(
+              "pipeline.run",
+              jsonPayload("runCompiled", { program, candidate, inputs }),
+              (requestJSON) => model(JSON.parse(requestJSON) as never),
+              (completedJobID, resultJSON) => {
+                if (completedJobID !== jobID)
+                  reject(
+                    new Error("runCompiled completed with an unexpected job id"),
+                  );
+                else
+                  try {
+                    resolve(parseEnvelope("runCompiled", resultJSON));
+                  } catch (error) {
+                    reject(error);
+                  }
+              },
+            ),
+            "runCompiled",
           );
-        stepInputs[key] = stateInputs[key];
-      }
-      const scoped: Candidate = {};
-      const prefix = `${step.name}.`;
-      for (const [key, value] of Object.entries(candidate))
-        if (key.startsWith(prefix)) scoped[key.slice(prefix.length)] = value;
-      const result = await predict(
-        {
-          program: applyCandidate(
-            step.program,
-            scoped,
-          ) as PredictConfig["program"],
-          inputs: stepInputs,
-        },
-        model,
-      );
-      usage = {
-        prompt_tokens: usage.prompt_tokens + result.usage.prompt_tokens,
-        completion_tokens:
-          usage.completion_tokens + result.usage.completion_tokens,
-        total_tokens: usage.total_tokens + result.usage.total_tokens,
-      };
-      const outputPrefix = (step.program.outputPrefix ?? "").trim();
-      last = {};
-      for (const [key, value] of Object.entries(result.prediction))
-        last[outputPrefix ? `${outputPrefix}${key}` : key] = value;
-      Object.assign(stateInputs, last);
-    }
-    return { prediction: program.returnAll ? stateInputs : last, usage };
+        } catch (error) {
+          reject(error);
+        }
+      }),
+    );
   }
   return {
     invoke,
@@ -434,5 +419,6 @@ export async function loadBrowserRuntime(
   await Promise.resolve();
   if (!global.gepagoWasm)
     throw new Error("Gepago WASM module did not register the expected API");
+  assertWasmAPIVersion(global.gepagoWasm.version);
   return createBrowserRuntime(global.gepagoWasm);
 }

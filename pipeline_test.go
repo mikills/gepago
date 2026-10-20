@@ -5,10 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"path/filepath"
-	"slices"
 	"sync"
-	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -46,7 +43,7 @@ func signatureProgram(outputs ...string) Predict {
 	}
 	return Predict{
 		Signature: Signature{Name: "extract", Inputs: []Field{{Name: "document"}}, Outputs: fields},
-		LM: LanguageModelFunc(func(context.Context, string) (string, error) {
+		LM: textModel(func(context.Context, string) (string, error) {
 			return `{"a": 1}`, nil
 		}),
 	}
@@ -290,6 +287,38 @@ func TestPipelineSpecBuildErrors(t *testing.T) {
 				`do not match declared writes ["answer" "other"]`,
 		},
 		{
+			name:    "untyped input",
+			spec:    PipelineSpec{Inputs: refs(KeyRef{Name: "document"}), Steps: []Step{amountStep()}},
+			wantErr: `pipeline inputs: state key "document" type is required; use Key.Ref`,
+		},
+		{
+			name: "merge rule without key",
+			spec: PipelineSpec{
+				Steps:  []Step{amountStep()},
+				Merges: []MergeRule{{Merge: func(_, next any) (any, error) { return next, nil }}},
+			},
+			wantErr: "merge rule 0 key is required",
+		},
+		{
+			name: "merge rule without function",
+			spec: PipelineSpec{
+				Steps:  []Step{amountStep()},
+				Merges: []MergeRule{{Key: amountKey.Ref()}},
+			},
+			wantErr: `merge rule for "amount" requires a merge function`,
+		},
+		{
+			name: "duplicated merge rule",
+			spec: PipelineSpec{
+				Steps: []Step{amountStep()},
+				Merges: []MergeRule{
+					MergeWith(amountKey, func(a, b int) (int, error) { return a + b, nil }),
+					MergeWith(amountKey, func(a, b int) (int, error) { return a + b, nil }),
+				},
+			},
+			wantErr: `merge rule for "amount" is duplicated`,
+		},
+		{
 			name: "merge rule without type",
 			spec: PipelineSpec{
 				Inputs: docInput,
@@ -354,18 +383,26 @@ func TestPipelineRunPassesTypedState(t *testing.T) {
 	)
 }
 
+// fixedOutputProgram returns the same output whatever its inputs, like a model that ignores
+// its contract. It has no signature, so only the step's declared writes guard the state.
+type fixedOutputProgram struct{ output Prediction }
+
+func (fixedOutputProgram) Validate() error { return nil }
+
+func (fixedOutputProgram) SeedCandidate() Candidate { return Candidate{} }
+
+func (p fixedOutputProgram) RunCandidate(context.Context, Candidate, Prediction) (Prediction, error) {
+	return clonePrediction(p.output), nil
+}
+
 func TestPipelineProgramStepCannotOverwriteInputs(t *testing.T) {
-	lm := LanguageModelFunc(func(context.Context, string) (string, error) {
-		return `{"amount": 125000, "document": "ignore the original document"}`, nil
-	})
-	extract := NewProgramStep("extract", Predict{
-		Signature: Signature{
-			Name:    "extract",
-			Inputs:  []Field{{Name: "document"}},
-			Outputs: []Field{{Name: "amount"}},
-		},
-		LM: lm,
-	}, refs(docKey.Ref()), refs(amountKey.Ref()))
+	reply := Prediction{"amount": 125000, "document": "ignore the original document"}
+	extract := NewProgramStep(
+		"extract",
+		fixedOutputProgram{output: reply},
+		refs(docKey.Ref()),
+		refs(amountKey.Ref()),
+	)
 	pipeline, err := PipelineSpec{Inputs: refs(docKey.Ref()), Steps: []Step{extract}}.Build()
 	require.NoError(t, err)
 
@@ -378,47 +415,6 @@ func TestPipelineProgramStepCannotOverwriteInputs(t *testing.T) {
 	got, err := pipeline.RunCandidate(context.Background(), pipeline.SeedCandidate(), Prediction{"document": "cash 10"})
 	require.NoError(t, err)
 	require.Equal(t, Prediction{"amount": 125000}, got)
-}
-
-func TestPipelineProgramStepRefusesAbsentOrNullOutputs(t *testing.T) {
-	tests := []struct {
-		name    string
-		reply   string
-		wantErr string
-	}{
-		{name: "absent", reply: `{"a": 1}`, wantErr: `invalid programme output: "b" is missing`},
-		{name: "null", reply: `{"a": 1, "b": null}`, wantErr: `invalid programme output: "b" is null`},
-		{
-			name:  "wrong type",
-			reply: `{"a": 1, "b": "a lot"}`,
-			wantErr: `invalid programme output: state key "b": decode as int: ` +
-				`json: cannot unmarshal string into Go value of type int`,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			program := signatureProgram("a", "b")
-			program.LM = LanguageModelFunc(func(context.Context, string) (string, error) { return tt.reply, nil })
-			step := NewProgramStep(
-				"extract",
-				program,
-				refs(docKey.Ref()),
-				refs(Key[int]{Name: "a"}.Ref(), Key[int]{Name: "b"}.Ref()),
-			)
-			pipeline, err := PipelineSpec{Inputs: refs(docKey.Ref()), Steps: []Step{step}}.Build()
-			require.NoError(t, err)
-
-			got, err := pipeline.RunCandidate(context.Background(), nil, Prediction{"document": "cash 10"})
-
-			var stepErr *StepError
-			require.ErrorAs(t, err, &stepErr)
-			require.Equal(t, "extract", stepErr.Step)
-			require.EqualError(t, stepErr.Err, tt.wantErr)
-			require.ErrorIs(t, err, ErrInvalidOutput)
-			require.Contains(t, stepErr.Details, "output")
-			require.Equal(t, Prediction{}, got)
-		})
-	}
 }
 
 func TestPipelineEnforcesDeclaredKeysAtRunTime(t *testing.T) {
@@ -469,6 +465,14 @@ func TestPipelineEnforcesDeclaredKeysAtRunTime(t *testing.T) {
 				},
 			),
 			wantErr: `pipeline step "invalid": state key "obligation": currency is required`,
+		},
+		{
+			name: "undeclared write and an error",
+			step: NewStep("both", refs(docKey.Ref()), refs(amountKey.Ref()), func(_ context.Context, s State) error {
+				docKey.Set(s, "rewritten")
+				return errors.New("model unavailable")
+			}),
+			wantErr: "pipeline step \"both\": model unavailable\nstate key \"document\" is not a declared write",
 		},
 		{
 			name: "read own write before setting it",
@@ -685,179 +689,11 @@ func TestPipelineZeroValueIsNotRunnable(t *testing.T) {
 	require.EqualError(t, err, "pipeline is not built; use PipelineSpec.Build")
 }
 
-func predictStep(name string, lm LanguageModel, input, output KeyRef) ComponentStep {
+func predictStep(name string, lm Generator, input, output KeyRef) ComponentStep {
 	return NewProgramStep(name, Predict{
 		Signature: Signature{Name: name, Inputs: []Field{{Name: input.Name}}, Outputs: []Field{{Name: output.Name}}},
 		LM:        lm,
 	}, refs(input), refs(output))
-}
-
-func TestPipelineCompiledUsage(t *testing.T) {
-	plan := Key[string]{Name: "plan"}
-	report := Key[string]{Name: "report"}
-	lm := &sequenceUsageModel{}
-	pipeline, err := PipelineSpec{
-		Inputs: refs(docKey.Ref()),
-		Steps: []Step{
-			predictStep("plan", lm, docKey.Ref(), plan.Ref()),
-			predictStep("report", lm, plan.Ref(), report.Ref()),
-		},
-	}.Build()
-	require.NoError(t, err)
-	compiled := CompiledProgram{Program: pipeline, Candidate: pipeline.SeedCandidate()}
-
-	got, usage, err := compiled.RunWithUsage(context.Background(), Prediction{"document": "cash 10"})
-	require.NoError(t, err)
-	require.Equal(t, "found evidence", got["report"])
-	require.Equal(t, Usage{PromptTokens: 3, CompletionTokens: 30, TotalTokens: 33}, usage)
-}
-
-// failingUsageModel answers the first call and fails the second after the provider has
-// reported usage for it.
-type failingUsageModel struct {
-	calls int
-	last  Usage
-}
-
-func (m *failingUsageModel) Generate(context.Context, string) (string, error) {
-	m.calls++
-	m.last = Usage{PromptTokens: m.calls, CompletionTokens: m.calls * 10, TotalTokens: m.calls * 11}
-	if m.calls == 1 {
-		return `{"plan":"find evidence"}`, nil
-	}
-	return "", errors.New("response truncated")
-}
-
-func (m *failingUsageModel) LastUsage() Usage { return m.last }
-
-func TestPipelineRecordsUsageOfFailedModelStep(t *testing.T) {
-	plan := Key[string]{Name: "plan"}
-	report := Key[string]{Name: "report"}
-	lm := &failingUsageModel{}
-	pipeline, err := PipelineSpec{
-		Inputs: refs(docKey.Ref()),
-		Steps: []Step{
-			predictStep("plan", lm, docKey.Ref(), plan.Ref()),
-			predictStep("report", lm, plan.Ref(), report.Ref()),
-		},
-	}.Build()
-	require.NoError(t, err)
-	compiled := CompiledProgram{Program: pipeline, Candidate: pipeline.SeedCandidate()}
-
-	got, usage, err := compiled.RunWithUsage(context.Background(), Prediction{"document": "cash 10"})
-
-	var stepErr *StepError
-	require.ErrorAs(t, err, &stepErr)
-	require.Equal(t, "report", stepErr.Step)
-	require.Equal(t, "find evidence", got["plan"])
-	require.Equal(t, Usage{PromptTokens: 3, CompletionTokens: 30, TotalTokens: 33}, usage)
-}
-
-func TestPipelineLoadsPipelineProgramArtifact(t *testing.T) {
-	prompts := map[string]string{}
-	predict := func(name string, input, output, reply string) Predict {
-		return Predict{
-			Signature:   Signature{Name: name, Inputs: []Field{{Name: input}}, Outputs: []Field{{Name: output}}},
-			Instruction: name + " seed",
-			LM: LanguageModelFunc(func(_ context.Context, prompt string) (string, error) {
-				prompts[name] = prompt
-				return reply, nil
-			}),
-		}
-	}
-	extract := predict("extract", "document", "amount", `{"amount": 10}`)
-	decide := predict("decide", "amount", "decision", `{"decision": "approve"}`)
-
-	legacy := PipelineProgram{Steps: []PipelineStep{
-		{Name: "extract", Program: extract},
-		{Name: "decide", Program: decide, InputKeys: []string{"amount"}},
-	}}
-	trained := legacy.SeedCandidate()
-	trained["extract.instruction"] = "extract trained"
-	trained["decide.instruction"] = "decide trained"
-	path := filepath.Join(t.TempDir(), "underwriting.json")
-	require.NoError(t, SaveProgramArtifact(path, NewProgramArtifact("underwriting", trained)))
-
-	pipeline, err := PipelineSpec{
-		Inputs: refs(docKey.Ref()),
-		Steps: []Step{
-			NewProgramStep("extract", extract, refs(docKey.Ref()), refs(amountKey.Ref())),
-			NewProgramStep("decide", decide, refs(amountKey.Ref()), refs(decisionKey.Ref())),
-		},
-	}.Build()
-	require.NoError(t, err)
-	require.Equal(
-		t,
-		slices.Sorted(maps.Keys(legacy.SeedCandidate())),
-		slices.Sorted(maps.Keys(pipeline.SeedCandidate())),
-	)
-
-	compiled, _, err := LoadCompiledProgram(path, pipeline)
-	require.NoError(t, err)
-	require.Equal(t, trained, compiled.Candidate)
-
-	ctx := context.Background()
-	inputs := Prediction{"document": "cash 10"}
-	_, err = legacy.RunCandidate(ctx, compiled.Candidate, inputs)
-	require.NoError(t, err)
-	legacyPrompts := maps.Clone(prompts)
-
-	_, err = compiled.Run(ctx, inputs)
-	require.NoError(t, err)
-	require.Equal(t, legacyPrompts, prompts)
-	require.Contains(t, prompts["extract"], "extract trained")
-	require.Contains(t, prompts["decide"], "decide trained")
-}
-
-func TestPipelineChainOfThoughtStep(t *testing.T) {
-	answer := Key[string]{Name: "answer"}
-	reasoning := Key[string]{Name: "reasoning"}
-	think := ChainOfThought{
-		Signature: signatureProgram("answer").Signature,
-		LM: LanguageModelFunc(func(context.Context, string) (string, error) {
-			return `{"answer": "42", "reasoning": "6 times 7"}`, nil
-		}),
-	}
-
-	for _, writes := range [][]KeyRef{refs(answer.Ref()), refs(answer.Ref(), reasoning.Ref())} {
-		pipeline, err := PipelineSpec{
-			Inputs: refs(docKey.Ref()),
-			Steps:  []Step{NewProgramStep("think", think, refs(docKey.Ref()), writes)},
-		}.Build()
-		require.NoError(t, err)
-
-		got, err := pipeline.RunCandidate(context.Background(), nil, Prediction{"document": "6*7?"})
-		require.NoError(t, err)
-		require.Equal(t, "42", got["answer"])
-		require.Len(t, got, len(writes))
-	}
-}
-
-func TestPipelineRefusesModelOutputFailingValidate(t *testing.T) {
-	obligation := Key[validatedObligation]{Name: "obligation"}
-	program := Predict{
-		Signature: Signature{
-			Name:    "extract",
-			Inputs:  []Field{{Name: "document"}},
-			Outputs: []Field{{Name: "obligation"}},
-		},
-		LM: LanguageModelFunc(func(context.Context, string) (string, error) {
-			return `{"obligation": {"amount": 10, "currency": ""}}`, nil
-		}),
-	}
-	pipeline, err := PipelineSpec{
-		Inputs: refs(docKey.Ref()),
-		Steps:  []Step{NewProgramStep("extract", program, refs(docKey.Ref()), refs(obligation.Ref()))},
-	}.Build()
-	require.NoError(t, err)
-
-	_, err = pipeline.RunCandidate(context.Background(), nil, Prediction{"document": "cash 10"})
-
-	var stepErr *StepError
-	require.ErrorAs(t, err, &stepErr)
-	require.Equal(t, "extract", stepErr.Step)
-	require.ErrorIs(t, err, ErrInvalidOutput)
-	require.EqualError(t, stepErr.Err, `invalid programme output: state key "obligation": currency is required`)
 }
 
 func TestPipelineMergeResultIsTypeChecked(t *testing.T) {
@@ -977,6 +813,24 @@ func TestPipelineRecoversStepPanic(t *testing.T) {
 	require.Equal(t, Prediction{"amount": 125000}, got)
 }
 
+func TestPipelineRecoversMergePanic(t *testing.T) {
+	pipeline, err := PipelineSpec{
+		Steps: []Step{writeAmount("first", 1), writeAmount("second", 2)},
+		Merges: []MergeRule{MergeWith(amountKey, func(int, int) (int, error) {
+			panic("merge exploded")
+		})},
+	}.Build()
+	require.NoError(t, err)
+
+	got, err := pipeline.RunCandidate(context.Background(), nil, Prediction{})
+
+	var stepErr *StepError
+	require.ErrorAs(t, err, &stepErr)
+	require.EqualError(t, err, `pipeline step "second": step panicked: merge exploded`)
+	require.Contains(t, stepErr.Details["stack"], "TestPipelineRecoversMergePanic")
+	require.Equal(t, Prediction{"amount": 1}, got)
+}
+
 func TestPipelineStopsWhenContextIsCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1026,92 +880,4 @@ func TestPipelineConcurrentRuns(t *testing.T) {
 		require.NoError(t, errs[i])
 		require.Equal(t, Prediction{"notes": []string{fmt.Sprint(i * 2)}}, got)
 	}
-}
-
-func TestProgramEvaluatorScoresInvalidOutputsZero(t *testing.T) {
-	label := Key[string]{Name: "label"}
-	calls := 0
-	program := signatureProgram("label")
-	program.LM = LanguageModelFunc(func(context.Context, string) (string, error) {
-		calls++
-		if calls == 2 {
-			return `{"label": null}`, nil
-		}
-		return `{"label": "positive"}`, nil
-	})
-	pipeline, err := PipelineSpec{
-		Inputs: refs(docKey.Ref()),
-		Steps:  []Step{NewProgramStep("classify", program, refs(docKey.Ref()), refs(label.Ref()))},
-	}.Build()
-	require.NoError(t, err)
-	evaluator := ProgramEvaluator{Program: pipeline, Metric: ExactMatchMetric{Fields: []string{"label"}}}
-	examples := []Example{
-		NewIOExample("1", Prediction{"document": "great"}, Prediction{"label": "positive"}),
-		NewIOExample("2", Prediction{"document": "fine"}, Prediction{"label": "positive"}),
-	}
-
-	result, err := evaluator.Evaluate(context.Background(), pipeline.SeedCandidate(), examples, false)
-	require.NoError(t, err)
-	require.Len(t, result.Items, 2)
-	require.Equal(t, 1.0, result.Items[0].Score)
-	require.Equal(t, 0.0, result.Items[1].Score)
-	require.Equal(
-		t,
-		`pipeline step "classify": invalid programme output: "label" is null`,
-		result.Items[1].SideInfo["feedback"],
-	)
-	require.Contains(t, result.Items[1].SideInfo["details"], "output")
-}
-
-func TestProgramEvaluatorReturnsUsageWithError(t *testing.T) {
-	plan := Key[string]{Name: "plan"}
-	pipeline, err := PipelineSpec{
-		Inputs: refs(docKey.Ref()),
-		Steps:  []Step{predictStep("plan", &failingUsageModel{}, docKey.Ref(), plan.Ref())},
-	}.Build()
-	require.NoError(t, err)
-	evaluator := ProgramEvaluator{
-		Program: pipeline,
-		Metric: MetricFunc(func(context.Context, Prediction, Prediction) (MetricResult, error) {
-			return MetricResult{Score: 1}, nil
-		}),
-	}
-	examples := []Example{
-		NewIOExample("1", Prediction{"document": "a"}, Prediction{"plan": "find evidence"}),
-		NewIOExample("2", Prediction{"document": "b"}, Prediction{"plan": "find evidence"}),
-	}
-
-	result, err := evaluator.Evaluate(context.Background(), pipeline.SeedCandidate(), examples, false)
-	require.EqualError(t, err, `evaluate example "2": run candidate: pipeline step "plan": response truncated`)
-	require.Equal(t, Usage{PromptTokens: 3, CompletionTokens: 30, TotalTokens: 33}, result.Usage)
-}
-
-var countedValidations atomic.Int32
-
-type countedValue struct {
-	Amount int `json:"amount"`
-}
-
-func (countedValue) Validate() error {
-	countedValidations.Add(1)
-	return nil
-}
-
-func TestPipelineConvertsModelOutputOnce(t *testing.T) {
-	value := Key[countedValue]{Name: "value"}
-	program := signatureProgram("value")
-	program.LM = LanguageModelFunc(func(context.Context, string) (string, error) {
-		return `{"value": {"amount": 3}}`, nil
-	})
-	pipeline, err := PipelineSpec{
-		Inputs: refs(docKey.Ref()),
-		Steps:  []Step{NewProgramStep("extract", program, refs(docKey.Ref()), refs(value.Ref()))},
-	}.Build()
-	require.NoError(t, err)
-	countedValidations.Store(0)
-
-	got, err := pipeline.RunCandidate(context.Background(), nil, Prediction{"document": "cash 10"})
-	require.NoError(t, err)
-	require.Equal(t, Prediction{"value": countedValue{Amount: 3}}, got)
-	require.Equal(t, int32(1), countedValidations.Load())
 }

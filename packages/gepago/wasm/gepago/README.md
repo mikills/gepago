@@ -96,6 +96,10 @@ For a development command at another path, use
 `wasm_exec.js`; otherwise the package copy is preferred, followed by Go's
 `GOROOT/lib/wasm/wasm_exec.js`.
 
+`version()` returns the WASM API version, `"3"`. Loading fails when a module
+reports another version, so build the WASM from the same release as this
+package.
+
 ## Installation and usage
 
 ```bash
@@ -257,23 +261,34 @@ bridge. The config contains a JSON-safe `program`, `trainset`, optional
 `capabilities.metric` for a custom metric. `capabilities.observer` and the
 `appendEvent`/`saveState`/`loadState` callbacks provide optimizer events and
 resumable persistence. The callback receives a normalized object of type
-`CompileModelRequest` and may return text, `{ text, usage }`, or a Promise of
-either. Requests are tagged with `task`, `reflector`, `judge`, or `repair`; an
+`CompileModelRequest` and may return text, `{ text, usage, finishReason?, model? }`,
+or a Promise of either. A `finishReason` of `length` marks a truncated reply and
+`content_filter` a refused one: the example scores zero and no repair is requested.
+Task and repair requests carry a `response_format` (`{ name, schema, strict }`); the
+OpenAI and Claude model helpers enforce it when `strict` is true. Requests are tagged with `task`, `reflector`, `judge`, or `repair`; an
 `llmJudge` metric uses the `judge` role. The resolved value is
 `{ candidate, state }`, including candidate scores and the optimization usage
 ledger.
 
 The wrapper validates inputs at the JSON boundary, converts model strings to
-`{ text }`, rejects Go error envelopes, and cancels the module-owned job when a
-model callback or completion fails. `close()` also requests cancellation for
-pending compile jobs.
+`{ text }` and rejects Go error envelopes. A model callback that throws or
+rejects fails that model call, in Node as in the browser, so `compile` and a
+pipeline's `runCompiled` reject with the failing step's error and the host's
+message rather than a cancelled job. `close()` requests cancellation for
+pending compile and pipeline jobs.
 
 `runCompiled(programConfig, candidate, inputs, model)` accepts wire `predict`,
 `chainOfThought`, and `pipeline` programs. COT programs add the reasoning output
 and instruction once; compiled COT candidates are overlaid after that normalization.
-Pipeline candidates use scoped keys such as `extract.instruction`. Steps run
-sequentially through the async `predict` bridge, honoring each step's
-`inputKeys`, `outputPrefix`, and the pipeline's `returnAll` setting.
+Pipeline candidates use scoped keys such as `extract.instruction`; a component
+the candidate leaves out keeps its seed text. A pipeline runs in the Go module
+as the same typed `gepa.Pipeline` that `compile` evaluates, so `runCompiled`
+accepts and rejects the same programs and inputs and sends the same prompts:
+each step sees its `inputKeys`, or only its signature's inputs when it lists
+none, typed inputs are converted to their types, its outputs are stored under
+its `outputPrefix` (an optional output the reply leaves out holds its type's
+zero value), and the pipeline's `returnAll` setting picks the result. Model
+requests have the `predict` host request shape.
 
 ## Async Agents
 
@@ -296,14 +311,17 @@ cancellation. `close()` cancels pending agent and compile jobs.
 
 ## Resumable Predict and limitations
 
-`predict(config, model)` implements the version-2 resumable host protocol. The
+`predict(config, model)` implements the version-3 resumable host protocol. The
 config is `{ program: { kind?: "predict" | "chainOfThought", signature,
 instruction?, demos?, maxParseRetries?, reasoningField? }, inputs }`.
 Chain-of-thought normalization adds the reasoning output and instruction before
 building the prompt. The async `model` callback receives `{ request_id, kind,
-role, prompt, attempt }` and returns either a raw string or
-`{ text, usage: { prompt_tokens, completion_tokens, total_tokens } }`. The
-returned value is `{ prediction, usage }`. If the callback rejects or returns
+role, prompt, attempt, response_format? }` and returns either a raw string or
+`{ text, usage: { prompt_tokens, completion_tokens, total_tokens }, finishReason?, model? }`.
+The returned value is `{ prediction, usage }`. A `finishReason` of `length` or
+`content_filter` fails the prediction without a repair request. `response_format`
+holds the signature's JSON schema; a model with structured output should enforce it
+when `strict` is true. If the callback rejects or returns
 invalid data, the wrapper cancels the module-owned job and rethrows the model
 error. Parse failures request repair until `maxParseRetries` is exhausted.
 

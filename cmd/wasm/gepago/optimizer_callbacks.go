@@ -68,6 +68,7 @@ type hostProposer struct {
 	lessons  []string
 	metadata []gepa.ProposalMetadata
 	usage    gepa.Usage
+	calls    int
 }
 
 func (p *hostProposer) Propose(
@@ -76,6 +77,12 @@ func (p *hostProposer) Propose(
 	dataset gepa.ReflectiveDataset,
 	components []string,
 ) (gepa.Candidate, error) {
+	// the optimiser reads LastUsage and LastModelCalls after failed proposals too, so clear
+	// the previous call's.
+	p.mu.Lock()
+	p.usage = gepa.Usage{}
+	p.calls = 0
+	p.mu.Unlock()
 	if p.callback == nil {
 		return nil, errors.New("host proposer callback is required")
 	}
@@ -90,17 +97,23 @@ func (p *hostProposer) Propose(
 		return nil, fmt.Errorf("encode proposer callback request: %w", err)
 	}
 	encoded, err := p.callback(ctx, string(request))
-	if err != nil {
-		return nil, err
-	}
-	patch, metadata, usage, err := decodeProposerResponse(encoded)
-	if err != nil {
-		return nil, err
-	}
 	p.mu.Lock()
-	p.metadata = metadata
-	p.usage = usage
+	p.calls = 1
 	p.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	// a response the proposer cannot use still reports the tokens the host spent on it.
+	patch, metadata, usage, err := decodeProposerResponse(encoded)
+	p.mu.Lock()
+	p.usage = usage
+	if err == nil {
+		p.metadata = metadata
+	}
+	p.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
 	return patch, nil
 }
 
@@ -126,6 +139,13 @@ func (p *hostProposer) LastUsage() gepa.Usage {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.usage
+}
+
+// LastModelCalls counts the host callback of the most recent proposal as one model call.
+func (p *hostProposer) LastModelCalls() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
 }
 
 type hostMergeProposer struct {
@@ -696,21 +716,39 @@ func decodeProposerResponse(encoded string) (gepa.Candidate, []gepa.ProposalMeta
 	if err := decodeObject(encoded, &raw); err != nil {
 		return nil, nil, gepa.Usage{}, fmt.Errorf("proposer callback response: %w", err)
 	}
-	candidate, err := decodeProposerCandidate(raw, encoded)
+	usage, err := decodeProposerUsage(raw)
 	if err != nil {
 		return nil, nil, gepa.Usage{}, err
 	}
-	metadata, usage, err := decodeProposerExtras(raw)
+	candidate, err := decodeProposerCandidate(raw, encoded)
+	if err != nil {
+		return nil, nil, usage, err
+	}
+	metadata, err := decodeProposerMetadata(raw)
 	if err != nil {
 		return nil, nil, usage, err
 	}
 	if err := validateOptimizerCandidate(candidate, "candidate"); err != nil {
 		return nil, nil, usage, fmt.Errorf("proposer callback response: %w", err)
 	}
-	if err := validateUsage(usage); err != nil {
-		return nil, nil, usage, fmt.Errorf("proposer usage: %w", err)
-	}
 	return candidate, metadata, usage, nil
+}
+
+// decodeProposerUsage decodes and validates the reported usage first, so a response that
+// fails later checks still reports it.
+func decodeProposerUsage(raw map[string]json.RawMessage) (gepa.Usage, error) {
+	var usage gepa.Usage
+	value, ok := raw["usage"]
+	if !ok {
+		return usage, nil
+	}
+	if err := json.Unmarshal(value, &usage); err != nil {
+		return gepa.Usage{}, errors.New("proposer usage is invalid")
+	}
+	if err := validateUsage(usage); err != nil {
+		return gepa.Usage{}, fmt.Errorf("proposer usage: %w", err)
+	}
+	return usage, nil
 }
 
 func decodeProposerCandidate(raw map[string]json.RawMessage, encoded string) (gepa.Candidate, error) {
@@ -728,20 +766,14 @@ func decodeProposerCandidate(raw map[string]json.RawMessage, encoded string) (ge
 	return candidate, nil
 }
 
-func decodeProposerExtras(raw map[string]json.RawMessage) ([]gepa.ProposalMetadata, gepa.Usage, error) {
+func decodeProposerMetadata(raw map[string]json.RawMessage) ([]gepa.ProposalMetadata, error) {
 	var metadata []gepa.ProposalMetadata
-	var usage gepa.Usage
 	if value, ok := raw["metadata"]; ok {
 		if err := json.Unmarshal(value, &metadata); err != nil {
-			return nil, usage, errors.New("proposer metadata must be an array")
+			return nil, errors.New("proposer metadata must be an array")
 		}
 	}
-	if value, ok := raw["usage"]; ok {
-		if err := json.Unmarshal(value, &usage); err != nil {
-			return nil, usage, errors.New("proposer usage is invalid")
-		}
-	}
-	return metadata, usage, nil
+	return metadata, nil
 }
 
 func validateMetricResult(result gepa.MetricResult) error {
@@ -796,8 +828,20 @@ func validateEvaluationItem(item gepa.EvaluationItem, index int, wanted, seen ma
 }
 
 func validateUsage(usage gepa.Usage) error {
-	if usage.PromptTokens < 0 || usage.CompletionTokens < 0 || usage.TotalTokens < 0 {
+	if negativeUsage(usage) {
 		return errors.New("token counts must not be negative")
 	}
 	return nil
+}
+
+// negativeUsage reports whether a host-supplied usage has any negative token count.
+func negativeUsage(usage gepa.Usage) bool {
+	return min(
+		usage.PromptTokens,
+		usage.CompletionTokens,
+		usage.TotalTokens,
+		usage.ReasoningTokens,
+		usage.CachedInputTokens,
+		usage.CacheCreationTokens,
+	) < 0
 }

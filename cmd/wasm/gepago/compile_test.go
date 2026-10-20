@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -298,25 +299,189 @@ func TestCompileJudgeUsage(t *testing.T) {
 	}
 }
 
-func TestCompileLanguageModelResetsUsageWhenCallIsCancelled(t *testing.T) {
+func TestCompileLanguageModelReportsHostUsage(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var requests []compileModelRequest
 	model := newCompileLanguageModel(compileModelInvokerFunc(
-		func(context.Context, compileModelRequest) (compileModelResult, error) {
-			return compileModelResult{Text: "ok", Usage: gepa.Usage{TotalTokens: 5}}, nil
+		func(_ context.Context, request compileModelRequest) (compileModelResult, error) {
+			requests = append(requests, request)
+			if request.Attempt == 2 {
+				cancel()
+			}
+			return compileModelResult{Text: "ok", Usage: gepa.Usage{TotalTokens: 5, ReasoningTokens: 2}}, nil
 		},
 	), "program")
-	if _, err := model.Generate(context.Background(), "prompt"); err != nil {
+
+	got, err := model.Generate(context.Background(), "prompt")
+	if err != nil {
 		t.Fatalf("Generate() error = %v", err)
 	}
-	if got := model.LastUsage().TotalTokens; got != 5 {
-		t.Fatalf("LastUsage().TotalTokens = %d, want 5", got)
+	want := gepa.Generation{Text: "ok", Usage: gepa.Usage{TotalTokens: 5, ReasoningTokens: 2}}
+	if got != want {
+		t.Fatalf("Generate() = %+v, want %+v", got, want)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if _, err := model.Generate(ctx, "prompt"); err != context.Canceled {
+	got, err = model.Generate(ctx, "prompt")
+	if err != context.Canceled {
 		t.Fatalf("Generate() error = %v, want context.Canceled", err)
 	}
-	if got := model.LastUsage(); got != (gepa.Usage{}) {
-		t.Fatalf("LastUsage() after cancelled call = %+v, want zero", got)
+	if got != (gepa.Generation{Usage: want.Usage}) {
+		t.Fatalf("Generate() after the host spent tokens = %+v, want only its usage", got)
+	}
+
+	got, err = model.Generate(ctx, "prompt")
+	if err != context.Canceled || got != (gepa.Generation{}) || len(requests) != 2 {
+		t.Fatalf("Generate() on a cancelled context = %+v, %v after %d host calls", got, err, len(requests))
+	}
+	if requests[0].Role != "program" || requests[1].Attempt != 2 {
+		t.Fatalf("requests = %+v", requests)
+	}
+}
+
+func TestCompileLanguageModelRequiresInvoker(t *testing.T) {
+	var model *compileLanguageModel
+	if _, err := model.Generate(context.Background(), "prompt"); err == nil {
+		t.Fatal("Generate() error = nil, want missing host model error")
+	}
+	hostErr := errors.New("host failed")
+	model = newCompileLanguageModel(compileModelInvokerFunc(
+		func(context.Context, compileModelRequest) (compileModelResult, error) {
+			return compileModelResult{}, hostErr
+		},
+	), "task")
+	if _, err := model.Generate(context.Background(), "prompt"); !errors.Is(err, hostErr) {
+		t.Fatalf("Generate() error = %v, want host error", err)
+	}
+}
+
+func TestParseHostFinishReason(t *testing.T) {
+	for _, value := range []string{"", "stop", "length", "tool_calls", "content_filter"} {
+		got, err := parseHostFinishReason(value)
+		if err != nil || string(got) != value {
+			t.Fatalf("parseHostFinishReason(%q) = %q, %v", value, got, err)
+		}
+	}
+	if _, err := parseHostFinishReason("MAX_TOKENS"); err == nil {
+		t.Fatal("parseHostFinishReason accepted a provider-native reason")
+	}
+}
+
+func TestCompileTreatsTruncatedHostRepliesAsInvalidOutput(t *testing.T) {
+	var roles []string
+	invoker := compileModelInvokerFunc(
+		func(_ context.Context, request compileModelRequest) (compileModelResult, error) {
+			roles = append(roles, request.Role)
+			return compileModelResult{
+				Text:         `{"label":"positive"}`,
+				Usage:        gepa.Usage{TotalTokens: 4},
+				FinishReason: gepa.FinishLength,
+				Model:        "host-model",
+			}, nil
+		},
+	)
+	model := newCompileLanguageModel(invoker, "task")
+	got, err := model.Generate(context.Background(), "prompt")
+	if err != nil || got.FinishReason != gepa.FinishLength || got.Model != "host-model" {
+		t.Fatalf("Generate() = %+v, %v; want the host finish reason and model", got, err)
+	}
+
+	payload := map[string]any{
+		"program": map[string]any{
+			"signature": map[string]any{
+				"inputs":  []map[string]any{{"name": "text"}},
+				"outputs": []map[string]any{{"name": "label"}},
+			},
+			"maxParseRetries": 1,
+		},
+		"trainset": []map[string]any{{
+			"id": "one", "input": map[string]any{"text": "great"}, "expected": map[string]any{"label": "positive"},
+		}},
+		"metric":         map[string]any{"kind": "exactMatch", "fields": []string{"label"}},
+		"maxMetricCalls": 1,
+	}
+	roles = nil
+
+	value, err := runCompileOperation(context.Background(), mustJSON(t, payload), invoker)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roles) != 1 || roles[0] != "task" {
+		t.Fatalf("roles = %v, want one task call and no repair", roles)
+	}
+	if score := value.State.Candidates[0].ValidationScore; score != 0 {
+		t.Fatalf("seed score = %v, want 0 for a truncated reply", score)
+	}
+	if value.State.Ledger.TotalTokens != 4 {
+		t.Fatalf("ledger = %+v, want the truncated call's usage", value.State.Ledger)
+	}
+}
+
+func TestCompileLanguageModelPassesTheResponseFormatToTheHost(t *testing.T) {
+	var requests []compileModelRequest
+	model := newCompileLanguageModel(compileModelInvokerFunc(
+		func(_ context.Context, request compileModelRequest) (compileModelResult, error) {
+			requests = append(requests, request)
+			return compileModelResult{Text: `{"label":"positive"}`}, nil
+		},
+	), "task")
+	var _ gepa.StructuredGenerator = model
+	format := gepa.ResponseFormat{Name: "sentiment", Schema: []byte(`{"type":"object"}`), Strict: true}
+
+	if _, err := model.GenerateStructured(context.Background(), "prompt", format); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := model.Generate(context.Background(), "prompt"); err != nil {
+		t.Fatal(err)
+	}
+
+	want := hostResponseFormat{Name: "sentiment", Schema: format.Schema, Strict: true}
+	if got := requests[0].ResponseFormat; got == nil || got.Name != want.Name ||
+		string(got.Schema) != string(want.Schema) ||
+		!got.Strict {
+		t.Fatalf("structured request response_format = %+v, want %+v", got, want)
+	}
+	if requests[1].ResponseFormat != nil {
+		t.Fatalf("plain request response_format = %+v, want none", requests[1].ResponseFormat)
+	}
+	encoded := mustJSON(t, requests[0])
+	if !strings.Contains(encoded, `"response_format":{"name":"sentiment","schema":{"type":"object"},"strict":true}`) {
+		t.Fatalf("encoded request = %s", encoded)
+	}
+	if strings.Contains(mustJSON(t, requests[1]), "response_format") {
+		t.Fatalf("plain request carries a response format: %s", mustJSON(t, requests[1]))
+	}
+}
+
+func TestCompileSendsTheResponseFormatOnTaskRequests(t *testing.T) {
+	var requests []compileModelRequest
+	invoker := compileModelInvokerFunc(
+		func(_ context.Context, request compileModelRequest) (compileModelResult, error) {
+			requests = append(requests, request)
+			return compileModelResult{Text: `{"label":"positive"}`}, nil
+		},
+	)
+	payload := map[string]any{
+		"program": map[string]any{
+			"signature": map[string]any{
+				"name":    "sentiment",
+				"inputs":  []map[string]any{{"name": "text"}},
+				"outputs": []map[string]any{{"name": "label", "type": "string"}},
+			},
+		},
+		"trainset": []map[string]any{{
+			"id": "one", "input": map[string]any{"text": "great"}, "expected": map[string]any{"label": "positive"},
+		}},
+		"metric":         map[string]any{"kind": "exactMatch", "fields": []string{"label"}},
+		"maxMetricCalls": 1,
+	}
+
+	if _, err := runCompileOperation(context.Background(), mustJSON(t, payload), invoker); err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) == 0 || requests[0].Role != "task" || requests[0].ResponseFormat == nil ||
+		!requests[0].ResponseFormat.Strict || requests[0].ResponseFormat.Name != "sentiment" {
+		t.Fatalf("task requests = %+v, want a strict response format", requests)
 	}
 }

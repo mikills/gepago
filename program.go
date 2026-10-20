@@ -1,11 +1,15 @@
 package gepa
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -59,17 +63,107 @@ func DecodeDemos(text string) ([]Demo, error) {
 	return demos, nil
 }
 
+// ErrOutputTruncated marks a model reply cut off at the output token limit (FinishLength).
+// It matches ErrInvalidOutput through errors.Is, so ProgramEvaluator scores such examples
+// zero instead of stopping optimisation.
+var ErrOutputTruncated = fmt.Errorf("%w: reply truncated at the output token limit", ErrInvalidOutput)
+
+// ErrContentFiltered marks a model reply that a content policy withheld or that the model
+// refused (FinishContentFilter). Like ErrOutputTruncated it matches ErrInvalidOutput, and the
+// reply is never sent for repair.
+var ErrContentFiltered = fmt.Errorf("%w: reply withheld or refused under a content policy", ErrInvalidOutput)
+
+// FinishReasonError returns the error for a reply that a model consumer must not use: one that
+// matches ErrOutputTruncated when it stopped at the output token limit, and one that matches
+// ErrContentFiltered and quotes the refusal when a content policy withheld or refused it. It
+// returns nil for any other finish reason. subject names the reply, such as "judge reply".
+func FinishReasonError(generation Generation, subject string) error {
+	switch generation.FinishReason {
+	case FinishLength:
+		return fmt.Errorf(
+			"%w: %s, %d completion tokens",
+			ErrOutputTruncated,
+			subject,
+			generation.Usage.CompletionTokens,
+		)
+	case FinishContentFilter:
+		return fmt.Errorf("%w: %s: %s", ErrContentFiltered, subject, refusalText(generation.Text))
+	}
+	return nil
+}
+
+// refusalText quotes a refusal for an error message, shortened to 200 characters.
+func refusalText(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "no reply text"
+	}
+	if runes := []rune(text); len(runes) > 200 {
+		text = string(runes[:200]) + "..."
+	}
+	return strconv.Quote(text)
+}
+
 // Predict is a prompt-backed programme: signature + instruction + model call + JSON parsing.
+// It records the usage of every model call, repair calls and failed calls included, into the
+// context's UsageCollector. A reply that stops at the token limit fails with ErrOutputTruncated,
+// and one a content policy withheld or refused fails with ErrContentFiltered; neither is sent
+// for repair.
+//
+// When LM (or RepairLM, for repairs) is a StructuredGenerator, Predict passes it the
+// signature's ResponseFormat; otherwise it sends the prompt alone. Either way it checks the
+// reply with ParseOutput before returning: each output not marked Optional must be present and
+// not null, an output with a Type must hold a value of that type, and the reply must have no
+// other fields. When MaxParseRetries is above zero, a reply that fails to parse or fails the
+// check is sent for repair up to MaxParseRetries times, with the original request, the error
+// and the JSON schema (see RepairPrompt).
+//
+// A Predict with Tools or Middleware chats instead: LM must also be a ChatClient, and the call
+// is a bounded tool loop described on Tools.
 type Predict struct {
 	Signature       Signature
-	LM              LanguageModel
+	LM              Generator
 	Instruction     string
 	Demos           []Demo
 	MaxParseRetries int
-	RepairLM        LanguageModel
+	RepairLM        Generator
+	// Tools names the tools the model may call while it answers. Predict then sends the prompt
+	// as a chat through LM, which must be a ChatClient, with the tools' schemas and the
+	// signature's ResponseFormat when it is strict. It runs the calls of each reply in order,
+	// sends their results back and asks again, until a reply calls no tool; that reply is
+	// checked as any other. Each chat call is admitted with AdmitModelCall and its usage
+	// recorded once with RecordUsage; each tool call goes through the run's ToolSession, so
+	// the ToolPolicy applies and its usage is recorded too. A tool that fails fails the call,
+	// and so does a call to a tool not in Tools (ErrUnknownTool).
+	// A reply that fails the check is repaired, up to MaxParseRetries times, by continuing the
+	// same chat with RepairPrompt's message; RepairLM is not used.
+	//
+	// Inside a pipeline the tools come from PipelineSpec.Tools under PipelineSpec.ToolPolicy,
+	// through the run's ToolSession, and Build checks the names; Build rejects a Predict step
+	// that sets a ToolPolicy or a ToolRegistry other than PipelineSpec.Tools. Outside one they
+	// come from ToolRegistry under ToolPolicy, with a session of their own for each call. A
+	// Predict with a registry of its own that runs inside a pipeline run anyway, in a step's
+	// own code, keeps its own session, and the run's ToolPolicy governs its calls too.
+	Tools []string
+	// MaxToolTurns bounds the replies that call tools: a reply that calls a tool after
+	// MaxToolTurns such replies fails with ErrToolTurnLimit without running the calls. Zero
+	// means 8.
+	MaxToolTurns int
+	// Middleware names chat middleware from the same registry as Tools, outermost first, that
+	// wraps LM for every chat call. Setting it makes Predict chat even without Tools.
+	Middleware []string
+	// ToolRegistry supplies Tools and Middleware outside a pipeline. In a pipeline step it must
+	// be unset or PipelineSpec.Tools.
+	ToolRegistry *ToolRegistry
+	// ToolPolicy governs the tool calls made through ToolRegistry outside a pipeline. It needs
+	// a ToolRegistry, and a pipeline step must leave it unset.
+	ToolPolicy ToolPolicy
 }
 
-// Validate checks that the programme has a valid signature and language model.
+// Validate checks that the programme has a valid signature and language model, and that a
+// ToolPolicy comes with a ToolRegistry. With Tools or Middleware, LM must also be a
+// ChatClient, the names must be unique, MaxToolTurns must not be negative, and when
+// ToolRegistry is set every name must be registered and every tool allowed by ToolPolicy.
 func (p Predict) Validate() error {
 	if err := p.Signature.Validate(); err != nil {
 		return err
@@ -77,7 +171,7 @@ func (p Predict) Validate() error {
 	if p.LM == nil {
 		return errors.New("predict language model is required")
 	}
-	return nil
+	return p.validateChat()
 }
 
 // SeedCandidate returns the initial optimisable instruction and optional demos.
@@ -97,8 +191,21 @@ func (p Predict) Run(ctx context.Context, inputs Prediction) (Prediction, error)
 	return p.RunCandidate(ctx, p.SeedCandidate(), inputs)
 }
 
-// RunCandidate executes the programme with a specific optimised candidate.
+// RunCandidate executes the programme with a specific optimised candidate. A reply that parses
+// but fails the output check is returned with its error, which matches ErrInvalidOutput and,
+// in a pipeline, puts the reply in StepError.Details under "output".
 func (p Predict) RunCandidate(ctx context.Context, candidate Candidate, inputs Prediction) (Prediction, error) {
+	return p.run(ctx, candidate, inputs, nil)
+}
+
+// run is RunCandidate with an extra output check, which TypedPredict uses to decode the reply
+// inside the repair loop. check runs only on replies that pass ParseOutput.
+func (p Predict) run(
+	ctx context.Context,
+	candidate Candidate,
+	inputs Prediction,
+	check func(Prediction) error,
+) (Prediction, error) {
 	if err := p.Validate(); err != nil {
 		return nil, err
 	}
@@ -106,26 +213,39 @@ func (p Predict) RunCandidate(ctx context.Context, candidate Candidate, inputs P
 	if err != nil {
 		return nil, err
 	}
-	raw, err := p.LM.Generate(ctx, prompt)
-	recordUsage(ctx, languageModelUsage(p.LM))
+	format, err := p.Signature.ResponseFormat()
 	if err != nil {
 		return nil, err
 	}
-	return p.parseOrRepair(ctx, raw)
+	if p.chats() {
+		return p.runChat(ctx, prompt, format, check)
+	}
+	raw, err := p.generate(ctx, p.LM, prompt, format)
+	if err != nil {
+		return nil, err
+	}
+	return p.parseOrRepair(ctx, prompt, raw, format, check)
+}
+
+// generate makes one model call, records its usage and rejects a truncated or refused reply.
+func (p Predict) generate(ctx context.Context, lm Generator, prompt string, format ResponseFormat) (string, error) {
+	if err := AdmitModelCall(ctx); err != nil {
+		return "", err
+	}
+	generation, err := GenerateWithFormat(ctx, lm, prompt, format)
+	RecordUsage(ctx, generation.Usage)
+	if err != nil {
+		return "", err
+	}
+	if err := FinishReasonError(generation, fmt.Sprintf("signature %q", p.Signature.Name)); err != nil {
+		return "", err
+	}
+	return generation.Text, nil
 }
 
 // BuildPrompt renders the signature, candidate text, demos, and inputs into a model prompt.
-func (p Predict) LastUsage() Usage {
-	return languageModelUsage(p.LM).Add(languageModelUsage(p.RepairLM))
-}
-
-func languageModelUsage(lm LanguageModel) Usage {
-	if reporter, ok := lm.(UsageReporter); ok {
-		return reporter.LastUsage()
-	}
-	return Usage{}
-}
-
+// When an output sets Type, Schema or Optional, the prompt also carries the signature's JSON
+// schema, so a model without structured output still learns the reply's shape.
 func (p Predict) BuildPrompt(candidate Candidate, inputs Prediction) (string, error) {
 	inputJSON, err := json.MarshalIndent(inputs, "", "  ")
 	if err != nil {
@@ -144,11 +264,35 @@ func (p Predict) BuildPrompt(candidate Candidate, inputs Prediction) (string, er
 	b.WriteString("\n```\n\nReturn only a JSON object with these output fields: ")
 	b.WriteString(strings.Join(p.Signature.OutputNames(), ", "))
 	b.WriteString(".")
+	if p.Signature.typed() {
+		schema, err := p.Signature.JSONSchema()
+		if err != nil {
+			return "", err
+		}
+		b.WriteString("\n\n")
+		b.WriteString(schemaInstruction(schema))
+	}
 	return b.String(), nil
 }
 
-func (p Predict) parseOrRepair(ctx context.Context, raw string) (Prediction, error) {
-	prediction, err := ParsePrediction(raw)
+// schemaInstruction renders a JSON schema for a prompt.
+func schemaInstruction(schema json.RawMessage) string {
+	var indented bytes.Buffer
+	if err := json.Indent(&indented, schema, "", "  "); err != nil {
+		indented.Reset()
+		indented.Write(schema)
+	}
+	return "The JSON object must match this JSON schema:\n```json\n" + indented.String() + "\n```"
+}
+
+func (p Predict) parseOrRepair(
+	ctx context.Context,
+	prompt string,
+	raw string,
+	format ResponseFormat,
+	check func(Prediction) error,
+) (Prediction, error) {
+	prediction, err := p.parseAndCheck(raw, check)
 	if err == nil || p.MaxParseRetries <= 0 {
 		return prediction, err
 	}
@@ -157,34 +301,107 @@ func (p Predict) parseOrRepair(ctx context.Context, raw string) (Prediction, err
 		repairLM = p.LM
 	}
 	for attempt := 0; attempt < p.MaxParseRetries; attempt++ {
-		repaired, repairErr := repairLM.Generate(ctx, p.RepairPrompt(raw, err))
-		recordUsage(ctx, languageModelUsage(repairLM))
+		repaired, repairErr := p.generate(ctx, repairLM, p.RepairPrompt(prompt, raw, err), format)
 		if repairErr != nil {
 			return nil, repairErr
 		}
-		prediction, err = ParsePrediction(repaired)
+		prediction, err = p.parseAndCheck(repaired, check)
 		if err == nil {
 			return prediction, nil
 		}
 		raw = repaired
 	}
-	return nil, err
+	return prediction, err
 }
 
-// RepairPrompt renders the prompt used to ask a language model to repair an
-// output that ParsePrediction could not decode. It is exported so resumable
-// integrations can preserve Predict's repair protocol without duplicating its
-// formatting.
-func (p Predict) RepairPrompt(raw string, parseErr error) string {
-	return strings.Join([]string{
-		"The model output could not be parsed as JSON for this signature.",
-		"Return only a valid JSON object with these output fields: " + strings.Join(
-			p.Signature.OutputNames(),
-			", ",
-		) + ".",
-		"Parse error: " + parseErr.Error(),
-		"Invalid output:\n```\n" + raw + "\n```",
-	}, "\n\n")
+// parseAndCheck parses and checks a reply. A reply that parses but fails a check carries
+// itself as the "output" step detail, so a pipeline's StepError shows what the model returned.
+func (p Predict) parseAndCheck(raw string, check func(Prediction) error) (Prediction, error) {
+	prediction, err := p.ParseOutput(raw)
+	if err == nil && check != nil {
+		err = check(prediction)
+	}
+	if err != nil && prediction != nil {
+		err = WithStepDetails(err, map[string]any{"output": clonePrediction(prediction)})
+	}
+	return prediction, err
+}
+
+// ParseOutput parses a model reply as ParsePrediction does and checks it against the
+// signature's outputs: each output not marked Optional must be present and not null, an output
+// with a Type must hold a value of that type, and the reply must have no other fields. A reply
+// that parses but fails the check is returned together with an error that matches
+// ErrInvalidOutput and names every offending field. It is exported so resumable integrations
+// can apply Predict's checks without duplicating them.
+func (p Predict) ParseOutput(raw string) (Prediction, error) {
+	prediction, err := ParsePrediction(raw)
+	if err != nil {
+		return nil, err
+	}
+	return prediction, p.Signature.checkOutputs(prediction)
+}
+
+// RepairPrompt renders the prompt that asks a language model to repair an output ParseOutput
+// rejected. It repeats prompt, the original request, so the repair model answers from the
+// task, instruction and inputs instead of inventing missing values; then it gives the rejected
+// output, the error, the expected fields and the signature's JSON schema (unless prompt already
+// carries it). It is exported so resumable integrations can preserve Predict's repair protocol
+// without duplicating its formatting.
+func (p Predict) RepairPrompt(prompt, raw string, outputErr error) string {
+	var parts []string
+	if prompt = strings.TrimSpace(prompt); prompt != "" {
+		parts = append(parts, prompt)
+	}
+	parts = append(
+		parts,
+		"Your previous reply was not a valid JSON object for this signature:\n```\n"+raw+"\n```",
+		"Error: "+outputErr.Error(),
+		"Answer the request above again, using its inputs. Return only a valid JSON object with these output fields: "+
+			strings.Join(p.Signature.OutputNames(), ", ")+".",
+	)
+	if schema, err := p.Signature.JSONSchema(); err == nil {
+		if instruction := schemaInstruction(schema); !strings.Contains(prompt, instruction) {
+			parts = append(parts, instruction)
+		}
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// checkOutputs reports every way prediction breaks the signature's outputs, as one error that
+// matches ErrInvalidOutput.
+func (s Signature) checkOutputs(prediction Prediction) error {
+	var problems []string
+	outputs := make(map[string]bool, len(s.Outputs))
+	for _, field := range s.Outputs {
+		outputs[field.Name] = true
+		value, ok := prediction[field.Name]
+		switch {
+		case !ok && !field.Optional:
+			problems = append(problems, fmt.Sprintf("output %q is missing", field.Name))
+		case value == nil && ok && !field.Optional:
+			problems = append(problems, fmt.Sprintf("output %q is null", field.Name))
+		case value != nil && fieldTypes[field.Type] != nil:
+			if _, err := decodeJSONValue(fieldTypes[field.Type], value); err != nil {
+				problems = append(problems, fmt.Sprintf("output %q is not a valid %s: %v", field.Name, field.Type, err))
+			}
+		}
+	}
+	for _, key := range slices.Sorted(maps.Keys(prediction)) {
+		if !outputs[key] {
+			problems = append(problems, fmt.Sprintf("field %q is not an output of the signature", key))
+		}
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %s%s", ErrInvalidOutput, signaturePrefix(s.Name), strings.Join(problems, "; "))
+}
+
+func signaturePrefix(name string) string {
+	if name == "" {
+		return ""
+	}
+	return fmt.Sprintf("signature %q: ", name)
 }
 
 // EncodeDemos serialises few-shot demonstrations as JSON for candidate storage.

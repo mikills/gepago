@@ -8,8 +8,13 @@ export type Prediction = Record<string, JSONValue>;
 export type Candidate = Record<string, string>;
 
 export type MessageRole = "system" | "user" | "assistant" | "tool";
-export type FinishReason = "stop" | "length" | "tool_calls";
-export type StopReason = "complete" | "length" | "max_turns" | "tool_error";
+export type FinishReason = "stop" | "length" | "tool_calls" | "content_filter";
+export type StopReason =
+  | "complete"
+  | "length"
+  | "max_turns"
+  | "tool_error"
+  | "content_filter";
 
 export interface ToolCall {
   id: string;
@@ -48,7 +53,8 @@ export interface ChatRequest {
 export interface ChatResponse {
   message: Message;
   usage: Usage;
-  finish_reason: FinishReason;
+  /** Why the model stopped; omitted when the provider does not report it. */
+  finish_reason?: FinishReason;
 }
 
 export interface AgentConfigBase {
@@ -146,7 +152,9 @@ export type MetricOptions =
 export interface Field {
   name: string;
   description?: string;
-  required?: boolean;
+  type?: string;
+  schema?: Record<string, unknown>;
+  optional?: boolean;
 }
 
 export interface Signature {
@@ -474,11 +482,24 @@ export interface CompileModelRequest {
   role: CompileModelRole;
   prompt: string;
   attempt?: number;
+  /**
+   * The JSON schema a structured reply must match, on task and repair requests. A model with
+   * structured output should enforce it when strict is true; the prompt asks for the same shape.
+   */
+  response_format?: JSONSchemaResponseFormat;
 }
 
 export interface CompileModelResult {
   text: string;
   usage?: Usage;
+  /**
+   * Why the model stopped; "length" marks a truncated reply and "content_filter" a refused
+   * one, neither of which is repaired. Omit it, or pass null or "", when the provider does not
+   * report one.
+   */
+  finishReason?: FinishReason | "" | null;
+  /** The model the provider resolved the request to. */
+  model?: string;
 }
 
 export type CompileModelOutput = string | CompileModelResult;
@@ -492,12 +513,23 @@ export interface PredictHostRequest {
   role: "task";
   prompt: string;
   attempt: number;
+  /**
+   * The JSON schema the reply must match. A model with structured output should enforce it
+   * when strict is true; the prompt asks for the same shape.
+   */
+  response_format?: JSONSchemaResponseFormat;
 }
 
 export interface Usage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  /** Part of completion_tokens spent on hidden reasoning. */
+  reasoning_tokens?: number;
+  /** Part of prompt_tokens read from a prompt cache. */
+  cached_input_tokens?: number;
+  /** Part of prompt_tokens written to a prompt cache. */
+  cache_creation_tokens?: number;
 }
 
 export type PredictModelUsage = Usage;
@@ -505,6 +537,13 @@ export type PredictModelUsage = Usage;
 export interface PredictModelResult {
   text: string;
   usage?: PredictModelUsage;
+  /**
+   * Why the model stopped; "length" and "content_filter" fail the prediction without a repair
+   * request. Omit it, or pass null or "", when the provider does not report one.
+   */
+  finishReason?: FinishReason | "" | null;
+  /** The model the provider resolved the request to. */
+  model?: string;
 }
 
 export interface PredictResult {
@@ -530,7 +569,11 @@ export interface GepagoWasm {
     chat: AgentChat,
     tool: AgentTool,
   ): Promise<RunResult>;
-  /** Runs a Compile candidate for Predict, ChainOfThought, or Pipeline programs. */
+  /**
+   * Runs a Compile candidate for Predict, ChainOfThought, or Pipeline programs. A pipeline
+   * runs as the same typed pipeline Compile evaluates, so it accepts the same inputs and
+   * sends the same prompts.
+   */
   runCompiled(
     programConfig: RunProgram,
     candidate: PredictCandidate | PipelineCandidate,

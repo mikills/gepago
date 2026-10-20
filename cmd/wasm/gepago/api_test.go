@@ -246,7 +246,11 @@ func TestPredictJobProtocol(t *testing.T) {
 	}
 	if !repairEnvelope.OK || repairEnvelope.Value.Status != "pending" ||
 		repairEnvelope.Value.HostRequest.Attempt != 2 ||
-		!strings.Contains(repairEnvelope.Value.HostRequest.Prompt, "Invalid output:\n```\nnot json\n```") {
+		!strings.Contains(
+			repairEnvelope.Value.HostRequest.Prompt,
+			"Your previous reply was not a valid JSON object for this signature:\n```\nnot json\n```",
+		) ||
+		!strings.Contains(repairEnvelope.Value.HostRequest.Prompt, "\"text\": \"great\"") {
 		t.Fatalf("unexpected repair request: %+v", repairEnvelope)
 	}
 	if !strings.Contains(invokeJSON("predict.resume", mustJSON(t, map[string]any{
@@ -336,4 +340,223 @@ func mustJSON(t *testing.T, value any) string {
 		t.Fatal(err)
 	}
 	return string(encoded)
+}
+
+func TestPredictResumeStopsOnTruncatedReply(t *testing.T) {
+	start := map[string]any{
+		"program": map[string]any{
+			"signature": gepa.Signature{
+				Name:    "sentiment",
+				Inputs:  []gepa.Field{{Name: "text"}},
+				Outputs: []gepa.Field{{Name: "label"}},
+			},
+			"maxParseRetries": 2,
+		},
+		"inputs": map[string]any{"text": "great"},
+	}
+	begin := func() (string, string) {
+		var envelope struct {
+			Value struct {
+				JobID       string `json:"job_id"`
+				HostRequest struct {
+					RequestID string `json:"request_id"`
+				} `json:"host_request"`
+			} `json:"value"`
+		}
+		if err := json.Unmarshal([]byte(invokeJSON("predict.start", mustJSON(t, start))), &envelope); err != nil {
+			t.Fatal(err)
+		}
+		return envelope.Value.JobID, envelope.Value.HostRequest.RequestID
+	}
+
+	jobID, requestID := begin()
+	truncated := invokeJSON("predict.resume", mustJSON(t, map[string]any{
+		"job_id": jobID, "request_id": requestID,
+		"result": map[string]any{"text": `{"label":"pos`, "finishReason": "length", "model": "m"},
+	}))
+	if !strings.Contains(truncated, "truncated") || strings.Contains(truncated, `"status":"pending"`) {
+		t.Fatalf("truncated reply was not rejected without repair: %s", truncated)
+	}
+	if stale := invokeJSON("predict.resume", mustJSON(t, map[string]any{
+		"job_id": jobID, "request_id": requestID, "result": map[string]any{"text": `{}`},
+	})); !strings.Contains(stale, "unknown or stale") {
+		t.Fatalf("truncated job was kept: %s", stale)
+	}
+
+	for _, reason := range []any{"stop", nil, ""} {
+		jobID, requestID = begin()
+		complete := invokeJSON("predict.resume", mustJSON(t, map[string]any{
+			"job_id": jobID, "request_id": requestID,
+			"result": map[string]any{"text": `{"label":"positive"}`, "finishReason": reason, "model": "m"},
+		}))
+		if !strings.Contains(complete, `"status":"complete"`) {
+			t.Fatalf("reply with finishReason %#v was not accepted: %s", reason, complete)
+		}
+	}
+
+	jobID, requestID = begin()
+	invalid := invokeJSON("predict.resume", mustJSON(t, map[string]any{
+		"job_id": jobID, "request_id": requestID,
+		"result": map[string]any{"text": `{"label":"positive"}`, "finishReason": "end_turn"},
+	}))
+	if !strings.Contains(invalid, `finishReason \"end_turn\" must be one of`) {
+		t.Fatalf("unknown finish reason was accepted: %s", invalid)
+	}
+}
+
+func TestPredictResumeChecksOutputsAsPredictDoes(t *testing.T) {
+	begin := func(maxParseRetries int) (string, string) {
+		start := map[string]any{
+			"program": map[string]any{
+				"signature": gepa.Signature{
+					Name:    "sentiment",
+					Inputs:  []gepa.Field{{Name: "text"}},
+					Outputs: []gepa.Field{{Name: "label", Type: "string"}},
+				},
+				"maxParseRetries": maxParseRetries,
+			},
+			"inputs": map[string]any{"text": "great"},
+		}
+		var envelope struct {
+			Value struct {
+				JobID       string `json:"job_id"`
+				HostRequest struct {
+					RequestID string `json:"request_id"`
+					Prompt    string `json:"prompt"`
+				} `json:"host_request"`
+			} `json:"value"`
+		}
+		if err := json.Unmarshal([]byte(invokeJSON("predict.start", mustJSON(t, start))), &envelope); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(envelope.Value.HostRequest.Prompt, "The JSON object must match this JSON schema") {
+			t.Fatalf("typed prompt does not carry the schema: %s", envelope.Value.HostRequest.Prompt)
+		}
+		return envelope.Value.JobID, envelope.Value.HostRequest.RequestID
+	}
+
+	jobID, requestID := begin(1)
+	var repair struct {
+		Value struct {
+			Status      string `json:"status"`
+			HostRequest struct {
+				Prompt string `json:"prompt"`
+			} `json:"host_request"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal([]byte(invokeJSON("predict.resume", mustJSON(t, map[string]any{
+		"job_id": jobID, "request_id": requestID,
+		"result": map[string]any{"text": `{"label":"positive","reasoning":"warm words"}`},
+	}))), &repair); err != nil {
+		t.Fatal(err)
+	}
+	if repair.Value.Status != "pending" ||
+		!strings.Contains(repair.Value.HostRequest.Prompt, `field "reasoning" is not an output of the signature`) ||
+		!strings.Contains(repair.Value.HostRequest.Prompt, "The JSON object must match this JSON schema") {
+		t.Fatalf("an extra field was not sent for repair with the schema: %+v", repair)
+	}
+
+	jobID, requestID = begin(0)
+	rejected := invokeJSON("predict.resume", mustJSON(t, map[string]any{
+		"job_id": jobID, "request_id": requestID, "result": map[string]any{"text": `{"label":null}`},
+	}))
+	if !strings.Contains(rejected, `invalid programme output: signature \"sentiment\": output \"label\" is null`) {
+		t.Fatalf("a null output was not rejected: %s", rejected)
+	}
+
+	jobID, requestID = begin(0)
+	notObject := invokeJSON("predict.resume", mustJSON(t, map[string]any{
+		"job_id": jobID, "request_id": requestID, "result": map[string]any{"text": `null`},
+	}))
+	if !strings.Contains(notObject, "parse prediction: result must be a JSON object") {
+		t.Fatalf("a null reply was not rejected: %s", notObject)
+	}
+}
+
+func TestPredictHostRequestsCarryTheResponseFormat(t *testing.T) {
+	signature := gepa.Signature{
+		Name:    "sentiment",
+		Inputs:  []gepa.Field{{Name: "text"}},
+		Outputs: []gepa.Field{{Name: "label", Type: "string"}},
+	}
+	format, err := signature.ResponseFormat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := map[string]any{
+		"program": map[string]any{"signature": signature, "maxParseRetries": 1},
+		"inputs":  map[string]any{"text": "great"},
+	}
+	type hostRequest struct {
+		RequestID      string              `json:"request_id"`
+		ResponseFormat *hostResponseFormat `json:"response_format"`
+	}
+	var started struct {
+		Value struct {
+			JobID       string      `json:"job_id"`
+			HostRequest hostRequest `json:"host_request"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal([]byte(invokeJSON("predict.start", mustJSON(t, start))), &started); err != nil {
+		t.Fatal(err)
+	}
+	want := hostResponseFormat{Name: "sentiment", Schema: format.Schema, Strict: true}
+	if got := started.Value.HostRequest.ResponseFormat; got == nil || got.Name != want.Name ||
+		string(got.Schema) != string(want.Schema) || !got.Strict {
+		t.Fatalf("start host request response_format = %+v, want %+v", got, want)
+	}
+
+	var repair struct {
+		Value struct {
+			HostRequest hostRequest `json:"host_request"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal([]byte(invokeJSON("predict.resume", mustJSON(t, map[string]any{
+		"job_id": started.Value.JobID, "request_id": started.Value.HostRequest.RequestID,
+		"result": map[string]any{"text": `{"label":1}`},
+	}))), &repair); err != nil {
+		t.Fatal(err)
+	}
+	if got := repair.Value.HostRequest.ResponseFormat; got == nil || string(got.Schema) != string(want.Schema) {
+		t.Fatalf("repair host request response_format = %+v, want %+v", got, want)
+	}
+}
+
+func TestPredictResumeStopsOnRefusedReply(t *testing.T) {
+	start := map[string]any{
+		"program": map[string]any{
+			"signature": gepa.Signature{
+				Name:    "sentiment",
+				Inputs:  []gepa.Field{{Name: "text"}},
+				Outputs: []gepa.Field{{Name: "label"}},
+			},
+			"maxParseRetries": 2,
+		},
+		"inputs": map[string]any{"text": "great"},
+	}
+	var envelope struct {
+		Value struct {
+			JobID       string `json:"job_id"`
+			HostRequest struct {
+				RequestID string `json:"request_id"`
+			} `json:"host_request"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal([]byte(invokeJSON("predict.start", mustJSON(t, start))), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	refused := invokeJSON("predict.resume", mustJSON(t, map[string]any{
+		"job_id": envelope.Value.JobID, "request_id": envelope.Value.HostRequest.RequestID,
+		"result": map[string]any{"text": "I can't help with that.", "finishReason": "content_filter"},
+	}))
+	if !strings.Contains(refused, "refused under a content policy") ||
+		!strings.Contains(refused, `I can't help with that.`) || strings.Contains(refused, `"status":"pending"`) {
+		t.Fatalf("refused reply was not rejected without repair: %s", refused)
+	}
+	if stale := invokeJSON("predict.resume", mustJSON(t, map[string]any{
+		"job_id": envelope.Value.JobID, "request_id": envelope.Value.HostRequest.RequestID,
+		"result": map[string]any{"text": `{}`},
+	})); !strings.Contains(stale, "unknown or stale") {
+		t.Fatalf("refused job was kept: %s", stale)
+	}
 }

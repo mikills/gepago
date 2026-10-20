@@ -12,7 +12,9 @@ import type {
 } from "@mikills/wasm/gepago";
 import {
   createClaudeChat,
+  createClaudeModel,
   createGoogleChat,
+  createGoogleModel,
   createOpenAIChat,
   createOpenAIModel,
   createPiModel,
@@ -110,10 +112,241 @@ test("OpenAI model callback keeps credentials out of the request payload", async
     completion_tokens: 3,
     total_tokens: 5,
   });
+  assert.equal(result.finishReason, "stop");
   assert.ok(seen);
   assert.equal(seen.init.headers?.authorization, "Bearer secret");
   assert.equal("apiKey" in seen.body, false);
   assert.equal(seen.body.max_tokens, 64);
+});
+
+test("OpenAI and Claude model callbacks enforce a strict response format", async () => {
+  const schema = {
+    type: "object",
+    properties: { label: { type: "string" } },
+    required: ["label"],
+    additionalProperties: false,
+  };
+  const strict = {
+    ...modelRequest("classify"),
+    response_format: { name: "sentiment", schema, strict: true },
+  };
+  const loose = {
+    ...modelRequest("classify"),
+    response_format: {
+      name: "sentiment",
+      schema: { type: "object" },
+      strict: false,
+    },
+  };
+  const bodies: JSONObject[] = [];
+  const openAIFetch = fakeFetch<JSONObject>((_url, _init, body) => {
+    bodies.push(body);
+    return jsonResponse({
+      choices: [
+        {
+          message: { role: "assistant", content: '{"label":"yes"}' },
+          finish_reason: "stop",
+        },
+      ],
+    });
+  });
+  const openAI = createOpenAIModel({
+    apiKey: "k",
+    model: "m",
+    fetch: openAIFetch,
+  }) as PredictModel;
+  await openAI(strict);
+  await openAI(loose);
+  assert.deepEqual(bodies[0]?.response_format, {
+    type: "json_schema",
+    json_schema: { name: "sentiment", schema, strict: true },
+  });
+  assert.equal(
+    "response_format" in (bodies[1] ?? {}),
+    false,
+    "a loose format is not enforced",
+  );
+
+  bodies.length = 0;
+  const claudeFetch = fakeFetch<JSONObject>((_url, _init, body) => {
+    bodies.push(body);
+    return jsonResponse({
+      content: [{ type: "text", text: '{"label":"yes"}' }],
+      stop_reason: "end_turn",
+    });
+  });
+  const claude = createClaudeModel({
+    apiKey: "k",
+    model: "m",
+    fetch: claudeFetch,
+  }) as PredictModel;
+  await claude(strict);
+  await claude(loose);
+  assert.deepEqual(bodies[0]?.output_config, {
+    format: { type: "json_schema", schema },
+  });
+  assert.equal(
+    "output_config" in (bodies[1] ?? {}),
+    false,
+    "Claude has no loose schema mode",
+  );
+
+  bodies.length = 0;
+  const googleFetch = fakeFetch<JSONObject>((_url, _init, body) => {
+    bodies.push(body);
+    return jsonResponse({
+      candidates: [
+        {
+          content: { parts: [{ text: '{"label":"yes"}' }] },
+          finishReason: "STOP",
+        },
+      ],
+    });
+  });
+  const google = createGoogleModel({
+    apiKey: "k",
+    model: "m",
+    fetch: googleFetch,
+  }) as PredictModel;
+  await google(strict);
+  assert.equal(
+    "responseSchema" in
+      ((bodies[0]?.generationConfig as JSONObject | undefined) ?? {}),
+    false,
+    "Gemini model callbacks keep the prompt-only path, as the Go provider does",
+  );
+});
+
+test("OpenAI refusals are content-filtered replies", async () => {
+  const model = createOpenAIModel({
+    apiKey: "k",
+    model: "m",
+    fetch: fakeFetch(() =>
+      jsonResponse({
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: null,
+              refusal: "I can't help with that.",
+            },
+            finish_reason: "stop",
+          },
+        ],
+      }),
+    ),
+  }) as PredictModel;
+  const result = (await model(modelRequest("classify"))) as PredictModelResult;
+  assert.equal(result.text, "I can't help with that.");
+  assert.equal(result.finishReason, "content_filter");
+});
+
+test("model callbacks report normalised finish reasons", async () => {
+  const cases: Array<{
+    create: (fetch: ProviderFetch) => PredictModel;
+    body: JSONObject;
+    want: PredictModelResult["finishReason"];
+  }> = [
+    {
+      create: (fetch) =>
+        createOpenAIModel({ apiKey: "k", model: "m", fetch }) as PredictModel,
+      body: {
+        choices: [{ message: { content: '{"cut' }, finish_reason: "length" }],
+      },
+      want: "length",
+    },
+    {
+      create: (fetch) =>
+        createOpenAIModel({ apiKey: "k", model: "m", fetch }) as PredictModel,
+      body: {
+        choices: [
+          { message: { content: "x" }, finish_reason: "content_filter" },
+        ],
+      },
+      want: "content_filter",
+    },
+    {
+      create: (fetch) =>
+        createClaudeModel({ apiKey: "k", model: "m", fetch }) as PredictModel,
+      body: {
+        content: [{ type: "text", text: '{"cut' }],
+        stop_reason: "model_context_window_exceeded",
+      },
+      want: "length",
+    },
+    {
+      create: (fetch) =>
+        createClaudeModel({ apiKey: "k", model: "m", fetch }) as PredictModel,
+      body: {
+        content: [{ type: "text", text: "no" }],
+        stop_reason: "refusal",
+      },
+      want: "content_filter",
+    },
+    {
+      create: (fetch) =>
+        createGoogleModel({ apiKey: "k", model: "m", fetch }) as PredictModel,
+      body: {
+        candidates: [
+          { content: { parts: [{ text: "x" }] }, finishReason: "SAFETY" },
+        ],
+      },
+      want: "content_filter",
+    },
+  ];
+  for (const { create, body, want } of cases) {
+    const model = create(fakeFetch(() => jsonResponse(body)));
+    const result = (await model(modelRequest("p"))) as PredictModelResult;
+    assert.equal(result.finishReason, want, JSON.stringify(body));
+  }
+});
+
+test("unknown or missing finish reasons are not reported", async () => {
+  const chats: Array<{
+    chat: (fetch: ProviderFetch) => ReturnType<typeof createOpenAIChat>;
+    body: JSONObject;
+  }> = [
+    {
+      chat: (fetch) => createClaudeChat({ apiKey: "k", model: "m", fetch }),
+      body: {
+        content: [{ type: "text", text: "paused" }],
+        stop_reason: "pause_turn",
+      },
+    },
+    {
+      chat: (fetch) => createGoogleChat({ apiKey: "k", model: "m", fetch }),
+      body: {
+        candidates: [
+          { content: { parts: [{ text: "x" }] }, finishReason: "OTHER" },
+        ],
+      },
+    },
+    {
+      chat: (fetch) => createOpenAIChat({ apiKey: "k", model: "m", fetch }),
+      body: { choices: [{ message: { content: "x" } }] },
+    },
+  ];
+  for (const { chat, body } of chats) {
+    const fetch = fakeFetch(() => jsonResponse(body));
+    const response = await chat(fetch)({
+      model: "m",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    assert.equal("finish_reason" in response, false, JSON.stringify(body));
+  }
+  const model = createGoogleModel({
+    apiKey: "k",
+    model: "m",
+    fetch: fakeFetch(() =>
+      jsonResponse({
+        candidates: [
+          { content: { parts: [{ text: "x" }] }, finishReason: "OTHER" },
+        ],
+      }),
+    ),
+  }) as PredictModel;
+  const result = (await model(modelRequest("p"))) as PredictModelResult;
+  assert.equal("finishReason" in result, false);
 });
 
 test("OpenAI chat maps tool calls and response format", async () => {

@@ -1,6 +1,7 @@
 package gepa
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,9 +9,16 @@ import (
 	"strings"
 )
 
-// LLMJudgeMetric uses a language model and rubric to score semantic prediction quality.
+// LLMJudgeMetric uses a language model and rubric to score semantic prediction quality. It
+// records the usage of every judge call, repair calls and failed calls included, into the
+// context's UsageCollector. A judge reply cut at the token limit fails with
+// ErrOutputTruncated, and one withheld or refused under a content policy with
+// ErrContentFiltered, rather than being scored or repaired. The expected and actual
+// predictions are shown to the judge as JSON in the canonical form ExactMatchMetric
+// describes, so typed Go values read as their JSON encoding, and a value JSON cannot encode,
+// such as NaN, is shown as a string such as "NaN" rather than failing the score.
 type LLMJudgeMetric struct {
-	LM         LanguageModel
+	LM         Generator
 	Rubric     string
 	MaxScore   float64
 	Fields     []string
@@ -32,19 +40,13 @@ func (m LLMJudgeMetric) Score(ctx context.Context, expected Prediction, actual P
 	if maxScore <= 0 {
 		maxScore = 1
 	}
-	prompt, err := m.prompt(expected, actual, maxScore)
-	if err != nil {
-		return MetricResult{}, err
-	}
-	raw, err := m.LM.Generate(ctx, prompt)
-	recordUsage(ctx, languageModelUsage(m.LM))
+	raw, err := m.generate(ctx, m.prompt(expected, actual, maxScore))
 	if err != nil {
 		return MetricResult{}, err
 	}
 	judge, err := parseJudgeResponse(raw)
 	if err != nil && m.ParseRetry {
-		repaired, repairErr := m.LM.Generate(ctx, judgeRepairPrompt(raw, err))
-		recordUsage(ctx, languageModelUsage(m.LM))
+		repaired, repairErr := m.generate(ctx, judgeRepairPrompt(raw, err))
 		if repairErr != nil {
 			return MetricResult{}, repairErr
 		}
@@ -60,23 +62,46 @@ func (m LLMJudgeMetric) Score(ctx context.Context, expected Prediction, actual P
 	}, nil
 }
 
-func (m LLMJudgeMetric) prompt(expected Prediction, actual Prediction, maxScore float64) (string, error) {
-	expectedJSON, err := json.MarshalIndent(filterPrediction(expected, m.Fields), "", "  ")
+// generate makes one judge call, records its usage and rejects a truncated or refused reply.
+func (m LLMJudgeMetric) generate(ctx context.Context, prompt string) (string, error) {
+	if err := AdmitModelCall(ctx); err != nil {
+		return "", err
+	}
+	generation, err := m.LM.Generate(ctx, prompt)
+	RecordUsage(ctx, generation.Usage)
 	if err != nil {
 		return "", err
 	}
-	actualJSON, err := json.MarshalIndent(filterPrediction(actual, m.Fields), "", "  ")
-	if err != nil {
+	if err := FinishReasonError(generation, "judge reply"); err != nil {
 		return "", err
 	}
+	return generation.Text, nil
+}
+
+func (m LLMJudgeMetric) prompt(expected Prediction, actual Prediction, maxScore float64) string {
 	return strings.Join([]string{
 		"Judge the actual prediction against the expected prediction.",
 		"Rubric:\n" + strings.TrimSpace(m.Rubric),
 		fmt.Sprintf("Return JSON only with score from 0 to %.4g and feedback.", maxScore),
-		"Expected JSON:\n```json\n" + string(expectedJSON) + "\n```",
-		"Actual JSON:\n```json\n" + string(actualJSON) + "\n```",
+		"Expected JSON:\n```json\n" + renderPrediction(filterPrediction(expected, m.Fields)) + "\n```",
+		"Actual JSON:\n```json\n" + renderPrediction(filterPrediction(actual, m.Fields)) + "\n```",
 		`Required output shape: {"score": number, "feedback": string, "details": object}`,
-	}, "\n\n"), nil
+	}, "\n\n")
+}
+
+// renderPrediction renders prediction as indented JSON whose values are in canonical form.
+func renderPrediction(prediction Prediction) string {
+	rendered := make(map[string]json.RawMessage, len(prediction))
+	for field, value := range prediction {
+		rendered[field] = metricJSON(value)
+	}
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	encoder.SetIndent("", "  ")
+	// every value is already valid JSON, so the map always encodes.
+	_ = encoder.Encode(rendered)
+	return strings.TrimSpace(buffer.String())
 }
 
 func parseJudgeResponse(raw string) (llmJudgeResponse, error) {

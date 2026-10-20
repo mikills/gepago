@@ -3,22 +3,20 @@ package gepa_test
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	gepa "github.com/mikills/gepago"
+	"github.com/mikills/gepago/gepatest"
 )
 
 func ExampleCompile() {
 	ctx := context.Background()
-	lm := gepa.LanguageModelFunc(func(_ context.Context, prompt string) (string, error) {
-		if strings.Contains(prompt, "Evaluation records and traces") {
-			return "```\nClassify customer text as exactly positive or negative.\n```", nil
-		}
-		if strings.Contains(strings.ToLower(prompt), "broken") {
-			return `{"label":"negative"}`, nil
-		}
-		return `{"label":"positive"}`, nil
-	})
+	lm := gepatest.NewFakeGenerator().
+		OnPrompt(
+			"Evaluation records and traces",
+			gepatest.Text("```\nClassify customer text as exactly positive or negative.\n```"),
+		).
+		OnPrompt("broken", gepatest.Text(`{"label":"negative"}`)).
+		Default(gepatest.Text(`{"label":"positive"}`))
 
 	program := gepa.Predict{
 		Signature: gepa.Signature{
@@ -63,9 +61,7 @@ func ExampleChainOfThought() {
 			Inputs:  []gepa.Field{{Name: "question"}},
 			Outputs: []gepa.Field{{Name: "answer"}},
 		},
-		LM: gepa.LanguageModelFunc(func(context.Context, string) (string, error) {
-			return `{"answer":"42","reasoning":"6 times 7 is 42"}`, nil
-		}),
+		LM: gepatest.NewFakeGenerator().Default(gepatest.Text(`{"answer":"42","reasoning":"6 times 7 is 42"}`)),
 	}
 	prediction, err := program.Run(context.Background(), gepa.Prediction{"question": "6*7?"})
 	if err != nil {
@@ -75,52 +71,54 @@ func ExampleChainOfThought() {
 	// Output: 42
 }
 
-func ExamplePipelineProgram() {
+func ExampleNewProgramStep() {
 	ctx := context.Background()
-	extractLM := gepa.LanguageModelFunc(func(context.Context, string) (string, error) {
-		return `{"amount":125000,"deadline":"2026-06-30"}`, nil
-	})
-	decideLM := gepa.LanguageModelFunc(func(_ context.Context, prompt string) (string, error) {
-		if strings.Contains(prompt, `"amount": 125000`) {
-			return `{"decision":"needs_review","reason":"Amount exceeds the automatic approval threshold."}`, nil
-		}
-		return `{"decision":"approve","reason":"Amount is within policy."}`, nil
-	})
+	document := gepa.Key[string]{Name: "document"}
+	amount := gepa.Key[int]{Name: "amount"}
+	deadline := gepa.Key[string]{Name: "deadline"}
+	decision := gepa.Key[string]{Name: "decision"}
+	reason := gepa.Key[string]{Name: "reason"}
+	extractLM := gepatest.NewFakeGenerator().Default(gepatest.Text(`{"amount":125000,"deadline":"2026-06-30"}`))
+	decideLM := gepatest.NewFakeGenerator().
+		OnPrompt(
+			`"amount": 125000`,
+			gepatest.Text(`{"decision":"needs_review","reason":"Amount exceeds the automatic approval threshold."}`),
+		).
+		Default(gepatest.Text(`{"decision":"approve","reason":"Amount is within policy."}`))
 
-	program := gepa.PipelineProgram{Steps: []gepa.PipelineStep{
-		{
-			Name: "extract",
-			Program: gepa.Predict{
-				Signature: gepa.Signature{
-					Name:    "extract_obligation",
-					Inputs:  []gepa.Field{{Name: "document"}},
-					Outputs: []gepa.Field{{Name: "amount"}, {Name: "deadline"}},
-				},
-				Instruction: "Extract the obligation amount and deadline.",
-				LM:          extractLM,
-			},
+	extract := gepa.NewProgramStep("extract", gepa.Predict{
+		Signature: gepa.Signature{
+			Name:    "extract_obligation",
+			Inputs:  []gepa.Field{{Name: "document"}},
+			Outputs: []gepa.Field{{Name: "amount", Type: "int"}, {Name: "deadline", Type: "string"}},
 		},
-		{
-			Name: "decide",
-			Program: gepa.Predict{
-				Signature: gepa.Signature{
-					Name:    "underwriting_decision",
-					Inputs:  []gepa.Field{{Name: "amount"}, {Name: "deadline"}},
-					Outputs: []gepa.Field{{Name: "decision"}, {Name: "reason"}},
-				},
-				Instruction: "Decide whether this obligation can be approved automatically.",
-				LM:          decideLM,
-			},
-			InputKeys: []string{"amount", "deadline"},
+		Instruction: "Extract the obligation amount and deadline.",
+		LM:          extractLM,
+	}, []gepa.KeyRef{document.Ref()}, []gepa.KeyRef{amount.Ref(), deadline.Ref()})
+	decide := gepa.NewProgramStep("decide", gepa.Predict{
+		Signature: gepa.Signature{
+			Name:    "underwriting_decision",
+			Inputs:  []gepa.Field{{Name: "amount"}, {Name: "deadline"}},
+			Outputs: []gepa.Field{{Name: "decision"}, {Name: "reason"}},
 		},
-	}}
+		Instruction: "Decide whether this obligation can be approved automatically.",
+		LM:          decideLM,
+	}, []gepa.KeyRef{amount.Ref(), deadline.Ref()}, []gepa.KeyRef{decision.Ref(), reason.Ref()})
 
-	prediction, err := program.Run(ctx, gepa.Prediction{"document": "Bond obligation for 125,000 due 30 June 2026."})
+	pipeline, err := gepa.PipelineSpec{
+		Inputs: []gepa.KeyRef{document.Ref()},
+		Steps:  []gepa.Step{extract, decide},
+	}.Build()
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println(prediction["decision"])
-	fmt.Println(prediction["reason"])
+	inputs := gepa.NewState(gepa.Prediction{"document": "Bond obligation for 125,000 due 30 June 2026."})
+	out, err := pipeline.Run(ctx, inputs)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(out.Prediction()["decision"])
+	fmt.Println(out.Prediction()["reason"])
 	// Output:
 	// needs_review
 	// Amount exceeds the automatic approval threshold.
@@ -139,9 +137,7 @@ func ExamplePipelineSpec_Build() {
 			Outputs: []gepa.Field{{Name: "amount"}},
 		},
 		Instruction: "Extract the obligation amount.",
-		LM: gepa.LanguageModelFunc(func(context.Context, string) (string, error) {
-			return `{"amount":125000}`, nil
-		}),
+		LM:          gepatest.NewFakeGenerator().OnStep("extract", gepatest.Text(`{"amount":125000}`)),
 	}, []gepa.KeyRef{document.Ref()}, []gepa.KeyRef{amount.Ref()})
 
 	decide := gepa.NewStep(
@@ -189,9 +185,8 @@ func ExamplePipelineSpec_Build() {
 
 func ExampleLLMJudgeMetric() {
 	metric := gepa.LLMJudgeMetric{
-		LM: gepa.LanguageModelFunc(func(context.Context, string) (string, error) {
-			return `{"score": 1, "feedback": "equivalent", "details": {}}`, nil
-		}),
+		LM: gepatest.NewFakeGenerator().
+			Default(gepatest.Text(`{"score": 1, "feedback": "equivalent", "details": {}}`)),
 		Rubric: "Score semantic equivalence.",
 	}
 	result, err := metric.Score(

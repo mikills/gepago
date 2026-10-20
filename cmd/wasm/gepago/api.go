@@ -11,7 +11,7 @@ import (
 )
 
 // wasmAPIVersion is the version of the JSON protocol, not the Gepago module.
-const wasmAPIVersion = "2"
+const wasmAPIVersion = "3"
 
 // ParsePredictionRequest contains the raw model output to parse.
 type ParsePredictionRequest struct {

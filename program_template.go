@@ -168,6 +168,8 @@ func WriteCandidateDiffReport(path string, seed Candidate, trained Candidate) er
 }
 
 // LoadCompiledFromManifest loads a registered programme using a manifest entry by name and version.
+// The artefact's fingerprint is checked unless version names the entry's ProgramVersion; a
+// version that matches only the entry's Version, or no version, does not skip the check.
 func (r *ProgramRegistry) LoadCompiledFromManifest(
 	manifest ProgramArtifactManifest,
 	baseDir string,
@@ -186,7 +188,7 @@ func (r *ProgramRegistry) LoadCompiledFromManifest(
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(baseDir, path)
 	}
-	return r.LoadCompiledVersion(path, entry.ProgramVersion)
+	return r.loadCompiled(path, entry.ProgramVersion, version)
 }
 
 // ProgramHTTPHandler serves compiled programmes from a registry and artifact directory.

@@ -4,3 +4,9 @@ use (
 	.
 	./programs/crucible
 )
+
+// programs/crucible requires gepago v0.8.0 before it is tagged, and workspace mode still reads
+// a required version's go.mod, so the workspace module stands in for it. After tagging v0.8.0,
+// run `GOWORK=off go mod tidy` in programs/crucible, commit its go.sum and remove this replace
+// (CONTRIBUTING.md, Releases).
+replace github.com/mikills/gepago v0.8.0 => ./

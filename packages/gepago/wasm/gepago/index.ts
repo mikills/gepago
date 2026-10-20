@@ -4,6 +4,7 @@ import { readFile as readFileAsync } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
+import { assertWasmAPIVersion } from "./api-version.ts";
 import { connectWorker } from "./worker-client.ts";
 import type {
   AgentChat,
@@ -259,10 +260,26 @@ function assertPrediction(value: unknown, name: string): WireObject {
   return value as WireObject;
 }
 
+const optionalUsageFields = [
+  "reasoning_tokens",
+  "cached_input_tokens",
+  "cache_creation_tokens",
+];
+
 function assertUsage(value: unknown, name: string): Usage {
   const usage = assertPlainObject(value, name);
   for (const field of ["prompt_tokens", "completion_tokens", "total_tokens"]) {
     if (!Number.isSafeInteger(usage[field]) || (usage[field] as number) < 0) {
+      throw new TypeError(
+        `${name}.${field} must be a non-negative safe integer`,
+      );
+    }
+  }
+  for (const field of optionalUsageFields) {
+    if (
+      usage[field] !== undefined &&
+      (!Number.isSafeInteger(usage[field]) || (usage[field] as number) < 0)
+    ) {
       throw new TypeError(
         `${name}.${field} must be a non-negative safe integer`,
       );
@@ -273,12 +290,18 @@ function assertUsage(value: unknown, name: string): Usage {
 }
 
 const agentRoles = new Set(["system", "user", "assistant", "tool"]);
-const agentFinishReasons = new Set(["stop", "length", "tool_calls"]);
+const agentFinishReasons = new Set([
+  "stop",
+  "length",
+  "tool_calls",
+  "content_filter",
+]);
 const agentStopReasons = new Set([
   "complete",
   "length",
   "max_turns",
   "tool_error",
+  "content_filter",
 ]);
 
 function assertAgentMessage(value: unknown, name: string): Message {
@@ -479,15 +502,14 @@ function normalizeAgentChatResponse(value: unknown): ChatResponse {
     throw new TypeError("agent chat response.message.role must be assistant");
   }
   const responseUsage = assertUsage(object.usage, "agent chat response.usage");
-  if (!agentFinishReasons.has(object.finish_reason as string)) {
+  const reported = isReportedFinishReason(object.finish_reason);
+  if (reported && !agentFinishReasons.has(object.finish_reason as string)) {
     throw new TypeError("agent chat response.finish_reason is invalid");
   }
   assertJSONValue(object, "agent chat response");
-  return {
-    message,
-    usage: responseUsage,
-    finish_reason: object.finish_reason as FinishReason,
-  };
+  const normalized: ChatResponse = { message, usage: responseUsage };
+  if (reported) normalized.finish_reason = object.finish_reason as FinishReason;
+  return normalized;
 }
 
 function assertAgentToolRequest(value: unknown): AgentToolRequest {
@@ -667,13 +689,25 @@ function normalizeChainOfThoughtProgram(
     program.reasoningField === undefined || program.reasoningField === ""
       ? "reasoning"
       : program.reasoningField;
+  // as in cot.go: the reasoning field comes first, so a model that writes fields in schema
+  // order reasons before it answers, and it is a string when the other outputs are typed.
+  const typed = signature.outputs.some(
+    (field) =>
+      field.type !== undefined ||
+      field.schema !== undefined ||
+      field.optional === true,
+  );
   const outputs = signature.outputs.some(
     (field) => field.name === reasoningField,
   )
     ? signature.outputs
     : [
+        {
+          name: reasoningField,
+          description: "brief reasoning for the answer",
+          ...(typed ? { type: "string" } : {}),
+        },
         ...signature.outputs,
-        { name: reasoningField, description: "brief reasoning for the answer" },
       ];
   const instruction = String(
     program.instruction ?? signature.description ?? "",
@@ -1142,17 +1176,39 @@ function parseCompileModelRequest(encoded: unknown): CompileModelRequest {
 function normalizeCompileModelResult(
   value: unknown,
 ): CompileModelOutput | CompileModelResult {
+  return normalizeHostModelResult(value, "compile model result");
+}
+
+// isReportedFinishReason treats undefined, null and "" as a finish reason the provider did not
+// report, as the Go bridge does.
+function isReportedFinishReason(value: unknown): boolean {
+  return value !== undefined && value !== null && value !== "";
+}
+
+// normalizeHostModelResult validates a host model's reply and keeps only the fields the WASM
+// module reads: text, plus optional usage, finishReason and model.
+function normalizeHostModelResult(
+  value: unknown,
+  name: string,
+): PredictModelResult {
   if (typeof value === "string") return { text: value };
-  const result = assertPlainObject(value, "compile model result");
+  const result = assertPlainObject(value, name);
   if (!Object.hasOwn(result, "text"))
-    throw new TypeError("compile model result.text is required");
-  assertString(result.text, "compile model result.text");
-  if (result.usage !== undefined)
-    assertUsage(result.usage, "compile model result.usage");
-  assertJSONValue(result, "compile model result");
-  return result.usage === undefined || result.usage === null
-    ? { text: result.text as string }
-    : { text: result.text as string, usage: result.usage as Usage };
+    throw new TypeError(`${name}.text is required`);
+  assertString(result.text, `${name}.text`);
+  if (result.usage !== undefined) assertUsage(result.usage, `${name}.usage`);
+  const reported = isReportedFinishReason(result.finishReason);
+  if (reported && !agentFinishReasons.has(result.finishReason as string))
+    throw new TypeError(
+      `${name}.finishReason must be one of stop, length, tool_calls or content_filter`,
+    );
+  if (result.model !== undefined) assertString(result.model, `${name}.model`);
+  assertJSONValue(result, name);
+  const normalized: PredictModelResult = { text: result.text as string };
+  if (result.usage !== undefined) normalized.usage = result.usage as Usage;
+  if (reported) normalized.finishReason = result.finishReason as FinishReason;
+  if (result.model !== undefined) normalized.model = result.model as string;
+  return normalized;
 }
 
 function assertCompileResult(value: unknown): CompileResult {
@@ -1365,18 +1421,48 @@ function assertPredictComplete(value: unknown): PredictResult {
   return result as unknown as PredictResult;
 }
 
+// parsePipelineRunRequest decodes a model request of a runCompiled pipeline job, which has the
+// shape of a predict host request.
+function parsePipelineRunRequest(encoded: unknown): PredictHostRequest {
+  assertString(encoded, "runCompiled model request");
+  let request;
+  try {
+    request = JSON.parse(encoded);
+  } catch (error) {
+    throw new GepagoWasmError(
+      `runCompiled model request is invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+      "runCompiled",
+    );
+  }
+  const object = assertPlainObject(request, "runCompiled model request");
+  if (
+    typeof object.request_id !== "string" ||
+    object.request_id === "" ||
+    object.kind !== "language_model.generate" ||
+    object.role !== "task" ||
+    typeof object.prompt !== "string" ||
+    !Number.isSafeInteger(object.attempt) ||
+    (object.attempt as number) < 1
+  ) {
+    throw new GepagoWasmError(
+      "runCompiled received an invalid model request",
+      "runCompiled",
+    );
+  }
+  assertJSONValue(object, "runCompiled model request");
+  return object as unknown as PredictHostRequest;
+}
+
+function assertPipelineRunResult(value: unknown): PredictResult {
+  const result = assertPlainObject(value, "runCompiled result");
+  assertPrediction(result.prediction, "runCompiled result.prediction");
+  assertUsage(result.usage, "runCompiled result.usage");
+  assertJSONValue(result, "runCompiled result");
+  return result as unknown as PredictResult;
+}
+
 function normalizeModelResult(value: unknown): PredictModelResult {
-  if (typeof value === "string") return { text: value };
-  const result = assertPlainObject(value, "predict model result");
-  if (!Object.hasOwn(result, "text"))
-    throw new TypeError("predict model result.text is required");
-  assertString(result.text, "predict model result.text");
-  if (result.usage !== undefined)
-    assertUsage(result.usage, "predict model result.usage");
-  assertJSONValue(result, "predict model result");
-  return result.usage === undefined || result.usage === null
-    ? { text: result.text as string }
-    : { text: result.text as string, usage: result.usage as Usage };
+  return normalizeHostModelResult(value, "predict model result");
 }
 
 function assertDemos(value: unknown): asserts value is Demo[] {
@@ -1565,15 +1651,6 @@ function assertCompiledCandidate(
   return object as unknown as Candidate;
 }
 
-function candidateForStep(candidate: Candidate, stepName: string): Candidate {
-  const scoped: Candidate = {};
-  const prefix = `${stepName}.`;
-  for (const [key, value] of Object.entries(candidate)) {
-    if (key.startsWith(prefix)) scoped[key.slice(prefix.length)] = value;
-  }
-  return scoped;
-}
-
 function applyCandidateToProgram(
   program: RunProgram,
   candidate: Candidate,
@@ -1664,6 +1741,7 @@ export async function createGepagoWasm(
         "Gepago WASM module did not register the expected gepagoWasm API",
       );
     }
+    assertWasmAPIVersion(namespace.version);
     const invokeFunction = namespace.invoke.bind(namespace);
     const startFunction = namespace.start.bind(namespace);
     const startAgentFunction = namespace.startAgent.bind(namespace);
@@ -1973,57 +2051,96 @@ export async function createGepagoWasm(
         );
       }
 
-      let stateInputs = { ...inputs };
-      let last: Record<string, JSONValue> = {};
-      let usage: Usage = {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
-      };
-      for (const step of program.steps) {
-        const keys = step.program.inputKeys;
-        const stepInputs: Record<string, JSONValue> = {};
-        if (keys === undefined || keys.length === 0) {
-          Object.assign(stepInputs, stateInputs);
-        } else {
-          for (const key of keys) {
-            if (!Object.hasOwn(stateInputs, key)) {
-              throw new Error(
-                `pipeline step "${step.name}": required input "${key}" is missing`,
-              );
-            }
-            stepInputs[key] = stateInputs[key];
+      // A pipeline runs in the Go module exactly as compile runs it, so both accept and reject
+      // the same programmes and inputs and send the same prompts.
+      if (typeof model !== "function")
+        throw new TypeError("runCompiled model must be a function");
+      return runModelJob(
+        "pipeline.run",
+        "runCompiled",
+        encodePayload("runCompiled", {
+          program,
+          candidate: compiledCandidate,
+          inputs,
+        }),
+        async (requestJSON) =>
+          normalizeModelResult(
+            await model(parsePipelineRunRequest(requestJSON)),
+          ),
+        (resultJSON) =>
+          assertPipelineRunResult(parseEnvelope("runCompiled", resultJSON)),
+      );
+    }
+
+    // runModelJob runs an async Go job whose model calls go to modelCallback and resolves with
+    // its result as parseResult reads it. A model callback that fails returns its error to Go
+    // as that call's error, as in the browser runtime, so the job reports the host's message
+    // and keeps the usage already spent; only cancel and close cancel the job.
+    async function runModelJob<T>(
+      goOperation: string,
+      operation: string,
+      payloadJSON: string,
+      modelCallback: (requestJSON: string) => Promise<unknown>,
+      parseResult: (resultJSON: string) => T,
+    ): Promise<T> {
+      let jobID: string | undefined;
+      let settled = false;
+      const completion = new Promise<T>((resolve, reject) => {
+        const onComplete = (
+          completedJobID: string,
+          resultJSON: string,
+        ): void => {
+          if (settled) return;
+          settled = true;
+          if (completedJobID !== jobID) {
+            cancelAsyncJob(jobID ?? "");
+            reject(
+              new GepagoWasmError(
+                `${operation} completed with an unexpected job id`,
+                operation,
+              ),
+            );
+            return;
           }
-        }
-        const stepProgram = normalizePredictProgram(
-          step.program,
-          `runCompiled program ${step.name}`,
-        ) as unknown as RunProgram;
-        const result = await predict(
-          {
-            program: applyCandidateToProgram(
-              stepProgram,
-              candidateForStep(compiledCandidate, step.name),
-              (text) => invoke("decodeDemos", { text }) as unknown as Demo[],
-            ),
-            inputs: stepInputs,
-          } as PredictConfig,
-          model,
-        );
-        usage = {
-          prompt_tokens: usage.prompt_tokens + result.usage.prompt_tokens,
-          completion_tokens:
-            usage.completion_tokens + result.usage.completion_tokens,
-          total_tokens: usage.total_tokens + result.usage.total_tokens,
+          try {
+            resolve(parseResult(resultJSON));
+          } catch (error) {
+            // This also covers the Go {ok:false,error} envelope. The job is
+            // normally already removed, so cancel is deliberately best effort.
+            cancelAsyncJob(jobID ?? "");
+            reject(error);
+          }
         };
-        const prefix = (step.program.outputPrefix ?? "").trim();
-        last = {};
-        for (const [key, value] of Object.entries(result.prediction)) {
-          last[prefix === "" ? key : `${prefix}${key}`] = value;
+        try {
+          jobID = unwrapRuntimeCall(
+            startFunction(goOperation, payloadJSON, modelCallback, onComplete),
+            operation,
+          );
+          if (typeof jobID !== "string" || jobID === "") {
+            throw new GepagoWasmError(
+              `${operation} start returned an invalid job id`,
+              operation,
+            );
+          }
+          state.pendingJobs.add(jobID);
+        } catch (error) {
+          settled = true;
+          reject(
+            error instanceof GepagoWasmError
+              ? error
+              : new GepagoWasmError(
+                  `${operation} start failed: ${error instanceof Error ? error.message : String(error)}`,
+                  operation,
+                  { cause: error },
+                ),
+          );
         }
-        Object.assign(stateInputs, last);
+      });
+      try {
+        return await completion;
+      } finally {
+        if (jobID) state.pendingJobs.delete(jobID);
       }
-      return { prediction: program.returnAll ? stateInputs : last, usage };
     }
 
     async function compile(
@@ -2053,79 +2170,17 @@ export async function createGepagoWasm(
           assertCompileResult,
         ) as Promise<CompileResult>;
       }
-      const payloadJSON = encodePayload("compile", request);
-      let jobID: string | undefined;
-      let settled = false;
-      const modelFunction = async (
-        requestJSON: string,
-      ): Promise<CompileModelOutput> => {
-        try {
-          const hostRequest = parseCompileModelRequest(requestJSON);
-          return normalizeCompileModelResult(await model(hostRequest));
-        } catch (error) {
-          // The Go bridge turns callback failures into completion errors. Cancel
-          // immediately as well, so a pending model Promise cannot keep the
-          // optimisation alive after a host callback failure.
-          cancelAsyncJob(jobID ?? "");
-          throw error;
-        }
-      };
-      const completion = new Promise<CompileResult>((resolve, reject) => {
-        const onComplete = (
-          completedJobID: string,
-          resultJSON: string,
-        ): void => {
-          if (settled) return;
-          settled = true;
-          if (completedJobID !== jobID) {
-            cancelAsyncJob(jobID ?? "");
-            reject(
-              new GepagoWasmError(
-                "compile completed with an unexpected job id",
-                "compile",
-              ),
-            );
-            return;
-          }
-          try {
-            resolve(assertCompileResult(parseEnvelope("compile", resultJSON)));
-          } catch (error) {
-            // This also covers the Go {ok:false,error} envelope. The job is
-            // normally already removed, so cancel is deliberately best effort.
-            cancelAsyncJob(jobID ?? "");
-            reject(error);
-          }
-        };
-        try {
-          jobID = unwrapRuntimeCall(
-            startFunction("compile", payloadJSON, modelFunction, onComplete),
-            "compile",
-          );
-          if (typeof jobID !== "string" || jobID === "") {
-            throw new GepagoWasmError(
-              "compile start returned an invalid job id",
-              "compile",
-            );
-          }
-          state.pendingJobs.add(jobID);
-        } catch (error) {
-          settled = true;
-          reject(
-            error instanceof GepagoWasmError
-              ? error
-              : new GepagoWasmError(
-                  `compile start failed: ${error instanceof Error ? error.message : String(error)}`,
-                  "compile",
-                  { cause: error },
-                ),
-          );
-        }
-      });
-      try {
-        return await completion;
-      } finally {
-        if (jobID) state.pendingJobs.delete(jobID);
-      }
+      return runModelJob(
+        "compile",
+        "compile",
+        encodePayload("compile", request),
+        async (requestJSON): Promise<CompileModelOutput> =>
+          normalizeCompileModelResult(
+            await model(parseCompileModelRequest(requestJSON)),
+          ),
+        (resultJSON) =>
+          assertCompileResult(parseEnvelope("compile", resultJSON)),
+      );
     }
 
     function invoke(operation: string, payload: unknown): JSONValue {

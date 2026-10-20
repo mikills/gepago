@@ -1,23 +1,21 @@
-package gepa
+package gepa_test
 
 import (
 	"context"
 	"strings"
 	"testing"
+
+	gepa "github.com/mikills/gepago"
 )
 
 func TestReflectiveProposer(t *testing.T) {
 	t.Run("builds prompt and parses fenced replacement", func(t *testing.T) {
-		var prompt string
-		lm := LanguageModelFunc(func(_ context.Context, p string) (string, error) {
-			prompt = p
-			return "```\nimproved prompt\n```", nil
-		})
-		proposer := &ReflectiveProposer{LM: lm, Objective: "be better"}
+		lm := replyModel("```\nimproved prompt\n```")
+		proposer := &gepa.ReflectiveProposer{LM: lm, Objective: "be better"}
 		patch, err := proposer.Propose(
 			context.Background(),
-			Candidate{"prompt": "old"},
-			ReflectiveDataset{"prompt": []ReflectiveRecord{{"Feedback": "bad"}}},
+			gepa.Candidate{"prompt": "old"},
+			gepa.ReflectiveDataset{"prompt": []gepa.ReflectiveRecord{{"Feedback": "bad"}}},
 			[]string{"prompt"},
 		)
 		if err != nil {
@@ -26,7 +24,7 @@ func TestReflectiveProposer(t *testing.T) {
 		if patch["prompt"] != "improved prompt" {
 			t.Fatalf("patch = %#v", patch)
 		}
-		if !strings.Contains(prompt, "be better") || !strings.Contains(prompt, "old") {
+		if prompt := prompts(lm)[0]; !strings.Contains(prompt, "be better") || !strings.Contains(prompt, "old") {
 			t.Fatalf("prompt missing context: %s", prompt)
 		}
 		if len(proposer.LastProposalMetadata()) != 1 {
@@ -35,17 +33,13 @@ func TestReflectiveProposer(t *testing.T) {
 	})
 
 	t.Run("parses json patch and includes lessons", func(t *testing.T) {
-		var prompt string
-		lm := LanguageModelFunc(func(_ context.Context, p string) (string, error) {
-			prompt = p
-			return "```json\n{\"prompt\":\"json improved\"}\n```", nil
-		})
-		proposer := &ReflectiveProposer{LM: lm, MaxRecords: 1}
+		lm := replyModel("```json\n{\"prompt\":\"json improved\"}\n```")
+		proposer := &gepa.ReflectiveProposer{LM: lm, MaxRecords: 1}
 		proposer.SetLessons([]string{"keep useful constraints"})
 		patch, err := proposer.Propose(
 			context.Background(),
-			Candidate{"prompt": "old"},
-			ReflectiveDataset{"prompt": []ReflectiveRecord{{"Feedback": "bad"}, {"Feedback": "ignored"}}},
+			gepa.Candidate{"prompt": "old"},
+			gepa.ReflectiveDataset{"prompt": []gepa.ReflectiveRecord{{"Feedback": "bad"}, {"Feedback": "ignored"}}},
 			[]string{"prompt"},
 		)
 		if err != nil {
@@ -54,7 +48,8 @@ func TestReflectiveProposer(t *testing.T) {
 		if patch["prompt"] != "json improved" {
 			t.Fatalf("patch = %#v", patch)
 		}
-		if !strings.Contains(prompt, "keep useful constraints") || strings.Contains(prompt, "ignored") {
+		if prompt := prompts(lm)[0]; !strings.Contains(prompt, "keep useful constraints") ||
+			strings.Contains(prompt, "ignored") {
 			t.Fatalf("prompt lesson/truncation mismatch: %s", prompt)
 		}
 	})
@@ -62,20 +57,23 @@ func TestReflectiveProposer(t *testing.T) {
 
 func TestSelectors(t *testing.T) {
 	t.Run("round robin component selector", func(t *testing.T) {
-		selector := RoundRobinComponentSelector{}
-		candidate := CandidateRecord{Candidate: Candidate{"a": "one", "b": "two"}}
-		first := selector.SelectComponents(OptimizationState{Iterations: 0}, candidate, nil)
-		second := selector.SelectComponents(OptimizationState{Iterations: 1}, candidate, nil)
+		selector := gepa.RoundRobinComponentSelector{}
+		candidate := gepa.CandidateRecord{Candidate: gepa.Candidate{"a": "one", "b": "two"}}
+		first := selector.SelectComponents(gepa.OptimizationState{Iterations: 0}, candidate, nil)
+		second := selector.SelectComponents(gepa.OptimizationState{Iterations: 1}, candidate, nil)
 		if first[0] != "a" || second[0] != "b" {
 			t.Fatalf("components = %v then %v", first, second)
 		}
 	})
 
 	t.Run("current best candidate selector", func(t *testing.T) {
-		selector := CurrentBestCandidateSelector{}
-		state := OptimizationState{
+		selector := gepa.CurrentBestCandidateSelector{}
+		state := gepa.OptimizationState{
 			BestCandidateID: "best",
-			Candidates:      []CandidateRecord{{ID: "other", ValidationScore: 0}, {ID: "best", ValidationScore: 1}},
+			Candidates: []gepa.CandidateRecord{
+				{ID: "other", ValidationScore: 0},
+				{ID: "best", ValidationScore: 1},
+			},
 		}
 		selected := selector.SelectCandidate(state, nil)
 		if selected.ID != "best" {

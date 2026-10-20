@@ -8,13 +8,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	gepa "github.com/mikills/gepago"
+	"github.com/mikills/gepago/agents"
+	"github.com/mikills/gepago/gepatest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -60,12 +61,12 @@ func TestRun(t *testing.T) {
 
 func TestJudges(t *testing.T) {
 	t.Run("rubric and pairwise", func(t *testing.T) {
-		judge := gepa.LanguageModelFunc(func(_ context.Context, prompt string) (string, error) {
-			if strings.Contains(prompt, "Compare two subject outputs") {
-				return `{"winner":"a","score_a":0.9,"score_b":0.2,"feedback":"A is clearer"}`, nil
-			}
-			return `{"score":0.8,"feedback":"good"}`, nil
-		})
+		judge := gepatest.NewFakeGenerator().
+			OnPrompt(
+				"Compare two subject outputs",
+				gepatest.Text(`{"winner":"a","score_a":0.9,"score_b":0.2,"feedback":"A is clearer"}`),
+			).
+			Default(gepatest.Text(`{"score":0.8,"feedback":"good"}`))
 		suite := Suite{
 			Name: "open-ended",
 			Cases: []EvalCase{{
@@ -592,4 +593,181 @@ func findSummary(summaries []SubjectSummary, subject string) SubjectSummary {
 		}
 	}
 	return SubjectSummary{}
+}
+
+func TestAgentSubjectFinishReasons(t *testing.T) {
+	chat := func(reason string) string {
+		return fmt.Sprintf(
+			`{"model":"m","choices":[{"message":{"role":"assistant","content":"x"},"finish_reason":%q}]}`,
+			reason,
+		)
+	}
+	responses := func(reason string) string {
+		return fmt.Sprintf(
+			`{"model":"m","output":[{"type":"message","content":[{"type":"output_text","text":"x"}]}],`+
+				`"incomplete_details":{"reason":%q}}`,
+			reason,
+		)
+	}
+	anthropic := func(reason string) string {
+		return fmt.Sprintf(`{"model":"m","content":[{"type":"text","text":"x"}],"stop_reason":%q}`, reason)
+	}
+	tests := []struct {
+		name   string
+		decode func([]byte) (agents.ChatResponse, error)
+		body   string
+		want   agents.FinishReason
+	}{
+		{"chat stop", decodeOpenAIChatResponse, chat("stop"), agents.FinishStop},
+		{"chat length", decodeOpenAIChatResponse, chat("length"), agents.FinishLength},
+		{"chat tool calls", decodeOpenAIChatResponse, chat("tool_calls"), agents.FinishToolCalls},
+		{"chat content filter", decodeOpenAIChatResponse, chat("content_filter"), agents.FinishContentFilter},
+		{"responses complete", decodeOpenAIResponsesResponse, responses(""), agents.FinishStop},
+		{"responses length", decodeOpenAIResponsesResponse, responses("max_output_tokens"), agents.FinishLength},
+		{
+			"responses content filter",
+			decodeOpenAIResponsesResponse,
+			responses("content_filter"),
+			agents.FinishContentFilter,
+		},
+		{"anthropic end turn", decodeAnthropicResponse, anthropic("end_turn"), agents.FinishStop},
+		{"anthropic max tokens", decodeAnthropicResponse, anthropic("max_tokens"), agents.FinishLength},
+		{"anthropic tool use", decodeAnthropicResponse, anthropic("tool_use"), agents.FinishToolCalls},
+		{"anthropic refusal", decodeAnthropicResponse, anthropic("refusal"), agents.FinishContentFilter},
+		{
+			"anthropic context window",
+			decodeAnthropicResponse,
+			anthropic("model_context_window_exceeded"),
+			agents.FinishLength,
+		},
+		{"anthropic unknown", decodeAnthropicResponse, anthropic("pause_turn"), ""},
+		{"chat unknown", decodeOpenAIChatResponse, chat("something_new"), ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.decode([]byte(tt.body))
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got.FinishReason)
+		})
+	}
+}
+
+func TestAgentSubjectUsageBreakdown(t *testing.T) {
+	tests := []struct {
+		name   string
+		decode func([]byte) (agents.ChatResponse, error)
+		body   string
+		want   gepa.Usage
+	}{
+		{
+			name:   "openai chat",
+			decode: decodeOpenAIChatResponse,
+			body: `{"model":"m","choices":[{"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],
+				"usage":{"prompt_tokens":120,"completion_tokens":40,"total_tokens":160,
+				"prompt_tokens_details":{"cached_tokens":64},"completion_tokens_details":{"reasoning_tokens":25}}}`,
+			want: gepa.Usage{
+				PromptTokens:      120,
+				CompletionTokens:  40,
+				TotalTokens:       160,
+				ReasoningTokens:   25,
+				CachedInputTokens: 64,
+			},
+		},
+		{
+			name:   "openai responses",
+			decode: decodeOpenAIResponsesResponse,
+			body: `{"model":"m","output":[{"type":"message","content":[{"type":"output_text","text":"x"}]}],
+				"usage":{"input_tokens":90,"output_tokens":30,"total_tokens":120,
+				"input_tokens_details":{"cached_tokens":50},"output_tokens_details":{"reasoning_tokens":12}}}`,
+			want: gepa.Usage{
+				PromptTokens:      90,
+				CompletionTokens:  30,
+				TotalTokens:       120,
+				ReasoningTokens:   12,
+				CachedInputTokens: 50,
+			},
+		},
+		{
+			name:   "anthropic",
+			decode: decodeAnthropicResponse,
+			body: `{"model":"m","content":[{"type":"text","text":"x"}],"stop_reason":"end_turn",
+				"usage":{"input_tokens":10,"output_tokens":30,
+				"cache_read_input_tokens":200,"cache_creation_input_tokens":50,
+				"output_tokens_details":{"thinking_tokens":12}}}`,
+			// input_tokens excludes the cached part, so PromptTokens adds it back.
+			want: gepa.Usage{
+				PromptTokens:        260,
+				CompletionTokens:    30,
+				TotalTokens:         290,
+				ReasoningTokens:     12,
+				CachedInputTokens:   200,
+				CacheCreationTokens: 50,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.decode([]byte(tt.body))
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got.Usage)
+		})
+	}
+}
+
+func TestJudgesRejectTruncatedReplies(t *testing.T) {
+	usage := gepa.Usage{PromptTokens: 5, CompletionTokens: 64, TotalTokens: 69}
+	judge := gepatest.NewFakeGenerator().Default(gepatest.Text(`{"winner":"a","score_a":1,"score_b":0,"score":1}`).
+		WithUsage(usage).
+		WithFinishReason(gepa.FinishLength))
+	evalCase := EvalCase{ID: "case", Rubric: "Be correct"}
+
+	score, err := RubricJudgeEvaluator{LM: judge}.Evaluate(context.Background(), EvalInput{Case: evalCase})
+	require.ErrorIs(t, err, gepa.ErrOutputTruncated)
+	assert.Zero(t, score.Score)
+	assert.Equal(t, usage, score.Usage)
+
+	pairwise, err := PairwiseJudgeEvaluator{LM: judge}.Compare(context.Background(), PairwiseInput{Case: evalCase})
+	require.ErrorIs(t, err, gepa.ErrOutputTruncated)
+	assert.Empty(t, pairwise.Winner)
+	assert.Equal(t, usage, pairwise.Usage)
+}
+
+func TestJudgesRejectRefusedReplies(t *testing.T) {
+	judge := gepatest.NewFakeGenerator().Default(
+		gepatest.Text("I can't grade that.").WithFinishReason(gepa.FinishContentFilter),
+	)
+	evalCase := EvalCase{ID: "case", Rubric: "Be correct"}
+
+	score, err := RubricJudgeEvaluator{LM: judge}.Evaluate(context.Background(), EvalInput{Case: evalCase})
+	require.ErrorIs(t, err, gepa.ErrContentFiltered)
+	assert.Zero(t, score.Score)
+
+	pairwise, err := PairwiseJudgeEvaluator{LM: judge}.Compare(context.Background(), PairwiseInput{Case: evalCase})
+	require.ErrorIs(t, err, gepa.ErrContentFiltered)
+	assert.Empty(t, pairwise.Winner)
+}
+
+func TestRawModelSubjectReportsUsageOfFailedCall(t *testing.T) {
+	cause := fmt.Errorf("model failed after billing")
+	usage := gepa.Usage{PromptTokens: 4, CompletionTokens: 2, TotalTokens: 6}
+	subject := RawModelSubject{
+		SubjectName: "raw",
+		LM:          gepatest.NewFakeGenerator().Default(gepatest.Fail(cause).WithUsage(usage).WithModel("resolved")),
+	}
+
+	got, err := subject.Run(context.Background(), gepa.Prediction{"q": "?"})
+
+	require.ErrorIs(t, err, cause)
+	assert.Equal(t, usage, got.Usage)
+	assert.Equal(t, map[string]any{"resolved_model": "resolved"}, got.Metadata)
+}
+
+func TestBuildLanguageModel(t *testing.T) {
+	lm, err := BuildLanguageModel(SubjectSpec{Type: "openai"})
+	require.EqualError(t, err, "openai model is required")
+	assert.Nil(t, lm, "a failed build must not return a typed nil generator")
+
+	lm, err = BuildLanguageModel(SubjectSpec{Type: "openai", Model: "m", APIKey: "key"})
+	require.NoError(t, err)
+	assert.NotNil(t, lm)
 }

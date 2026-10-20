@@ -32,7 +32,7 @@ type EvaluatorSpec struct {
 
 // EvaluatorFactoryConfig provides runtime dependencies for serialized evaluator specs.
 type EvaluatorFactoryConfig struct {
-	JudgeLM      gepa.LanguageModel
+	JudgeLM      gepa.Generator
 	AllowCommand bool
 }
 

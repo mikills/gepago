@@ -118,19 +118,41 @@ type anthropicContentBlock struct {
 }
 
 type anthropicTool struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	InputSchema map[string]any `json:"input_schema,omitempty"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema json.RawMessage `json:"input_schema,omitempty"`
 }
 
 type anthropicResponse struct {
 	Model      string                  `json:"model"`
 	Content    []anthropicContentBlock `json:"content"`
 	StopReason string                  `json:"stop_reason"`
-	Usage      struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
-	} `json:"usage"`
+	Usage      anthropicUsage          `json:"usage"`
+}
+
+type anthropicUsage struct {
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	OutputTokensDetails      struct {
+		ThinkingTokens int `json:"thinking_tokens"`
+	} `json:"output_tokens_details"`
+}
+
+// gepaUsage maps Anthropic usage as the claude provider does: input_tokens excludes the
+// cached part, so PromptTokens adds cache reads and writes back, and ReasoningTokens is
+// output_tokens_details.thinking_tokens, the part of output_tokens spent on extended thinking.
+func (u anthropicUsage) gepaUsage() gepa.Usage {
+	prompt := u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
+	return gepa.Usage{
+		PromptTokens:        prompt,
+		CompletionTokens:    u.OutputTokens,
+		TotalTokens:         prompt + u.OutputTokens,
+		ReasoningTokens:     u.OutputTokensDetails.ThinkingTokens,
+		CachedInputTokens:   u.CacheReadInputTokens,
+		CacheCreationTokens: u.CacheCreationInputTokens,
+	}
 }
 
 func anthropicMaxTokens(maxTokens *int) int {
@@ -209,14 +231,9 @@ func decodeAnthropicResponse(data []byte) (agents.ChatResponse, error) {
 	for _, block := range response.Content {
 		applyAnthropicBlock(&message, block)
 	}
-	usage := gepa.Usage{
-		PromptTokens:     response.Usage.InputTokens,
-		CompletionTokens: response.Usage.OutputTokens,
-		TotalTokens:      response.Usage.InputTokens + response.Usage.OutputTokens,
-	}
 	return agents.ChatResponse{
 		Message:       message,
-		Usage:         usage,
+		Usage:         response.Usage.gepaUsage(),
 		FinishReason:  anthropicFinishReason(response.StopReason),
 		ResolvedModel: response.Model,
 	}, nil
@@ -236,12 +253,19 @@ func applyAnthropicBlock(message *agents.Message, block anthropicContentBlock) {
 	}
 }
 
+// anthropicFinishReason maps a stop reason; a missing or unknown one maps to the empty
+// FinishReason.
 func anthropicFinishReason(reason string) agents.FinishReason {
-	if reason == "tool_use" {
+	switch reason {
+	case "end_turn", "stop_sequence":
+		return agents.FinishStop
+	case "tool_use":
 		return agents.FinishToolCalls
-	}
-	if reason == "max_tokens" {
+	case "max_tokens", "model_context_window_exceeded":
 		return agents.FinishLength
+	case "refusal":
+		return agents.FinishContentFilter
+	default:
+		return ""
 	}
-	return agents.FinishStop
 }

@@ -4,6 +4,8 @@ import type {
   ChatRequest,
   ChatResponse,
   CompileModel,
+  FinishReason,
+  JSONSchemaResponseFormat,
   Message,
   PredictModel,
   PredictHostRequest,
@@ -173,19 +175,71 @@ export function responseMessage(
   if (toolCalls.length > 0) message.tool_calls = toolCalls;
   return message;
 }
+const contentFilterReasons = [
+  "content_filter",
+  "refusal",
+  "SAFETY",
+  "RECITATION",
+  "BLOCKLIST",
+  "PROHIBITED_CONTENT",
+  "SPII",
+  "IMAGE_SAFETY",
+];
+const stopReasons = ["stop", "end_turn", "stop_sequence", "STOP"];
+const lengthReasons = [
+  "length",
+  "max_tokens",
+  "MAX_TOKENS",
+  "max_output_tokens",
+  "model_context_window_exceeded",
+];
+// finishReason normalises a provider stop reason. A missing or unknown one, such as Claude's
+// pause_turn or Gemini's OTHER, is not reported, as in the Go providers.
 export function finishReason(
   value: unknown,
   hasTools = false,
-): ChatResponse["finish_reason"] {
-  if (hasTools || value === "tool_use" || value === "function_call")
+): FinishReason | undefined {
+  const reason = String(value);
+  if (hasTools || ["tool_calls", "tool_use", "function_call"].includes(reason))
     return "tool_calls";
-  if (["length", "max_tokens", "MAX_TOKENS"].includes(String(value)))
-    return "length";
-  return "stop";
+  if (lengthReasons.includes(reason)) return "length";
+  if (contentFilterReasons.includes(reason)) return "content_filter";
+  if (stopReasons.includes(reason)) return "stop";
+  return undefined;
 }
+// finishReasonField is the finish_reason entry of a chat response, empty when not reported.
+export function finishReasonField(
+  value: unknown,
+  hasTools = false,
+): Pick<ChatResponse, "finish_reason"> {
+  const reason = finishReason(value, hasTools);
+  return reason === undefined ? {} : { finish_reason: reason };
+}
+// strictResponseFormat returns a model request's response format when it is strict, so a
+// provider can enforce it. A format that is not strict is not enforced, as in the Go providers:
+// the prompt alone asks for the shape.
+function strictResponseFormat(
+  value: unknown,
+): JSONSchemaResponseFormat | undefined {
+  const format = asObject(value);
+  if (
+    format.strict !== true ||
+    typeof format.name !== "string" ||
+    Object.keys(asObject(format.schema)).length === 0
+  )
+    return undefined;
+  return {
+    name: format.name,
+    schema: format.schema as JSONSchemaResponseFormat["schema"],
+    strict: true,
+  };
+}
+// modelCallbackFromChat adapts a chat function to a Predict and Compile model callback. When
+// structured is true, a request's strict response_format goes to the chat request.
 export function modelCallbackFromChat(
   chat: AgentChat,
   modelName: string,
+  structured = false,
 ): ModelFunction {
   return async (
     request:
@@ -193,6 +247,9 @@ export function modelCallbackFromChat(
   ): Promise<PredictModelResult | string> => {
     const object = jsonObject(request, "model request");
     const prompt = nonEmptyString(object.prompt, "model request.prompt");
+    const format = structured
+      ? strictResponseFormat(object.response_format)
+      : undefined;
     const response = await chat({
       model: modelName,
       messages: [
@@ -203,8 +260,14 @@ export function modelCallbackFromChat(
         },
         { role: "user", content: prompt },
       ],
+      ...(format ? { response_format: format } : {}),
     });
-    return { text: response.message.content ?? "", usage: response.usage };
+    const result: PredictModelResult = {
+      text: response.message.content ?? "",
+      usage: response.usage,
+    };
+    if (response.finish_reason) result.finishReason = response.finish_reason;
+    return result;
   };
 }
 export function providerCallbacks(

@@ -5,15 +5,18 @@ import (
 	"strings"
 )
 
-// ChainOfThought wraps Predict with an added reasoning output field.
+// ChainOfThought wraps Predict with a reasoning output field added before the other outputs.
+// The reasoning field is a required output like any other, so a reply without it fails
+// Predict's output check. When another output sets Type, Schema or Optional, the added
+// reasoning field has Type "string".
 type ChainOfThought struct {
 	Signature       Signature
-	LM              LanguageModel
+	LM              Generator
 	Instruction     string
 	Demos           []Demo
 	ReasoningField  string
 	MaxParseRetries int
-	RepairLM        LanguageModel
+	RepairLM        Generator
 }
 
 // Validate checks the underlying Predict programme produced by ToPredict.
@@ -70,10 +73,6 @@ func (c ChainOfThought) BuildPrompt(candidate Candidate, inputs Prediction) (str
 	return c.ToPredict().BuildPrompt(candidate, inputs)
 }
 
-func (c ChainOfThought) LastUsage() Usage {
-	return c.ToPredict().LastUsage()
-}
-
 func (c ChainOfThought) signatureWithReasoning(reasoningField string) Signature {
 	signature := c.Signature
 	for _, output := range signature.Outputs {
@@ -81,9 +80,14 @@ func (c ChainOfThought) signatureWithReasoning(reasoningField string) Signature 
 			return signature
 		}
 	}
-	outputs := append([]Field(nil), signature.Outputs...)
-	outputs = append(outputs, Field{Name: reasoningField, Description: "brief reasoning for the answer"})
-	signature.Outputs = outputs
+	reasoning := Field{Name: reasoningField, Description: "brief reasoning for the answer"}
+	if signature.typed() {
+		// a typed reasoning field keeps an otherwise strict schema strict.
+		reasoning.Type = "string"
+	}
+	// reasoning comes first, so a model that writes fields in schema order reasons before it
+	// answers.
+	signature.Outputs = append([]Field{reasoning}, signature.Outputs...)
 	return signature
 }
 

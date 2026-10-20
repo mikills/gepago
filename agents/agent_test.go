@@ -7,38 +7,21 @@ import (
 	"testing"
 
 	gepa "github.com/mikills/gepago"
+	"github.com/mikills/gepago/gepatest"
 )
 
-type fakeChatClient struct {
-	responses []ChatResponse
-	requests  []ChatRequest
-	err       error
-}
-
-func (c *fakeChatClient) Chat(_ context.Context, req ChatRequest) (ChatResponse, error) {
-	c.requests = append(c.requests, req)
-	if c.err != nil {
-		return ChatResponse{}, c.err
+// chatRequests returns the requests the fake model received, in order.
+func chatRequests(fake *gepatest.FakeGenerator) []ChatRequest {
+	var requests []ChatRequest
+	for _, call := range fake.Calls() {
+		requests = append(requests, *call.Request)
 	}
-	if len(c.responses) == 0 {
-		return ChatResponse{Message: Message{Role: RoleAssistant, Content: "done"}, FinishReason: FinishStop}, nil
-	}
-	resp := c.responses[0]
-	c.responses = c.responses[1:]
-	return resp, nil
+	return requests
 }
 
 func TestAgentRun(t *testing.T) {
 	t.Run("returns final assistant message", func(t *testing.T) {
-		client := &fakeChatClient{
-			responses: []ChatResponse{
-				{
-					Message:      Message{Role: RoleAssistant, Content: "hello"},
-					Usage:        Usage{TotalTokens: 3},
-					FinishReason: FinishStop,
-				},
-			},
-		}
+		client := gepatest.NewFakeGenerator().Default(gepatest.Text("hello").WithUsage(Usage{TotalTokens: 3}))
 		recorder := NewTraceRecorder()
 		agent := Agent{
 			Name:         "test",
@@ -68,11 +51,12 @@ func TestAgentRun(t *testing.T) {
 			result.Spans[1].Kind != gepa.UsageSpanAgentRun {
 			t.Fatalf("Spans = %#v", result.Spans)
 		}
-		if len(client.requests) != 1 {
-			t.Fatalf("requests len = %d", len(client.requests))
+		requests := chatRequests(client)
+		if len(requests) != 1 {
+			t.Fatalf("requests len = %d", len(requests))
 		}
-		if client.requests[0].Messages[0].Role != RoleSystem {
-			t.Fatalf("first transcript role = %q", client.requests[0].Messages[0].Role)
+		if requests[0].Messages[0].Role != RoleSystem {
+			t.Fatalf("first transcript role = %q", requests[0].Messages[0].Role)
 		}
 		trace, ok := recorder.Trace("run-1")
 		if !ok {
@@ -86,16 +70,10 @@ func TestAgentRun(t *testing.T) {
 	})
 
 	t.Run("dispatches tool calls and continues", func(t *testing.T) {
-		client := &fakeChatClient{responses: []ChatResponse{
-			{
-				Message: Message{
-					Role:      RoleAssistant,
-					ToolCalls: []ToolCall{{ID: "call-1", Name: "lookup", Arguments: `{"q":"x"}`}},
-				},
-				FinishReason: FinishToolCalls,
-			},
-			{Message: Message{Role: RoleAssistant, Content: "used tool"}, FinishReason: FinishStop},
-		}}
+		client := gepatest.NewFakeGenerator().Default(
+			gepatest.ToolCall("call-1", "lookup", `{"q":"x"}`),
+			gepatest.Text("used tool"),
+		)
 		agent := Agent{
 			Name:   "test",
 			Client: client,
@@ -129,23 +107,15 @@ func TestAgentRun(t *testing.T) {
 		if result.Ledger.ToolCalls != 1 || result.Ledger.ModelCalls != 2 {
 			t.Fatalf("Ledger = %#v", result.Ledger)
 		}
-		if got := client.requests[1].Messages[len(client.requests[1].Messages)-1]; got.Role != RoleTool ||
-			got.Content != "tool output" {
+		second := chatRequests(client)[1]
+		if got := second.Messages[len(second.Messages)-1]; got.Role != RoleTool || got.Content != "tool output" {
 			t.Fatalf("last second request message = %#v", got)
 		}
 	})
 
 	t.Run("tool trace events are immutable snapshots", func(t *testing.T) {
-		client := &fakeChatClient{responses: []ChatResponse{
-			{
-				Message: Message{
-					Role:      RoleAssistant,
-					ToolCalls: []ToolCall{{ID: "call-1", Name: "lookup", Arguments: `{}`}},
-				},
-				FinishReason: FinishToolCalls,
-			},
-			{Message: Message{Role: RoleAssistant, Content: "done"}, FinishReason: FinishStop},
-		}}
+		client := gepatest.NewFakeGenerator().
+			Default(gepatest.ToolCall("call-1", "lookup", `{}`), gepatest.Text("done"))
 		recorder := NewTraceRecorder()
 		agent := Agent{
 			Name:      "test",
@@ -194,14 +164,7 @@ func TestAgentRun(t *testing.T) {
 	})
 
 	t.Run("unknown tool returns tool error", func(t *testing.T) {
-		client := &fakeChatClient{
-			responses: []ChatResponse{
-				{
-					Message:      Message{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "call-1", Name: "missing"}}},
-					FinishReason: FinishToolCalls,
-				},
-			},
-		}
+		client := gepatest.NewFakeGenerator().Default(gepatest.ToolCall("call-1", "missing", ""))
 		agent := Agent{Name: "test", Client: client, Model: "fake"}
 
 		result, err := agent.Run(
@@ -217,9 +180,7 @@ func TestAgentRun(t *testing.T) {
 	})
 
 	t.Run("observer panic is contained", func(t *testing.T) {
-		client := &fakeChatClient{
-			responses: []ChatResponse{{Message: Message{Role: RoleAssistant, Content: "ok"}, FinishReason: FinishStop}},
-		}
+		client := gepatest.NewFakeGenerator().Default(gepatest.Text("ok"))
 		recorder := NewTraceRecorder()
 		agent := Agent{
 			Name:      "test",
@@ -247,4 +208,46 @@ func eventKinds(events []Event) []EventKind {
 		kinds = append(kinds, event.Kind)
 	}
 	return kinds
+}
+
+func TestAgentRunMapsFinishReasons(t *testing.T) {
+	tests := []struct {
+		finish FinishReason
+		want   StopReason
+	}{
+		{finish: FinishStop, want: StopComplete},
+		{finish: FinishLength, want: StopLength},
+		{finish: FinishContentFilter, want: StopContentFilter},
+		{finish: "", want: StopComplete},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.finish), func(t *testing.T) {
+			client := gepatest.NewFakeGenerator().Default(gepatest.Text("partial").
+				WithUsage(Usage{TotalTokens: 4, ReasoningTokens: 2, CachedInputTokens: 1}).
+				WithFinishReason(tt.finish))
+			agent := Agent{Name: "test", Client: client, Model: "fake"}
+
+			result, err := agent.Run(context.Background(), RunRequest{
+				Memory:   NewMemory("run"),
+				Messages: []Message{{Role: RoleUser, Content: "hi"}},
+			})
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if result.StopReason != tt.want {
+				t.Fatalf("StopReason = %q, want %q", result.StopReason, tt.want)
+			}
+			if result.Ledger.ReasoningTokens != 2 || result.Ledger.CachedInputTokens != 1 {
+				t.Fatalf("Ledger = %#v", result.Ledger)
+			}
+		})
+	}
+}
+
+func TestFinishReasonAliasesGepa(t *testing.T) {
+	var reason gepa.FinishReason = FinishContentFilter
+	if reason != gepa.FinishContentFilter || FinishStop != gepa.FinishStop || FinishLength != gepa.FinishLength ||
+		FinishToolCalls != gepa.FinishToolCalls {
+		t.Fatalf("agents finish reasons diverge from gepa: %q", reason)
+	}
 }

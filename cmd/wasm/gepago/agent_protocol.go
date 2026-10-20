@@ -168,7 +168,7 @@ func (c *declarativeChatClient) Chat(ctx context.Context, request agents.ChatReq
 	if c.callbacks.chat == nil {
 		return agents.ChatResponse{}, errors.New("agent chat callback is not configured")
 	}
-	requestJSON, err := json.Marshal(request)
+	requestJSON, err := json.Marshal(hostChatRequest(request))
 	if err != nil {
 		return agents.ChatResponse{}, fmt.Errorf("encode chat callback request: %w", err)
 	}
@@ -193,8 +193,29 @@ func (c *declarativeChatClient) Chat(ctx context.Context, request agents.ChatReq
 	return response, nil
 }
 
+// hostChatRequest returns the request the host chat callback receives. A tool that declares
+// parameters sends its InputSchema, which always names type "object", as every provider
+// requires; a tool that declares none sends no parameters, which every host adapter treats as
+// an empty object.
+func hostChatRequest(request agents.ChatRequest) agents.ChatRequest {
+	if len(request.Tools) == 0 {
+		return request
+	}
+	tools := make([]agents.Tool, len(request.Tools))
+	for i, tool := range request.Tools {
+		if declared := strings.TrimSpace(string(tool.Parameters)); declared != "" && declared != "null" {
+			tool.Parameters = tool.InputSchema()
+		} else {
+			tool.Parameters = nil
+		}
+		tools[i] = tool
+	}
+	request.Tools = tools
+	return request
+}
+
 func normalizeAgentUsage(usage agents.Usage) (agents.Usage, error) {
-	if usage.PromptTokens < 0 || usage.CompletionTokens < 0 || usage.TotalTokens < 0 {
+	if negativeUsage(usage) {
 		return agents.Usage{}, errors.New("token counts must not be negative")
 	}
 	if usage.PromptTokens > math.MaxInt-usage.CompletionTokens {

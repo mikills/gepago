@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -103,6 +104,53 @@ func TestAgentOperationWithToolAndMemory(t *testing.T) {
 	}
 }
 
+func TestAgentHostChatRequestToolSchemas(t *testing.T) {
+	payload := `{"name":"a","model":"m","run_id":"r","messages":[{"role":"user","content":"hi"}],"tools":[` +
+		`{"name":"now","description":"current time","parameters":{}},` +
+		`{"name":"find","description":"find","parameters":{"properties":{"q":{"type":"string"}},"required":["q"]}},` +
+		`{"name":"typed","description":"typed","parameters":{"type":"object","properties":{}}},` +
+		`{"name":"bare","description":"no parameters"},` +
+		`{"name":"null","description":"null parameters","parameters":null},` +
+		`{"name":"spaced","description":"spaced","parameters":{ }},` +
+		`{"name":"any","description":"any of","parameters":{"anyOf":[{"type":"object"}]}}]}`
+	var sent map[string]any
+	callbacks := agentHostCallbacks{
+		chat: func(_ context.Context, requestJSON string) (string, error) {
+			if err := json.Unmarshal([]byte(requestJSON), &sent); err != nil {
+				t.Fatal(err)
+			}
+			return `{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}`, nil
+		},
+	}
+
+	if _, err := runAgentOperation(context.Background(), payload, callbacks); err != nil {
+		t.Fatalf("runAgentOperation error = %v", err)
+	}
+
+	tools := sent["tools"].([]any)
+	want := []any{
+		map[string]any{"type": "object"},
+		map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"q": map[string]any{"type": "string"}},
+			"required":   []any{"q"},
+		},
+		map[string]any{"type": "object", "properties": map[string]any{}},
+		nil,
+		nil,
+		map[string]any{"type": "object"},
+		map[string]any{"type": "object", "anyOf": []any{map[string]any{"type": "object"}}},
+	}
+	if len(tools) != len(want) {
+		t.Fatalf("sent %d tools, want %d", len(tools), len(want))
+	}
+	for i, tool := range tools {
+		if got := tool.(map[string]any)["parameters"]; !reflect.DeepEqual(got, want[i]) {
+			t.Fatalf("tool %d parameters = %#v, want %#v", i, got, want[i])
+		}
+	}
+}
+
 func TestAgentUsageValidation(t *testing.T) {
 	got, err := normalizeAgentUsage(agents.Usage{PromptTokens: 2, CompletionTokens: 3})
 	if err != nil || got.TotalTokens != 5 {
@@ -110,6 +158,31 @@ func TestAgentUsageValidation(t *testing.T) {
 	}
 	if _, err := normalizeAgentUsage(agents.Usage{PromptTokens: 3, CompletionTokens: 2, TotalTokens: 4}); err == nil {
 		t.Fatal("inconsistent usage was accepted")
+	}
+}
+
+func TestHostUsageRejectsNegativeBreakdown(t *testing.T) {
+	for _, usage := range []agents.Usage{
+		{ReasoningTokens: -1},
+		{CachedInputTokens: -1},
+		{CacheCreationTokens: -1},
+		{PromptTokens: -1},
+	} {
+		if !negativeUsage(usage) {
+			t.Fatalf("negativeUsage(%+v) = false", usage)
+		}
+		if err := validateUsage(usage); err == nil {
+			t.Fatalf("validateUsage(%+v) accepted negative counts", usage)
+		}
+		if err := validatePredictUsage(usage); err == nil {
+			t.Fatalf("validatePredictUsage(%+v) accepted negative counts", usage)
+		}
+		if _, err := normalizeAgentUsage(usage); err == nil {
+			t.Fatalf("normalizeAgentUsage(%+v) accepted negative counts", usage)
+		}
+	}
+	if negativeUsage(agents.Usage{PromptTokens: 1, ReasoningTokens: 1, CachedInputTokens: 1}) {
+		t.Fatal("positive usage reported as negative")
 	}
 }
 

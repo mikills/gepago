@@ -62,8 +62,12 @@ func startWASM(_ js.Value, args []js.Value) (result any) {
 		return wasmAPIError(errors.New("gepagoWasm.start onComplete must be a function"))
 	}
 	operation := args[0].String()
-	if operation != "compile" {
-		return wasmAPIError(fmt.Errorf("unsupported operation %q; supported async operations: compile", operation))
+	if operation != "compile" && operation != pipelineRunOperation {
+		return wasmAPIError(fmt.Errorf(
+			"unsupported operation %q; supported async operations: compile, %s",
+			operation,
+			pipelineRunOperation,
+		))
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -128,11 +132,15 @@ func runWASMJob(job *wasmAsyncJob) {
 				resultJSON = errorEnvelope(fmt.Errorf("WASM async job panic: %v", recovered))
 			}
 		}()
-		if job.operation == "agent.run" {
+		switch {
+		case job.operation == "agent.run":
 			resultJSON = runAgentWASMJob(job)
-		} else if job.capabilities != nil {
+		case job.capabilities != nil:
 			resultJSON = runWASMCapabilitiesJob(job)
-		} else {
+		case job.operation == pipelineRunOperation:
+			value, err := runCompiledPipeline(job.ctx, job.payloadJSON, &wasmHostModelInvoker{modelFn: job.modelFn})
+			resultJSON = envelopeResult(value, err)
+		default:
 			resultJSON = compileResultJSON(job.ctx, job.payloadJSON, &wasmHostModelInvoker{modelFn: job.modelFn})
 		}
 	}()
@@ -151,7 +159,28 @@ func runWASMJob(job *wasmAsyncJob) {
 	safeCompleteWASMJob(job, resultJSON)
 }
 
+// safeCompleteWASMJob passes the job's result to its onComplete callback from a later
+// JavaScript task. A job that finishes without waiting on the host, such as one whose payload
+// is invalid, runs to its end before start returns, so completing it at once would call
+// onComplete before the caller knows the job id.
 func safeCompleteWASMJob(job *wasmAsyncJob, resultJSON string) {
+	var deliver js.Func
+	deliver = js.FuncOf(func(js.Value, []js.Value) any {
+		deliver.Release()
+		invokeWASMCompletion(job, resultJSON)
+		return nil
+	})
+	defer func() {
+		if recover() != nil {
+			// without a timer to defer with, complete now rather than strand the caller.
+			deliver.Release()
+			invokeWASMCompletion(job, resultJSON)
+		}
+	}()
+	js.Global().Call("setTimeout", deliver, 0)
+}
+
+func invokeWASMCompletion(job *wasmAsyncJob, resultJSON string) {
 	defer func() {
 		// A host completion callback is outside the Go API boundary. A callback
 		// panic must not take down the Go runtime or strand later jobs.
@@ -171,6 +200,18 @@ func (m *wasmHostModelInvoker) GenerateModel(
 	ctx context.Context,
 	request compileModelRequest,
 ) (compileModelResult, error) {
+	return m.generate(ctx, request)
+}
+
+// GeneratePredict sends a pipeline.run job's model request, in the form a predict job sends.
+func (m *wasmHostModelInvoker) GeneratePredict(
+	ctx context.Context,
+	request predictHostRequest,
+) (compileModelResult, error) {
+	return m.generate(ctx, request)
+}
+
+func (m *wasmHostModelInvoker) generate(ctx context.Context, request any) (compileModelResult, error) {
 	if err := ctx.Err(); err != nil {
 		return compileModelResult{}, err
 	}
@@ -303,6 +344,9 @@ func decodeWASMModelResult(value js.Value) (compileModelResult, error) {
 		return compileModelResult{}, errors.New("model result.text must be a string")
 	}
 	result := compileModelResult{Text: text.String()}
+	if err := decodeWASMModelResultExtras(value, &result); err != nil {
+		return compileModelResult{}, err
+	}
 	usage := value.Get("usage")
 	if usage.IsUndefined() || usage.IsNull() {
 		return result, nil
@@ -323,8 +367,29 @@ func decodeWASMModelResult(value js.Value) (compileModelResult, error) {
 	return result, nil
 }
 
+// decodeWASMModelResultExtras reads the optional finishReason and model of a host result.
+func decodeWASMModelResultExtras(value js.Value, result *compileModelResult) error {
+	if reason := value.Get("finishReason"); !reason.IsUndefined() && !reason.IsNull() {
+		if reason.Type() != js.TypeString {
+			return errors.New("model result.finishReason must be a string")
+		}
+		parsed, err := parseHostFinishReason(reason.String())
+		if err != nil {
+			return fmt.Errorf("model result.%w", err)
+		}
+		result.FinishReason = parsed
+	}
+	if model := value.Get("model"); !model.IsUndefined() && !model.IsNull() {
+		if model.Type() != js.TypeString {
+			return errors.New("model result.model must be a string")
+		}
+		result.Model = model.String()
+	}
+	return nil
+}
+
 func validateCompileUsage(usage gepa.Usage) error {
-	if usage.PromptTokens < 0 || usage.CompletionTokens < 0 || usage.TotalTokens < 0 {
+	if negativeUsage(usage) {
 		return errors.New("model result.usage token counts must not be negative")
 	}
 	return nil

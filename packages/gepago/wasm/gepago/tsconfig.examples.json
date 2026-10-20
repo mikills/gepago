@@ -9,7 +9,6 @@
     "types": ["node"],
     "typeRoots": ["../node_modules/@types"],
     "allowImportingTsExtensions": true,
-    "baseUrl": ".",
     "paths": {
       "@mikills/wasm/gepago": ["./dist/index.d.ts"],
       "@mikills/wasm/gepago/*": ["./dist/*.d.ts"]
