@@ -1,5 +1,7 @@
 # v0.8.0 progress
 
+Status: all packages done; final `make verify` and final review pass at 68b712a. Not pushed, no PR, not tagged.
+
 Branch `feat/v0.8.0-flow-runtime`, started from `1e3cc7b` (v0.7.0).
 
 ## Packages
@@ -9,13 +11,14 @@ Branch `feat/v0.8.0-flow-runtime`, started from `1e3cc7b` (v0.7.0).
 | A. Model call contract | done | a1791af, 53893a4, b8fd03f | 1: 14 findings, fixed; 2: 4 findings, fixed; 3: none | none |
 | B. Structured output | done | 6eb19d9, 59c26b8, 04521cf, fb9e31a, 096233f, 3ff9b8c, 75803f9, c468be7 | 1: 11, 2: 3, 3: 3, 4: 2 + deferred, 5: 2 + perf, 6: 1, 7: 2, all fixed; 8: none | none |
 | C. Pipeline control flow and policy | done (merged in 1306f2b) | 8a69ad8, 9b95e07, c76a7b9, 82e32ca, 3c5a14b, merge 1306f2b | 1: 5, 2: 3, 3: 1, 4: 1 finding, all fixed; 5: none | none |
+| Final review (v0.7.0..68b712a) | done | 68b712a | 1: 1 low–medium (TS artefact helpers dropped fingerprint) + 1 nit + spelling, fixed; 2: none | none |
 | I. Tools | done (merged in 19cc05e) | 3344220, acc200b, 58cf7ec, a696312, merge 19cc05e | 1: 8, 2: 3, all fixed; 3: none | none |
 | D. Observability | done (merged in fdaa382, 7e33dda) | 5351b86, 40af86e, 0e0d914, bbeaf71, 040c8a6, 72d5707, 0459b30 (worktree branch) | 1: 4 + D2 partial, 2: 4, 3: 4 + 1 decision, 4: 2, 5: 2, 6: 1, all fixed; 7: none | none |
 | D/F/I integration | done | merge fdaa382, 6bd1530, merge 7e33dda, 108cc8d, 8cf4f9d, 773ba2d | 1: 2, 2: 3, 3: 1, all fixed; 4: none | none |
 | E. Run context | done (feature branch fast-forwarded to 93b9125) | 802e2ab, merge ac100ad, 2e1ecb5, merge 15de703, a7313f7, 93b9125 | 1: 2 + doc nit, fixed; 2: none; flaky test found by the orchestrator, fixed; 3: 1 (test helper too broad), fixed; 4: none | none |
 | F. Artefacts and compile | done (merged in 8212dbf) | 442358c, 4c92e2a, 309504d, merge 8212dbf | 1: 2, 2: 1, all fixed; 3: none | none |
-| G. Test kit | implementing (worktree from ac100ad) | | | |
-| H. Housekeeping | implementing (worktree from a7313f7) | | | |
+| G. Test kit | done (merged in c55c605) | cb9d266, merge dcd3aad, bb759d1, merge 6830be0, ce202ba | 1: 3, 2: 3, all fixed; 3: none | none |
+| H. Housekeeping | done (merged in c55c605) | d54cdd0, merge 1281d5a, 471b8bd, 8324ab0, 576108f, merge 6830be0 | 1: 3 + missing CHANGELOG entries, 2: 3, all fixed; 3: none | none |
 
 ## Commands
 
@@ -51,6 +54,12 @@ Branch `feat/v0.8.0-flow-runtime`, started from `1e3cc7b` (v0.7.0).
 | clean worktree: full set (after freeing disk) | pass | 15de703 |
 | clean worktree: fmt, diff, test, vet, staticcheck | pass | a7313f7, 93b9125 |
 | `go test -race -count=300` on the redaction tests | pass | 93b9125 |
+| clean worktree: full set | pass | 1281d5a (H), dcd3aad (G merged), bb759d1 (G) |
+| clean worktree: full set | FAIL (staticcheck U1000 in run_compiled.go) | 471b8bd |
+| clean worktree: full set | pass | 8324ab0, 576108f (H), 6830be0 (G+H) |
+| clean worktree: full set | pass | ce202ba (G) |
+| clean worktree: `npm ci`, then `make verify` (fmt, test, vet, staticcheck, diago, wasm-test; both modules), then `git diff --exit-code` | pass, no formatting diff (diago 6/6 checks per module, TS 19/19) | c55c605 |
+| clean worktree: `npm ci`, then `make verify`, then `git diff --exit-code` | pass, no formatting diff (diago 6/6 per module, TS 22/22) | 68b712a (final) |
 | clean worktree: same plus `npm ci`, `make diago`, `make wasm-test` | pass | 6eb19d9 |
 
 ## Decisions
@@ -94,6 +103,10 @@ Branch `feat/v0.8.0-flow-runtime`, started from `1e3cc7b` (v0.7.0).
   ParentRunID, fresh RunID); attributes pass the Redactor as "attribute:<name>"; provider logs carry
   attributes unredacted (filter in the slog handler). A run with a Redactor and no observers is
   observed silently so nested runs inherit it.
+- E1 scope: agent runs inside a pipeline step keep their own `Memory.RunID` span trace id; they see the
+  step's `RunContext` through ctx but agent traces do not carry it (final review, not counted).
+- `RetryingLanguageModel` is not on the CHANGELOG unkeyed-literal list: it has had an unexported `mu`
+  field since v0.7, so unkeyed literals were never possible outside the package (H review round 2).
 - `programs/kiln` and `programs/documentscout` are gitignored local projects inside the root
   module. They are not part of the repo; the final `make verify` runs in a clean worktree,
   as CI does.
@@ -198,10 +211,7 @@ A (model call contract):
 
 ## Open findings
 
+None in the release. Follow-ups outside it:
+
 - `make fmt` and `make verify` fail in the main checkout because the gitignored kiln and documentscout no longer compile against the new API. CI and the clean-worktree checks are unaffected.
 - crucible's go.mod requires gepago v0.6.0; bump it after the root v0.8.0 tag.
-- Integration after D, F and I merge: F's `StepError.Reads` and reflection `SideInfo` go through D's
-  `Redactor`; I's tool call records (with `Cached`) reach D's events and `PipelineTrace`, redacted.
-  Fix the `ToolSession.id` doc (a policy-only middle run's session can be newer than the one it
-  encloses) and document that `ToolPolicy.Cache` on a run without `Tools` caches nothing.
-- README and `docs/architecture.html` still describe `LanguageModel` (H3).
