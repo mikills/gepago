@@ -28,11 +28,11 @@ import (
 // transitionFacts). Build records the steps a rule skips or rewinds as the bounds of difference
 // arrays, so the count stays between the steps plus the transitions and a small multiple of
 // them; walking the steps between each rule's From and To to write a fact, or copying a range's
-// keys once per rule, would make it quadratic. The last subtests hold the rules that make the
-// count complete whether or not a loop counts its own iterations (see factProblems): only the
-// methods of transitionFacts that count write its facts, each without a loop, and no loop but
-// the passes and the methods that word an error walks the facts. A count makes the check
-// independent of the machine's load.
+// keys once per rule, would make it quadratic. The count misses work a loop does without
+// counting it, so the last subtests check the source for the likely ways to do that (see
+// factProblems): a fact written outside the methods of transitionFacts that count, a loop over
+// the facts outside the passes and the methods that word an error, and recursion or goto in a
+// function that uses them. A count makes the check independent of the machine's load.
 func TestBuildIsLinearInStepsAndTransitions(t *testing.T) {
 	name := func(i int) string { return fmt.Sprintf("s%d", i) }
 	// the forward rules are declared from the last step back, so the first rule that skips over a
@@ -103,7 +103,7 @@ func TestBuildIsLinearInStepsAndTransitions(t *testing.T) {
 	}
 
 	source := loadPackageSource(t)
-	t.Run("only the counting methods write the facts, and no loop walks them uncounted", func(t *testing.T) {
+	t.Run("the source check finds nothing in the package", func(t *testing.T) {
 		require.Empty(t, source.factProblems(t, ""))
 	})
 	t.Run("the source check finds what the count could miss", func(t *testing.T) {
@@ -141,6 +141,62 @@ func (f *transitionFacts) mayNotWrite(i int) bool {
 }`,
 				want: []string{
 					"mutation.go:5:2: transitionFacts.mayNotWrite loops over transitionFacts.skips; " + loopAdvice,
+				},
+			},
+			{
+				// a method of transitionFacts may read any fact, a getter's or reach's among them.
+				name: "loops that read the facts through a method",
+				mutation: `
+func (f *transitionFacts) skipsAt(k int) int { return f.skips[k] }
+
+func (f *transitionFacts) mayNotWrite(i int) bool {
+	skipping := 0
+	for k := 0; k <= i; k++ {
+		skipping += f.skipsAt(k)
+	}
+	return skipping > 0 || f.onErrorBy[i] >= 0
+}
+
+func (b *pipelineBuilder) bothCommit(key string) bool {
+	earlier := b.flow.writtenBy[key]
+	for k := range b.index {
+		if b.flow.reach(k) < 0 {
+			return true
+		}
+	}
+	return earlier.reach <= b.index || b.flow.rewinds > earlier.rewinds
+}`,
+				want: []string{
+					"mutation.go:7:2: transitionFacts.mayNotWrite calls transitionFacts.skipsAt in a loop; " +
+						loopAdvice,
+					"mutation.go:15:2: pipelineBuilder.bothCommit calls transitionFacts.reach in a loop; " +
+						loopAdvice,
+				},
+			},
+			{
+				name: "a walk by recursion or goto",
+				mutation: `
+func skippedThrough(f *transitionFacts, k int) int {
+	if k < 0 {
+		return 0
+	}
+	return f.skips[k] + skippedThrough(f, k-1)
+}
+
+func (f *transitionFacts) skip(start, end int) {
+	f.work++
+	k := start
+next:
+	if k < end {
+		f.skips[k]++
+		f.skips[k+1]--
+		k++
+		goto next
+	}
+}`,
+				want: []string{
+					"mutation.go:7:22: skippedThrough calls itself; " + loopAdvice,
+					"mutation.go:18:3: transitionFacts.skip uses goto; " + loopAdvice,
 				},
 			},
 			{
@@ -274,6 +330,13 @@ func (r *runTally) tick(i int) {
 	r.amended[i] = true
 }
 
+func (r *runTally) skipped(k int) int {
+	if k < 0 {
+		return 0
+	}
+	return r.skips[k] + r.skipped(k-1)
+}
+
 func (f *transitionFacts) skip(start, end int) {
 	f.work += 1
 	if start < end {
@@ -378,19 +441,23 @@ func loadPackageSource(t *testing.T) packageSource {
 //   - a method of factWriters that loops or does not add to work;
 //   - outside factLoopers and the passes, a loop that walks the facts: a range over, or a for
 //     whose header uses, a field of transitionFacts or a value taken from one, or a loop whose
-//     body indexes a slice of the facts; and a loop of factLoopers over the facts that does not
-//     add to work;
+//     body indexes a slice of the facts or names a method of transitionFacts other than
+//     factWriters and factLoopers, which may read any fact; and such a loop of factLoopers that
+//     does not add to work;
 //   - outside factLoopers, a slice, map or pointer taken from the facts that is passed to a
 //     function other than len, cap, delete or append's first argument, returned, or stored
-//     anywhere but a local variable or the facts, since a loop over it there would go unseen.
+//     anywhere but a local variable or the facts, since a loop over it there would go unseen;
+//   - in a function that names a field or a method of transitionFacts, a goto or a call of the
+//     function itself, either of which can walk the facts without a loop.
 //
 // Selectors are resolved by type, so a field of another type is never taken for a fact. The
-// check does not see a loop that reaches the facts in other ways: through a method called on a
-// value taken from them, such as a rule's skips, which the check does not follow; through an
-// interface or a closure; or through another name for a slice the facts were given, as table
-// holds target and rules. Nor does it see a loop over something else, such as the keys a step
-// reads, that looks the facts up in a map by each element, which is linear only when what it
-// walks is.
+// check guards against the likely regressions and is not a proof. It does not see a walk that
+// reaches the facts in other ways: through recursion across functions; through a function
+// value, an interface or a closure; through a method called on a value taken from them, such
+// as a rule's skips, which the check does not follow; or through another name for a slice the
+// facts were given, as table holds target and rules. Nor does it see a loop over something
+// else, such as the keys a step reads, that looks the facts up in a map by each element, which
+// is linear only when what it walks is.
 func (s packageSource) factProblems(t *testing.T, mutation string) []string {
 	t.Helper()
 	files := s.files
@@ -541,6 +608,7 @@ func (c *factChecker) report(node ast.Node, format string, args ...any) {
 
 // checkFunc applies the rules to fn and the function literals in it.
 func (c *factChecker) checkFunc(fn *ast.FuncDecl) {
+	self, touches := c.info.Defs[fn.Name], c.touches(fn.Body)
 	f := &funcFacts{
 		name:    funcName(fn),
 		writer:  c.factsMethod(fn, factWriters),
@@ -573,6 +641,13 @@ func (c *factChecker) checkFunc(fn *ast.FuncDecl) {
 			}
 		case *ast.CallExpr:
 			c.checkCall(f, node)
+			if callee := c.callee(node); touches && callee != nil && callee == self {
+				c.report(node, "%s calls itself; %s", f.name, loopAdvice)
+			}
+		case *ast.BranchStmt:
+			if touches && node.Tok == token.GOTO {
+				c.report(node, "%s uses goto; %s", f.name, loopAdvice)
+			}
 		case *ast.ReturnStmt:
 			for _, result := range node.Results {
 				if from := c.escapes(result, f.tainted); from != nil && !f.looper {
@@ -592,12 +667,46 @@ func (c *factChecker) checkFunc(fn *ast.FuncDecl) {
 
 // factsMethod reports whether fn is a method of transitionFacts named in names.
 func (c *factChecker) factsMethod(fn *ast.FuncDecl, names []string) bool {
-	method, ok := c.info.Defs[fn.Name].(*types.Func)
-	if !ok || !slices.Contains(names, fn.Name.Name) || method.Signature().Recv() == nil {
+	return slices.Contains(names, fn.Name.Name) && c.onFacts(c.info.Defs[fn.Name])
+}
+
+// onFacts reports whether obj is a method of transitionFacts.
+func (c *factChecker) onFacts(obj types.Object) bool {
+	method, ok := obj.(*types.Func)
+	if !ok || method.Signature().Recv() == nil {
 		return false
 	}
-	recv, ok := method.Signature().Recv().Type().(*types.Pointer)
-	return ok && types.Identical(recv.Elem(), c.pkg.Scope().Lookup("transitionFacts").Type())
+	recv := method.Signature().Recv().Type()
+	if pointer, ok := recv.(*types.Pointer); ok {
+		recv = pointer.Elem()
+	}
+	return types.Identical(recv, c.pkg.Scope().Lookup("transitionFacts").Type())
+}
+
+// touches reports whether body selects a field or a method of transitionFacts.
+func (c *factChecker) touches(body *ast.BlockStmt) bool {
+	found := false
+	ast.Inspect(body, func(node ast.Node) bool {
+		if selector, ok := node.(*ast.SelectorExpr); ok {
+			found = c.facts[c.field(selector)] != "" || c.onFacts(c.info.Uses[selector.Sel])
+		}
+		return !found
+	})
+	return found
+}
+
+// callee returns the function or method that call names, or nil when it names none.
+func (c *factChecker) callee(call *ast.CallExpr) *types.Func {
+	fun := ast.Unparen(call.Fun)
+	if selector, ok := fun.(*ast.SelectorExpr); ok {
+		fun = selector.Sel
+	}
+	if ident, ok := fun.(*ast.Ident); ok {
+		if fn, ok := c.info.Uses[ident].(*types.Func); ok {
+			return fn.Origin()
+		}
+	}
+	return nil
 }
 
 // taint returns the local variables of body that hold a value taken from the facts, each with
@@ -824,7 +933,8 @@ func (c *factChecker) writesFirstArgument(call *ast.CallExpr) bool {
 }
 
 // checkLoop refuses any loop in a method of factWriters and, outside factLoopers and the passes,
-// a loop that walks the facts; a loop of factLoopers over the facts must add to work.
+// a loop that walks the facts or calls a method that reads them; a loop of factLoopers that does
+// either must add to work.
 func (c *factChecker) checkLoop(f *funcFacts, loop ast.Stmt) {
 	if f.writer {
 		c.report(loop, "counting method %s loops; %s", f.name, loopAdvice)
@@ -846,13 +956,40 @@ func (c *factChecker) checkLoop(f *funcFacts, loop ast.Stmt) {
 	if from == nil {
 		from = c.indexedFact(body, f.tainted)
 	}
-	switch {
-	case from == nil, f.passes[loop]:
-	case !f.looper:
-		c.report(loop, "%s loops over %s; %s", f.name, c.facts[from], loopAdvice)
-	case !c.counts(body):
-		c.report(loop, "%s loops over %s without adding to work; %s", f.name, c.facts[from], countAdvice)
+	walk := ""
+	if from != nil {
+		walk = "loops over " + c.facts[from]
+	} else if reader := c.readerIn(loop); reader != "" {
+		walk = "calls " + reader + " in a loop"
 	}
+	switch {
+	case walk == "", f.passes[loop]:
+	case !f.looper:
+		c.report(loop, "%s %s; %s", f.name, walk, loopAdvice)
+	case !c.counts(body):
+		c.report(loop, "%s %s without adding to work; %s", f.name, walk, countAdvice)
+	}
+}
+
+// readerIn returns the method of transitionFacts other than factWriters and factLoopers that
+// loop names, outside the loops in it, or "" when it names none. Such a method may read any of
+// the facts, so a call of it is taken for a read.
+func (c *factChecker) readerIn(loop ast.Stmt) string {
+	reader := ""
+	ast.Inspect(loop, func(node ast.Node) bool {
+		switch node := node.(type) {
+		case *ast.ForStmt, *ast.RangeStmt:
+			return node == loop
+		case *ast.SelectorExpr:
+			name := node.Sel.Name
+			if c.onFacts(c.info.Uses[node.Sel]) && !slices.Contains(factWriters, name) &&
+				!slices.Contains(factLoopers, name) {
+				reader = "transitionFacts." + name
+			}
+		}
+		return reader == ""
+	})
+	return reader
 }
 
 // indexedFact returns the field of transitionFacts whose slice or array body indexes, outside
