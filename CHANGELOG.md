@@ -4,6 +4,64 @@ All notable changes to `gepago` will be documented in this file.
 
 The project follows semantic versioning once public tags are published.
 
+## v0.9.0
+
+`Pipeline` can run a real extraction flow: one transition engine with forward skips and bounded rewinds replaces the control-flow combinators, `Map` fans out over lists known only at run time, tool calls carry the caller's scope and usage billed elsewhere, and state decodes with `encoding/json/v2` on Go 1.27.
+
+### Breaking changes
+
+#### Toolchain and decoding
+
+- Both modules require Go 1.27.1, and `GOEXPERIMENT=nojsonv2` is not supported. Upgrade Go.
+- State values, `TypedPredict` replies and `NewTool` arguments decode with `encoding/json/v2`, which refuses input v0.8.0 accepted: duplicate object names, times that are not strict RFC 3339 (such as `,` before the fraction or a `+24:00` offset), base64 with line breaks, lone UTF-16 surrogate escapes in `,string` fields, invalid UTF-8 or lone surrogates inside a `json.RawMessage`, and map keys that decode to the same key (`"1"` and `"01"`). Fix such data where it is produced.
+- A struct whose definition v2 refuses fails every decode, even of an object without the faulty field, and `JSONSchemaFor`, `NewTool` and `TypedPredict` (given `Inputs` included, at any depth) refuse it up front: an unexported field with a json tag, two fields with one JSON name, an unnamed embedded non-struct, an embedded struct with tag options or marshal methods, a struct without exported fields, a malformed or repeated tag option, a single-quoted name, `json:"-,"`, any option but `omitempty`, `omitzero` and `string` (`embed`, `inline`, `case:…`, `format:…`, misspellings), and `,string` on anything but a boolean, number or string (or an unnamed pointer to one) or on a type with its own unmarshal method. Remove the tag or option, or rename the field.
+- A json tag name that `encoding/json` rejected, such as `temp°C`, is now the field's JSON name for decoding and encoding, as the schema already said; v0.8.0 refused such members and wrote the Go field name. Rename the tag if you relied on the Go name.
+- A type with `UnmarshalJSONFrom` decodes through it and gets schema `{}`, so a struct embedding `json.Number` decodes from a bare number and refuses `{"Number":"5"}`. A `,string` `json.Number` refuses text that is not a JSON number (`"0x10"`, `"01"`, `"1."`, `"-Inf"`, `"5 "`). Send the JSON form.
+- Decoding error text changed: errors from custom unmarshalers and times are wrapped as `json: cannot unmarshal … of type T: <err>`, paths name the innermost struct and the JSON field names, `,string`, `TextUnmarshaler`, `Duration` overflow and `*T` messages read differently, and with several faults the one reported can differ (a type error before a renamed field now reports the missing field). A stored Go map with float keys now converts, and bool, pointer and struct keys fail with another error. Metric text for map keys that encode alike is `{"a":1,"a#2":2}`. Match errors with `errors.Is` and `errors.As`, not text.
+
+#### Tools
+
+- `ToolCall` gains `Scope any` (JSON `scope`), so `==` on calls and calls as map keys panic when the scope holds a map, slice or func, and `ToolSession.Call` replaces any scope on a call with the one in its context. Set scopes with `WithToolScope` and compare calls by `ID`, `Name` and `Arguments`.
+- A `NewTool` function or an agent `ToolBinding` handler invoked directly, without a session, sees the call's `Scope` rather than the scope in its context. Set `ToolCall.Scope` when you invoke a tool yourself.
+- `Provenance` is `{Kind, ID, Source, Detail}` and its JSON `source` is omitted when empty. A result with an entry that fails `Provenance.Validate` (empty, a blank `Source`, `Detail` without `Source`, or only one of `Kind` and `ID`) fails the call. Give each entry a `Source` or a `Kind` and `ID`.
+- `RunWithUsage`, `UsageCollector`, `ProgramEvaluator`, and an agent's `RunResult.Usage`, `Ledger` and `Event.Usage` include tools' `UnbudgetedUsage`; the agent run span's `Usage` is budgeted only. Read `Unbudgeted` on spans, events and traces for the split.
+- The Google chat client and `gepatest.FakeGenerator.Chat` refuse a request no provider accepts before sending it, with a Permanent error: a role other than gepa's four (Google refuses an empty role too), tool parameters that are not a JSON object, and a response-format schema that is not a JSON object (Google checks it only when the request has no tools). Send gepa's roles and object schemas.
+
+#### Pipelines and control flow
+
+- `StepPolicy.OnError`, `ErrorAction`, `OnErrorFail`, `OnErrorSkip` and `OnErrorFallback` are removed: a step that still fails after its last attempt fails the run. Use an `OnError` `Transition` to a later step, with a `Default` for the step's writes, for `OnErrorSkip`, and `Fallback` for `OnErrorFallback`.
+- `RetryPolicy.RetryIf` is removed: a `StepPolicy` retries Transient errors only. Wrap retryable errors with `TransientError`.
+- `KeyDefault` is now `Default`, which `DefaultValue` returns. Defaults seed state before every run's first step, so steps see them and `Run` returns those no write replaced; a `MergeRule` never merges a write with a default; and `Build` refuses only a default that no step reads or writes. Rename the type, and drop defaults you do not want in the output.
+- `Branch` and `Fallback` return a `Flow` of top-level steps and transitions, which cannot nest inside `Parallel`, `WithPolicy`, `WithCache` or `Map`. Add it with `spec.Add(gepa.Branch(...))`.
+- Arms and a Fallback's two steps are top-level steps: errors, step paths and events name them without the flow's name, their candidate keys lose the `<branch>.` or `<fallback>.` prefix, and a routing step (named after the Branch, writing its chosen label to a string key of that name) and a join step appear in events and traces. Arms and a Fallback's steps may not write, so a later step that reads their writes needs a `Default`. Rename `OnStep` scripts and expectations, and add the defaults.
+- A Branch's name may not be a pipeline input or another step's write, and `Build` refuses steps named `$end` or `$fail` and a `PerStepTokens` entry that names a Branch or Fallback. Rename them, and budget the arms or steps instead.
+- `Fallback` fails with the secondary step's error only; v0.8.0 joined both errors. Read the primary's error from its event or trace.
+- v0.8.0 artefacts of pipelines that use `Branch`, `Fallback` or `OnErrorFallback` no longer load: the fingerprint changed, and old candidate keys for arms are ignored even under a matching `ProgramVersion`. Retrain them.
+- These structs gain fields, so unkeyed struct literals of them break: `PipelineSpec` (`Transitions`, `MaxVisits`), `ToolCall` (`Scope`), `Provenance` (`Kind`, `ID`), `ToolResult` and `ToolCallRecord` (`UnbudgetedUsage`), `UsageSpan`, `RunFinishedEvent` and `PipelineTrace` (`Unbudgeted`), `StepStartedEvent` (`Attributes`), `StepFinishedEvent` (`Attributes`, `Unbudgeted`), `StepTrace` (`Attributes`, `Transition`, `RewindRejected`, `Unbudgeted`), and gepatest's `Call`, `ExpectedStep` and `ExpectedTrace`. Use keyed literals.
+
+#### Observability
+
+- `StepFinishedEvent.Skipped`, `StepTrace.Skipped` (JSON `skipped`), the run report's skipped badge, the `skipped` key of `TraceDatasetBuilder` records and `gepatest.ExpectedStep.Skipped` are removed. A step a transition skips emits no events; read `StepTrace.Transition` on the step before it.
+- Event and trace order change for flows (routing and join steps, arms at top level), and `Attempt` counts a step's executions across rewind visits. `gepatest.AssertTrace` compares `Transition`, `RewindRejected` and `Unbudgeted` in full. Update golden traces and expectations.
+
+### Added
+
+- Transitions: `Transition{From, OnError, When, To, Amend, Accept}` in `PipelineSpec.Transitions`, with `End`, `Fail`, `PipelineSpec.MaxVisits` and `ErrMaxVisits`. After a top-level step finishes, the first matching transition skips forward, ends or fails the run, or rewinds to the same or an earlier step and runs the range again, bounded by the target's `MaxVisits`, one range at a time. `Build` checks them in one pass over the transitions and one over the steps.
+- Guaranteed keys: a step a transition skips over, or one with an `OnError` transition forward, may not write, and `Build` refuses a later read of its writes unless the key has a `Default`.
+- Rewinds: `WithAmendable(step, keys...)` declares the keys a rewind's `Amend` may set for the target's next visit only, never committed; `Accept(prev, next)` keeps the new visit or restores the old one. Every visit's usage counts.
+- `Flow` and `PipelineSpec.Add`; `Branch` and `Fallback` are built from ordinary steps and transitions.
+- `Map` and `MapCollect` run a body once per element of a list known only at run time, each on its own view, at most `MapOptions.MaxConcurrency` at a time and refusing more than `MaxItems`. `Map` fails fast and commits nothing; `MapCollect` writes a `MapResult{Index, Value, Error, Usage, Duration}` for every element. Elements share the run's budget and tool scope.
+- Events: `Attributes` on `StepStartedEvent`, `StepFinishedEvent` and `StepTrace` (`visit`, a Map element's `index`, a Map's `failed`), `StepAttributesFrom(ctx)`, and `TransitionObserver` with `TransitionTakenEvent` and `RewindRejectedEvent`, which `RecordingObserver` records as `StepTrace.Transition` (`TransitionTrace`) and `StepTrace.RewindRejected`. The run report shows visits, elements, transitions and rejected rewinds.
+- Tool scope: `WithToolScope(ctx, scope)` sets an opaque scope, such as a tenant, on every tool call of a run; a tool reads it with `ToolCall.ScopeAs[T]()`, or with `ToolScopeFrom(ctx)` in a `NewTool` function or an agent `ToolBinding` handler. gepago never inspects or marshals it in-process; it must be JSON-marshalable when calls cross a process boundary.
+- Unbudgeted usage: `ToolResult.UnbudgetedUsage` and `RecordUnbudgetedUsage` record usage a run reports but no budget counts. `UsageSpan`, `StepFinishedEvent`, `RunFinishedEvent`, `StepTrace`, `PipelineTrace` and `ToolCallRecord` carry it apart from `Usage`.
+- `Provenance.Kind` and `ID` name a protected resource for audit, beside `Source` and `Detail`, checked by `Provenance.Validate`.
+- Test kit: `gepatest.CheckToolProvider(t, provider, arguments...)` and `CheckChatClient(t, client)` drive an implementation through invalid input, a panic, usage on failure, an ended context, a cache hit and concurrent calls, so you can prove your adapters. `FakeGenerator.OnVisit` and `OnElement` script one visit or one Map element, calls record their `Attributes`, and `ErrInvalidChatRequest` marks a refused chat request. `AssertTrace` checks attributes and matches Map elements by index.
+- Example `examples/map_reduce`: a deterministic pipeline with two forward skips, `MapCollect`, a `TypedPredict` reducer that rewinds once with an amendment, and a tool that reads the scope.
+
+### Dependencies
+
+- The Makefile pins modernize v0.52.0 and staticcheck v0.8.2 (golines stays at v0.13.0) and runs every Go tool and `gofmt` on the toolchain `go.mod` selects. CI uses Go 1.27.x.
+
 ## v0.8.0
 
 `Pipeline` becomes the unit of a production flow: typed steps, bounded model calls, tools, per-step policy and a trace for every run.
