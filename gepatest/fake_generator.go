@@ -171,8 +171,8 @@ type Call struct {
 // answers every further call it matches, so a one-reply script answers any number of calls. A
 // call that no script matches fails with an error that matches ErrNoScript and names the step
 // and the start of the prompt, and Unmatched lists it. A call whose context has already ended
-// returns the context's error and takes no reply, as does a Chat request that no provider
-// accepts, which fails with ErrInvalidChatRequest.
+// returns the context's error and takes no reply, as does a Chat request of a kind
+// ErrInvalidChatRequest lists, which fails with it.
 //
 // It records every call (see Calls) and reports each reply's usage in the Generation or
 // ChatResponse it returns, so the caller records it, as callers of a provider do: it never
@@ -382,8 +382,9 @@ func (f *FakeGenerator) GenerateStructured(
 }
 
 // Chat answers req with the next reply of the script that matches the content of its
-// messages, as an assistant message. Like a provider, it refuses a request no provider accepts
-// (see ErrInvalidChatRequest) without taking a reply; Calls records it all the same.
+// messages, as an assistant message. Like a provider, it refuses the requests
+// ErrInvalidChatRequest lists, which no provider accepts, without taking a reply; Calls records
+// it all the same.
 func (f *FakeGenerator) Chat(ctx context.Context, req gepa.ChatRequest) (gepa.ChatResponse, error) {
 	request := cloneRequest(req)
 	contents := make([]string, len(req.Messages))
