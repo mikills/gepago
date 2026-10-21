@@ -85,7 +85,7 @@ type sample struct {
 	name string
 	text string
 	// sloppy makes the scripted reducer find no values until the rewind amends its hint, and
-	// hopeless makes it find none even then.
+	// hopeless makes it list none even then, though its second answer has the total.
 	sloppy, hopeless bool
 }
 
@@ -215,15 +215,7 @@ func buildPipeline(model gepa.Generator, recorder gepa.PipelineObserver) (gepa.P
 		Instruction: "Collect the amounts of every reading into values and add them up. Follow the hint, if any.",
 		LM:          model,
 	}, []gepa.KeyRef{readingsKey.Ref(), hintKey.Ref()}, []gepa.KeyRef{valuesKey.Ref(), totalKey.Ref()}), hintKey.Ref())
-	record := gepa.NewTool("record_total", "Record a document's total for the account the run acts for.",
-		func(ctx context.Context, args recordArgs) (recordOut, error) {
-			account, ok := gepa.ToolScopeFrom(ctx).(string)
-			if !ok || account == "" {
-				return recordOut{}, gepa.PermanentError(errors.New("record_total: the run has no account scope"))
-			}
-			return recordOut{Receipt: account + " recorded " + strconv.Itoa(args.Total)}, nil
-		})
-	tools, err := gepa.NewToolRegistry(record)
+	tools, err := gepa.NewToolRegistry(recordTotal())
 	if err != nil {
 		return gepa.Pipeline{}, err
 	}
@@ -264,6 +256,19 @@ func buildPipeline(model gepa.Generator, recorder gepa.PipelineObserver) (gepa.P
 	}.Build()
 }
 
+// recordTotal returns the record_total tool, which records a total for the account the run acts
+// for: the run's tool scope.
+func recordTotal() gepa.ToolProvider {
+	return gepa.NewTool("record_total", "Record a document's total for the account the run acts for.",
+		func(ctx context.Context, args recordArgs) (recordOut, error) {
+			account, ok := gepa.ToolScopeFrom(ctx).(string)
+			if !ok || account == "" {
+				return recordOut{}, gepa.PermanentError(errors.New("record_total: the run has no account scope"))
+			}
+			return recordOut{Receipt: account + " recorded " + strconv.Itoa(args.Total)}, nil
+		})
+}
+
 // modeIs returns a transition condition that holds when classify chose mode.
 func modeIs(mode string) func(gepa.State, error) bool {
 	return func(s gepa.State, _ error) bool {
@@ -293,8 +298,8 @@ var number = regexp.MustCompile(`\d+`)
 
 // scriptedModel stands in for a model reading the sample's document: it answers each window's
 // reading, by the window's index, with the numbers the window holds, and the reducer, by its
-// visit, with their sum, or with nothing on the first visit when the sample is sloppy and on
-// every visit when it is hopeless.
+// visit, with them and their sum, or with nothing on the first visit when the sample is sloppy
+// or hopeless, and with the sum alone on the second when it is hopeless.
 func scriptedModel(sample sample) *gepatest.FakeGenerator {
 	model := gepatest.NewFakeGenerator()
 	separator := "\n"
@@ -319,7 +324,8 @@ func scriptedModel(sample sample) *gepatest.FakeGenerator {
 	missed := gepatest.Text(`{"values":[],"total":0}`)
 	switch {
 	case sample.hopeless:
-		model.OnStep("reduce", missed)
+		model.OnVisit("reduce", 1, missed).
+			OnVisit("reduce", 2, gepatest.Text(mustJSON(reduceOut{Values: []int{}, Total: total})))
 	case sample.sloppy:
 		model.OnVisit("reduce", 1, missed).OnVisit("reduce", 2, found)
 	default:

@@ -56,12 +56,51 @@ func (p problems) report(t TestingT, subject string) bool {
 	return len(p) == 0
 }
 
+// ToolCheckOption configures CheckToolProvider. ToolArguments and ToolScope return one.
+type ToolCheckOption func(*toolCheck)
+
+// toolCheck is what the options of CheckToolProvider set: the argument objects of the valid
+// calls and the scope the calls of a run carry.
+type toolCheck struct {
+	arguments []string
+	scope     any
+}
+
+// ToolArguments gives CheckToolProvider argument objects, as JSON text, that the tool accepts,
+// in place of the one it derives from the schema. Each is checked as a valid call, and the
+// first is also the base of the other calls. Given more than once, the lists add up; given no
+// arguments, it changes nothing.
+func ToolArguments(arguments ...string) ToolCheckOption {
+	return func(check *toolCheck) { check.arguments = append(check.arguments, arguments...) }
+}
+
+// ToolScope gives CheckToolProvider the scope a run passes the tool (see gepa.WithToolScope),
+// for a tool that needs one, such as one that reads the account a run acts for with
+// gepa.ToolScopeFrom. Every call of the check carries scope, in its context and its Scope, as a
+// call through a gepa.ToolSession does, but those the no panic requirement makes with another
+// scope or none. Given more than once, the last scope counts; a nil scope is none.
+func ToolScope(scope any) ToolCheckOption {
+	return func(check *toolCheck) { check.scope = scope }
+}
+
+// context returns ctx carrying the check's scope.
+func (c toolCheck) context(ctx context.Context) context.Context {
+	return gepa.WithToolScope(ctx, c.scope)
+}
+
+// call returns a call of the tool named name with arguments and the check's scope.
+func (c toolCheck) call(id, name, arguments string) gepa.ToolCall {
+	return gepa.ToolCall{ID: id, Name: name, Arguments: arguments, Scope: c.scope}
+}
+
 // CheckToolProvider drives provider through the calls a run can make and reports, with
 // t.Errorf, each requirement below that it breaks, returning whether it meets them all. It
-// calls t.Helper when t has that method. arguments are argument objects the tool accepts; with
-// none, it derives one from the schema, giving each required property a value of its type (the
-// first of an enum), and a tool that refuses those must be given its own. The requirements
-// follow from gepa.ToolProvider, gepa.ToolResult and gepa.ToolSession:
+// calls t.Helper when t has that method, and ignores a nil option. Without ToolArguments it
+// derives one argument object from the schema, giving each required property a value of its
+// type (the first of an enum), and a tool that refuses those must be given its own. Without
+// ToolScope its calls carry no scope, and a tool that needs one must be given the scope a run
+// would pass it. The requirements follow from gepa.ToolProvider, gepa.ToolResult and
+// gepa.ToolSession:
 //
 //   - schema: Schema returns, without panicking and the same each time, a tool that a
 //     gepa.ToolRegistry registers: a name of letters, digits, '_' and '-', a description and
@@ -77,8 +116,9 @@ func (p problems) report(t TestingT, subject string) bool {
 //   - no panic: Invoke returns rather than panics for every call the check makes, among them
 //     the invalid ones, a call without an ID, calls whose Scope is of a type the tool cannot
 //     know (a value of a type private to gepatest, and a map, as a remote tool host decodes a
-//     scope) and calls whose context carries no tool memory, scope or run. A gepa.ToolSession
-//     contains a panic, but as a failure of the call.
+//     scope), a call without the scope ToolScope gives, when it gives one, and calls whose
+//     context carries no tool memory or run. A gepa.ToolSession contains a panic, but as a
+//     failure of the call.
 //   - usage: every result, of a call that failed too, reports usage a run can count: no count
 //     is negative, ReasoningTokens is within CompletionTokens and CachedInputTokens and
 //     CacheCreationTokens together are within PromptTokens, for Usage and UnbudgetedUsage.
@@ -87,17 +127,18 @@ func (p problems) report(t TestingT, subject string) bool {
 //     context's error and reports no usage, so the run reports the cancellation rather than a
 //     tool failure. It may succeed, as a tool that does no I/O can; the session then fails the
 //     call with the context's cause.
-//   - valid call: each of arguments succeeds through a gepa.ToolSession, so its Output is JSON
-//     and each Provenance passes Validate. The ended context and concurrent calls requirements
-//     are checked only once every valid call has succeeded.
+//   - valid call: each argument object succeeds through a gepa.ToolSession, so its Output is
+//     JSON and each Provenance passes Validate. The ended context and concurrent calls
+//     requirements are checked only once every valid call has succeeded; otherwise the check
+//     reports that it skipped them.
 //   - cache hit: through a session whose ToolPolicy caches, the same arguments with their keys
 //     in another order and spacing added are answered from the cache without invoking the tool
 //     again, and invoking the tool directly with them succeeds too, since the cache treats them
 //     as the call it answered.
-//   - concurrent calls: calls with the first of arguments made at the same time all succeed,
-//     as gepa.ToolProvider requires implementations to be safe for concurrent use; run the test
-//     with -race to catch the data races too.
-func CheckToolProvider(t TestingT, provider gepa.ToolProvider, arguments ...string) bool {
+//   - concurrent calls: calls with the first argument object made at the same time all
+//     succeed, as gepa.ToolProvider requires implementations to be safe for concurrent use; run
+//     the test with -race to catch the data races too.
+func CheckToolProvider(t TestingT, provider gepa.ToolProvider, options ...ToolCheckOption) bool {
 	if helper, ok := t.(interface{ Helper() }); ok {
 		helper.Helper()
 	}
@@ -110,20 +151,30 @@ func CheckToolProvider(t TestingT, provider gepa.ToolProvider, arguments ...stri
 	if !ok {
 		return found.report(t, "tool provider")
 	}
-	derived := len(arguments) == 0
-	if derived {
-		arguments = []string{exampleArguments(schema.Parameters)}
+	var check toolCheck
+	for _, option := range options {
+		if option != nil {
+			option(&check)
+		}
 	}
-	checkToolArguments(provider, schema, arguments[0], &found)
-	checkToolOddCalls(provider, schema, arguments[0], &found)
+	derived := len(check.arguments) == 0
+	if derived {
+		check.arguments = []string{exampleArguments(schema.Parameters)}
+	}
+	first := check.arguments[0]
+	checkToolArguments(provider, schema, check, first, &found)
+	checkToolOddCalls(provider, schema, check, first, &found)
 	valid := true
-	for _, args := range arguments {
-		valid = checkToolCache(provider, schema, args, derived, &found) && valid
+	for _, args := range check.arguments {
+		valid = checkToolCache(provider, schema, check, args, derived, &found) && valid
 	}
 	// a call the tool refuses for its arguments says nothing about its context or concurrency.
 	if valid {
-		checkToolEndedContext(provider, schema, arguments[0], &found)
-		checkToolConcurrency(provider, schema, arguments[0], &found)
+		checkToolEndedContext(provider, schema, check, first, &found)
+		checkToolConcurrency(provider, schema, check, first, &found)
+	} else {
+		found.add(requireValidCall, "the %s and %s requirements were not checked, since they need a valid call",
+			requireEndedContext, requireConcurrentCalls)
 	}
 	return found.report(t, fmt.Sprintf("tool %q", schema.Name))
 }
@@ -278,12 +329,14 @@ func invalidArguments(parameters json.RawMessage, valid string) [][2]string {
 }
 
 // checkToolArguments checks the invalid arguments requirement.
-func checkToolArguments(provider gepa.ToolProvider, schema gepa.Tool, valid string, found *problems) {
+func checkToolArguments(provider gepa.ToolProvider, schema gepa.Tool, check toolCheck, valid string, found *problems) {
 	for _, invalid := range invalidArguments(schema.Parameters, valid) {
 		what, arguments := invalid[0], invalid[1]
-		outcome := invokeTool(context.Background(), provider, gepa.ToolCall{
-			ID: "gepatest-invalid", Name: schema.Name, Arguments: arguments,
-		})
+		outcome := invokeTool(
+			check.context(context.Background()),
+			provider,
+			check.call("gepatest-invalid", schema.Name, arguments),
+		)
 		if !outcome.checked(what+" "+arguments, found) {
 			continue
 		}
@@ -309,22 +362,26 @@ func checkToolArguments(provider gepa.ToolProvider, schema gepa.Tool, valid stri
 // foreignScope is a scope of a type no tool knows.
 type foreignScope struct{ Tenant string }
 
+// oddCall is a valid call that differs from a session's: its description, ID and scope.
+type oddCall struct {
+	what, id string
+	scope    any
+}
+
 // checkToolOddCalls makes valid calls that differ from a session's in ways a tool must survive.
-func checkToolOddCalls(provider gepa.ToolProvider, schema gepa.Tool, valid string, found *problems) {
-	calls := []struct {
-		what string
-		call gepa.ToolCall
-	}{
-		{"a call without an ID", gepa.ToolCall{Name: schema.Name, Arguments: valid}},
-		{"a call whose Scope is a gepatest type", gepa.ToolCall{
-			ID: "gepatest-scope", Name: schema.Name, Arguments: valid, Scope: foreignScope{Tenant: "gepatest"},
-		}},
-		{"a call whose Scope is a map", gepa.ToolCall{
-			ID: "gepatest-scope", Name: schema.Name, Arguments: valid, Scope: map[string]any{"tenant": "gepatest"},
-		}},
+// Each carries its scope in its context too, as a session's call does.
+func checkToolOddCalls(provider gepa.ToolProvider, schema gepa.Tool, check toolCheck, valid string, found *problems) {
+	calls := []oddCall{
+		{"a call without an ID", "", check.scope},
+		{"a call whose Scope is a gepatest type", "gepatest-scope", foreignScope{Tenant: "gepatest"}},
+		{"a call whose Scope is a map", "gepatest-scope", map[string]any{"tenant": "gepatest"}},
+	}
+	if check.scope != nil {
+		calls = append(calls, oddCall{"a call without a scope", "gepatest-unscoped", nil})
 	}
 	for _, odd := range calls {
-		invokeTool(context.Background(), provider, odd.call).checked(odd.what, found)
+		call := gepa.ToolCall{ID: odd.id, Name: schema.Name, Arguments: valid, Scope: odd.scope}
+		invokeTool(gepa.WithToolScope(context.Background(), odd.scope), provider, call).checked(odd.what, found)
 	}
 }
 
@@ -364,13 +421,19 @@ func within(call func()) bool {
 }
 
 // checkToolEndedContext checks the ended context requirement.
-func checkToolEndedContext(provider gepa.ToolProvider, schema gepa.Tool, valid string, found *problems) {
+func checkToolEndedContext(
+	provider gepa.ToolProvider,
+	schema gepa.Tool,
+	check toolCheck,
+	valid string,
+	found *problems,
+) {
 	contexts, release := endedContexts()
 	defer release()
 	for _, ended := range contexts {
 		outcomes := make(chan toolOutcome, 1)
-		call := gepa.ToolCall{ID: "gepatest-ended", Name: schema.Name, Arguments: valid}
-		if !within(func() { outcomes <- invokeTool(ended.ctx, provider, call) }) {
+		ctx, call := check.context(ended.ctx), check.call("gepatest-ended", schema.Name, valid)
+		if !within(func() { outcomes <- invokeTool(ctx, provider, call) }) {
 			found.add(requireEndedContext, "Invoke with %s did not return within %s", ended.what, checkWait)
 			continue
 		}
@@ -405,6 +468,7 @@ func (c *countingTool) Invoke(ctx context.Context, call gepa.ToolCall) (gepa.Too
 func checkToolCache(
 	provider gepa.ToolProvider,
 	schema gepa.Tool,
+	check toolCheck,
 	arguments string,
 	derived bool,
 	found *problems,
@@ -415,13 +479,19 @@ func checkToolCache(
 		found.add(requireValidCall, "a gepa.ToolSession refuses the tool: %v", err)
 		return false
 	}
-	ctx := context.Background()
+	// the session passes the scope of its context to the tool as the call's Scope.
+	ctx := check.context(context.Background())
 	if _, _, err := session.Call(ctx, gepa.ToolCall{ID: "gepatest-1", Name: schema.Name, Arguments: arguments}); err != nil {
-		hint := ""
+		var hints strings.Builder
 		if derived {
-			hint = "; these arguments were derived from the schema, so pass ones the tool accepts"
+			hints.WriteString("; these arguments were derived from the schema, so pass ones the tool accepts " +
+				"with ToolArguments")
 		}
-		found.add(requireValidCall, "a call with the arguments %s failed: %v%s", arguments, err, hint)
+		if check.scope == nil {
+			hints.WriteString("; the call carried no scope, so pass the one a run gives the tool with ToolScope " +
+				"if it needs one")
+		}
+		found.add(requireValidCall, "a call with the arguments %s failed: %v%s", arguments, err, hints.String())
 		return false
 	}
 	relaid, ok := relayArguments(arguments)
@@ -439,7 +509,7 @@ func checkToolCache(
 			relaid,
 		)
 	}
-	outcome := invokeTool(ctx, provider, gepa.ToolCall{ID: "gepatest-3", Name: schema.Name, Arguments: relaid})
+	outcome := invokeTool(ctx, provider, check.call("gepatest-3", schema.Name, relaid))
 	if outcome.checked("the arguments laid out as "+relaid, found) && outcome.err != nil {
 		found.add(requireCacheHit,
 			"Invoke refused the arguments %s laid out as %s, which the session's cache answers as the same call: %v",
@@ -449,14 +519,23 @@ func checkToolCache(
 }
 
 // checkToolConcurrency checks the concurrent calls requirement.
-func checkToolConcurrency(provider gepa.ToolProvider, schema gepa.Tool, valid string, found *problems) {
+func checkToolConcurrency(
+	provider gepa.ToolProvider,
+	schema gepa.Tool,
+	check toolCheck,
+	valid string,
+	found *problems,
+) {
 	outcomes := make([]toolOutcome, checkConcurrency)
+	ctx := check.context(context.Background())
 	var wg sync.WaitGroup
 	for i := range outcomes {
 		wg.Go(func() {
-			outcomes[i] = invokeTool(context.Background(), provider, gepa.ToolCall{
-				ID: fmt.Sprintf("gepatest-concurrent-%d", i), Name: schema.Name, Arguments: valid,
-			})
+			outcomes[i] = invokeTool(
+				ctx,
+				provider,
+				check.call(fmt.Sprintf("gepatest-concurrent-%d", i), schema.Name, valid),
+			)
 		})
 	}
 	wg.Wait()

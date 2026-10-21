@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -122,7 +123,12 @@ func TestCheckToolProviderPassesTheRepositoryTools(t *testing.T) {
 	}
 
 	recorder := &recordingT{}
-	require.True(t, gepatest.CheckToolProvider(recorder, lookup(), `{"id":"a-1","limit":3}`, `{"limit":0,"id":""}`),
+	require.True(t, gepatest.CheckToolProvider(
+		recorder,
+		lookup(),
+		gepatest.ToolArguments(`{"id":"a-1","limit":3}`),
+		gepatest.ToolArguments(`{"limit":0,"id":""}`),
+	),
 		"%q", recorder.errors)
 }
 
@@ -134,12 +140,126 @@ func TestCheckToolProviderAsksForArgumentsWhenItCannotDeriveThem(t *testing.T) {
 
 	recorder := &recordingT{}
 	require.False(t, gepatest.CheckToolProvider(recorder, picky))
-	require.Len(t, recorder.errors, 1)
+	require.Len(t, recorder.errors, 2)
 	require.Contains(t, recorder.errors[0], `gepatest: tool "picky": valid call: a call with the arguments`)
-	require.Contains(t, recorder.errors[0], "derived from the schema, so pass ones the tool accepts")
+	require.Contains(t, recorder.errors[0], "derived from the schema, so pass ones the tool accepts with ToolArguments")
+	require.Equal(t, `gepatest: tool "picky": valid call: the ended context and concurrent calls requirements `+
+		"were not checked, since they need a valid call", recorder.errors[1])
 
 	recorder = &recordingT{}
-	require.True(t, gepatest.CheckToolProvider(recorder, picky, `{"id":"known","limit":1}`), "%q", recorder.errors)
+	require.True(t, gepatest.CheckToolProvider(recorder, picky, gepatest.ToolArguments(`{"id":"known","limit":1}`)),
+		"%q", recorder.errors)
+
+	recorder = &recordingT{}
+	require.True(t, gepatest.CheckToolProvider(recorder, picky, nil, gepatest.ToolArguments(),
+		gepatest.ToolArguments(`{"id":"known","limit":1}`)), "%q", recorder.errors)
+}
+
+type accountArgs struct {
+	Total int `json:"total"`
+}
+
+// recordForAccount is a typed tool that needs the run's scope, the account the run acts for, as
+// the record_total tool of examples/map_reduce does.
+func recordForAccount() gepa.ToolProvider {
+	return gepa.NewTool("record_total", "Record a total for the account the run acts for.",
+		func(ctx context.Context, args accountArgs) (string, error) {
+			account, ok := gepa.ToolScopeFrom(ctx).(string)
+			if !ok || account == "" {
+				return "", gepa.PermanentError(errors.New("record_total: the run has no account scope"))
+			}
+			return fmt.Sprintf("%s recorded %d", account, args.Total), nil
+		})
+}
+
+func TestCheckToolProviderGivesTheCallsAScope(t *testing.T) {
+	recorder := &recordingT{}
+	require.True(t, gepatest.CheckToolProvider(recorder, recordForAccount(), gepatest.ToolScope("acme")),
+		"%q", recorder.errors)
+	recorder = &recordingT{}
+	require.True(t, gepatest.CheckToolProvider(recorder, recordForAccount(), gepatest.ToolScope("other"),
+		gepatest.ToolScope("acme"), gepatest.ToolArguments(`{"total":15}`)), "%q", recorder.errors)
+
+	recorder = &recordingT{}
+	require.False(t, gepatest.CheckToolProvider(recorder, recordForAccount(), gepatest.ToolArguments(`{"total":15}`)))
+	require.Equal(t, []string{
+		`gepatest: tool "record_total": valid call: a call with the arguments {"total":15} failed: ` +
+			`tool "record_total": record_total: the run has no account scope; the call carried no scope, so pass ` +
+			"the one a run gives the tool with ToolScope if it needs one",
+		`gepatest: tool "record_total": valid call: the ended context and concurrent calls requirements ` +
+			"were not checked, since they need a valid call",
+	}, recorder.errors)
+
+	recorder = &recordingT{}
+	require.False(t, gepatest.CheckToolProvider(recorder, recordForAccount(), gepatest.ToolScope("acme"),
+		gepatest.ToolScope(nil)), "a nil scope is none")
+	require.Contains(t, recorder.errors[0], "the run has no account scope")
+}
+
+// scopeRecorder is a tool that records the scope each call carries in its context and in its
+// Scope, by the call's ID, and that blocks on an ended context when blocking is set.
+type scopeRecorder struct {
+	mu       sync.Mutex
+	scopes   map[string][2]any
+	release  chan struct{}
+	blocking bool
+}
+
+func (s *scopeRecorder) Schema() gepa.Tool {
+	return gepa.Tool{Name: "scoped", Description: "Answer for the run's account.", Parameters: json.RawMessage(
+		`{"type":"object","properties":{},"additionalProperties":false}`,
+	)}
+}
+
+func (s *scopeRecorder) Invoke(ctx context.Context, call gepa.ToolCall) (gepa.ToolResult, error) {
+	s.mu.Lock()
+	s.scopes[call.ID] = [2]any{gepa.ToolScopeFrom(ctx), call.Scope}
+	s.mu.Unlock()
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(call.Arguments), &fields); err != nil || fields == nil || len(fields) > 0 {
+		return gepa.ToolResult{}, gepa.PermanentError(fmt.Errorf("%w: want {}", gepa.ErrInvalidToolArguments))
+	}
+	if account, ok := call.ScopeAs[string](); !ok || account != "acme" {
+		return gepa.ToolResult{}, gepa.PermanentError(errors.New("scoped: the call has no account"))
+	}
+	if s.blocking && ctx.Err() != nil {
+		<-s.release
+	}
+	return gepa.ToolResult{Output: json.RawMessage(`"acme"`)}, nil
+}
+
+func TestCheckToolProviderPassesTheScopeToEveryCallOfARun(t *testing.T) {
+	tool := &scopeRecorder{scopes: map[string][2]any{}}
+	recorder := &recordingT{}
+
+	require.True(t, gepatest.CheckToolProvider(recorder, tool, gepatest.ToolScope("acme")), "%q", recorder.errors)
+
+	acme := [2]any{"acme", "acme"}
+	for _, id := range []string{
+		"gepatest-invalid", "", "gepatest-1", "gepatest-3", "gepatest-ended",
+		"gepatest-concurrent-0", "gepatest-concurrent-1", "gepatest-concurrent-2", "gepatest-concurrent-3",
+	} {
+		require.Equal(t, acme, tool.scopes[id], "call %q", id)
+	}
+	require.Equal(t, [2]any{nil, nil}, tool.scopes["gepatest-unscoped"], "one call goes without the scope")
+	require.IsType(t, map[string]any{}, tool.scopes["gepatest-scope"][1], "the last call with a foreign scope")
+	require.Equal(t, tool.scopes["gepatest-scope"][0], tool.scopes["gepatest-scope"][1])
+}
+
+func TestCheckToolProviderChecksAScopedToolOnAnEndedContext(t *testing.T) {
+	restore := gepatest.SetCheckWait(50 * time.Millisecond)
+	defer restore()
+	tool := &scopeRecorder{scopes: map[string][2]any{}, release: make(chan struct{}), blocking: true}
+	defer close(tool.release)
+	recorder := &recordingT{}
+
+	require.False(t, gepatest.CheckToolProvider(recorder, tool, gepatest.ToolScope("acme")))
+
+	require.Len(t, recorder.errors, 2, "%q", recorder.errors)
+	for _, message := range recorder.errors {
+		require.Equal(t, "ended context", requirementOf(t, message), message)
+	}
+	require.Contains(t, tool.scopes, "gepatest-concurrent-0", "the concurrent calls ran too")
 }
 
 // validatingTool refuses every argument object but one, as a tool whose arguments have a
@@ -726,6 +846,11 @@ func TestCheckChatClientReportsANilClient(t *testing.T) {
 	}
 }
 
+// strictFormat returns a strict response format with schema.
+func strictFormat(schema string) *gepa.ResponseFormat {
+	return &gepa.ResponseFormat{Name: "answer", Schema: json.RawMessage(schema), Strict: true}
+}
+
 func TestFakeGeneratorRefusesARequestNoProviderAccepts(t *testing.T) {
 	for name, req := range map[string]gepa.ChatRequest{
 		"an unknown role": {Messages: []gepa.Message{{Role: "narrator", Content: "hi"}}},
@@ -737,9 +862,9 @@ func TestFakeGeneratorRefusesARequestNoProviderAccepts(t *testing.T) {
 			Messages: []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}},
 			Tools:    []gepa.Tool{{Name: "t", Description: "d", Parameters: json.RawMessage(`[1]`)}},
 		},
-		"a format schema that is not an object": {
+		"a strict format schema that is not JSON": {
 			Messages:       []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}},
-			ResponseFormat: &gepa.ResponseFormat{Name: "answer", Schema: json.RawMessage(`"string"`)},
+			ResponseFormat: &gepa.ResponseFormat{Name: "answer", Schema: json.RawMessage(`{"type":`), Strict: true},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -767,17 +892,28 @@ func TestFakeGeneratorRefusesARequestNoProviderAccepts(t *testing.T) {
 	_, err := fake.Chat(cancelled, gepa.ChatRequest{Messages: []gepa.Message{{Role: "narrator"}}})
 	require.ErrorIs(t, err, context.Canceled, "an ended context comes first")
 
-	for _, req := range []gepa.ChatRequest{
-		{},
-		{Messages: []gepa.Message{{Content: "a message without a role"}}},
-		{
-			Messages:       []gepa.Message{{Role: gepa.RoleTool, Content: "orphan"}},
-			Tools:          []gepa.Tool{{Name: "ping", Description: "Ping."}},
-			ResponseFormat: &gepa.ResponseFormat{Name: "answer"},
-		},
+	user := []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}}
+	tools := []gepa.Tool{{Name: "lookup", Description: "Look up."}}
+	for name, req := range map[string]gepa.ChatRequest{
+		"a zero request":               {},
+		"a message without a role":     {Messages: []gepa.Message{{Content: "a message without a role"}}},
+		"a format without a schema":    {Messages: user, Tools: tools, ResponseFormat: &gepa.ResponseFormat{Name: "a"}},
+		"a strict format without one":  {Messages: user, ResponseFormat: &gepa.ResponseFormat{Name: "a", Strict: true}},
+		"a strict format of spaces":    {Messages: user, ResponseFormat: strictFormat(" \n")},
+		"a strict format of null":      {Messages: user, ResponseFormat: strictFormat(`null`)},
+		"a strict format of an array":  {Messages: user, ResponseFormat: strictFormat(`[1]`)},
+		"a format that is not strict":  {Messages: user, ResponseFormat: &gepa.ResponseFormat{Name: "a", Schema: []byte(`[1]`)}},
+		"a format of text, not strict": {Messages: user, ResponseFormat: &gepa.ResponseFormat{Name: "a", Schema: []byte(`{"t`)}},
+		"a strict format with tools":   {Messages: user, Tools: tools, ResponseFormat: strictFormat(`{"type":`)},
+		"tool parameters of null":      {Messages: user, Tools: []gepa.Tool{{Name: "t", Description: "d", Parameters: []byte(`null`)}}},
+		"a number no float64 holds": {Messages: user, Tools: []gepa.Tool{{Name: "t", Description: "d", Parameters: []byte(
+			`{"type":"object","properties":{"n":{"type":"number","maximum":1e400}}}`,
+		)}}},
 	} {
-		_, err := fake.Chat(context.Background(), req)
-		require.NoError(t, err, "%+v", req)
+		t.Run("accepts "+name, func(t *testing.T) {
+			_, err := fake.Chat(context.Background(), req)
+			require.NoError(t, err)
+		})
 	}
 	require.True(
 		t,

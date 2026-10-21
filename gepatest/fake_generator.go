@@ -9,6 +9,7 @@ package gepatest
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -32,10 +33,15 @@ var ErrNoScript = errors.New("gepatest: no scripted reply")
 var ErrToolCallsInGenerate = errors.New("gepatest: scripted reply has tool calls, which only Chat returns")
 
 // ErrInvalidChatRequest marks a Chat request that no provider accepts, which a FakeGenerator
-// refuses as a provider does, before any script answers it: one with a message whose role is
-// set but none of gepa's four, a tool whose parameters are not a JSON object, or a response
-// format whose schema is set but not a JSON object. An empty role passes, since tests that
-// script replies often leave it out. It is a Permanent error.
+// refuses as a provider does, before any script answers it. The chat clients of
+// providers/openai, providers/claude and providers/google each refuse such a request before
+// sending it (providers/pi has none): one with a message whose role is set but none of gepa's
+// four, one with a tool whose parameters are not a JSON object, and one without tools whose
+// response format is strict and has a schema that is neither blank nor valid JSON. A request
+// that a provider sends passes, even when its API may refuse it: Claude sends no format that is
+// not strict, Gemini sends no format in a request with tools, and OpenAI sends a strict schema
+// that is valid JSON but not an object. An empty role passes too, since tests that script
+// replies often leave it out. It is a Permanent error.
 var ErrInvalidChatRequest = errors.New("gepatest: invalid chat request")
 
 // Method names the FakeGenerator method a Call went through.
@@ -124,8 +130,9 @@ type Call struct {
 	// Request is a copy of a Chat call's request, and nil for the other methods.
 	Request *gepa.ChatRequest
 	// Attributes are those of the pipeline step execution that made the call, as
-	// gepa.StepAttributesFrom reports them: its "visit" and, for a Map element, its "index". It
-	// is nil outside a step.
+	// gepa.StepAttributesFrom reports them: its "visit" and, for an execution of a Map element,
+	// its "index", which a step of a pipeline that the element runs does not have. It is nil
+	// outside a step.
 	Attributes map[string]int
 	// RunContext is the gepa.RunContext the call's context carried, and the zero value when it
 	// carried none.
@@ -246,6 +253,14 @@ func (f *FakeGenerator) OnVisit(step string, visit int, replies ...Reply) *FakeG
 // Above a MaxConcurrency of one a Map's elements run in any order, so OnElement can script each
 // element's calls whatever order they come in. Adding to an element that has a script appends
 // to it; adding no replies does nothing.
+//
+// It matches only the calls whose context names the element: those of the body and of the
+// executions nested in it, such as the attempts of a WithPolicy body. A call made by a step of a
+// pipeline that the element runs, such as the pipeline of a NewProgramStep body, does not: that
+// step has the attributes of its own run, with no "index" (see gepa.StepAttributesFrom), and
+// nothing else its context carries names the element. Script such calls with OnStep or OnVisit,
+// which match them by their path, such as "m.b.inner", or with OnPrompt, by text of the element's
+// item that their prompt contains.
 func (f *FakeGenerator) OnElement(step string, index int, replies ...Reply) *FakeGenerator {
 	return f.onStep(stepKey{step: step, kind: elementCall, n: index}, fmt.Sprintf(" element %d", index), replies)
 }
@@ -524,7 +539,8 @@ func cloneCall(call Call) Call {
 	return call
 }
 
-// checkChatRequest returns why no provider accepts req, or nil.
+// checkChatRequest returns why no provider accepts req, or nil. It decodes JSON as the
+// providers do, keeping each value raw, so a number no float64 holds passes as it does there.
 func checkChatRequest(req gepa.ChatRequest) error {
 	for i, message := range req.Messages {
 		switch message.Role {
@@ -534,14 +550,15 @@ func checkChatRequest(req gepa.ChatRequest) error {
 		}
 	}
 	for _, tool := range req.Tools {
-		if _, ok := decodeObject(tool.InputSchema()); !ok {
+		var object map[string]json.RawMessage
+		if json.Unmarshal(tool.InputSchema(), &object) != nil || object == nil {
 			return fmt.Errorf("tool %q: parameters are not a JSON object", tool.Name)
 		}
 	}
-	if format := req.ResponseFormat; format != nil && len(bytes.TrimSpace(format.Schema)) > 0 {
-		if _, ok := decodeObject(format.Schema); !ok {
-			return fmt.Errorf("response format %q: schema is not a JSON object", format.Name)
-		}
+	format := req.ResponseFormat
+	if format != nil && format.Strict && len(req.Tools) == 0 && len(bytes.TrimSpace(format.Schema)) > 0 &&
+		!json.Valid(format.Schema) {
+		return fmt.Errorf("strict response format %q: schema is not valid JSON", format.Name)
 	}
 	return nil
 }

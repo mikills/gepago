@@ -50,20 +50,25 @@ type ExpectedStep struct {
 	// Step is the execution's path: the names of the executions that contain it, from the
 	// top-level step down through composite steps and nested pipeline runs, and its own, joined
 	// with '.', as gepa.StepPathFrom reports it while the step runs. The element executions of a
-	// Map named "m" whose body is "b" all have the path "m.b"; Attributes["index"] tells them
-	// apart.
+	// Map named "m" whose body is "b" all have the path "m.b", and those nested in them share
+	// paths too; Attributes["index"] tells them apart.
 	Step string `json:"step"`
-	// Attempt is the execution's attempt number; zero means 1. An execution of an element of a
-	// Map, or one nested in it, is numbered among the executions with its path and its element's
-	// index, from one, rather than among all those with its path, whose numbers depend on the
-	// order the elements started in; see Attributes.
+	// Attempt is the execution's attempt number, as gepa.StepTrace records it; zero means 1. An
+	// execution of a Map element, or one nested in it, such as a step of a pipeline the
+	// element's body runs, is instead numbered from one among the executions of its element with
+	// its path, in the order they ran, so its number does not depend on the order the elements
+	// started in; see Attributes. Executions of elements with one index in the Maps that the
+	// elements of an enclosing Map run are numbered in the order of the enclosing elements'
+	// indices.
 	Attempt int `json:"attempt,omitempty"`
 	// Attributes are attributes the execution must have, each with the value given, as
 	// gepa.StepStartedEvent and gepa.StepFinishedEvent report them: "visit", the visit of the
 	// top-level step it belongs to, "index", the index of the Map element it belongs to, and a
 	// Map's "failed". An attribute it does not list is not compared. An expected execution that
-	// lists "index" stands for an execution of that element; one that does not never stands for
-	// an element's execution.
+	// lists "index" stands for an execution of that element or one nested in it, the nearest
+	// element that contains it where Maps nest; one that does not never stands for such an
+	// execution. gepa records no "index" on the steps of a pipeline that an element runs (see
+	// gepa.StepAttributesFrom), so AssertTrace gives them the index of their element.
 	Attributes map[string]int `json:"attributes,omitempty"`
 	// Failed reports that the execution failed, whatever its error's message. Err and ErrKind,
 	// when set, imply it.
@@ -95,9 +100,10 @@ const maxOrderNotes = 10
 // could have run in (see ExpectedTrace.Steps), with their attempts, attributes, outcomes, cached
 // flags, usage, unbudgeted usage, tool calls, transitions and rejected rewinds, and the run's
 // outcome and usage. An expected execution stands for the recorded one with the same path and
-// attempt, or, for an element of a Map, with the same path, index and attempt among that
-// element's (see ExpectedStep.Attempt); when several have both, as the steps of a nested
-// pipeline run by successive attempts of its step do, they are taken in the order they started.
+// attempt, or, for an execution of a Map element or one nested in it, with the same path,
+// index and number among that element's (see ExpectedStep.Attempt); when several have both, as
+// the steps of a nested pipeline run by successive attempts of its step do, they are taken in
+// the order they started.
 //
 // On a mismatch it reports the difference with t.Errorf and returns false; it does not stop the
 // test. The report lists the executions in an order they ran in, as close to want's order as
@@ -175,8 +181,8 @@ func AssertTrace(t TestingT, trace gepa.PipelineTrace, want ExpectedTrace) bool 
 }
 
 // rowKey identifies an execution for pairing: its path and attempt, or, for an execution of a
-// Map element, its path, the element's index and its attempt among that element's executions
-// with the path.
+// Map element or one nested in it, its path, the element's index and its number among that
+// element's executions with the path.
 type rowKey struct {
 	path    string
 	element bool
@@ -195,11 +201,14 @@ type expectedRow struct {
 func (r expectedRow) label() string { return r.key.label() }
 
 // recordedRow is an execution of a trace with its key, the nodes that contain it, outermost
-// first and its own last, and the index of the expected row that stands for it, or -1.
+// first and its own last, and the index of the expected row that stands for it, or -1. For an
+// execution of a Map element or one nested in it, outer holds the indices of the elements of
+// enclosing Maps that contain its element, outermost first.
 type recordedRow struct {
 	key   rowKey
 	step  gepa.StepTrace
 	chain []*traceNode
+	outer []int
 	match int
 }
 
@@ -236,12 +245,15 @@ func expectedRows(steps []ExpectedStep) []expectedRow {
 }
 
 // recordedRows returns the executions of trace depth first, each before those nested in it and
-// siblings in the order they started. An execution of a Map element is numbered among those of
-// its element with its path, in the order of their attempts, which follow the order they started.
+// siblings in the order they started. An execution of a Map element, or one nested in it, takes
+// the index of its element, which gepa records on the element's own executions but not on the
+// steps of a pipeline the element runs.
 func recordedRows(trace gepa.PipelineTrace) []recordedRow {
 	var rows []recordedRow
-	var walk func(steps []gepa.StepTrace, prefix string, chain []*traceNode)
-	walk = func(steps []gepa.StepTrace, prefix string, chain []*traceNode) {
+	// elements holds the indices of the Map elements that contain steps, outermost first, and
+	// inMap reports that steps are the executions of a Map's elements.
+	var walk func(steps []gepa.StepTrace, prefix string, chain []*traceNode, elements []int, inMap bool)
+	walk = func(steps []gepa.StepTrace, prefix string, chain []*traceNode, elements []int, inMap bool) {
 		for i, step := range steps {
 			path := prefix + step.Step
 			node := &traceNode{
@@ -251,27 +263,41 @@ func recordedRows(trace gepa.PipelineTrace) []recordedRow {
 				lane:    step.Lane,
 				element: -1,
 			}
-			key := rowKey{path: path, attempt: step.Attempt}
+			own := elements
 			if index, ok := step.Attributes["index"]; ok {
-				key.element, key.index = true, index
 				node.element = index
+				// an execution nested in an element repeats its index, unless it is an element
+				// of a Map the element runs.
+				if n := len(elements); n == 0 || inMap || elements[n-1] != index {
+					own = append(slices.Clip(elements), index)
+				}
 			}
-			own := append(slices.Clip(chain), node)
-			rows = append(rows, recordedRow{key: key, step: step, chain: own, match: -1})
-			walk(step.Steps, path+".", own)
+			row := recordedRow{key: rowKey{path: path, attempt: step.Attempt}, step: step, match: -1}
+			if n := len(own); n > 0 {
+				row.key.element, row.key.index, row.outer = true, own[n-1], own[:n-1]
+			}
+			row.chain = append(slices.Clip(chain), node)
+			rows = append(rows, row)
+			// only a Map reports how many of its elements failed.
+			_, isMap := step.Attributes["failed"]
+			walk(step.Steps, path+".", row.chain, own, isMap)
 			for j, run := range step.Runs {
 				runNode := &traceNode{index: len(step.Steps) + j, start: run.StartedAt, end: run.EndedAt, element: -1}
-				walk(run.Steps, path+".", append(slices.Clip(own), runNode))
+				walk(run.Steps, path+".", append(slices.Clip(row.chain), runNode), own, false)
 			}
 		}
 	}
-	walk(trace.Steps, "", nil)
+	walk(trace.Steps, "", nil, nil, false)
 	numberElements(rows)
 	return rows
 }
 
-// numberElements replaces the attempt of each element execution's key with its number among the
-// executions of its element with its path, from one, in the order of their attempts.
+// numberElements replaces the attempt of each key of an execution of a Map element, or one
+// nested in it, with its number among the executions of its element with its path, from one, in
+// the order of the indices of the elements of enclosing Maps that contain its element and then
+// in the order recordedRows lists them, which is the order they started in: the executions of
+// one element with one path run one after another, unless a step of the element runs a
+// pipeline several times at once.
 func numberElements(rows []recordedRow) {
 	type element struct {
 		path  string
@@ -285,7 +311,7 @@ func numberElements(rows []recordedRow) {
 		}
 	}
 	for _, members := range groups {
-		slices.SortStableFunc(members, func(a, b int) int { return rows[a].step.Attempt - rows[b].step.Attempt })
+		slices.SortStableFunc(members, func(a, b int) int { return slices.Compare(rows[a].outer, rows[b].outer) })
 		for n, i := range members {
 			rows[i].key.attempt = n + 1
 		}
@@ -399,7 +425,9 @@ func displayOrder(recorded []recordedRow) []int {
 
 // outcomeMatches reports whether got ended as want expects: failed or not, with the expected
 // error text and kind, attributes, cached flag, usage, unbudgeted usage, tool calls,
-// transition and rejected rewind. It ignores the step and attempt.
+// transition and rejected rewind. It ignores the step, the attempt and the index, which pair
+// want with got, since the steps of a pipeline that a Map element runs take their element's
+// index without recording it.
 func outcomeMatches(want ExpectedStep, got gepa.StepTrace) bool {
 	switch {
 	case (want.Failed || want.Err != "" || want.ErrKind != "") != failed(got):
@@ -414,7 +442,7 @@ func outcomeMatches(want ExpectedStep, got gepa.StepTrace) bool {
 		return false
 	}
 	for name, value := range want.Attributes {
-		if got, ok := got.Attributes[name]; !ok || got != value {
+		if got, ok := got.Attributes[name]; name != "index" && (!ok || got != value) {
 			return false
 		}
 	}

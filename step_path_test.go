@@ -239,7 +239,42 @@ func TestStepAttributesFromNamesTheVisitAndTheElement(t *testing.T) {
 	require.False(t, recorder.observed, "an observer's context has no step attributes")
 
 	recorder.seen["check"][0]["visit"] = 7
-	require.Equal(t, map[string]int{"visit": 1}, recorder.started["check"][0], "each call returns a new map")
+	require.Equal(t, map[string]int{"visit": 1}, recorder.started["check"][0],
+		"the step's map is not its StepStarted event's")
+}
+
+func TestStepAttributesFromReturnsANewMapEachCall(t *testing.T) {
+	items := gepa.Key[[]string]{Name: "items"}
+	item := gepa.Key[string]{Name: "item"}
+	out := gepa.Key[string]{Name: "out"}
+	outs := gepa.Key[[]string]{Name: "outs"}
+	var mu sync.Mutex
+	var seconds []map[string]int
+	body := gepa.NewStep("body", []gepa.KeyRef{item.Ref()}, []gepa.KeyRef{out.Ref()},
+		func(ctx context.Context, s gepa.State) error {
+			first, ok := gepa.StepAttributesFrom(ctx)
+			if !ok {
+				return errors.New("no step attributes")
+			}
+			first["visit"], first["index"], first["added"] = 7, 9, 1
+			second, _ := gepa.StepAttributesFrom(ctx)
+			mu.Lock()
+			seconds = append(seconds, second)
+			mu.Unlock()
+			out.Set(s, "x")
+			return nil
+		})
+	pipeline, err := gepa.PipelineSpec{
+		Inputs: []gepa.KeyRef{items.Ref()},
+		Steps:  []gepa.Step{gepa.Map("each", items, item, body, outs, gepa.MapOptions{MaxConcurrency: 2})},
+	}.Build()
+	require.NoError(t, err)
+
+	_, err = pipeline.Run(context.Background(), gepa.NewState(gepa.Prediction{"items": []string{"a", "b"}}))
+
+	require.NoError(t, err)
+	require.ElementsMatch(t, []map[string]int{{"visit": 1, "index": 0}, {"visit": 1, "index": 1}}, seconds,
+		"changing the map one call returned changes neither the next call's nor the execution's attributes")
 }
 
 func TestStepAttributesFromOutsideAStep(t *testing.T) {

@@ -49,24 +49,28 @@ func TestChatRefusesARequestGeminiCannotTake(t *testing.T) {
 	server, requests := cachingServer(t)
 	client, err := NewChatClient(Config{APIKey: "secret", BaseURL: server.URL, Model: "gemini-test"})
 	require.NoError(t, err)
+	fake := gepatest.NewFakeGenerator().Default(gepatest.Text("ok"))
 	user := gepa.Message{Role: gepa.RoleUser, Content: "hi"}
+	tool := func(parameters string) []gepa.Tool {
+		return []gepa.Tool{{Name: "lookup", Description: "Look up.", Parameters: json.RawMessage(parameters)}}
+	}
+	strict := func(schema string) *gepa.ResponseFormat {
+		return &gepa.ResponseFormat{Name: "answer", Schema: json.RawMessage(schema), Strict: true}
+	}
 
+	// each request the fake refuses too, since no provider accepts it.
 	for name, req := range map[string]gepa.ChatRequest{
-		"an unknown role": {Messages: []gepa.Message{user, {Role: "narrator", Content: "Once"}}},
-		"tool parameters that are not JSON": {
-			Messages: []gepa.Message{user},
-			Tools:    []gepa.Tool{{Name: "lookup", Description: "Look up.", Parameters: json.RawMessage(`{"type":`)}},
-		},
-		"tool parameters that are not an object": {
-			Messages: []gepa.Message{user},
-			Tools:    []gepa.Tool{{Name: "lookup", Description: "Look up.", Parameters: json.RawMessage(`[1]`)}},
-		},
-		"a format schema that is not JSON": {
-			Messages:       []gepa.Message{user},
-			ResponseFormat: &gepa.ResponseFormat{Name: "answer", Schema: json.RawMessage(`{"type":`), Strict: true},
-		},
+		"an unknown role":                   {Messages: []gepa.Message{user, {Role: "narrator", Content: "Once"}}},
+		"tool parameters that are not JSON": {Messages: []gepa.Message{user}, Tools: tool(`{"type":`)},
+		"tool parameters that are an array": {Messages: []gepa.Message{user}, Tools: tool(`[1]`)},
+		"tool parameters that are a string": {Messages: []gepa.Message{user}, Tools: tool(`"object"`)},
+		"a strict format that is not JSON":  {Messages: []gepa.Message{user}, ResponseFormat: strict(`{"type":`)},
+		"a strict format of plain text":     {Messages: []gepa.Message{user}, ResponseFormat: strict(`not json`)},
 	} {
 		t.Run(name, func(t *testing.T) {
+			_, err := fake.Chat(context.Background(), req)
+			require.ErrorIs(t, err, gepatest.ErrInvalidChatRequest)
+
 			resp, err := client.Chat(context.Background(), req)
 
 			require.Error(t, err)
@@ -77,16 +81,35 @@ func TestChatRefusesARequestGeminiCannotTake(t *testing.T) {
 		})
 	}
 
-	_, err = client.Chat(context.Background(), gepa.ChatRequest{
-		Messages:       []gepa.Message{user},
-		Tools:          []gepa.Tool{{Name: "lookup", Description: "Look up."}},
-		ResponseFormat: &gepa.ResponseFormat{Name: "answer", Schema: json.RawMessage(`[1]`)},
-	})
-	require.NoError(t, err, "a request with tools is sent without its response format")
-	_, err = client.Chat(context.Background(), gepa.ChatRequest{
-		Messages:       []gepa.Message{user},
-		ResponseFormat: &gepa.ResponseFormat{Name: "answer"},
-	})
-	require.NoError(t, err, "a format without a schema asks for JSON alone")
-	require.Equal(t, int32(2), requests.Load())
+	// requests the fake accepts because Gemini sends them.
+	for name, req := range map[string]gepa.ChatRequest{
+		"a request with tools, sent without its response format": {
+			Messages:       []gepa.Message{user},
+			Tools:          tool(``),
+			ResponseFormat: &gepa.ResponseFormat{Name: "answer", Schema: json.RawMessage(`[1]`)},
+		},
+		"a strict format that is not JSON, with tools": {
+			Messages:       []gepa.Message{user},
+			Tools:          tool(``),
+			ResponseFormat: strict(`{"type":`),
+		},
+		"a format without a schema, which asks for JSON alone": {
+			Messages:       []gepa.Message{user},
+			ResponseFormat: &gepa.ResponseFormat{Name: "answer"},
+		},
+		"a number no float64 holds": {Messages: []gepa.Message{user}, Tools: tool(
+			`{"type":"object","properties":{"n":{"type":"number","maximum":1e400}}}`,
+		)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := fake.Chat(context.Background(), req)
+			require.NoError(t, err)
+			sent := requests.Load()
+
+			_, err = client.Chat(context.Background(), req)
+
+			require.NoError(t, err)
+			require.Equal(t, sent+1, requests.Load(), "the request was sent")
+		})
+	}
 }

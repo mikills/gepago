@@ -182,3 +182,46 @@ func TestFakeGeneratorCallOutsideAStepHasNoAttributes(t *testing.T) {
 	calls[0].Attributes = map[string]int{"changed": 1}
 	require.Nil(t, fake.Calls()[0].Attributes, "Calls returns copies")
 }
+
+func TestFakeGeneratorOnElementDoesNotMatchAPipelineAnElementRuns(t *testing.T) {
+	fake := gepatest.NewFakeGenerator().
+		OnElement("deep", 0, gepatest.Text("element zero")).
+		OnElement("readings.nest.deep", 0, gepatest.Text("element zero by path")).
+		OnElement("nest", 0, gepatest.Text("element zero by body")).
+		OnPrompt("read a", gepatest.Text("a by prompt")).
+		OnPrompt("read b", gepatest.Text("b by prompt"))
+	deep := gepa.NewStep("deep", []gepa.KeyRef{word.Ref()}, []gepa.KeyRef{reading.Ref()},
+		func(ctx context.Context, s gepa.State) error {
+			w, err := word.Get(s)
+			if err != nil {
+				return err
+			}
+			got, err := fake.Generate(ctx, "read "+w)
+			if err != nil {
+				return err
+			}
+			reading.Set(s, got.Text)
+			return nil
+		})
+	inner, err := gepa.PipelineSpec{Inputs: []gepa.KeyRef{word.Ref()}, Steps: []gepa.Step{deep}}.Build()
+	require.NoError(t, err)
+	pipeline, err := gepa.PipelineSpec{
+		Inputs: []gepa.KeyRef{words.Ref()},
+		Steps: []gepa.Step{gepa.Map("readings", words, word,
+			gepa.NewProgramStep("nest", inner, []gepa.KeyRef{word.Ref()}, []gepa.KeyRef{reading.Ref()}),
+			readings, gepa.MapOptions{MaxConcurrency: 2})},
+	}.Build()
+	require.NoError(t, err)
+
+	out, err := pipeline.Run(context.Background(), gepa.NewState(gepa.Prediction{"words": []string{"a", "b"}}))
+
+	require.NoError(t, err)
+	got, err := readings.Get(out)
+	require.NoError(t, err)
+	require.Equal(t, []string{"a by prompt", "b by prompt"}, got, "no element script matches a nested step's call")
+	for _, call := range fake.Calls() {
+		require.Equal(t, "readings.nest.deep", call.Step)
+		require.Equal(t, map[string]int{"visit": 1}, call.Attributes, "the call's context names no element")
+	}
+	require.Empty(t, fake.Unmatched())
+}
