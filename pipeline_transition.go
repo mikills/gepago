@@ -285,11 +285,13 @@ type rewindRange struct {
 // TestBuildIsLinearInStepsAndTransitions bounds work and checks the type-checked source for the
 // likely ways around it: a write of the fields elsewhere; outside the methods that word an
 // error, a field's slice, map or pointer passed on, returned or stored, and a loop other than a
-// pass's outermost that indexes or ranges over a field, or calls a method of transitionFacts not
-// named here with an integer argument the loop changes; and goto or a call of itself in a
-// function that uses the facts. It is a guard, not a proof: it misses recursion through another
-// function, generic self-calls with explicit type arguments, function values, interfaces, and
-// other names for what the facts hold, such as the table's target.
+// pass's outermost that indexes a slice field, ranges over a field, or calls a method of
+// transitionFacts not named here with an integer argument the loop assigns or steps directly;
+// and goto or a call of itself in a function that uses the facts. It is a guard, not a proof: it
+// misses map lookups, arguments stepped indirectly (by a method, through a pointer, in a nested
+// loop or as an array element), recursion through another function, generic self-calls with
+// explicit type arguments, function values, interfaces, and other names for what the facts
+// hold, such as the table's target.
 type transitionFacts struct {
 	work        int
 	rules       []*transitionRule
