@@ -70,6 +70,39 @@ func rawLookup() gepa.ToolProvider {
 	})
 }
 
+// The arguments of these tools start with an optional field, which gepa.NewTool lists in
+// required, as nullable, and lets the arguments omit.
+type (
+	omitemptyFirstArgs struct {
+		Limit int    `json:"limit,omitempty"`
+		Query string `json:"query"`
+	}
+	omitzeroFirstArgs struct {
+		Page  int    `json:"page,omitzero"`
+		Query string `json:"query"`
+	}
+	pointerFirstArgs struct {
+		Cursor *string `json:"cursor,omitempty"`
+		Query  string  `json:"query"`
+	}
+	optionalArgs struct {
+		Limit  int     `json:"limit,omitempty"`
+		Cursor *string `json:"cursor,omitempty"`
+	}
+	// paymentArgs has a json.Number, whose schema is a string's but which takes a number too.
+	paymentArgs struct {
+		Memo   string      `json:"memo,omitempty"`
+		Amount json.Number `json:"amount"`
+	}
+)
+
+// echo is a typed tool that returns its arguments.
+func echo[Args any](name string) gepa.ToolProvider {
+	return gepa.NewTool(name, "Return the arguments.", func(_ context.Context, args Args) (Args, error) {
+		return args, nil
+	})
+}
+
 func mustJSON(value any) string {
 	data, err := json.Marshal(value)
 	if err != nil {
@@ -110,11 +143,15 @@ func TestCheckToolProviderPassesTheRepositoryTools(t *testing.T) {
 	})
 
 	for name, provider := range map[string]gepa.ToolProvider{
-		"NewTool":             lookup(),
-		"NewTool of a string": text,
-		"NewToolFunc":         rawLookup(),
-		"a registry's tool":   registered,
-		"an enum and a list":  enum,
+		"NewTool":                                 lookup(),
+		"NewTool of a string":                     text,
+		"NewToolFunc":                             rawLookup(),
+		"a registry's tool":                       registered,
+		"an enum and a list":                      enum,
+		"NewTool with an omitempty field first":   echo[omitemptyFirstArgs]("search"),
+		"NewTool with an omitzero field first":    echo[omitzeroFirstArgs]("search"),
+		"NewTool with an omitempty pointer first": echo[pointerFirstArgs]("search"),
+		"NewTool with only optional fields":       echo[optionalArgs]("search"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			recorder := &recordingT{}
@@ -131,6 +168,122 @@ func TestCheckToolProviderPassesTheRepositoryTools(t *testing.T) {
 		gepatest.ToolArguments(`{"limit":0,"id":""}`),
 	),
 		"%q", recorder.errors)
+
+	// the check derives "x" for the amount, which is not a number.
+	recorder = &recordingT{}
+	require.True(t, gepatest.CheckToolProvider(
+		recorder,
+		echo[paymentArgs]("pay"),
+		gepatest.ToolArguments(`{"amount":"12.5"}`, `{"memo":"rent","amount":12.5}`),
+	),
+		"%q", recorder.errors)
+}
+
+func TestCheckToolProviderFindsAMissingOrMistypedPropertyPastAnOptionalOne(t *testing.T) {
+	for name, tc := range map[string]struct {
+		accepts func(arguments string) bool
+		want    string
+	}{
+		"accepting an object without the amount": {
+			accepts: func(arguments string) bool {
+				return strings.HasPrefix(arguments, "{") && !strings.Contains(arguments, `"amount"`)
+			},
+			want: `Invoke accepted an object without the required property "amount": {"memo":"rent"}`,
+		},
+		"accepting a boolean amount": {
+			accepts: func(arguments string) bool { return strings.Contains(arguments, `"amount":true`) },
+			want: `Invoke accepted an object whose property "amount" is true, not of its type: ` +
+				`{"amount":true,"memo":"rent"}`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			broken := &brokenTool{
+				base: echo[paymentArgs]("pay"),
+				invoke: func(ctx context.Context, call gepa.ToolCall, base gepa.ToolProvider) (gepa.ToolResult, error) {
+					result, err := base.Invoke(ctx, call)
+					if err != nil && tc.accepts(call.Arguments) {
+						return gepa.ToolResult{Output: json.RawMessage(`{}`)}, nil
+					}
+					return result, err
+				},
+			}
+			recorder := &recordingT{}
+
+			require.False(t, gepatest.CheckToolProvider(recorder, broken,
+				gepatest.ToolArguments(`{"memo":"rent","amount":"12.5"}`)))
+
+			require.Equal(t, []string{`gepatest: tool "pay": invalid arguments: ` + tc.want}, recorder.errors)
+		})
+	}
+}
+
+// anyObject is a NewToolFunc tool that accepts every object, so the check reports each invalid
+// object it builds. It requires p, whose schema is property, and q, an integer.
+func anyObject(property string) gepa.ToolProvider {
+	return gepa.NewToolFunc(gepa.Tool{
+		Name:        "any_object",
+		Description: "Accept any object.",
+		Parameters: json.RawMessage(`{"type":"object","properties":{"p":` + property +
+			`,"q":{"type":"integer"}},"required":["p","q"]}`),
+	}, func(_ context.Context, call gepa.ToolCall) (gepa.ToolResult, error) {
+		if !strings.HasPrefix(call.Arguments, "{") {
+			return gepa.ToolResult{}, gepa.PermanentError(fmt.Errorf("%w: not an object", gepa.ErrInvalidToolArguments))
+		}
+		return gepa.ToolResult{Output: json.RawMessage(`"ok"`)}, nil
+	})
+}
+
+// requireReported requires a message of recorder to contain want.
+func requireReported(t *testing.T, recorder *recordingT, want string) {
+	t.Helper()
+	require.True(t, slices.ContainsFunc(recorder.errors, func(message string) bool {
+		return strings.Contains(message, want)
+	}), "want %q in %q", want, recorder.errors)
+}
+
+func TestCheckToolProviderLeavesOutTheFirstRequiredPropertyThatIsNotNullable(t *testing.T) {
+	for property, leftOut := range map[string]string{
+		`{"type":"string"}`: "p",
+		`{"enum":["a"]}`:    "p",
+		`{"const":"a"}`:     "p",
+		`{"anyOf":[{"type":"string"},{"type":"integer"}]}`:         "p",
+		`{"allOf":[{"type":["string","null"]},{"type":"string"}]}`: "p",
+		`false`:                      "p",
+		`{"type":["string","null"]}`: "q",
+		`{"enum":["a",null]}`:        "q",
+		`{"const":null}`:             "q",
+		`{"oneOf":[{"type":"string"},{"type":"null"}]}`:              "q",
+		`{"allOf":[{"type":["string","null"]},{"description":"a"}]}`: "q",
+		`{"description":"anything"}`:                                 "q",
+		`true`:                                                       "q",
+	} {
+		t.Run(property, func(t *testing.T) {
+			recorder := &recordingT{}
+
+			require.False(t, gepatest.CheckToolProvider(recorder, anyObject(property)))
+
+			requireReported(t, recorder, fmt.Sprintf(
+				"invalid arguments: Invoke accepted an object without the required property %q", leftOut))
+		})
+	}
+}
+
+func TestCheckToolProviderGivesAPropertyAValueOfAnotherType(t *testing.T) {
+	for property, wrong := range map[string]string{
+		`{"type":"string"}`:             `true`,
+		`{"type":"integer"}`:            `true`,
+		`{"type":"boolean"}`:            `42`,
+		`{"type":["boolean","number"]}`: `"text"`,
+	} {
+		t.Run(property, func(t *testing.T) {
+			recorder := &recordingT{}
+
+			require.False(t, gepatest.CheckToolProvider(recorder, anyObject(property)))
+
+			requireReported(t, recorder, fmt.Sprintf(
+				"invalid arguments: Invoke accepted an object whose property \"p\" is %s, not of its type", wrong))
+		})
+	}
 }
 
 func TestCheckToolProviderAsksForArgumentsWhenItCannotDeriveThem(t *testing.T) {

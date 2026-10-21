@@ -110,9 +110,14 @@ func (c toolCheck) call(id, name, arguments string) gepa.ToolCall {
 //     describes, before doing any work: text that is not JSON, an array, a string, a number,
 //     null, an object followed by more JSON, and, as the schema declares them, an object
 //     without a required property, one with a property of the wrong JSON type and one with an
-//     undeclared property where additionalProperties is false. Each fails with an error that
-//     matches gepa.ErrInvalidToolArguments and is Permanent (see gepa.IsPermanent), and reports
-//     no usage.
+//     undeclared property where additionalProperties is false. The property left out is the
+//     first required one whose schema does not admit null, since gepa.NewTool lists an
+//     omitempty or omitzero field in required, as nullable, and lets the arguments omit it;
+//     when there is none, the check leaves that object out. The wrong type is a boolean, or a
+//     number where the property admits booleans, since a string property may be a json.Number,
+//     which takes a number too. Each fails with an error that matches
+//     gepa.ErrInvalidToolArguments and is Permanent (see gepa.IsPermanent), and reports no
+//     usage.
 //   - no panic: Invoke returns rather than panics for every call the check makes, among them
 //     the invalid ones, a call without an ID, calls whose Scope is of a type the tool cannot
 //     know (a value of a type private to gepatest, and a map, as a remote tool host decodes a
@@ -303,10 +308,12 @@ func invalidArguments(parameters json.RawMessage, valid string) [][2]string {
 			}
 		}
 	}
-	if len(required) > 0 {
+	// a required property that admits null may be optional, as an omitempty field of
+	// gepa.NewTool's arguments is.
+	if i := slices.IndexFunc(required, func(name string) bool { return !admitsNull(properties[name]) }); i >= 0 {
 		cases = append(cases, [2]string{
-			fmt.Sprintf("an object without the required property %q", required[0]),
-			encodeWithout(object, required[0]),
+			fmt.Sprintf("an object without the required property %q", required[i]),
+			encodeWithout(object, required[i]),
 		})
 	}
 	for _, name := range append(required, slices.Sorted(maps.Keys(properties))...) {
@@ -919,11 +926,10 @@ func schemaType(schema map[string]any) string {
 	return ""
 }
 
-// wrongTypeValue returns a JSON value whose type the property's schema does not admit, when the
-// schema names its types.
-func wrongTypeValue(property map[string]any) (string, bool) {
+// declaredTypes returns the type names a schema's type keyword lists.
+func declaredTypes(schema map[string]any) map[string]bool {
 	types := map[string]bool{}
-	switch typ := property["type"].(type) {
+	switch typ := schema["type"].(type) {
 	case string:
 		types[typ] = true
 	case []any:
@@ -933,6 +939,44 @@ func wrongTypeValue(property map[string]any) (string, bool) {
 			}
 		}
 	}
+	return types
+}
+
+// admitsNull reports whether a schema may admit null, which it does unless its type, enum,
+// const, anyOf, oneOf or allOf keyword rules null out. The schema false admits nothing, and a
+// missing schema anything.
+func admitsNull(node any) bool {
+	schema, ok := node.(map[string]any)
+	if !ok {
+		return node != false
+	}
+	isNull := func(value any) bool { return value == nil }
+	if _, ok := schema["type"]; ok && !declaredTypes(schema)["null"] {
+		return false
+	}
+	if values, ok := schema["enum"].([]any); ok && !slices.ContainsFunc(values, isNull) {
+		return false
+	}
+	if value, ok := schema["const"]; ok && !isNull(value) {
+		return false
+	}
+	for _, keyword := range []string{"anyOf", "oneOf"} {
+		if branches, ok := schema[keyword].([]any); ok && !slices.ContainsFunc(branches, admitsNull) {
+			return false
+		}
+	}
+	if branches, ok := schema["allOf"].([]any); ok &&
+		slices.ContainsFunc(branches, func(branch any) bool { return !admitsNull(branch) }) {
+		return false
+	}
+	return true
+}
+
+// wrongTypeValue returns a JSON value whose type the property's schema does not admit, when the
+// schema names its types. A boolean comes first: a string property may be a json.Number, which
+// takes a number too, and no decoder of a string or a number takes a boolean.
+func wrongTypeValue(property map[string]any) (string, bool) {
+	types := declaredTypes(property)
 	if len(types) == 0 {
 		return "", false
 	}
@@ -940,9 +984,9 @@ func wrongTypeValue(property map[string]any) (string, bool) {
 		value string
 		types []string
 	}{
+		{`true`, []string{"boolean"}},
 		{`42`, []string{"integer", "number"}},
 		{`"text"`, []string{"string"}},
-		{`true`, []string{"boolean"}},
 		{`[]`, []string{"array"}},
 		{`{}`, []string{"object"}},
 	} {
