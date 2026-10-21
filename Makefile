@@ -4,9 +4,16 @@ GOFILES := $(shell find . -name '*.go' \
 	-not -path './testdata/*' \
 	-not -path './usecases/*' \
 	-not -path './programs/kiln/train/repos/quote/v3/*')
+# go run tool@version ignores go.mod and builds the tool with the go on PATH, which cannot read
+# code that needs a newer Go. Unless GOTOOLCHAIN is set, every go command and tool here runs on
+# at least the toolchain go.mod selects, and gofmt is that toolchain's.
+ifeq ($(origin GOTOOLCHAIN),undefined)
+export GOTOOLCHAIN := $(shell go env GOVERSION)+auto
+endif
+GOFMT := $(shell go env GOROOT)/bin/gofmt
 GOLINES := go run github.com/segmentio/golines@v0.13.0
-MODERNIZE := go run golang.org/x/tools/go/analysis/passes/modernize/cmd/modernize@v0.49.0
-STATICCHECK := go run honnef.co/go/tools/cmd/staticcheck@v0.7.0
+MODERNIZE := go run golang.org/x/tools/go/analysis/passes/modernize/cmd/modernize@v0.52.0
+STATICCHECK := go run honnef.co/go/tools/cmd/staticcheck@v0.8.2
 MAX_LEN ?= 120
 DIAGO_OUTPUT ?= .diago/audit.txt
 WORK_MODULES := . ./programs/crucible
@@ -19,7 +26,7 @@ modernize:
 
 fmt: modernize
 	$(GOLINES) --max-len=$(MAX_LEN) -w .
-	gofmt -w $(GOFILES)
+	$(GOFMT) -w $(GOFILES)
 
 test:
 	@set -e; for module in $(WORK_MODULES); do \

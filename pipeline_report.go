@@ -42,11 +42,13 @@ func WriteHTMLRunReport(path string, trace PipelineTrace, options HTMLReportOpti
 // HTMLRunReport renders a self-contained HTML report of one pipeline run, such as a trace from
 // a RecordingObserver: a summary of the run with its run context (run id, parent run id, trace
 // id and attributes, as redacted when the run's events carried them), then every step
-// execution in the order it started with its duration, usage, reads, writes, tool calls and
-// error, executions nested in a composite step or a nested pipeline shown inside the execution
-// that ran them. Every value and error is escaped. Values are shown as JSON, indented when it
-// nests no deeper than 32 levels and is no larger than 64 KiB, and compact otherwise, so the
-// report grows linearly with the trace.
+// execution in the order it started with its visit, the index of the Map element it ran for,
+// the number of a Map's elements that failed, duration, usage, unbudgeted usage when it has
+// any, reads, writes, tool calls, error, a rejected rewind and the transition taken after it,
+// executions nested in a composite step or a nested pipeline shown inside the execution that ran
+// them. Every value and error is escaped. Values are shown as JSON, indented when it nests no
+// deeper than 32 levels and is no larger than 64 KiB, and compact otherwise, so the report grows
+// linearly with the trace.
 func HTMLRunReport(trace PipelineTrace, options HTMLReportOptions) (string, error) {
 	title := strings.TrimSpace(options.Title)
 	if title == "" {
@@ -109,6 +111,16 @@ func reportJSON(data []byte) string {
 	return out.String()
 }
 
+// reportElement names the element of a Map an execution ran for, from its attributes, or
+// returns "" for an execution of no element.
+func reportElement(attributes map[string]int) string {
+	index, ok := attributes["index"]
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf(" · element %d", index)
+}
+
 // reportValues renders values as JSON, without escaping HTML, which the template escapes,
 // indented as reportJSON indents it.
 func reportValues(values map[string]any) string {
@@ -148,22 +160,26 @@ func jsonDepth(data []byte) int {
 }
 
 var runReportTemplate = template.Must(template.New("gepa-run-report").Funcs(template.FuncMap{
-	"values": reportValues,
-	"json":   reportJSON,
-	"bytes":  func(text string) []byte { return []byte(text) },
-	"runID":  traceRunID,
+	"values":  reportValues,
+	"json":    reportJSON,
+	"bytes":   func(text string) []byte { return []byte(text) },
+	"runID":   traceRunID,
+	"tokens":  usageTokens,
+	"element": reportElement,
 }).Parse(`{{define "steps"}}
 <ol class="steps">
 {{range .}}
 <li class="step{{if or .Failed .Err}} failed{{end}}">
 <div class="step-head">
 <strong>{{.Step}}</strong>
-<span class="muted">attempt {{.Attempt}}</span>
+<span class="muted">attempt {{.Attempt}}{{with index .Attributes "visit"}} · visit {{.}}{{end}}
+{{- element .Attributes}}{{with index .Attributes "failed"}} · {{.}} failed{{end}}</span>
 {{if .Cached}}<span class="badge">cached</span>{{end}}
-{{if .Skipped}}<span class="badge">skipped</span>{{end}}
+{{if .RewindRejected}}<span class="badge">rewind rejected</span>{{end}}
 {{if or .Failed .Err}}<span class="badge error-badge">failed{{with .ErrKind}} · {{.}}{{end}}</span>{{end}}
 <span class="muted">
 {{.Duration}} · {{.Usage.TotalTokens}} tokens ({{.Usage.PromptTokens}} in, {{.Usage.CompletionTokens}} out)
+{{- with tokens .Unbudgeted}} · {{.}} unbudgeted tokens{{end}}
 </span>
 </div>
 {{if .Err}}<pre class="error">{{.Err}}</pre>{{end}}
@@ -180,6 +196,7 @@ var runReportTemplate = template.Must(template.New("gepa-run-report").Funcs(temp
 {{if .Err}}<span class="badge error-badge">failed</span>{{end}}
 <span class="muted">
 {{.Duration}} · {{.Usage.TotalTokens}} tokens ({{.Usage.PromptTokens}} in, {{.Usage.CompletionTokens}} out)
+{{- with tokens .UnbudgetedUsage}} · {{.}} unbudgeted tokens{{end}}
 </span>
 </div>
 <div class="muted">Arguments</div><pre>{{json (bytes .Arguments)}}</pre>
@@ -191,10 +208,12 @@ var runReportTemplate = template.Must(template.New("gepa-run-report").Funcs(temp
 </ol>
 </details>{{end}}
 {{if .Steps}}{{template "steps" .Steps}}{{end}}
+{{with .Transition}}<div class="transition muted">transition {{.Rule}}: {{.From}} → {{.To}}{{if .Rewind}} (rewind){{end}}</div>{{end}}
 {{range .Runs}}
 <div class="nested-run">
 <div class="muted">
-Nested run {{runID .}} · {{.Duration}} · {{.Usage.TotalTokens}} tokens{{if or .Failed .Err}} · failed{{end}}
+Nested run {{runID .}} · {{.Duration}} · {{.Usage.TotalTokens}} tokens
+{{- with tokens .Unbudgeted}} · {{.}} unbudgeted tokens{{end}}{{if or .Failed .Err}} · failed{{end}}
 </div>
 {{template "steps" .Steps}}
 </div>
@@ -284,6 +303,7 @@ Generated {{.GeneratedAt.Format "2006-01-02 15:04:05 MST"}} · Trace {{.TraceID}
 <div class="metric"><span class="muted">Total tokens</span><strong>{{.Trace.Usage.TotalTokens}}</strong></div>
 <div class="metric"><span class="muted">Prompt tokens</span><strong>{{.Trace.Usage.PromptTokens}}</strong></div>
 <div class="metric"><span class="muted">Completion tokens</span><strong>{{.Trace.Usage.CompletionTokens}}</strong></div>
+{{with tokens .Trace.Unbudgeted}}<div class="metric"><span class="muted">Unbudgeted tokens</span><strong>{{.}}</strong></div>{{end}}
 </div>
 {{if .Trace.Err}}<h2 style="margin-top:18px">Error</h2><pre class="error">{{.Trace.Err}}</pre>{{end}}
 {{if .Trace.Inputs}}<details><summary>Inputs</summary><pre>{{values .Trace.Inputs}}</pre></details>{{end}}

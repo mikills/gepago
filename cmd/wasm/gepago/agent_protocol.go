@@ -53,6 +53,9 @@ func decodeAgentRunPayload(payloadJSON string) (agentRunPayload, error) {
 	if payload.Messages == nil {
 		payload.Messages = payload.InitialMessages
 	}
+	for _, message := range payload.Messages {
+		clearToolCallScopes(message.ToolCalls)
+	}
 	if payload.MaxTurns < 0 {
 		return agentRunPayload{}, errors.New("agent.run payload: maxTurns must not be negative")
 	}
@@ -63,6 +66,15 @@ func decodeAgentRunPayload(payloadJSON string) (agentRunPayload, error) {
 		return agentRunPayload{}, errors.New("agent.run payload: run_id is required")
 	}
 	return payload, nil
+}
+
+// clearToolCallScopes drops any scope the host gave on calls, in a reply or the initial
+// messages. A model gives no tool scope, so the bridge ignores one, as before ToolCall had a
+// Scope, and it never returns to the host in a chat request's transcript or the run's result.
+func clearToolCallScopes(calls []agents.ToolCall) {
+	for i := range calls {
+		calls[i].Scope = nil
+	}
 }
 
 func validateAgentRunPayload(payloadJSON string) error {
@@ -180,6 +192,7 @@ func (c *declarativeChatClient) Chat(ctx context.Context, request agents.ChatReq
 	if err := decodeObject(responseJSON, &response); err != nil {
 		return agents.ChatResponse{}, fmt.Errorf("chat callback response: %w", err)
 	}
+	clearToolCallScopes(response.Message.ToolCalls)
 	if response.Message.Role != agents.RoleAssistant {
 		return agents.ChatResponse{}, fmt.Errorf(
 			"chat callback response: message.role must be %q",

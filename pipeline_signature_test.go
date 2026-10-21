@@ -228,16 +228,10 @@ func TestSignatureStepChecksInsideComposites(t *testing.T) {
 		return gepa.NewProgramStep("s", program, refs(stepQuestion.Ref()),
 			refs(wrongType.Ref(), stepNote.Ref(), stepRef.Ref(), stepScore.Ref()))
 	}
-	partner := func() gepa.Step {
-		return gepa.NewStep("other", nil, refs(wrongType.Ref(), stepNote.Ref(), stepRef.Ref(), stepScore.Ref()),
-			func(context.Context, gepa.State) error { return nil })
-	}
 	cacheKey := func(gepa.State) (string, error) { return "k", nil }
-	route := func(gepa.State) (string, error) { return "a", nil }
+	// the Branch and Fallback flows' case is TestSignatureStepChecksInsideFlows.
 	composites := map[string]gepa.Step{
-		"Branch":     gepa.Branch("route", route, map[string]gepa.Step{"a": bad(), "b": partner()}),
 		"Parallel":   gepa.Parallel("fan", bad()),
-		"Fallback":   gepa.Fallback("guard", bad(), partner()),
 		"WithPolicy": gepa.WithPolicy(bad(), gepa.StepPolicy{Retry: gepa.RetryPolicy{MaxAttempts: 2}}),
 		"WithCache":  gepa.WithCache(bad(), cacheKey),
 		"nested":     gepa.Parallel("outer", gepa.WithPolicy(gepa.WithCache(bad(), cacheKey), gepa.StepPolicy{})),

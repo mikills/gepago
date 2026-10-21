@@ -119,12 +119,9 @@ func TestFakeGeneratorMatchOrder(t *testing.T) {
 			OnStep("summarise", gepatest.Text("name")).
 			OnStep("route.summarise", gepatest.Text("path"))
 	}
+	// v0.9.0: Branch runs its arms as top-level steps, so a Parallel of one step nests it.
 	branch := func(fake *gepatest.FakeGenerator) gepa.Step {
-		return gepa.Branch(
-			"route",
-			func(gepa.State) (string, error) { return "only", nil },
-			map[string]gepa.Step{"only": callFrom("summarise", fake)},
-		)
+		return gepa.Parallel("route", callFrom("summarise", fake))
 	}
 
 	t.Run("the step path first", func(t *testing.T) {
@@ -270,7 +267,7 @@ func TestFakeGeneratorUnmatched(t *testing.T) {
 		unmatched[1].Request.Messages[0].Content = "changed"
 		require.Equal(t, "a stray chat", fake.Unmatched()[1].Request.Messages[0].Content, "Unmatched returns copies")
 	})
-	t.Run("catches a call a step policy hides", func(t *testing.T) {
+	t.Run("catches a call an OnError transition hides", func(t *testing.T) {
 		fake := gepatest.NewFakeGenerator().OnStep("other", gepatest.Text("x"))
 		draft := gepa.NewStep("draft", nil, nil, func(ctx context.Context, _ gepa.State) error {
 			_, err := fake.Generate(ctx, "draft a reply")
@@ -278,13 +275,14 @@ func TestFakeGeneratorUnmatched(t *testing.T) {
 		})
 		template := gepa.NewStep("template", nil, nil, func(context.Context, gepa.State) error { return nil })
 		pipeline, err := gepa.PipelineSpec{
-			Steps: []gepa.Step{gepa.WithPolicy(draft, gepa.StepPolicy{OnError: gepa.OnErrorFallback(template)})},
+			Steps:       []gepa.Step{draft, template},
+			Transitions: []gepa.Transition{{From: "draft", OnError: true, To: "template"}},
 		}.Build()
 		require.NoError(t, err)
 
 		_, err = pipeline.Run(context.Background(), gepa.NewState(nil))
 
-		require.NoError(t, err, "the fallback hides the missing script")
+		require.NoError(t, err, "the transition hides the missing script")
 		unmatched := fake.Unmatched()
 		require.Len(t, unmatched, 1)
 		require.Equal(t, "draft", unmatched[0].Step)

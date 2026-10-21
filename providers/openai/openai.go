@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 
@@ -98,9 +99,14 @@ func NewLanguageModel(config Config) (*LanguageModel, error) {
 // returns ctx.Err() unwrapped. A reply that fails after the API
 // reported usage returns that usage with the error. A refusal is not an error: it returns the
 // refusal as the text with FinishContentFilter. An empty reply is an error unless it stopped at
-// the token limit or under a content policy.
+// the token limit or under a content policy. A configured Temperature that is NaN or infinite,
+// which JSON cannot carry, fails with a Permanent error before the request is sent.
 func (m *LanguageModel) Generate(ctx context.Context, prompt string) (gepa.Generation, error) {
-	return m.complete(ctx, "generate", m.params(prompt))
+	params, err := m.params(prompt)
+	if err != nil {
+		return gepa.Generation{}, err
+	}
+	return m.complete(ctx, "generate", params)
 }
 
 // GenerateStructured is Generate with a response format, making LanguageModel a
@@ -115,8 +121,12 @@ func (m *LanguageModel) GenerateStructured(
 	prompt string,
 	format gepa.ResponseFormat,
 ) (gepa.Generation, error) {
+	params, err := m.params(prompt)
+	if err != nil {
+		return gepa.Generation{}, err
+	}
 	if !format.Strict {
-		return m.complete(ctx, "generate_structured", m.params(prompt))
+		return m.complete(ctx, "generate_structured", params)
 	}
 	if !json.Valid(format.Schema) {
 		return gepa.Generation{}, gepa.PermanentError(
@@ -127,7 +137,6 @@ func (m *LanguageModel) GenerateStructured(
 	if name == "" {
 		name = "output"
 	}
-	params := m.params(prompt)
 	params.ResponseFormat = openai.ChatCompletionNewParamsResponseFormatUnion{
 		OfJSONSchema: &shared.ResponseFormatJSONSchemaParam{
 			JSONSchema: shared.ResponseFormatJSONSchemaJSONSchemaParam{
@@ -140,7 +149,9 @@ func (m *LanguageModel) GenerateStructured(
 	return m.complete(ctx, "generate_structured", params)
 }
 
-func (m *LanguageModel) params(prompt string) openai.ChatCompletionNewParams {
+// params returns the request Generate sends for prompt, or a Permanent error when the
+// configured temperature is not finite.
+func (m *LanguageModel) params(prompt string) (openai.ChatCompletionNewParams, error) {
 	params := openai.ChatCompletionNewParams{
 		Model: openai.ChatModel(m.model),
 		Messages: []openai.ChatCompletionMessageParamUnion{
@@ -151,10 +162,22 @@ func (m *LanguageModel) params(prompt string) openai.ChatCompletionNewParams {
 		},
 		MaxCompletionTokens: openai.Int(int64(m.maxTokens)),
 	}
+	if err := checkTemperature(m.temperature); err != nil {
+		return params, gepa.PermanentError(fmt.Errorf("openai reflection completion: %w", err))
+	}
 	if m.temperature != nil {
 		params.Temperature = openai.Float(*m.temperature)
 	}
-	return params
+	return params, nil
+}
+
+// checkTemperature returns an error when temperature is set to NaN or an infinity, which JSON
+// cannot carry.
+func checkTemperature(temperature *float64) error {
+	if temperature != nil && (math.IsNaN(*temperature) || math.IsInf(*temperature, 0)) {
+		return fmt.Errorf("temperature %v is not a finite number", *temperature)
+	}
+	return nil
 }
 
 // complete sends params for the named operation and logs the call.
@@ -299,6 +322,9 @@ func (m *LanguageModel) chatParams(req gepa.ChatRequest) (openai.ChatCompletionN
 	if temperature := req.Temperature; temperature != nil || m.temperature != nil {
 		if temperature == nil {
 			temperature = m.temperature
+		}
+		if err := checkTemperature(temperature); err != nil {
+			return params, err
 		}
 		params.Temperature = openai.Float(*temperature)
 	}

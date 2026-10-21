@@ -19,22 +19,31 @@ import (
 //   - every property is listed in required, as strict providers need; a field tagged
 //     omitempty or omitzero, which Get lets the reply omit, is nullable instead;
 //   - a pointer, slice, map or interface admits null, as Get does; other types do not;
-//   - a type with its own UnmarshalJSON or UnmarshalText, an interface, and a struct that
-//     contains itself are unconstrained ({}), since their JSON form is not known;
+//   - a type with its own UnmarshalJSON, UnmarshalJSONFrom or UnmarshalText, an interface, and
+//     a struct that contains itself are unconstrained ({}), since their JSON form is not known;
+//     json.Number is a string, as before Go 1.27 gave it UnmarshalJSONFrom;
 //   - []byte is a (base64) string, a map is an object whose additionalProperties hold the
 //     element schema, and an array [N]T has exactly N items (minItems and maxItems);
 //   - a field with the ",string" tag option is a string with a pattern for the JSON encoding
-//     of its value, such as "12" for an int or "\"bob\"" for a string;
+//     of its value, such as "12" for an int or "\"bob\"" for a string; a json.Number, whose
+//     kind is string, has a string's pattern, such as "\"12\"";
 //   - a field's description tag becomes its property's description.
 //
 // A value Get accepts with every field present matches the schema, and a value that matches
-// the schema decodes with Get, except where the schema is unconstrained and where a number does
-// not fit its type (300 for an int8, 1e39 or 1e-50 for a float32), which Get refuses. The
-// array bounds and patterns fall outside the strict subset (see StrictJSONSchema), so
-// providers do not enforce them.
+// the schema decodes with Get, except where the schema is unconstrained, where a number does
+// not fit its type (300 for an int8, 1e39 or 1e-50 for a float32), which Get refuses, and in a
+// ",string" json.Number, where Get also takes the number without inner quotes ("12") and
+// refuses a string that holds no number ("\"x\""). The array bounds and patterns fall outside
+// the strict subset (see StrictJSONSchema), so providers do not enforce them.
 //
 // Channels, functions, complex numbers and maps whose keys cannot come from a JSON object key
-// have no JSON form and return an error.
+// have no JSON form and return an error. So does a struct whose definition encoding/json/v2
+// refuses, such as one with an unexported field that has a json tag or a malformed tag option,
+// or that has a json tag option other than omitempty, omitzero and string (encoding/json ignored
+// the others, and v2 may apply them), the tag `json:"-,"`, which v2 refuses, or a ",string"
+// field that is not a boolean, number or string (or an unnamed pointer to one) or whose type
+// has its own unmarshal method (json.Number aside), at any depth, since Get refuses every object
+// for it.
 func JSONSchemaFor[T any]() (json.RawMessage, error) {
 	typ := reflect.TypeFor[T]()
 	node, nullable, err := newSchemaBuilder().typeSchema(typ, "")
@@ -199,6 +208,9 @@ func (b *schemaBuilder) structSchema(typ reflect.Type, path string) (schemaNode,
 	if b.expanding[typ] {
 		return schemaNode{}, nil
 	}
+	if err := structDefinitionError(typ); err != nil {
+		return nil, fmt.Errorf("%s%w", pathPrefix(path), err)
+	}
 	b.expanding[typ] = true
 	defer delete(b.expanding, typ)
 	fields := jsonFields(typ)
@@ -253,7 +265,8 @@ const jsonNumberPattern = `^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$`
 
 // quotedSchema is the schema of a field with the ",string" option: a string that holds the JSON
 // encoding of the value, as encoding/json requires. For a string value that is a JSON string
-// literal: no raw control characters, and only the escapes JSON defines.
+// literal: no raw control characters, and only the escapes JSON defines, with a UTF-16
+// surrogate escaped only as a high and low pair, as encoding/json requires since Go 1.27.
 func quotedSchema(typ reflect.Type) schemaNode {
 	if typ.Name() == "" && typ.Kind() == reflect.Pointer {
 		typ = typ.Elem()
@@ -263,7 +276,8 @@ func quotedSchema(typ reflect.Type) schemaNode {
 	case reflect.Bool:
 		pattern = `^(true|false)$`
 	case reflect.String:
-		pattern = `^"([^"\\\x00-\x1f]|\\(["\\/bfnrt]|u[0-9a-fA-F]{4}))*"$`
+		pattern = `^"([^"\\\x00-\x1f]|\\(["\\/bfnrt]|u([0-9a-cA-CefEF][0-9a-fA-F]{3}|[dD][0-7][0-9a-fA-F]{2}|` +
+			`[dD][89abAB][0-9a-fA-F]{2}\\u[dD][c-fC-F][0-9a-fA-F]{2})))*"$`
 	case reflect.Float32, reflect.Float64:
 		pattern = jsonNumberPattern
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
@@ -316,6 +330,34 @@ func jsonFieldOrder(fields map[string]jsonField) []string {
 		return strings.Compare(a, b)
 	})
 	return names
+}
+
+// reachableDefinitionError returns structDefinitionError for the first struct type, in field
+// order, that a value of typ can hold through pointers, slices, arrays, map values and struct
+// fields and that does not decode, worded as JSONSchemaFor words it with path naming typ. Types
+// with their own unmarshal method and interfaces are not followed, nor is a type in seen.
+func reachableDefinitionError(typ reflect.Type, path string, seen map[reflect.Type]bool) error {
+	if seen[typ] || customJSON(typ) {
+		return nil
+	}
+	seen[typ] = true
+	switch typ.Kind() {
+	case reflect.Pointer:
+		return reachableDefinitionError(typ.Elem(), path, seen)
+	case reflect.Slice, reflect.Array, reflect.Map:
+		return reachableDefinitionError(typ.Elem(), path+"[]", seen)
+	case reflect.Struct:
+		if err := structDefinitionError(typ); err != nil {
+			return fmt.Errorf("%s%w", pathPrefix(path), err)
+		}
+		fields := jsonFields(typ)
+		for _, name := range jsonFieldOrder(fields) {
+			if err := reachableDefinitionError(fields[name].typ, joinJSONPath(path, name), seen); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func pathPrefix(path string) string {

@@ -14,7 +14,7 @@ import (
 
 // TestNewEvaluationCaptureFindsThePipelinesOfAProgramme checks that the capture finds the
 // Redactors and key types of the pipelines a programme's structure shows, nested ones and
-// those inside composite steps and policy fallbacks included, each once, and not those of a
+// those inside composite steps and step policies included, each once, and not those of a
 // pipeline reached only through another kind of Program.
 func TestNewEvaluationCaptureFindsThePipelinesOfAProgramme(t *testing.T) {
 	scoreKey := Key[float64]{Name: "score"}
@@ -36,18 +36,17 @@ func TestNewEvaluationCaptureFindsThePipelinesOfAProgramme(t *testing.T) {
 	deepest := redacting("deepest", lengthStep())
 	parallel := redacting("parallel",
 		NewProgramStep("deepest", deepest, refs(docKey.Ref()), refs(amountKey.Ref())))
-	fallback := redacting("fallback", writing("write letter", letterKey.Ref()))
+	policy := redacting("policy", writing("write letter", letterKey.Ref()))
 	hidden := redacting("hidden", writing("write summary", summaryKey.Ref()))
 	listed := redacting("listed", writing("write score", scoreKey.Ref()))
 	outer, err := PipelineSpec{
 		Inputs: refs(docKey.Ref()),
 		Steps: []Step{
 			Parallel("fan", NewProgramStep("nested", parallel, refs(docKey.Ref()), refs(amountKey.Ref()))),
-			WithPolicy(writing("letter", letterKey.Ref()), StepPolicy{
-				OnError: OnErrorFallback(
-					NewProgramStep("letter fallback", fallback, refs(docKey.Ref()), refs(letterKey.Ref())),
-				),
-			}),
+			WithPolicy(
+				NewProgramStep("letter", policy, refs(docKey.Ref()), refs(letterKey.Ref())),
+				StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}},
+			),
 			NewProgramStep("custom", programFunc(func(ctx context.Context, inputs Prediction) (Prediction, error) {
 				return hidden.RunCandidate(ctx, hidden.SeedCandidate(), inputs)
 			}), refs(docKey.Ref()), refs(summaryKey.Ref())),
@@ -72,7 +71,7 @@ func TestNewEvaluationCaptureFindsThePipelinesOfAProgramme(t *testing.T) {
 
 	capture := newEvaluationCapture(&program)
 	require.Len(t, capture.redactors, 5, "each pipeline's Redactor is found once")
-	for _, name := range []string{"outer", "parallel", "deepest", "fallback", "listed"} {
+	for _, name := range []string{"outer", "parallel", "deepest", "policy", "listed"} {
 		require.Equal(t, "["+name+"]", applyRedactors(capture.redactors, name, "secret"), name)
 	}
 	require.Equal(t, "secret", applyRedactors(capture.redactors, "hidden", "secret"),
@@ -366,5 +365,96 @@ func TestProgramEvaluatorReleasesEachExamplesValues(t *testing.T) {
 			redactor != nil,
 			growth,
 		)
+	}
+}
+
+// TestEvaluationCaptureRecordsOneMapPerShape checks that the capture, and a fork of it, records
+// a Map only when none it holds has the same key names, item and output types and collecting,
+// all that decides what hideMapElements hides through it, so a Map built again on each run is
+// recorded once.
+func TestEvaluationCaptureRecordsOneMapPerShape(t *testing.T) {
+	writing := func(outs ...KeyRef) Step {
+		return NewStep("use", refs(mapNumKey.Ref()), outs, func(context.Context, State) error { return nil })
+	}
+	doubles := func() Step {
+		return Map("doubles", mapNumsKey, mapNumKey, writing(mapDoubleKey.Ref()), mapDoublesKey, MapOptions{})
+	}
+	triple := Key[int]{Name: "triple"}
+	for _, tt := range []struct {
+		name  string
+		other Step
+		want  int
+	}{
+		{name: "the same Map built again", other: doubles(), want: 1},
+		{
+			name: "another name and options",
+			other: Map("again", mapNumsKey, mapNumKey, writing(mapDoubleKey.Ref()), mapDoublesKey,
+				MapOptions{MaxConcurrency: 3}),
+			want: 1,
+		},
+		{
+			name:  "inside a policy",
+			other: WithPolicy(doubles(), StepPolicy{}),
+			want:  1,
+		},
+		{
+			name: "another items key",
+			other: Map("doubles", Key[[]int]{Name: "others"}, mapNumKey, writing(mapDoubleKey.Ref()),
+				mapDoublesKey, MapOptions{}),
+			want: 2,
+		},
+		{
+			name: "another item key",
+			other: Map("doubles", mapNumsKey, Key[int]{Name: "other"}, writing(mapDoubleKey.Ref()),
+				mapDoublesKey, MapOptions{}),
+			want: 2,
+		},
+		{
+			name: "another results key",
+			other: Map("doubles", mapNumsKey, mapNumKey, writing(mapDoubleKey.Ref()),
+				Key[[]int]{Name: "others"}, MapOptions{}),
+			want: 2,
+		},
+		{
+			name:  "another body key",
+			other: Map("doubles", mapNumsKey, mapNumKey, writing(triple.Ref()), mapDoublesKey, MapOptions{}),
+			want:  2,
+		},
+		{
+			name: "a body with two keys",
+			other: Map("doubles", mapNumsKey, mapNumKey, writing(mapDoubleKey.Ref(), triple.Ref()),
+				mapDoublesKey, MapOptions{}),
+			want: 2,
+		},
+		{
+			name: "another item type",
+			other: Map("doubles", Key[[]int64]{Name: "nums"}, Key[int64]{Name: "num"}, writing(mapDoubleKey.Ref()),
+				mapDoublesKey, MapOptions{}),
+			want: 2,
+		},
+		{
+			name: "another output type",
+			other: Map("doubles", mapNumsKey, mapNumKey, writing(mapDoubleKey.Ref()), Key[[]int64]{Name: "doubles"},
+				MapOptions{}),
+			want: 2,
+		},
+		{
+			name: "a MapCollect",
+			other: MapCollect("doubles", mapNumsKey, mapNumKey, writing(mapDoubleKey.Ref()),
+				Key[[]MapResult[int]]{Name: "doubles"}, MapOptions{}),
+			want: 2,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			capture := newEvaluationCapture(nil)
+			capture.addMaps(newStepNode(doubles()))
+			fork := capture.fork(nil)
+
+			capture.addMaps(newStepNode(tt.other))
+			fork.addMaps(newStepNode(tt.other))
+
+			require.Len(t, capture.mapSteps, tt.want)
+			require.Len(t, fork.mapSteps, tt.want, "a fork knows the shapes of the Maps it starts with")
+		})
 	}
 }

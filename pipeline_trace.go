@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,8 @@ type PipelineTrace struct {
 	Duration   time.Duration  `json:"duration"`
 	Inputs     map[string]any `json:"inputs,omitempty"`
 	Usage      Usage          `json:"usage"`
+	// Unbudgeted is the run's unbudgeted usage, apart from Usage; see RunFinishedEvent.
+	Unbudgeted Usage `json:"unbudgeted,omitzero"`
 	// Failed reports that the run failed. Err is its error's message, which may be empty.
 	Failed  bool      `json:"failed,omitempty"`
 	Err     string    `json:"err,omitempty"`
@@ -47,6 +50,8 @@ type StepTrace struct {
 	EndedAt   time.Time     `json:"ended_at,omitzero"`
 	Duration  time.Duration `json:"duration"`
 	Usage     Usage         `json:"usage"`
+	// Unbudgeted is the execution's unbudgeted usage, apart from Usage; see StepFinishedEvent.
+	Unbudgeted Usage `json:"unbudgeted,omitzero"`
 	// Failed reports that the execution failed. Err is its error's message, which may be empty.
 	Failed  bool           `json:"failed,omitempty"`
 	Err     string         `json:"err,omitempty"`
@@ -55,28 +60,50 @@ type StepTrace struct {
 	Reads   map[string]any `json:"reads,omitempty"`
 	Writes  map[string]any `json:"writes,omitempty"`
 	Cached  bool           `json:"cached,omitempty"`
-	Skipped bool           `json:"skipped,omitempty"`
 	// Lane names the step of a Parallel the execution belongs to when the execution is that step
-	// or one its step policy ran, such as a retry or an OnErrorFallback step; it is empty
-	// otherwise, for the executions nested in them too. The executions of different lanes of a
+	// or one its step policy ran, such as a retry; it is empty otherwise, for the executions
+	// nested in them too. The executions of different lanes of a
 	// Parallel ran side by side, so they may have started in any order.
 	Lane string `json:"lane,omitempty"`
+	// Attributes are the execution's, as StepStartedEvent reported them, such as its "visit" and
+	// a Map element's "index", and once it has finished as StepFinishedEvent did, with a Map's
+	// "failed".
+	Attributes map[string]int `json:"attributes,omitempty"`
+	// Transition is the transition the run took after this execution, the last of a top-level
+	// step's visit, as TransitionTakenEvent reported it.
+	Transition *TransitionTrace `json:"transition,omitempty"`
+	// RewindRejected reports that Accept rejected the rewind this execution ended, as
+	// RewindRejectedEvent reported it.
+	RewindRejected bool `json:"rewind_rejected,omitempty"`
 	// ToolCalls holds the tool calls the execution made, as StepFinishedEvent reported them,
 	// with each Output compacted as encoding/json writes it, or stored as a JSON string when it
 	// is not JSON.
 	ToolCalls []ToolCallRecord `json:"tool_calls,omitempty"`
-	// Steps holds the executions nested in this one, such as the arm of a Branch or the steps
-	// of a Parallel, in the order they started.
+	// Steps holds the executions nested in this one, such as the attempts of a WithPolicy, the
+	// steps of a Parallel or the elements of a Map, in the order they started. A Map's elements
+	// start in input order only at a MaxConcurrency of zero or one, and in any order above it, so
+	// each carries its index in the list under Attributes["index"] (see PipelineObserver).
 	Steps []StepTrace `json:"steps,omitempty"`
 	// Runs holds the pipeline runs this execution started, such as the run of a pipeline
 	// adapted with NewProgramStep.
 	Runs []PipelineTrace `json:"runs,omitempty"`
 }
 
+// TransitionTrace is the record of a transition the run took, in the StepTrace of the execution
+// it followed.
+type TransitionTrace struct {
+	From   string `json:"from"`
+	To     string `json:"to"`
+	Rule   int    `json:"rule"`
+	Rewind bool   `json:"rewind,omitempty"`
+}
+
 // RecordingObserver is a PipelineObserver that records the runs it observes as PipelineTraces.
 // A run nested in an execution it has recorded is recorded in that execution's Runs; any other
-// run is a trace of its own. Events about spans it has not seen start are ignored. It keeps every
-// trace until it is discarded. Its zero value is ready to use, and it is safe for concurrent use.
+// run is a trace of its own. Events about spans it has not seen start are ignored. It is a
+// TransitionObserver, and records each transition in the last top-level execution of the run
+// before it. It keeps every trace until it is discarded. Its zero value is ready to use, and it
+// is safe for concurrent use.
 type RecordingObserver struct {
 	mu     sync.Mutex
 	traces []*recordedRun
@@ -124,13 +151,14 @@ func (r *RecordingObserver) StepStarted(_ context.Context, event StepStartedEven
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	step := &recordedStep{trace: StepTrace{
-		SpanID:    event.Span.ID,
-		ParentID:  event.Span.ParentID,
-		Step:      event.Step,
-		Attempt:   event.Attempt,
-		StartedAt: event.Span.StartedAt,
-		Reads:     traceValues(event.Reads),
-		Lane:      event.Lane,
+		SpanID:     event.Span.ID,
+		ParentID:   event.Span.ParentID,
+		Step:       event.Step,
+		Attempt:    event.Attempt,
+		StartedAt:  event.Span.StartedAt,
+		Reads:      traceValues(event.Reads),
+		Lane:       event.Lane,
+		Attributes: traceAttributes(event.Attributes),
 	}}
 	if run, ok := r.runs[event.Span.ParentID]; ok {
 		run.steps = append(run.steps, step)
@@ -153,6 +181,7 @@ func (r *RecordingObserver) StepFinished(_ context.Context, event StepFinishedEv
 	step.trace.EndedAt = event.Span.EndedAt
 	step.trace.Duration = event.Duration
 	step.trace.Usage = event.Usage
+	step.trace.Unbudgeted = event.Unbudgeted
 	step.trace.Failed = event.Err != nil
 	step.trace.Err = errorString(event.Err)
 	step.trace.ErrKind = ErrorKindOf(event.Err)
@@ -160,8 +189,44 @@ func (r *RecordingObserver) StepFinished(_ context.Context, event StepFinishedEv
 	step.trace.Reads = traceValues(event.Reads)
 	step.trace.Writes = traceValues(event.Writes)
 	step.trace.Cached = event.Cached
-	step.trace.Skipped = event.Skipped
+	step.trace.Attributes = traceAttributes(event.Attributes)
 	step.trace.ToolCalls = traceToolCalls(event.ToolCalls)
+}
+
+// TransitionTaken records a transition in the last top-level execution of its run.
+func (r *RecordingObserver) TransitionTaken(_ context.Context, event TransitionTakenEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if step := r.lastStep(event.RunContext.RunID); step != nil {
+		step.trace.Transition = &TransitionTrace{From: event.From, To: event.To, Rule: event.Rule, Rewind: event.Rewind}
+	}
+}
+
+// RewindRejected records a rejected rewind in the last top-level execution of its run.
+func (r *RecordingObserver) RewindRejected(_ context.Context, event RewindRejectedEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if step := r.lastStep(event.RunContext.RunID); step != nil {
+		step.trace.RewindRejected = true
+	}
+}
+
+// lastStep returns the last top-level execution recorded for the run whose span is runID, or
+// nil when there is none. The caller holds mu.
+func (r *RecordingObserver) lastStep(runID string) *recordedStep {
+	run, ok := r.runs[runID]
+	if !ok || len(run.steps) == 0 {
+		return nil
+	}
+	return run.steps[len(run.steps)-1]
+}
+
+// traceAttributes returns a copy of attributes, or nil when there are none.
+func traceAttributes(attributes map[string]int) map[string]int {
+	if len(attributes) == 0 {
+		return nil
+	}
+	return maps.Clone(attributes)
 }
 
 // RunFinished records the end of a run. Once a trace's top-level run has finished, the
@@ -176,6 +241,7 @@ func (r *RecordingObserver) RunFinished(_ context.Context, event RunFinishedEven
 	run.trace.EndedAt = event.Span.EndedAt
 	run.trace.Duration = event.Duration
 	run.trace.Usage = event.Usage
+	run.trace.Unbudgeted = event.Unbudgeted
 	run.trace.Failed = event.Err != nil
 	run.trace.Err = errorString(event.Err)
 	run.trace.ErrKind = ErrorKindOf(event.Err)
@@ -228,6 +294,11 @@ func (r *recordedStep) snapshot() StepTrace {
 	trace.Reads = copyValues(trace.Reads)
 	trace.Writes = copyValues(trace.Writes)
 	trace.ToolCalls = cloneRecords(trace.ToolCalls)
+	trace.Attributes = maps.Clone(trace.Attributes)
+	if trace.Transition != nil {
+		transition := *trace.Transition
+		trace.Transition = &transition
+	}
 	for _, step := range r.steps {
 		trace.Steps = append(trace.Steps, step.snapshot())
 	}
@@ -330,7 +401,7 @@ func isTraceDatasetBuilder(builder ReflectiveDatasetBuilder) bool {
 //
 // Each step record holds "trace_id", "step", the step's name, "attempt", "reads", "writes" and
 // "usage", and for a failed execution "error" and, when the step attached any, "details". A
-// cache hit adds "cached" and a skip "skipped".
+// cache hit adds "cached".
 func (TraceDatasetBuilder) BuildReflectiveDataset(
 	candidate Candidate,
 	eval EvaluationResult,
@@ -461,9 +532,6 @@ func stepRecord(traceID string, step StepTrace) ReflectiveRecord {
 	}
 	if step.Cached {
 		record["cached"] = true
-	}
-	if step.Skipped {
-		record["skipped"] = true
 	}
 	return record
 }

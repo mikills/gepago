@@ -3,6 +3,7 @@ package agents
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync/atomic"
 	"testing"
 
@@ -87,6 +88,196 @@ func TestAgentRunsRegistryTools(t *testing.T) {
 	require.Equal(t, Usage{TotalTokens: 2}, result.Usage, "tool usage is added to the run's")
 	require.Equal(t, 2, result.Ledger.TotalTokens)
 	require.Equal(t, 2, result.Ledger.ToolCalls)
+}
+
+func TestAgentToolCallsCarryTheToolScope(t *testing.T) {
+	var scopes []any
+	scoped := gepa.NewToolFunc(
+		gepa.Tool{Name: "scoped", Description: "record the scope"},
+		func(_ context.Context, call ToolCall) (gepa.ToolResult, error) {
+			scopes = append(scopes, call.Scope)
+			return gepa.ToolResult{Text: "ok"}, nil
+		},
+	)
+	registry, err := gepa.NewToolRegistry(scoped)
+	require.NoError(t, err)
+	client := gepatest.NewFakeGenerator().Default(gepatest.ToolCall("call-1", "scoped", `{}`), gepatest.Text("done"))
+	agent := Agent{Name: "orders", Client: client, Model: "fake", ToolRegistry: registry, ToolNames: []string{"scoped"}}
+
+	_, err = agent.Run(
+		gepa.WithToolScope(context.Background(), "tenant-7"),
+		RunRequest{Memory: NewMemory("run"), Messages: []Message{{Role: RoleUser, Content: "hi"}}},
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, []any{"tenant-7"}, scopes)
+	for _, message := range chatRequests(client)[1].Messages {
+		for _, call := range message.ToolCalls {
+			require.Nil(t, call.Scope, "the model's transcript carries no scope")
+		}
+	}
+}
+
+func TestAgentToolContextsCarryTheToolScope(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(t *testing.T, agent *Agent, ctx context.Context) error
+	}{
+		{
+			name: "a run on its own",
+			run: func(t *testing.T, agent *Agent, ctx context.Context) error {
+				_, err := agent.Run(ctx, RunRequest{Memory: NewMemory("run"), Messages: []Message{{Role: RoleUser}}})
+				return err
+			},
+		},
+		{
+			name: "a run in a pipeline step",
+			run: func(t *testing.T, agent *Agent, ctx context.Context) error {
+				pipeline := agentPipeline(t, agent, gepa.RunBudget{})
+				_, err := pipeline.Run(ctx, gepa.NewState(gepa.Prediction{"question": "hi"}))
+				return err
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var scopes []any
+			status := func(ctx context.Context, _ orderArgs) (order, error) {
+				scopes = append(scopes, gepa.ToolScopeFrom(ctx))
+				return order{Status: "shipped"}, nil
+			}
+			registry, err := gepa.NewToolRegistry(gepa.NewTool("order_status", "Order status", status))
+			require.NoError(t, err)
+			client := gepatest.NewFakeGenerator().Default(
+				gepatest.ToolCall("call-1", "order_status", `{"order_id":"A-1"}`),
+				gepatest.ToolCall("call-2", "echo", `{}`),
+				gepatest.Text("done"),
+			)
+			agent := &Agent{
+				Name:   "orders",
+				Client: client,
+				Model:  "fake",
+				Tools: []ToolBinding{{
+					Definition: Tool{Name: "echo", Description: "echo"},
+					Handler: func(ctx context.Context, _ *Memory, _ string) (string, error) {
+						scopes = append(scopes, gepa.ToolScopeFrom(ctx))
+						return "ok", nil
+					},
+				}},
+				ToolRegistry: registry,
+				ToolNames:    []string{"order_status"},
+			}
+
+			err = tt.run(t, agent, gepa.WithToolScope(context.Background(), "tenant-7"))
+
+			require.NoError(t, err)
+			require.Equal(t, []any{"tenant-7", "tenant-7"}, scopes, "a typed tool and a binding read the run's scope")
+		})
+	}
+}
+
+func TestToolBindingContextCarriesTheCallsScope(t *testing.T) {
+	got := any("unset")
+	binding := bindingTool{binding: ToolBinding{
+		Definition: Tool{Name: "echo", Description: "echo"},
+		Handler: func(ctx context.Context, _ *Memory, _ string) (string, error) {
+			got = gepa.ToolScopeFrom(ctx)
+			return "ok", nil
+		},
+	}}
+
+	_, err := binding.Invoke(context.Background(), ToolCall{Name: "echo", Scope: "tenant-7"})
+	require.NoError(t, err)
+	require.Equal(t, "tenant-7", got, "a call served apart from a run gives the handler its scope")
+
+	_, err = binding.Invoke(gepa.WithToolScope(context.Background(), "stale"), ToolCall{Name: "echo"})
+	require.NoError(t, err)
+	require.Nil(t, got, "the handler sees the call's scope, never one the call does not carry")
+}
+
+// billedRegistry holds "bill", which spends usage against the run's budget and unbudgeted
+// usage beside it, and fails with err.
+func billedRegistry(t *testing.T, usage, unbudgeted Usage, err error) *gepa.ToolRegistry {
+	t.Helper()
+	bill := gepa.NewToolFunc(
+		gepa.Tool{Name: "bill", Description: "bill elsewhere"},
+		func(context.Context, ToolCall) (gepa.ToolResult, error) {
+			return gepa.ToolResult{Text: "billed", Usage: usage, UnbudgetedUsage: unbudgeted}, err
+		},
+	)
+	registry, regErr := gepa.NewToolRegistry(bill)
+	require.NoError(t, regErr)
+	return registry
+}
+
+// spanOf returns the first span of kind.
+func spanOf(t *testing.T, spans []gepa.UsageSpan, kind gepa.UsageSpanKind) gepa.UsageSpan {
+	t.Helper()
+	for _, span := range spans {
+		if span.Kind == kind {
+			return span
+		}
+	}
+	require.Failf(t, "no span", "no %s span in %v", kind, spans)
+	return gepa.UsageSpan{}
+}
+
+func TestAgentCountsItsToolsUnbudgetedUsage(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       error
+		wantChats int
+		wantErr   string
+	}{
+		{name: "a successful call", wantChats: 2},
+		{
+			name:      "a failed call",
+			err:       errors.New("billing failed"),
+			wantChats: 1,
+			wantErr:   `agent "billing" tool "bill": billing failed`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			chat := Usage{TotalTokens: 3}
+			client := gepatest.NewFakeGenerator().Default(
+				gepatest.ToolCall("call-1", "bill", `{}`).WithUsage(chat),
+				gepatest.Text("done").WithUsage(chat),
+			)
+			recorder := NewTraceRecorder()
+			agent := Agent{
+				Name:         "billing",
+				Client:       client,
+				Model:        "fake",
+				ToolRegistry: billedRegistry(t, Usage{TotalTokens: 1}, Usage{TotalTokens: 50}, tt.err),
+				ToolNames:    []string{"bill"},
+				Observers:    []Observer{recorder},
+			}
+			ctx, collector := gepa.WithUsageCollector(context.Background())
+
+			result, err := agent.Run(ctx, RunRequest{Memory: NewMemory("run"), Messages: []Message{{Role: RoleUser}}})
+
+			if tt.wantErr != "" {
+				require.EqualError(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+			budgeted := Usage{TotalTokens: 3*tt.wantChats + 1}
+			total := budgeted.Add(Usage{TotalTokens: 50})
+			require.Equal(t, total, collector.Usage())
+			require.Equal(t, total, result.Usage, "the run's usage is budgeted and unbudgeted, as RunWithUsage's is")
+			require.Equal(t, total.TotalTokens, result.Ledger.TotalTokens)
+			tool := spanOf(t, result.Spans, gepa.UsageSpanToolCall)
+			require.Equal(t, Usage{TotalTokens: 1}, tool.Usage)
+			require.Equal(t, Usage{TotalTokens: 50}, tool.Unbudgeted)
+			run := spanOf(t, result.Spans, gepa.UsageSpanAgentRun)
+			require.Equal(t, budgeted, run.Usage, "a span's Usage leaves out its unbudgeted usage")
+			require.Equal(t, Usage{TotalTokens: 50}, run.Unbudgeted)
+			ends := slices.DeleteFunc(recorder.Events(), func(event Event) bool { return event.Kind != EventRunEnd })
+			require.Len(t, ends, 1)
+			require.Equal(t, total, ends[0].Usage)
+		})
+	}
 }
 
 func TestAgentDropsMemoryWritesOfAFailedTool(t *testing.T) {

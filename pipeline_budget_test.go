@@ -301,7 +301,9 @@ func TestAdmitModelCallAfterTheRunBudgetIsSpent(t *testing.T) {
 	require.True(t, IsBudget(admitErr))
 }
 
-func TestOnErrorFallbackHasItsOwnStepBudget(t *testing.T) {
+// TestFallbackSecondaryHasItsOwnStepBudget is v0.8.0's test of a policy fallback's budget, ported
+// to the Fallback flow, whose secondary step is a top-level step limited by its own entry.
+func TestFallbackSecondaryHasItsOwnStepBudget(t *testing.T) {
 	out := Key[string]{Name: "out"}
 	tests := []struct {
 		name          string
@@ -310,10 +312,9 @@ func TestOnErrorFallbackHasItsOwnStepBudget(t *testing.T) {
 		wantRemaining BudgetRemaining
 	}{
 		{
-			name:   "limited by its own entry",
-			budget: RunBudget{PerStepTokens: map[string]int{"fallback": 5}},
-			wantErr: `pipeline step "a": flaky; fallback failed: pipeline step "fallback": ` +
-				`run budget PerStepTokens["fallback"] 5 exceeded: 10 tokens spent`,
+			name:    "limited by its own entry",
+			budget:  RunBudget{PerStepTokens: map[string]int{"fallback": 5}},
+			wantErr: `pipeline step "fallback": run budget PerStepTokens["fallback"] 5 exceeded: 10 tokens spent`,
 			wantRemaining: BudgetRemaining{
 				Duration:   math.MaxInt64,
 				ModelCalls: math.MaxInt,
@@ -332,10 +333,9 @@ func TestOnErrorFallbackHasItsOwnStepBudget(t *testing.T) {
 			},
 		},
 		{
-			name:   "limited by the run",
-			budget: RunBudget{MaxTokens: 5},
-			wantErr: `pipeline step "a": flaky; fallback failed: pipeline step "fallback": ` +
-				`run budget MaxTokens 5 exceeded: 10 tokens spent`,
+			name:    "limited by the run",
+			budget:  RunBudget{MaxTokens: 5},
+			wantErr: `pipeline step "fallback": run budget MaxTokens 5 exceeded: 10 tokens spent`,
 			wantRemaining: BudgetRemaining{
 				Duration:   math.MaxInt64,
 				ModelCalls: math.MaxInt,
@@ -361,11 +361,9 @@ func TestOnErrorFallbackHasItsOwnStepBudget(t *testing.T) {
 					return model.Run(ctx, s)
 				},
 			)
-			pipeline, err := PipelineSpec{
-				Inputs: refs(docKey.Ref()),
-				Steps:  []Step{WithPolicy(failing, StepPolicy{OnError: OnErrorFallback(fallback)})},
-				Budget: tt.budget,
-			}.Build()
+			spec := PipelineSpec{Inputs: refs(docKey.Ref()), Budget: tt.budget}
+			spec.Add(Fallback("guard", failing, fallback))
+			pipeline, err := spec.Build()
 			require.NoError(t, err)
 
 			got, err := pipeline.RunCandidate(context.Background(), nil, Prediction{"document": "doc"})
@@ -394,13 +392,12 @@ func TestOnErrorFallbackHasItsOwnStepBudget(t *testing.T) {
 				return nil
 			},
 		)
-		pipeline, err := PipelineSpec{
+		spec := PipelineSpec{
 			Inputs: refs(docKey.Ref()),
-			Steps: []Step{WithPolicy(replyStep("a", "document", tenTokens, calls), StepPolicy{
-				OnError: OnErrorFallback(cheap),
-			})},
 			Budget: RunBudget{PerStepTokens: map[string]int{"a": 5}},
-		}.Build()
+		}
+		spec.Add(Fallback("guard", replyStep("a", "document", tenTokens, calls), cheap))
+		pipeline, err := spec.Build()
 		require.NoError(t, err)
 
 		got, run, err := pipeline.execute(context.Background(), nil, Prediction{"document": "x"})
@@ -408,7 +405,7 @@ func TestOnErrorFallbackHasItsOwnStepBudget(t *testing.T) {
 		require.Equal(t, Prediction{"a": "cheap"}, pipeline.written(got))
 		require.Equal(
 			t,
-			[]string{`a#1 err: run budget PerStepTokens["a"] 5 exceeded: 10 tokens spent`, "cheap#1"},
+			[]string{`a#1 err: run budget PerStepTokens["a"] 5 exceeded: 10 tokens spent`, "cheap#1", "guard#1"},
 			outcomeSummary(run),
 		)
 	})

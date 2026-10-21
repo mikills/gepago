@@ -457,10 +457,12 @@ func TestPipelineObserverContextOutlivesStepTimeouts(t *testing.T) {
 	})
 	pipeline, err := PipelineSpec{
 		Steps: []Step{
-			WithPolicy(slow, StepPolicy{Timeout: 5 * time.Millisecond, OnError: OnErrorSkip}),
+			WithPolicy(slow, StepPolicy{Timeout: 5 * time.Millisecond}),
+			writeNotes("after", "x"),
 		},
-		Defaults:  []KeyDefault{DefaultValue(amountKey, 0)},
-		Observers: []PipelineObserver{observer},
+		Transitions: []Transition{{From: "slow", OnError: true, To: "after"}},
+		Defaults:    []Default{DefaultValue(amountKey, 0)},
+		Observers:   []PipelineObserver{observer},
 	}.Build()
 	require.NoError(t, err)
 
@@ -470,10 +472,10 @@ func TestPipelineObserverContextOutlivesStepTimeouts(t *testing.T) {
 	require.Equal(t, []error{nil, nil}, observer.finished, "a step's timeout does not end the observer's context")
 }
 
-// TestPipelineObserverStress runs many runs of a Parallel of retried, cached steps with
-// fallbacks, a redactor and a recorder at once; run it with -race.
+// TestPipelineObserverStress runs many runs of a Parallel of retried, cached steps, each failing
+// its first attempt in a run, with a redactor and a recorder at once; run it with -race.
 func TestPipelineObserverStress(t *testing.T) {
-	var calls atomic.Int32
+	var failed sync.Map
 	branch := func(i int) Step {
 		key := Key[string]{Name: fmt.Sprintf("out%d", i)}
 		flaky := NewStep(
@@ -482,7 +484,8 @@ func TestPipelineObserverStress(t *testing.T) {
 			refs(key.Ref()),
 			func(ctx context.Context, s State) error {
 				RecordUsage(ctx, tenTokens)
-				if calls.Add(1)%3 == 0 {
+				rc, _ := RunContextFrom(ctx)
+				if _, again := failed.LoadOrStore(fmt.Sprintf("%s/%d", rc.RunID, i), true); !again {
 					return errRateLimited
 				}
 				document, err := docKey.Get(s)
@@ -493,21 +496,7 @@ func TestPipelineObserverStress(t *testing.T) {
 				return nil
 			},
 		)
-		spare := NewStep(
-			fmt.Sprintf("spare%d", i),
-			refs(docKey.Ref()),
-			refs(key.Ref()),
-			func(ctx context.Context, s State) error {
-				RecordUsage(ctx, tenTokens)
-				key.Set(s, "spare")
-				return nil
-			},
-		)
-		return Fallback(
-			fmt.Sprintf("f%d", i),
-			WithPolicy(WithCache(flaky, nil), StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}}),
-			spare,
-		)
+		return WithPolicy(WithCache(flaky, nil), StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}})
 	}
 	var branches []Step
 	for i := range 6 {

@@ -575,9 +575,8 @@ func TestStepErrorReadsNeverLeaveUnredacted(t *testing.T) {
 	check := NewStep("check", refs(secretKey.Ref()), refs(decisionKey.Ref()), func(context.Context, State) error {
 		return errors.New("check failed")
 	})
-	arms := map[string]Step{"check": check}
-	route := func(State) (string, error) { return "check", nil }
-	for _, step := range []Step{check, Branch("route", route, arms)} {
+	// the Branch arm's case is TestStepErrorReadsNeverLeaveUnredactedFromAnArm.
+	for _, step := range []Step{check, Parallel("fan", check)} {
 		t.Run(step.Name(), func(t *testing.T) {
 			recorder := &RecordingObserver{}
 			log := &eventLog{}

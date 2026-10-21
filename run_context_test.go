@@ -219,7 +219,7 @@ func TestPipelineRunKeepsTheCallerRunContext(t *testing.T) {
 }
 
 // nestedRunContextPipeline returns a pipeline whose steps run pipelines directly, two levels
-// deep, inside a Parallel and inside the chosen arm of a Branch, every one of them probed.
+// deep, inside a Parallel and as the chosen arm of a Branch, every one of them probed.
 func nestedRunContextPipeline(t *testing.T, probe *runContextProbe, spec PipelineSpec) Pipeline {
 	t.Helper()
 	grandchild := buildPipeline(t, PipelineSpec{Steps: []Step{probe.step("grandchild", intKey("g"))}})
@@ -239,12 +239,14 @@ func nestedRunContextPipeline(t *testing.T, probe *runContextProbe, spec Pipelin
 			NewProgramStep("run left", left, nil, refs(intKey("l").Ref())),
 			NewProgramStep("run right", right, nil, refs(intKey("r").Ref())),
 		),
-		Branch("route", func(State) (string, error) { return "chosen", nil }, map[string]Step{
-			"chosen": NewProgramStep("run chosen", chosen, nil, refs(intKey("arm").Ref())),
-			"other":  NewProgramStep("run other", other, nil, refs(intKey("arm").Ref())),
-		}),
-		probe.step("outer again", intKey("o2")),
 	}
+	route := func(State) (string, error) { return "chosen", nil }
+	arms := map[string]Step{
+		"chosen": NewProgramStep("run chosen", chosen, nil, refs(intKey("arm").Ref())),
+		"other":  NewProgramStep("run other", other, nil, refs(intKey("arm").Ref())),
+	}
+	spec.Add(Branch("route", route, arms))
+	spec.Steps = append(spec.Steps, probe.step("outer again", intKey("o2")))
 	return buildPipeline(t, spec)
 }
 

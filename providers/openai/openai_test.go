@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -362,6 +363,50 @@ func TestGenerateStructuredRejectsAnInvalidSchema(t *testing.T) {
 	require.EqualError(t, err, "openai reflection completion: response format schema is not valid JSON")
 	require.True(t, gepa.IsPermanent(err))
 	require.Empty(t, *requests)
+}
+
+func TestLanguageModelRefusesAConfiguredTemperatureThatIsNotFinite(t *testing.T) {
+	strict := gepa.ResponseFormat{Name: "qa", Schema: json.RawMessage(`{"type":"object"}`), Strict: true}
+	user := gepa.ChatRequest{Messages: []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}}}
+	for name, value := range map[string]float64{"NaN": math.NaN(), "+Inf": math.Inf(1), "-Inf": math.Inf(-1)} {
+		t.Run(name, func(t *testing.T) {
+			server, requests := recordingServer(t, structuredReply)
+			lm, err := NewLanguageModel(Config{BaseURL: server.URL, Model: "m", Temperature: &value})
+			require.NoError(t, err)
+			reason := fmt.Sprintf("temperature %v is not a finite number", value)
+
+			for path, call := range map[string]func() (gepa.Generation, error){
+				"Generate": func() (gepa.Generation, error) { return lm.Generate(context.Background(), "prompt") },
+				"GenerateStructured, strict": func() (gepa.Generation, error) {
+					return lm.GenerateStructured(context.Background(), "prompt", strict)
+				},
+				"GenerateStructured, not strict": func() (gepa.Generation, error) {
+					return lm.GenerateStructured(context.Background(), "prompt", gepa.ResponseFormat{Name: "qa"})
+				},
+			} {
+				generation, err := call()
+
+				require.EqualError(t, err, "openai reflection completion: "+reason, path)
+				require.True(t, gepa.IsPermanent(err), path)
+				require.Equal(t, gepa.Generation{}, generation, path)
+			}
+
+			resp, err := lm.Chat(context.Background(), user)
+
+			require.EqualError(t, err, "openai chat completion: "+reason)
+			require.True(t, gepa.IsPermanent(err))
+			require.Equal(t, gepa.ChatResponse{}, resp)
+			require.Empty(t, *requests, "no request was sent")
+
+			own := user
+			own.Temperature = floatPtr(0.5)
+			_, err = lm.Chat(context.Background(), own)
+
+			require.NoError(t, err, "a request's own temperature replaces the configured one")
+			require.Len(t, *requests, 1)
+			require.Contains(t, (*requests)[0], `"temperature":0.5`)
+		})
+	}
 }
 
 const refusalReply = `{

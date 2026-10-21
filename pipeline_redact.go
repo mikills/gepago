@@ -2,7 +2,6 @@ package gepa
 
 import (
 	"bytes"
-	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,7 +11,6 @@ import (
 	"reflect"
 	"slices"
 	"strconv"
-	"strings"
 )
 
 // Redactor rewrites a value before a pipeline event carries it out of the run, set with
@@ -55,6 +53,15 @@ import (
 // from the decoded value of each string and number, whatever the spacing or escapes, a number
 // whose text changes becoming a string, and object keys are kept; the JSON is written again,
 // compact and in its order, when a value changes.
+//
+// Under a Map or MapCollect, the events of the Map and of every execution and run nested in it
+// carry each element's item under the Map's item key and its output under the key the body
+// writes. Such a value passes through the Redactor under its own key and then again under the
+// Map's items key, as a list holding only it, or under its results key, as the results of such
+// a list. When the Redactor changes that list, the events carry RedactedText in place of the
+// value, which is removed from error messages like any other redacted value. So a Redactor that
+// hides a Map's items hides every element's item, and one that hides its results every element's
+// output, in MapResult.Error too, and in what ProgramEvaluator gives reflection.
 //
 // The Attributes of the RunContext that every event carries pass through the Redactor when a
 // run starts, before RunStarted, each under the key "attribute:<name>", where <name> is the
@@ -209,31 +216,38 @@ func (r *runObservation) scrubValues(values map[string]any) map[string]any {
 
 // evaluationRedaction redacts the values an evaluation item carries for reflection: redactors
 // are those of the pipelines the programme holds or ran, types the types of the keys those
-// pipelines declare, values the values the example's runs were given, wrote or tried to write,
-// details the details their steps attached to errors, and toolCalls the tool calls their steps
-// made.
+// pipelines declare, mapSteps their Maps, values the values the example's runs were given,
+// wrote or tried to write, the items of their Maps' elements included, details the details
+// their steps attached to errors, and toolCalls the tool calls their steps made.
 type evaluationRedaction struct {
 	redactors []Redactor
 	types     map[string]reflect.Type
+	mapSteps  []*mapStep
 	values    []stateWrite
 	details   []stateWrite
 	toolCalls []ToolCallRecord
 }
 
-// apply returns item with the values reflection reads passed through the redactors. Its Output
-// and each SideInfo entry are redacted as an event's details are (see redactEntry), with the
-// "inputs" and "expected" entries first converted to their keys' types where they convert, so a
-// Redactor sees them as it sees a run's values, SideInfo's "details" one level further, as an
-// event's details, and the inputs, reads, writes, details and run context attributes of any
-// PipelineTrace in its Trace as an event's, with the tool calls of its steps redacted as an
-// event's are. Then the text of every value the redactors change, among those and the values,
-// details and tool calls of the runs, is removed from every string in them, errors and
-// attributes included. Without redactors it returns item unchanged.
+// apply returns item with the values reflection reads passed through the redactors, followed,
+// when the pipelines hold Maps, by hideMapElements, so that it hides each element's item and
+// output wherever the events of the runs do. Its Output and each SideInfo entry are redacted as
+// an event's details are (see redactEntry), with the "inputs" and "expected" entries first
+// converted to their keys' types where they convert, so a Redactor sees them as it sees a run's
+// values, SideInfo's "details" one level further, as an event's details, and the inputs, reads,
+// writes, details and run context attributes of any PipelineTrace in its Trace as an event's,
+// with the tool calls of its steps redacted as an event's are. Then the text of every value the
+// redactors change, among those and the values, details and tool calls of the runs, is removed
+// from every string in them, errors and attributes included. Without redactors it returns item
+// unchanged.
 func (e evaluationRedaction) apply(item EvaluationItem) EvaluationItem {
 	if len(e.redactors) == 0 {
 		return item
 	}
-	run := &runObservation{trace: &traceObservation{}, redactors: e.redactors}
+	redactors := e.redactors
+	if len(e.mapSteps) > 0 {
+		redactors = append(slices.Clone(e.redactors), hideMapElements(e.redactors, e.mapSteps))
+	}
+	run := &runObservation{trace: &traceObservation{}, redactors: redactors}
 	for _, value := range e.values {
 		run.redact(value.key, value.value)
 	}
@@ -354,6 +368,11 @@ func mapTrace(trace PipelineTrace, mapping traceMapping) PipelineTrace {
 		step.Details = mapping.details(step.Details)
 		step.ToolCalls = mapping.tools(step.ToolCalls)
 		step.Err = mapping.text(step.Err)
+		step.Attributes = maps.Clone(step.Attributes)
+		if step.Transition != nil {
+			transition := *step.Transition
+			step.Transition = &transition
+		}
 		nested := mapTrace(PipelineTrace{Steps: step.Steps}, mapping)
 		step.Steps = nested.Steps
 		if step.Runs != nil {
@@ -561,8 +580,11 @@ func (r *runObservation) scrubToolCalls(records []ToolCallRecord) []ToolCallReco
 		record.Text = scrubJSONText(record.Text, r.trace.scrub)
 		record.Err = r.trace.scrub(record.Err)
 		for j := range record.Provenance {
-			record.Provenance[j].Source = r.trace.scrub(record.Provenance[j].Source)
-			record.Provenance[j].Detail = r.trace.scrub(record.Provenance[j].Detail)
+			provenance := &record.Provenance[j]
+			provenance.Kind = r.trace.scrub(provenance.Kind)
+			provenance.ID = r.trace.scrub(provenance.ID)
+			provenance.Source = r.trace.scrub(provenance.Source)
+			provenance.Detail = r.trace.scrub(provenance.Detail)
 		}
 	}
 	return records
@@ -737,11 +759,31 @@ func (r *runObservation) redactError(err error) error {
 	return WithErrorKind(redacted, ErrorKindOf(err))
 }
 
+// eventErrorText returns the message of err, a step's error, as the events of the run in ctx
+// carry it, with the text the run's redactors removed so far taken out; outside an observed run
+// it is err's own message.
+func eventErrorText(ctx context.Context, err error) string {
+	scope := observeScopeFrom(ctx)
+	if scope == nil {
+		return err.Error()
+	}
+	run := scope.run
+	if run == nil {
+		run = scope.recording
+	}
+	if run == nil {
+		return err.Error()
+	}
+	run.trace.mu.Lock()
+	defer run.trace.mu.Unlock()
+	return run.redactError(err).Error()
+}
+
 // redacting reports whether the run's events are redacted: the run or one around it has a
 // Redactor, or a run of its trace has already redacted a value. The caller holds the trace
 // lock.
 func (r *runObservation) redacting() bool {
-	return len(r.redactors) > 0 || len(r.trace.forms) > 0
+	return len(r.redactors) > 0 || r.trace.remembered()
 }
 
 // redactedError is an error as an event carries it under a Redactor.
@@ -756,71 +798,6 @@ func (e *redactedError) Error() string {
 
 func (e *redactedError) Is(target error) bool {
 	return slices.Contains(e.matches, target)
-}
-
-// redactedText holds the text forms of the values redacted in a trace and what replaces each.
-type redactedText struct {
-	forms    map[string]string
-	replacer *strings.Replacer
-}
-
-// remember records the text forms of original, which a redactor turned into redacted. The
-// forms of a string redacted still holds, such as a field the redactor kept, are not recorded.
-func (t *redactedText) remember(original, redacted any) {
-	t.rememberForms(textForms(original), redacted)
-}
-
-// rememberForm records that form is replaced by replacement, unless form is empty or is the
-// replacement itself.
-func (t *redactedText) rememberForm(form, replacement string) {
-	if form == "" || form == replacement {
-		return
-	}
-	if t.forms == nil {
-		t.forms = map[string]string{}
-	}
-	t.forms[form] = replacement
-	t.replacer = nil
-}
-
-// rememberForms records forms, the text forms of a value a redactor turned into redacted, as
-// remember does.
-func (t *redactedText) rememberForms(forms []string, redacted any) {
-	replacement := RedactedText
-	if text, ok := redacted.(string); ok {
-		replacement = text
-	}
-	if t.forms == nil {
-		t.forms = map[string]string{}
-	}
-	kept := map[string]bool{}
-	for _, form := range stringForms(redacted) {
-		kept[form] = true
-	}
-	for _, form := range forms {
-		if form != "" && form != replacement && !kept[form] {
-			t.forms[form] = replacement
-		}
-	}
-	t.replacer = nil
-}
-
-// scrub replaces every remembered text form in text, longest first.
-func (t *redactedText) scrub(text string) string {
-	if len(t.forms) == 0 {
-		return text
-	}
-	if t.replacer == nil {
-		forms := slices.SortedFunc(maps.Keys(t.forms), func(a, b string) int {
-			return cmp.Or(cmp.Compare(len(b), len(a)), cmp.Compare(a, b))
-		})
-		pairs := make([]string, 0, 2*len(forms))
-		for _, form := range forms {
-			pairs = append(pairs, form, t.forms[form])
-		}
-		t.replacer = strings.NewReplacer(pairs...)
-	}
-	return t.replacer.Replace(text)
 }
 
 // textForms returns the ways value may appear in an error message: each string it holds, as

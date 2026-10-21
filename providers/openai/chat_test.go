@@ -268,7 +268,7 @@ func TestChatRejectsInvalidRequestsWithoutSendingThem(t *testing.T) {
 		{
 			name:    "tool parameters that are not an object",
 			req:     gepa.ChatRequest{Tools: []gepa.Tool{{Name: "t", Parameters: json.RawMessage(`[1]`)}}},
-			wantErr: `openai chat completion: tool "t" parameters: json: cannot unmarshal array into Go value of type map[string]json.RawMessage`,
+			wantErr: `openai chat completion: tool "t" parameters: json: cannot unmarshal array into Go value of type map[string]jsontext.Value`,
 		},
 		{
 			name:    "tool parameters that are not JSON",

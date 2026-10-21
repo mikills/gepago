@@ -94,7 +94,7 @@ func TestTraceDatasetBuilderMatchesNestedComponents(t *testing.T) {
 		}},
 		{Step: "inner", Runs: []PipelineTrace{{Steps: []StepTrace{{Step: "classify", Attempt: 1}}}}},
 		{Step: "route", Err: "branch condition: no label"},
-		{Step: "guess", Attempt: 2, Skipped: true},
+		{Step: "guess", Attempt: 2},
 	}}
 	candidate := Candidate{"fan.summarise.instruction": "be brief", "inner.classify.instruction": "classify"}
 	eval := EvaluationResult{Items: []EvaluationItem{
@@ -140,7 +140,10 @@ func TestTraceDatasetBuilderMatchesNestedComponents(t *testing.T) {
 	require.Len(t, route, 1)
 	require.Equal(t, "branch condition: no label", route[0]["error"])
 	require.NotContains(t, route[0], "details")
-	require.Equal(t, true, stepsOf("guess.instruction", 0)[0]["skipped"])
+	guess := stepsOf("guess.instruction", 0)
+	require.Len(t, guess, 1)
+	require.Equal(t, 2, guess[0]["attempt"])
+	require.NotContains(t, guess[0], "error")
 	require.Empty(t, stepsOf("fan.instruction", 0), "a composite with nested executions owns no component")
 	require.Empty(t, stepsOf("summarise.instruction", 0), "a nested step owns only keys scoped by its path")
 	require.Equal(

@@ -25,7 +25,8 @@ import (
 // Exceeding a limit fails with a Budget error (see IsBudget) that names the limit and its
 // value. A run limit ends the run: it cancels the context of every running step, and a step
 // that finishes after that fails with the budget error, its writes dropped. A PerStepTokens
-// limit fails only the steps it names, which a policy or Fallback around them may handle.
+// limit fails only the steps it names, which an OnError transition (see Transition and
+// Fallback) may handle.
 //
 // MaxDuration does not bound a step that ignores its context: the pipeline waits for every
 // step to return rather than abandon a goroutine that still uses the run's state, and only then
@@ -35,9 +36,10 @@ type RunBudget struct {
 	MaxModelCalls int
 	MaxTokens     int
 	// PerStepTokens limits the tokens spent while the named step runs, nested steps included,
-	// summed over all its executions in the run. A name may be a nested step's. A step's
-	// OnErrorFallback step is not part of it: the fallback is limited by its own entry, under
-	// its own name, and by the run limits.
+	// summed over all its executions in the run, so over every visit a rewind makes (see
+	// Transition) as over every retry. A name may be a nested step's. The steps a Branch or a
+	// Fallback adds where the run is routed or where its steps meet spend no tokens, so Build
+	// refuses a limit for one: limit the arms, or the primary and secondary steps, instead.
 	PerStepTokens map[string]int
 }
 
@@ -134,15 +136,17 @@ type budgetClockKey struct{}
 // its enclosing steps and runs, including the runs of pipelines that run this one as a step.
 // returned lists the retried calls made with this frame's context that have returned with
 // pending tokens their callers have yet to record, and toolCalls the tool calls a step
-// execution made itself.
+// execution made itself. unbudgeted is the usage RecordUnbudgetedUsage recorded against the
+// frame, which no limit counts.
 type usageFrame struct {
-	parent    *usageFrame
-	budget    *runBudget
-	step      string
-	cancel    context.CancelCauseFunc
-	usage     Usage
-	returned  []returnedCall
-	toolCalls []ToolCallRecord
+	parent     *usageFrame
+	budget     *runBudget
+	step       string
+	cancel     context.CancelCauseFunc
+	usage      Usage
+	unbudgeted Usage
+	returned   []returnedCall
+	toolCalls  []ToolCallRecord
 }
 
 // returnedCall is a retried call that has returned: the tokens of the usage it returned, which
@@ -266,6 +270,19 @@ func (f *usageFrame) add(usage Usage) {
 		budget.stepPending[frame.step] -= settled
 		budget.stepTokens[frame.step] += tokens
 		frame.checkStepTokens(frame.spent())
+	}
+}
+
+// addUnbudgeted records usage against f and every frame around it as unbudgeted usage, which
+// no limit counts.
+func (f *usageFrame) addUnbudgeted(usage Usage) {
+	if f == nil {
+		return
+	}
+	f.budget.mu.Lock()
+	defer f.budget.mu.Unlock()
+	for frame := f; frame != nil; frame = frame.parent {
+		frame.unbudgeted = frame.unbudgeted.Add(usage)
 	}
 }
 
@@ -487,6 +504,16 @@ func (f *usageFrame) total() Usage {
 	f.budget.mu.Lock()
 	defer f.budget.mu.Unlock()
 	return f.usage
+}
+
+// unbudgetedTotal returns the unbudgeted usage recorded against f.
+func (f *usageFrame) unbudgetedTotal() Usage {
+	if f == nil {
+		return Usage{}
+	}
+	f.budget.mu.Lock()
+	defer f.budget.mu.Unlock()
+	return f.unbudgeted
 }
 
 // fail records the run's first budget error and cancels the run with it. It returns the error

@@ -14,8 +14,8 @@ Original paper:
 
 - Call any model through the provider-neutral `Generator` interface, with usage, the resolved model and a finish reason on every call.
 - Ask for structured output: typed signature fields, strict JSON schemas, native structured output where the provider has it, and validation before a reply is returned.
-- Build typed `Pipeline`s with retries, timeouts, fallbacks, branches, parallel steps, step caching and run budgets.
-- Give model steps tools from a registry, under a per-run policy with call limits and caching.
+- Build typed `Pipeline`s with retries, timeouts, forward skips, bounded rewinds, branches, fallbacks, parallel steps, run-time fan-out with `Map`, step caching and run budgets.
+- Give model steps tools from a registry, under a per-run policy with call limits and caching, with the caller's scope, such as a tenant, on every call.
 - Observe every run with events, recorded traces, HTML run reports, a run context and redaction.
 - Run optional agent loops from the composable `agents` package, with full trace events for runs, turns, LLM calls, tool calls, errors, and run completion.
 - Track usage with spans and ledgers instead of relying only on turn counts.
@@ -44,7 +44,7 @@ packages/gepago/wasm                       Node.js ESM WASM packages
 ```
 
 The root package is intentionally provider-neutral and does not depend on the agent runtime.
-Use subpackages only for the integrations you need.
+Use subpackages only for the integrations you need. The module requires Go 1.27.1 or later.
 
 ## Core flow
 
@@ -196,9 +196,11 @@ pipeline, err := gepa.PipelineSpec{
 
 Steps declare the keys they read and write as `KeyRef`s, which carry the value type. `Build` checks the contract once:
 
-- every key a step reads is a pipeline input or written by an earlier step, with the same type
-- a key written by more than one step needs a `MergeRule`
-- pipeline inputs are read-only
+- every key a step reads is a pipeline input, has a `Default` or is written by an earlier step, with the same type
+- a key written by more than one step needs a `MergeRule`, unless transitions keep any run from committing both writes
+- pipeline inputs are read-only, and no `Default` may name one
+
+`PipelineSpec.Defaults` seed keys before the first step, so every step sees a default until a committed write replaces it; each run gets its own copy. A `MergeRule` combines writes only: the first write of a key replaces its default rather than merging with it.
 
 At run time each step only sees the keys it declared. Its writes must have the declared type, and they are copied into state only when the step succeeds. Values are copied whenever they cross into or out of state, so a step cannot change an input or an earlier result through a shared map or slice. A run fails when its inputs hold a key not declared in `Inputs`, unless `AllowExtraInputs` is set, and input values are converted to their declared types before the first step runs.
 
@@ -206,38 +208,104 @@ At run time each step only sees the keys it declared. Its writes must have the d
 
 `Key.Get` converts model output into `T` strictly: unknown fields, fields that match only by case, missing fields not tagged `omitempty` and nulls in non-nullable positions are errors, not zero values. If `T` has a `Validate() error` method, `Get` calls it too.
 
-`Run` and `RunCandidate`, which `Compile` uses, return only the values the steps wrote; `RunState` also returns the inputs. A failed run returns what was accumulated before the failing step together with a `*StepError` naming it and holding the values it read. A step can attach diagnostics with `WithStepDetails`, a panicking step's stack is kept under `Details["stack"]`, and usage from a failed model call is still recorded.
+`Run` and `RunCandidate`, which `Compile` uses, return the state without the inputs: the values the steps wrote and the defaults no write replaced; `RunState` also returns the inputs. A failed run returns that state as it stood before the failing step, defaults included, together with a `*StepError` naming it and holding the values it read. A step can attach diagnostics with `WithStepDetails`, a panicking step's stack is kept under `Details["stack"]`, and usage from a failed model call is still recorded.
 
 This mirrors the GEPA paper's compound-system formulation `Φ = (M, C, X, Y)`: the `Pipeline` is `Φ`, each step is a language module `Mᵢ`, each wrapped `Predict` carries the prompt and local input/output schema `(πᵢ, Xᵢ, Yᵢ)`, and the steps and their control flow are `C`.
 
 ### Control flow, policies and budgets
 
+A run executes the top-level steps in order. `PipelineSpec.Transitions` change where it goes next: when step `From` finishes, its transitions are tried in the order declared, those with `OnError` if it failed and the others if it succeeded, and the first whose `When` holds sends the run `To` another top-level step, `gepa.End` or `gepa.Fail`. With no match, a step that succeeded is followed by the next one and a step that failed fails the run. A failed step's writes are always dropped.
+
+```go
+hint := gepa.Key[string]{Name: "hint"}
+approved := gepa.Key[bool]{Name: "approved"}
+
+extract := gepa.WithAmendable(gepa.NewProgramStep("extract", gepa.Predict{
+    Signature: gepa.Signature{
+        Name:    "extract_amount",
+        Inputs:  []gepa.Field{{Name: "document"}, {Name: "hint"}},
+        Outputs: []gepa.Field{{Name: "amount", Type: "int"}},
+    },
+    Instruction: "Extract the obligation amount. Follow the hint, if any.",
+    LM:          lm,
+}, []gepa.KeyRef{document.Ref(), hint.Ref()}, []gepa.KeyRef{amount.Ref()}), hint.Ref())
+review := gepa.NewStep("review", []gepa.KeyRef{amount.Ref()}, []gepa.KeyRef{approved.Ref()}, askReviewer)
+decide := gepa.NewStep("decide", []gepa.KeyRef{approved.Ref()}, []gepa.KeyRef{decision.Ref()}, recordDecision)
+
+noAmount := func(s gepa.State, _ error) bool { v, err := amount.Get(s); return err != nil || v == 0 }
+small := func(s gepa.State, _ error) bool { v, err := amount.Get(s); return err == nil && v < 1000 }
+
+pipeline, err := gepa.PipelineSpec{
+    Inputs: []gepa.KeyRef{document.Ref()},
+    Steps:  []gepa.Step{extract, review, decide},
+    Transitions: []gepa.Transition{
+        // no amount: extract again with a hint, and keep that visit only if it found one
+        {
+            From:   "extract",
+            When:   noAmount,
+            To:     "extract",
+            Amend:  func(s gepa.State) error { hint.Set(s, "The amount may be written in words."); return nil },
+            Accept: func(_, next gepa.State) bool { return !noAmount(next, nil) },
+        },
+        // small amounts skip the review
+        {From: "extract", When: small, To: "decide"},
+    },
+    MaxVisits: map[string]int{"extract": 2},
+    Defaults:  []gepa.Default{gepa.DefaultValue(hint, ""), gepa.DefaultValue(approved, true)},
+}.Build()
+```
+
+`Build` enforces three constraints:
+
+- A forward target is a later top-level step, `End` or `Fail`. The steps in between do not run and emit no events.
+- An earlier target, or `From` itself, is a rewind: the run goes back and runs every step from the target to `From` again. The target needs a `MaxVisits` of at least 2, and a rewind that would exceed it fails `From` with `ErrMaxVisits`, which an `OnError` transition can catch.
+- One rewind range at a time: two rewinds must have the same target and `From`, or ranges that do not overlap; nested ranges are not supported. Transitions name top-level steps only.
+
+A step that a transition skips over, or that has an `OnError` transition to a later step or `End`, may not write. A key is guaranteed at a step when it is an input, has a `Default` or is written by an earlier step that always writes, and `Build` fails on any read of a key that is not guaranteed, naming the step and the key. A key written by a step that may not write needs a `Default` if any later step reads it, even when another step always writes it. Above, `review` may be skipped, so `decide` can read `approved` only because it has a default.
+
+On a rewind, `Amend` may set only the keys the target declared with `WithAmendable`; the target reads them on its next visit only, and they are never committed. When the run reaches `From` again, `Accept(prev, next)` compares the values the range wrote before and after: true keeps the new ones, false restores the old ones, emits `RewindRejected` and goes on past `From`. The usage of every visit counts. Step events carry the visit in `Attributes["visit"]`, and a `TransitionObserver`, such as `RecordingObserver`, also receives `TransitionTaken` and `RewindRejected`.
+
+`Branch` and `Fallback` build a `Flow` of ordinary steps and transitions, which `PipelineSpec.Add` appends:
+
 ```go
 reads, writes := []gepa.KeyRef{document.Ref()}, []gepa.KeyRef{amount.Ref()}
 extract := gepa.WithPolicy(
     gepa.NewProgramStep("extract", extractProgram, reads, writes),
-    gepa.StepPolicy{
-        Timeout: 20 * time.Second,
-        Retry:   gepa.RetryPolicy{MaxAttempts: 3},
-        OnError: gepa.OnErrorFallback(gepa.NewProgramStep("extract_small", smallProgram, reads, writes)),
-    },
+    gepa.StepPolicy{Timeout: 20 * time.Second, Retry: gepa.RetryPolicy{MaxAttempts: 3}},
 )
 
-pipeline, err := gepa.PipelineSpec{
-    Inputs: []gepa.KeyRef{document.Ref()},
-    Steps: []gepa.Step{
-        extract,
-        gepa.Branch("route", route, map[string]gepa.Step{"review": review, "approve": approve}, amount.Ref()),
-    },
-    Budget: gepa.RunBudget{MaxDuration: time.Minute, MaxModelCalls: 6, MaxTokens: 20000},
-}.Build()
+spec := gepa.PipelineSpec{
+    Inputs:   []gepa.KeyRef{document.Ref()},
+    Defaults: []gepa.Default{gepa.DefaultValue(amount, 0)},
+    Budget:   gepa.RunBudget{MaxDuration: time.Minute, MaxModelCalls: 6, MaxTokens: 20000},
+}
+spec.Add(
+    gepa.Fallback("extracted", extract, gepa.NewProgramStep("extract_small", smallProgram, reads, writes)),
+    gepa.Branch("route", route, map[string]gepa.Step{"review": review, "approve": approve}, amount.Ref()),
+)
+pipeline, err := spec.Build()
 ```
 
-- `WithPolicy` gives a step a per-attempt `Timeout`, retries (of transient errors unless `RetryIf` says otherwise) and an action for when it still fails: `OnErrorFail`, `OnErrorSkip` (its writes take their `PipelineSpec.Defaults`, see `DefaultValue`) or `OnErrorFallback(step)`.
-- `Branch` runs one of several arms that write the same keys, `Parallel` runs steps with disjoint writes concurrently and commits them together, `Fallback` runs a secondary step when the primary fails with a non-permanent error, and `WithCache` reuses a step's result within a run when its key function returns a key it has seen.
-- `RunBudget` limits a run's duration, model calls, tokens and tokens per step; exceeding a limit fails with a `Budget` error naming it. A step reads what is left with `gepa.BudgetFrom(ctx).Remaining()`.
+- `Branch` calls `route` once, writes the chosen label to a string key named after the branch and runs the arm with that label; all arms write the same keys. `Fallback` runs its secondary step when the primary fails with an error that is not Permanent. Arms and a fallback's steps are top-level steps that may not write, so a later reader of their keys needs a `Default`, as `amount` has here. Budget the arms or steps by name.
+- `WithPolicy` gives a step a per-attempt `Timeout` and retries of Transient errors (`Retry{MaxAttempts, Backoff}`). A step that still fails fails the run unless an `OnError` transition takes it elsewhere.
+- `Parallel` runs steps with disjoint writes concurrently and commits them together, and `WithCache` reuses a step's result within a run when its key function returns a key it has seen.
+- `RunBudget` limits a run's duration, model calls, tokens and tokens per step, summed over every visit; exceeding a limit fails with a `Budget` error naming it. A step reads what is left with `gepa.BudgetFrom(ctx).Remaining()`.
 
-`Build` checks all of this before the first run: arms that disagree, overlapping parallel writes, a skippable write with neither a default nor a later writer, and budgets that name unknown steps all fail it.
+`Map` and `MapCollect` run a body step once per element of a list known only at run time:
+
+```go
+pages := gepa.Key[[]string]{Name: "pages"}
+page := gepa.Key[string]{Name: "page"}
+found := gepa.Key[int]{Name: "found"}
+readings := gepa.Key[[]gepa.MapResult[int]]{Name: "readings"}
+
+readPage := gepa.NewProgramStep("read_page", pageProgram, []gepa.KeyRef{page.Ref()}, []gepa.KeyRef{found.Ref()})
+read := gepa.MapCollect("read", pages, page, readPage, readings, gepa.MapOptions{MaxConcurrency: 4, MaxItems: 200})
+```
+
+The body reads the element under `page` and writes exactly one key; each element runs on its own view of that key and the guaranteed keys the body reads, at most `MaxConcurrency` at a time, and more than `MaxItems` elements fail the step before any runs. `Map` writes the outputs in input order and fails fast: the first failure cancels the other elements and commits nothing. `MapCollect` runs every element and writes a `MapResult{Index, Value, Error, Usage, Duration}` for each, so a later step can tell what is missing, except that a `Budget` error in an element or the end of the run's context fails the step. Elements share the run's budget and tool scope, and their events carry `Attributes["index"]`. A `Redactor` that hides the items key hides each element's item, and one that hides the results key each element's output, in events and reflection. A body has no transitions; a rewind that reaches the Map runs every element again.
+
+[`examples/map_reduce`](examples/map_reduce) puts skips, `MapCollect`, a rewind with `Amend` and `Accept`, and a scoped tool into one runnable pipeline.
 
 ## Tools
 
@@ -257,9 +325,42 @@ tools, err := gepa.NewToolRegistry(lookup)
 
 `NewTool` derives the argument schema from `Args` and encodes `Out` as the result; `NewToolFunc` takes a hand-written schema. In a pipeline, set `PipelineSpec.Tools` and either call a tool deterministically with `gepa.ToolStep("lookup", "lookup_customer", reads, writes)` or give a `Predict` step a bounded tool loop with `Predict.Tools` (its `LM` must be a `ChatClient`, which the OpenAI, Claude and Google providers are). `PipelineSpec.ToolPolicy` sets the run's allow-list, total and per-tool call limits and result cache, and a tool's memory writes commit only with its step's writes. `Build` fails on a tool that is not registered or not allowed. Chat middleware registered with `RegisterMiddleware` wraps a step's or an agent's chat client by name, outermost first.
 
+Tools often act for someone: a tenant, a user, an account. Set that scope on the run's context and every tool call of the run carries it as `ToolCall.Scope`, from a `ToolStep`, a `Predict` tool loop, a `Map` element or an agent. The model never sees it, and gepago never inspects it.
+
+```go
+ctx = gepa.WithToolScope(ctx, Tenant{ID: tenantID})
+out, err := pipeline.Run(ctx, inputs)
+```
+
+A `NewTool` function or an agent's `ToolBinding` handler reads the scope with `gepa.ToolScopeFrom(ctx)`; any other `ToolProvider` reads it from the call:
+
+```go
+func (t crmTool) Invoke(ctx context.Context, call gepa.ToolCall) (gepa.ToolResult, error) {
+    tenant, ok := call.ScopeAs[Tenant]()
+    if !ok {
+        return gepa.ToolResult{}, gepa.PermanentError(errors.New("crm: the run has no tenant"))
+    }
+    record, usage, err := t.lookup(ctx, tenant, call.Arguments)
+    if err != nil {
+        return gepa.ToolResult{}, err
+    }
+    return gepa.ToolResult{
+        Output:          record.JSON,
+        Provenance:      []gepa.Provenance{{Kind: "customer", ID: record.ID, Source: record.URL}},
+        UnbudgetedUsage: usage, // billed to the tenant, not the run
+    }, nil
+}
+```
+
+In-process the scope is passed as it is, so any value works. A call that crosses a process boundary, such as to a remote tool host, carries the scope's JSON form, so the scope must be JSON-marshalable, and `ScopeAs` on the decoded call sees that form (a `map[string]any` for a struct), not your type. A `ToolPolicy` cache answers by tool and arguments whatever the scope, so give each run one scope.
+
+A tool reports usage it did not record itself in `ToolResult.Usage`, which counts against the run's budget, and usage the run should see but not count, such as a call billed elsewhere, in `UnbudgetedUsage`; other code records the latter with `gepa.RecordUnbudgetedUsage(ctx, usage)`. Events, spans and traces report it apart from `Usage`, as `Unbudgeted`, and `RunWithUsage` returns both together. A tool that records its usage itself must not report it again.
+
+`Provenance` names a protected resource the result touched (`Kind` and `ID`, for audit), where it came from (`Source`, with `Detail` locating the part used), or both. An entry that names neither, has only one of `Kind` and `ID`, or has `Detail` without `Source` fails the call (see `Provenance.Validate`).
+
 ## Observability and redaction
 
-`PipelineSpec.Observers` receive `RunStarted`, `StepStarted`, `StepFinished` (duration, usage, error, reads, writes, tool calls, attempt and whether the result was cached) and `RunFinished` events; an observer that panics does not fail the run. `RecordingObserver` turns the events into serialisable `PipelineTrace`s, which `WriteHTMLRunReport` renders step by step and `TraceDatasetBuilder` turns into reflection records during `Compile`.
+`PipelineSpec.Observers` receive `RunStarted`, `StepStarted`, `StepFinished` (duration, usage and unbudgeted usage, error, reads, writes, tool calls, attempt, attributes such as the visit and a Map element's index, and whether the result was cached) and `RunFinished` events, and a `TransitionObserver` also `TransitionTaken` and `RewindRejected`; an observer that panics does not fail the run. `RecordingObserver` turns the events into serialisable `PipelineTrace`s, which `WriteHTMLRunReport` renders step by step and `TraceDatasetBuilder` turns into reflection records during `Compile`.
 
 ```go
 recorder := &gepa.RecordingObserver{}
@@ -289,7 +390,7 @@ ctx = gepa.WithRunContext(ctx, gepa.RunContext{
 out, err := pipeline.Run(ctx, inputs)
 ```
 
-Each run keeps the trace ID and attributes, gets a fresh `RunID` and records the caller's run as its parent, so nested pipelines form one trace. Steps, tools and models find it with `gepa.RunContextFrom(ctx)`, events, traces and run reports carry it, and providers given a `Config.Logger` log it with every model call. The library has no tenant model: attributes are plain strings, redacted like other values in events but logged as they are.
+Each run keeps the trace ID and attributes, gets a fresh `RunID` and records the caller's run as its parent, so nested pipelines form one trace. Steps, tools and models find it with `gepa.RunContextFrom(ctx)`, events, traces and run reports carry it, and providers given a `Config.Logger` log it with every model call. The library has no tenant model: attributes are plain strings, redacted like other values in events but logged as they are. To pass a tenant to tools, use the tool scope (see [Tools](#tools)).
 
 ## Reusable programme artefacts
 
@@ -300,7 +401,7 @@ artifact := compiled.Artifact("internal-program")
 err := gepa.SaveProgramArtifact("internal-program.program.json", artifact)
 ```
 
-`compiled.Artifact` records the programme's fingerprint. `Pipeline.Fingerprint()` is derived from the step names, keys and types, and every loader refuses an artefact whose fingerprint differs from the programme's with a `*FingerprintMismatchError` that shows both, so a renamed key or step never silently picks up a stale prompt. Artefacts saved before v0.8.0 have no fingerprint and still load. To load an artefact across a shape change you know is compatible, record the same `ProgramVersion` on the artefact and pass it to `LoadCompiledProgramVersion` or `LoadCompiledVersion`.
+`compiled.Artifact` records the programme's fingerprint. `Pipeline.Fingerprint()` is derived from the step names, keys and types, the transitions, `MaxVisits`, amendable keys and each `Map`'s keys and `MapOptions` (so changing `MaxConcurrency` changes it), and every loader refuses an artefact whose fingerprint differs from the programme's with a `*FingerprintMismatchError` that shows both, so a renamed key or step never silently picks up a stale prompt. Artefacts saved before v0.8.0 have no fingerprint and still load. To load an artefact across a shape change you know is compatible, record the same `ProgramVersion` on the artefact and pass it to `LoadCompiledProgramVersion` or `LoadCompiledVersion`.
 
 At runtime, register factories that inject app dependencies such as models, tools, stores, or retrievers:
 
@@ -339,16 +440,18 @@ Lower-level optimiser APIs remain available when you need full control.
 
 ## Test kit
 
-Package `gepatest` provides `FakeGenerator`, a model with scripted replies, usage, finish reasons and errors per call, and `AssertTrace`, which compares a recorded run's steps, the order they ran in, their errors and usage.
+Package `gepatest` provides `FakeGenerator`, a model with scripted replies, usage, finish reasons and errors per call, and `AssertTrace`, which compares a recorded run's steps, the order they ran in, their errors, usage, attributes and transitions; the steps of a pipeline that a Map element runs take that element's index.
 
-A call takes the next reply of the script for its step path (as `gepa.StepPathFrom` reports it), else its step name, else the first prompt substring it contains, else the default; a script repeats its last reply once used up. `Calls` returns every call the fake received, `Unmatched` the calls no script answered (a step policy's fallback or skip can hide their error), and `Plain` hides its structured and chat methods to test the prompt-only path.
+A call takes the next reply of the script for its Map element (`OnElement`), else its visit (`OnVisit`), else its step (`OnStep`), each tried by step path, as `gepa.StepPathFrom` reports it, and then by step name; else the first prompt substring it contains, else the default. `OnElement` does not match the calls of a pipeline that an element runs; script those by step path. A script repeats its last reply once used up. `Chat` refuses the requests `ErrInvalidChatRequest` lists, which no provider accepts, with that error; a message without a role passes, though all three providers refuse it. `Calls` returns every call the fake received, `Unmatched` the calls no script answered (an `OnError` transition can hide their error), and `Plain` hides its structured and chat methods to test the prompt-only path.
+
+`CheckToolProvider(t, provider, options...)` and `CheckChatClient(t, client)` are contract tests for your own tools and chat clients, and report each requirement one breaks. `CheckToolProvider` checks that a `ToolRegistry` registers the tool's schema, that it refuses invalid arguments with a Permanent `ErrInvalidToolArguments`, never panics and reports usage a run can count, that on an ended context it returns promptly and fails, if at all, with the context's error, that valid calls succeed through a `ToolSession`, that a caching session answers the same arguments laid out differently from its cache, and that concurrent calls succeed. `CheckChatClient` checks that the client refuses requests no provider accepts with a Permanent error and no usage, never panics and reports usage a run can count, that it fails promptly with the context's error on an ended context, that a valid request succeeds, that the same request sent again, which a provider may answer from its prompt cache, reports the same `PromptTokens`, or zero usage when the client answers it from its own cache without calling the provider, and that concurrent requests succeed. Equal counts catch only counting that differs between a cache miss and a hit, not cached tokens left out of `PromptTokens` on both. Pass `ToolArguments(...)` to a tool that refuses the arguments the check derives from its schema, and `ToolScope(...)` to one that needs a scope.
 
 ## Key extension points
 
 - `Generator`: provider-neutral model interface; `StructuredGenerator` and `ChatClient` add response formats and tool calls.
 - `Step` and `ComponentStep`: pipeline steps, deterministic or optimisable.
 - `ToolProvider`: a tool a registry can hold.
-- `PipelineObserver` and `Redactor`: watch runs and control what leaves them.
+- `PipelineObserver`, `TransitionObserver` and `Redactor`: watch runs and control what leaves them.
 - `Evaluator`: scores candidates against examples.
 - `ReflectiveDatasetBuilder`: turns outputs, feedback, and traces into reflection records.
 - `Proposer`: creates candidate patches.
@@ -473,11 +576,14 @@ chatClient, err := gepagoogle.NewChatClient(gepagoogle.Config{
 
 ## Examples
 
-Run the deterministic example without API keys:
+Run the deterministic examples without API keys:
 
 ```bash
 go run ./examples/deterministic
+go run ./examples/map_reduce
 ```
+
+`map_reduce` totals the amounts in two documents with a pipeline on a scripted model: forward skips choose a read mode, `MapCollect` reads the windows, a reducer rewinds once with a hint, and a tool records the total for the account in the tool scope.
 
 Run the sentiment prompt optimisation example with OpenAI:
 

@@ -14,31 +14,6 @@ func failStep(node *stepNode, values map[string]any, err error) *StepError {
 	return stepErr
 }
 
-// failure returns err as the failure of the step p wraps. With a fallback step, the StepError
-// the pipeline gives p holds the fallback's reads as well, so every failure of the wrapped step
-// gets a StepError of its own, with only its own reads and details.
-func (p *policyStep) failure(s State, err error) error {
-	if p.fallback == nil {
-		return err
-	}
-	return &namedStepError{step: failStep(p.child, s.values, err)}
-}
-
-// namedStepError holds the StepError of a step that the enclosing StepError already names, as
-// the step a WithPolicy wraps, and prints only that step's error, so the message names the
-// step once.
-type namedStepError struct {
-	step *StepError
-}
-
-func (e *namedStepError) Error() string {
-	return e.step.Err.Error()
-}
-
-func (e *namedStepError) Unwrap() error {
-	return e.step
-}
-
 // stepReads returns copies of the values of node's declared reads found in values, or nil when
 // there are none.
 func stepReads(node *stepNode, values map[string]any) map[string]any {
@@ -58,7 +33,7 @@ func stepReads(node *stepNode, values map[string]any) map[string]any {
 
 // invalidOutputStep returns the innermost StepError in err's tree whose error is an invalid
 // output, which names the step that produced it, or nil when there is none. It walks the tree
-// in the order errors.Is does, so when two branches hold an invalid output, as a Fallback whose
+// in the order errors.Is does, so when two branches hold an invalid output, as a Parallel whose
 // steps both failed can, the one errors.Is reaches first wins.
 func invalidOutputStep(err error) *StepError {
 	switch e := err.(type) {

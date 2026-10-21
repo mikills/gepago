@@ -50,8 +50,9 @@ func (p CompiledProgram) Run(ctx context.Context, inputs Prediction) (Prediction
 	return prediction, err
 }
 
-// RunWithUsage executes the compiled programme and returns the usage its model calls recorded
-// with RecordUsage, failed calls included.
+// RunWithUsage executes the compiled programme and returns its usage: what its model and tool
+// calls recorded with RecordUsage, which counts against a budget, plus what its tool calls
+// recorded with RecordUnbudgetedUsage, which does not, failed calls included.
 func (p CompiledProgram) RunWithUsage(ctx context.Context, inputs Prediction) (Prediction, Usage, error) {
 	runCtx, collector := WithUsageCollector(ctx)
 	prediction, err := p.Program.RunCandidate(runCtx, p.Candidate, inputs)
@@ -157,7 +158,10 @@ func (c CompileConfig) Validate() error {
 // An example whose run fails with ErrInvalidOutput scores zero instead of failing the
 // evaluation; when a pipeline step produced the output, the item's SideInfo names the step
 // under "step" and holds its StepError.Details under "details" and copies of the values it
-// read under "reads", so DefaultReflectiveDatasetBuilder passes them to reflection.
+// read under "reads", so DefaultReflectiveDatasetBuilder passes them to reflection. The
+// result's Usage sums what the programme's and the Metric's calls recorded with RecordUsage
+// and RecordUnbudgetedUsage, budgeted and unbudgeted together, as CompiledProgram.RunWithUsage
+// does.
 type ProgramEvaluator struct {
 	Program Program
 	Metric  Metric
@@ -180,18 +184,22 @@ type ProgramEvaluator struct {
 // SideInfo entry are redacted as an event's details are, the example's inputs and expected
 // values first converted to their keys' types where they convert, SideInfo's "reads" by key,
 // SideInfo's "details" as an event's details, and the values of its PipelineTraces by key, the
-// attributes of their RunContexts included. Then the text of every value the Redactors change,
-// among those and those the example's runs were given, wrote, tried to write or attached to
-// their errors, and the attributes of their RunContexts, is removed from every string in them
-// (see Redactor). The Redactors are those of the Pipelines the programme's structure shows,
-// found before any example runs: the programme itself when it is a Pipeline and the Pipelines
-// its steps run through NewProgramStep, inside composite steps and policy fallbacks too; a
-// Pipeline reached only through another kind of Program adds its Redactor for the examples on
-// which it runs, from when it starts: the values runs gave, wrote or attached to errors before
-// then do not pass through it, so it removes their text only where it changes one of the
-// item's own values that holds them. Without any Redactor no values are kept, and each
-// example's values are released once its item is redacted. The Metric still scores the real
-// values.
+// attributes of their RunContexts included. A Map of those Pipelines hides its elements' items
+// and outputs as its events do (see Map): a value under its item key, or under the key its body
+// writes, is hidden when the Redactors hide the list holding only it under its items key, or
+// the results of such a list under its results key, wherever that key appears among the values
+// reflection reads. Then the text of every value the Redactors change, among those and those
+// the example's runs were given, wrote, tried to write or attached to their errors, each Map
+// element's item included, and the attributes of their RunContexts, is removed from every
+// string in them (see Redactor). The Redactors and Maps are those of the Pipelines the
+// programme's structure shows, found before any example runs: the programme itself when it is a
+// Pipeline and the Pipelines its steps run through NewProgramStep, inside composite steps
+// too; a Pipeline reached only through another kind of Program adds its
+// Redactor and Maps for the examples on which it runs, from when it starts: the values runs
+// gave, wrote or attached to errors before then do not pass through its Redactor, so it removes
+// their text only where it changes one of the item's own values that holds them. Without any
+// Redactor no values are kept, and each example's values are released once its item is
+// redacted. The Metric still scores the real values.
 func (e ProgramEvaluator) Evaluate(
 	ctx context.Context,
 	candidate Candidate,

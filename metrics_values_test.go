@@ -163,6 +163,18 @@ func TestNumericValueKinds(t *testing.T) {
 	}
 }
 
+// TestMetricTextWritesObjectsDeeperThanEncodingJSONAllows checks that a value nested deeper than
+// encoding/json writes, which it refuses since Go 1.27, still has its canonical text.
+func TestMetricTextWritesObjectsDeeperThanEncodingJSONAllows(t *testing.T) {
+	deep := any("x")
+	for range 10001 {
+		deep = map[string]any{"a": deep}
+	}
+	text, ok := metricText(map[string]any{"b": deep, "a": 1})
+	require.True(t, ok)
+	require.Equal(t, `{"a":1,"b":`+strings.Repeat(`{"a":`, 10001)+`"x"`+strings.Repeat("}", 10002), text)
+}
+
 func TestMetricTextCanonicalForm(t *testing.T) {
 	deep := any("x")
 	for range 10001 {

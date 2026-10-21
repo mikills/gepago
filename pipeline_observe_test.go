@@ -68,9 +68,6 @@ func (l *eventLog) StepFinished(_ context.Context, event StepFinishedEvent) {
 	if event.Cached {
 		line += " cached"
 	}
-	if event.Skipped {
-		line += " skipped"
-	}
 	if event.Err != nil {
 		line += " err: " + event.Err.Error()
 	}
@@ -92,6 +89,22 @@ func (l *eventLog) RunFinished(_ context.Context, event RunFinishedEvent) {
 	}
 	l.lines = append(l.lines, line)
 	l.runsFinished = append(l.runsFinished, event)
+}
+
+func (l *eventLog) TransitionTaken(_ context.Context, event TransitionTakenEvent) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	line := fmt.Sprintf("transition %d %s -> %s", event.Rule, event.From, event.To)
+	if event.Rewind {
+		line += " rewind"
+	}
+	l.lines = append(l.lines, line)
+}
+
+func (l *eventLog) RewindRejected(_ context.Context, event RewindRejectedEvent) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprintf("rewind %d rejected at %s", event.Rule, event.Step))
 }
 
 func (l *eventLog) Lines() []string {
@@ -343,80 +356,53 @@ func TestPipelineObserverCacheHitSequence(t *testing.T) {
 }
 
 func TestPipelineObserverNestedCompositeSequence(t *testing.T) {
-	verdictKey := Key[string]{Name: "verdict"}
 	brief := NewStep("brief", refs(docKey.Ref()), refs(decisionKey.Ref()), func(_ context.Context, s State) error {
 		decisionKey.Set(s, "brief")
 		return nil
 	})
-	full := NewStep("full", refs(docKey.Ref()), refs(decisionKey.Ref()), func(_ context.Context, s State) error {
-		decisionKey.Set(s, "full")
+	attempts := 0
+	estimate := NewStep("estimate", nil, refs(amountKey.Ref()), func(_ context.Context, s State) error {
+		attempts++
+		if attempts == 1 {
+			return TransientError(errors.New("down"))
+		}
+		amountKey.Set(s, 7)
 		return nil
-	})
-	route := Branch("route", func(State) (string, error) { return "short", nil }, map[string]Step{
-		"short": brief,
-		"long":  full,
-	})
-	verdict := func(name, value string, err error) Step {
-		return NewStep(name, nil, refs(verdictKey.Ref()), func(_ context.Context, s State) error {
-			verdictKey.Set(s, value)
-			return err
-		})
-	}
-	guess := NewStep("guess", nil, refs(notesKey.Ref()), func(context.Context, State) error {
-		return errors.New("no notes")
 	})
 	log := &eventLog{}
 	pipeline, err := PipelineSpec{
 		Inputs: refs(docKey.Ref()),
 		Steps: []Step{
-			route,
-			Fallback("fb", failAmount("primary", TransientError(errors.New("down"))), writeAmount("secondary", 7)),
-			WithPolicy(guess, StepPolicy{OnError: OnErrorSkip}),
-			WithPolicy(
-				verdict("estimate", "x", errBadRequest),
-				StepPolicy{OnError: OnErrorFallback(verdict("spare", "ok", nil))},
-			),
+			Parallel("route", brief),
+			WithPolicy(estimate, StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}}),
+			Parallel("fan", WithPolicy(WithCache(writeNotes("note", "n"), nil), StepPolicy{})),
 		},
-		Defaults:  []KeyDefault{DefaultValue(notesKey, []string{"none"})},
 		Observers: []PipelineObserver{log},
 	}.Build()
 	require.NoError(t, err)
 
 	got, err := pipeline.Run(context.Background(), NewState(Prediction{"document": "d"}))
 	require.NoError(t, err)
-	require.Equal(
-		t,
-		Prediction{"decision": "brief", "amount": 7, "notes": []string{"none"}, "verdict": "ok"},
-		got.Prediction(),
-	)
+	require.Equal(t, Prediction{"decision": "brief", "amount": 7, "notes": []string{"n"}}, got.Prediction())
 	require.Equal(t, []string{
 		"start run",
 		"start route#1 in run",
 		"start brief#1 in route#1",
 		"finish brief#1",
 		"finish route#1",
-		"start fb#1 in run",
-		"start primary#1 in fb#1",
-		"finish primary#1 err: down",
-		"start secondary#1 in fb#1",
-		"finish secondary#1",
-		"finish fb#1",
-		"start guess#1 in run",
-		"finish guess#1 err: no notes",
-		"start guess#2 in run",
-		"finish guess#2 skipped",
 		"start estimate#1 in run",
-		"finish estimate#1 err: bad request",
-		"start spare#1 in run",
-		"finish spare#1",
+		"finish estimate#1 err: down",
+		"start estimate#2 in run",
+		"finish estimate#2",
+		"start fan#1 in run",
+		"start note#1 in fan#1",
+		"finish note#1",
+		"finish fan#1",
 		"finish run",
 	}, log.Lines())
 	require.Equal(t, map[string]any{"decision": "brief"}, log.finishedStep(t, "route", 1).Writes)
-	require.Equal(t, map[string]any{"amount": 7}, log.finishedStep(t, "fb", 1).Writes)
-	skipped := log.finishedStep(t, "guess", 2)
-	require.True(t, skipped.Skipped)
-	require.NoError(t, skipped.Err)
-	require.Equal(t, map[string]any{"notes": []string{"none"}}, skipped.Writes)
+	require.Equal(t, map[string]any{"amount": 7}, log.finishedStep(t, "estimate", 2).Writes)
+	require.Empty(t, log.finishedStep(t, "estimate", 1).Writes)
 }
 
 func TestPipelineObserverNestedPipelineSequence(t *testing.T) {

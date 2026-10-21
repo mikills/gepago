@@ -25,15 +25,16 @@ type ModelCallReporter interface {
 
 type usageCollectorKey struct{}
 
-// UsageCollector sums the usage that model calls record into a context. It is safe for
-// concurrent use.
+// UsageCollector sums the usage that model and tool calls record into a context, budgeted and
+// unbudgeted together. It is safe for concurrent use.
 type UsageCollector struct {
 	mu    sync.Mutex
 	usage Usage
 }
 
-// WithUsageCollector returns a context that collects the usage RecordUsage records into it,
-// and the collector that sums it. A collector replaces any collector already in ctx.
+// WithUsageCollector returns a context that collects the usage RecordUsage and
+// RecordUnbudgetedUsage record into it, and the collector that sums it. A collector replaces
+// any collector already in ctx.
 func WithUsageCollector(ctx context.Context) (context.Context, *UsageCollector) {
 	collector := &UsageCollector{}
 	return context.WithValue(ctx, usageCollectorKey{}, collector), collector
@@ -41,13 +42,28 @@ func WithUsageCollector(ctx context.Context) (context.Context, *UsageCollector) 
 
 // RecordUsage adds usage to the collector carried by ctx, if there is one, and counts it
 // against the RunBudget of the pipeline run in ctx. Predict, LLMJudgeMetric and other model
-// consumers call it once for every model call, failed calls included; a custom Program or
-// Metric that calls a Generator directly should do the same so its usage reaches
-// CompiledProgram.RunWithUsage, ProgramEvaluator and the run budget.
+// consumers call it once for every model call, failed calls included, and a ToolSession once
+// for every call that invokes its tool, with ToolResult.Usage; a custom Program or Metric that
+// calls a Generator directly should do the same so its usage reaches
+// CompiledProgram.RunWithUsage, ProgramEvaluator and the run budget. Usage that must not count
+// against the budget is recorded with RecordUnbudgetedUsage instead.
 func RecordUsage(ctx context.Context, usage Usage) {
 	collector, _ := ctx.Value(usageCollectorKey{}).(*UsageCollector)
 	collector.Add(usage)
 	usageFrameFrom(ctx).add(usage)
+}
+
+// RecordUnbudgetedUsage records usage the run must see but must not count against its budget,
+// such as a call billed elsewhere. It adds usage to the collector carried by ctx, if there is
+// one, so CompiledProgram.RunWithUsage and ProgramEvaluator report it with the budgeted usage,
+// and to the Unbudgeted usage of the pipeline step and run in ctx and every step and run around
+// them, which their events and traces report apart from Usage. It counts against no RunBudget
+// limit. A ToolSession calls it once for every call that invokes its tool, failed calls
+// included, with ToolResult.UnbudgetedUsage.
+func RecordUnbudgetedUsage(ctx context.Context, usage Usage) {
+	collector, _ := ctx.Value(usageCollectorKey{}).(*UsageCollector)
+	collector.Add(usage)
+	usageFrameFrom(ctx).addUnbudgeted(usage)
 }
 
 // AdmitModelCall reserves one model call against the RunBudget of the pipeline run in ctx,
@@ -155,7 +171,9 @@ const (
 	UsageSpanPipelineStep UsageSpanKind = "pipeline.step"
 )
 
-// UsageSpan records timing and usage for one measured operation.
+// UsageSpan records timing and usage for one measured operation. Unbudgeted is the usage the
+// operation recorded with RecordUnbudgetedUsage, which Usage does not include; pipeline run
+// and step spans and an agent's run and tool call spans report it.
 type UsageSpan struct {
 	ID         string         `json:"id"`
 	ParentID   string         `json:"parent_id,omitempty"`
@@ -167,6 +185,7 @@ type UsageSpan struct {
 	Duration   time.Duration  `json:"duration"`
 	Model      string         `json:"model,omitempty"`
 	Usage      Usage          `json:"usage"`
+	Unbudgeted Usage          `json:"unbudgeted,omitzero"`
 	CostUSD    float64        `json:"cost_usd,omitempty"`
 	Err        string         `json:"err,omitempty"`
 	Attributes map[string]any `json:"attributes,omitempty"`

@@ -655,8 +655,6 @@ func TestRetryPendingTokensSettleOnEveryPath(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			lm := gepatest.NewFakeGenerator().Default(tt.replies...)
-			policy := tt.policy
-			policy.OnError = gepa.OnErrorSkip
 			var after gepa.BudgetRemaining
 			probe := gepa.NewStep("probe", nil, nil, func(ctx context.Context, _ gepa.State) error {
 				after = gepa.BudgetFrom(ctx).Remaining()
@@ -667,12 +665,14 @@ func TestRetryPendingTokensSettleOnEveryPath(t *testing.T) {
 				Steps: []gepa.Step{
 					gepa.WithPolicy(
 						modelStep("a", nestRetries(lm, 5), docKey.Ref(), gepa.Key[string]{Name: "a"}.Ref()),
-						policy,
+						tt.policy,
 					),
 					probe,
 				},
-				Defaults: []gepa.KeyDefault{gepa.DefaultValue(gepa.Key[string]{Name: "a"}, "")},
-				Budget:   tt.budget,
+				// the run goes on to the probe when a fails, as v0.8.0's skip on error let it.
+				Transitions: []gepa.Transition{{From: "a", OnError: true, To: "probe"}},
+				Defaults:    []gepa.Default{gepa.DefaultValue(gepa.Key[string]{Name: "a"}, "")},
+				Budget:      tt.budget,
 			}.Build()
 			require.NoError(t, err)
 
@@ -850,22 +850,21 @@ func TestRetryStopsWithoutWaitingWhenTheBudgetRefuses(t *testing.T) {
 	}
 }
 
-func TestRunBudgetStepLimitStaysSpentAcrossRetries(t *testing.T) {
+// v0.9.0: a policy retries Transient errors only, and a spent step limit is a Budget error, so
+// the step is not retried; v0.8.0 retried it under a retry predicate that accepted every error.
+func TestRunBudgetStepLimitIsNotRetried(t *testing.T) {
 	lm := gepatest.NewFakeGenerator()
-	retryAll := gepa.StepPolicy{Retry: gepa.RetryPolicy{MaxAttempts: 2, RetryIf: func(error) bool { return true }}}
+	retry := gepa.StepPolicy{Retry: gepa.RetryPolicy{MaxAttempts: 2}}
 	pipeline, err := gepa.PipelineSpec{
 		Inputs: refs(docKey.Ref()),
-		Steps:  []gepa.Step{gepa.WithPolicy(replyStep(lm, "a", "document", tenTokens), retryAll)},
+		Steps:  []gepa.Step{gepa.WithPolicy(replyStep(lm, "a", "document", tenTokens), retry)},
 		Budget: gepa.RunBudget{PerStepTokens: map[string]int{"a": 5}},
 	}.Build()
 	require.NoError(t, err)
 
 	_, err = pipeline.RunCandidate(context.Background(), nil, gepa.Prediction{"document": "cash 10"})
-	require.EqualError(
-		t,
-		err,
-		`pipeline step "a": after 2 attempts: run budget PerStepTokens["a"] 5 exceeded: 10 tokens spent`,
-	)
+	require.EqualError(t, err, `pipeline step "a": run budget PerStepTokens["a"] 5 exceeded: 10 tokens spent`)
+	require.True(t, gepa.IsBudget(err))
 	require.Equal(t, int32(1), calls(lm))
 }
 
@@ -880,14 +879,16 @@ func TestRunBudgetStepLimitCanFallBack(t *testing.T) {
 			return nil
 		},
 	)
-	pipeline, err := gepa.PipelineSpec{
+	spec := gepa.PipelineSpec{
 		Inputs: refs(docKey.Ref()),
-		Steps:  []gepa.Step{gepa.Fallback("guard", replyStep(lm, "a", "document", tenTokens), cheap)},
 		Budget: gepa.RunBudget{PerStepTokens: map[string]int{"a": 5}},
-	}.Build()
+	}
+	spec.Add(gepa.Fallback("guard", replyStep(lm, "a", "document", tenTokens), cheap))
+	pipeline, err := spec.Build()
 	require.NoError(t, err)
 
 	got, err := pipeline.RunCandidate(context.Background(), nil, gepa.Prediction{"document": "cash 10"})
 	require.NoError(t, err)
 	require.Equal(t, gepa.Prediction{"a": "cheap"}, got)
+	require.Equal(t, int32(1), calls(lm))
 }

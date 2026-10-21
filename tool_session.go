@@ -89,10 +89,12 @@ type ToolCallRecord struct {
 	Output     json.RawMessage `json:"output,omitempty"`
 	Text       string          `json:"text,omitempty"`
 	Provenance []Provenance    `json:"provenance,omitempty"`
-	// Usage is what the call spent; a cached call spends nothing.
-	Usage    Usage         `json:"usage"`
-	Err      string        `json:"err,omitempty"`
-	Duration time.Duration `json:"duration"`
+	// Usage is what the call spent against the run's budget and UnbudgetedUsage what it spent
+	// outside it (see ToolResult); a cached call spends nothing.
+	Usage           Usage         `json:"usage"`
+	UnbudgetedUsage Usage         `json:"unbudgeted_usage,omitzero"`
+	Err             string        `json:"err,omitempty"`
+	Duration        time.Duration `json:"duration"`
 	// Cached reports a call answered from the run's cache, without invoking the tool.
 	Cached bool `json:"cached,omitempty"`
 }
@@ -152,9 +154,10 @@ func ToolMemoryFrom(ctx context.Context) ToolMemory {
 // ToolSession runs the tool calls of one run under a ToolPolicy: it refuses unknown and
 // disallowed tools and calls past a limit, answers repeated calls from its cache, contains a
 // tool's panic as an error, records every call, applies the memory writes of successful
-// calls and records each call's usage with RecordUsage. Pipelines, agents and a Predict with
-// tools each start one per run. Create one with NewToolSession; a nil session refuses every
-// call. It is safe for concurrent use.
+// calls, records each call's usage with RecordUsage and RecordUnbudgetedUsage, and passes the
+// scope of the call's context to the tool (see WithToolScope). Pipelines, agents and a Predict
+// with tools each start one per run. Create one with NewToolSession; a nil session refuses
+// every call. It is safe for concurrent use.
 //
 // A session used inside a pipeline run, such as an agent's in a step or a nested pipeline's,
 // is also governed by the session of every enclosing pipeline run: each call must be allowed
@@ -288,12 +291,15 @@ func (s *ToolSession) Records() []ToolCallRecord {
 // tool, when ctx has ended, the tool is unknown (ErrUnknownTool) or not allowed
 // (ErrToolNotAllowed), or a call limit is spent (ErrToolCallLimit, a Budget error naming the
 // tool and the limit). A cached call returns the cached result. Otherwise the tool runs with a
-// context that carries the session's memory; a panic becomes an error with the stack in its
-// step details, output that is not valid JSON is an error, and so is a result that arrives
-// after ctx ended, which fails with the cause of ctx ending. The call's usage is recorded with
-// RecordUsage, failed calls included, and its memory writes apply only when it succeeds. Every
-// call that reaches the tool or the cache is recorded. Inside a pipeline run the policies of the
-// enclosing runs' sessions apply too, and the call is recorded in them (see ToolSession).
+// context that carries the session's memory, and the call it receives carries the scope ctx
+// carries (see WithToolScope) in place of any it had; a panic becomes an error with the stack
+// in its step details, and so are output that is not valid JSON, a Provenance entry that fails
+// Provenance.Validate, and a result that arrives after ctx ended, which fails with the cause of
+// ctx ending. The call's usage is recorded once with RecordUsage and its unbudgeted usage once
+// with RecordUnbudgetedUsage, failed calls included, and its memory writes apply only when it
+// succeeds. Every call that reaches the tool or the cache is recorded. Inside a pipeline run
+// the policies of the enclosing runs' sessions apply too, and the call is recorded in them (see
+// ToolSession).
 func (s *ToolSession) Call(ctx context.Context, call ToolCall) (ToolResult, ToolCallRecord, error) {
 	record := ToolCallRecord{
 		Step:      currentStep(ctx),
@@ -324,6 +330,7 @@ func (s *ToolSession) Call(ctx context.Context, call ToolCall) (ToolResult, Tool
 		record = withResult(record, result)
 		record.Cached = true
 		record.Usage = Usage{}
+		record.UnbudgetedUsage = Usage{}
 		s.record(ctx, record, enclosing)
 		return result, cloneRecord(record), nil
 	}
@@ -334,10 +341,12 @@ func (s *ToolSession) Call(ctx context.Context, call ToolCall) (ToolResult, Tool
 	if stage != nil {
 		memory = stage
 	}
+	call.Scope = ToolScopeFrom(ctx)
 	start := time.Now()
 	result, err := s.invoke(WithToolMemory(ctx, memory), call)
 	record.Duration = time.Since(start)
 	RecordUsage(ctx, result.Usage)
+	RecordUnbudgetedUsage(ctx, result.UnbudgetedUsage)
 	record = withResult(record, result)
 	if err == nil && ctx.Err() != nil {
 		err = context.Cause(ctx)
@@ -378,7 +387,8 @@ func applyMemoryWrites(memory ToolMemory, writes map[string]any) {
 	}
 }
 
-// invoke runs the tool, turning a panic into an error and rejecting output that is not JSON.
+// invoke runs the tool, turning a panic into an error and rejecting output that is not JSON
+// and provenance that is not valid.
 func (s *ToolSession) invoke(ctx context.Context, call ToolCall) (result ToolResult, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -390,10 +400,18 @@ func (s *ToolSession) invoke(ctx context.Context, call ToolCall) (result ToolRes
 	}()
 	result, err = s.tools[call.Name].Invoke(ctx, call)
 	result = result.clone()
-	if err == nil && len(result.Output) > 0 && !json.Valid(result.Output) {
+	if err != nil {
+		return result, err
+	}
+	if len(result.Output) > 0 && !json.Valid(result.Output) {
 		return result, errors.New("tool output is not valid JSON")
 	}
-	return result, err
+	for i, provenance := range result.Provenance {
+		if err := provenance.Validate(); err != nil {
+			return result, fmt.Errorf("invalid provenance %d: %w", i, err)
+		}
+	}
+	return result, nil
 }
 
 // cacheKey returns the cache key of call, when the policy caches and its arguments parse.
@@ -503,6 +521,7 @@ func withResult(record ToolCallRecord, result ToolResult) ToolCallRecord {
 	record.Text = result.transcriptText()
 	record.Provenance = result.Provenance
 	record.Usage = result.Usage
+	record.UnbudgetedUsage = result.UnbudgetedUsage
 	return cloneRecord(record)
 }
 

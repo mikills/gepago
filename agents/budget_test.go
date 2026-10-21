@@ -332,6 +332,50 @@ func TestAgentRecordsTheUsageOfAFailedChatCallOnce(t *testing.T) {
 	require.Equal(t, 1, result.Ledger.ModelCalls)
 }
 
+func TestAgentToolsUnbudgetedUsageIsNotCountedAgainstTheBudget(t *testing.T) {
+	tests := []struct {
+		name    string
+		budget  gepa.RunBudget
+		wantErr string
+	}{
+		{name: "MaxTokens below the unbudgeted usage", budget: gepa.RunBudget{MaxTokens: 40}},
+		{name: "MaxTokens at the budgeted usage", budget: gepa.RunBudget{MaxTokens: 7}},
+		{
+			name:    "MaxTokens one below the budgeted usage",
+			budget:  gepa.RunBudget{MaxTokens: 6},
+			wantErr: `pipeline step "agent": run budget MaxTokens 6 exceeded: 7 tokens spent`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			chat := Usage{TotalTokens: 3}
+			client := gepatest.NewFakeGenerator().Default(
+				gepatest.ToolCall("call-1", "bill", `{}`).WithUsage(chat),
+				gepatest.Text("done").WithUsage(chat),
+			)
+			agent := &Agent{
+				Name:         "billing",
+				Client:       client,
+				Model:        "fake",
+				ToolRegistry: billedRegistry(t, Usage{TotalTokens: 1}, Usage{TotalTokens: 50}, nil),
+				ToolNames:    []string{"bill"},
+			}
+			pipeline := agentPipeline(t, agent, tt.budget)
+			ctx, collector := gepa.WithUsageCollector(context.Background())
+
+			_, err := pipeline.Run(ctx, gepa.NewState(gepa.Prediction{"question": "hi"}))
+
+			require.Equal(t, Usage{TotalTokens: 57}, collector.Usage(), "the run sees the unbudgeted usage")
+			if tt.wantErr == "" {
+				require.NoError(t, err, "only the 7 budgeted tokens count against the budget")
+				return
+			}
+			require.EqualError(t, err, tt.wantErr)
+			require.True(t, gepa.IsBudget(err))
+		})
+	}
+}
+
 func TestAgentRefusedChatCallMakesNoCall(t *testing.T) {
 	agent, client := threeTurnAgent()
 	pipeline := agentPipeline(t, agent, gepa.RunBudget{MaxModelCalls: 1})

@@ -3,6 +3,7 @@ package gepa
 import (
 	"context"
 	"errors"
+	"maps"
 	"reflect"
 	"slices"
 	"sync"
@@ -16,23 +17,31 @@ import (
 // step has a span whose parent is the span of the run or of the execution around it. Every span
 // of a run has the TraceID of the run's RunContext, which the runs nested in it share (see
 // RunContext), and every event carries the run's RunContext, with its attributes redacted (see
-// Redactor). An execution is one run of a step: each retry attempt, each fallback step, each
-// cache hit and each skip on error is an execution of its own, numbered by Attempt. WithPolicy
-// and WithCache are not executions of their own; their attempts, fallbacks, cache hits and skips
-// are. A top-level step's writes are merged into the state as part of its execution, so a
+// Redactor). An execution is one run of a step: each retry attempt and each cache hit is an
+// execution of its own, numbered by Attempt. WithPolicy and WithCache are not executions of
+// their own; their attempts and cache hits are. A top-level step's writes are merged into the state as part of its execution, so a
 // MergeRule that fails fails that execution; for a top-level WithPolicy or WithCache step it
-// adds a failed execution after the one that wrote.
+// adds a failed execution after the one that wrote. The same holds for the step's transitions
+// on success, evaluated before its execution ends: a When, Amend or Accept that fails or panics
+// fails that execution. Each execution reports the visit of its top-level step in Attributes.
 //
 // The events of a run are ordered:
 //   - RunStarted comes before every other event of the run and RunFinished after them. A run
 //     that fails before its first step, because the pipeline is not built or its inputs are
 //     invalid, emits no events.
 //   - Every execution emits StepStarted and later StepFinished with the same span.
-//   - A top-level step finishes before the next one starts. An execution nested in a composite
-//     step (Branch, Parallel, Fallback, or the fallback step of an OnErrorFallback policy
-//     nested in one) starts after the composite starts and finishes before it finishes.
-//   - The attempts of a step follow each other in order. A skip, or the fallback step of an
-//     OnErrorFallback policy, follows the step's last failed attempt.
+//   - A top-level step finishes before the next one starts, and a top-level step a transition
+//     skips over emits nothing (see Transition). An execution nested in a composite step (a
+//     Parallel or an element of a Map) starts after the composite starts and finishes before it
+//     finishes.
+//   - The attempts of a step follow each other in order, except for the steps of a Map's body
+//     above a MaxConcurrency of one (see below).
+//   - With a MaxConcurrency of zero or one, the elements of a Map run in input order, each
+//     finishing before the next starts, so the attempts of its body follow each other in order.
+//     Above one, its elements start in any order, and the attempts of its body and of the steps
+//     nested in it interleave in any order, those of one element still following each other in
+//     order. The events of an element, and of the executions nested in it, carry its index in
+//     the list under Attributes["index"].
 //   - A pipeline run by a step, through NewProgramStep or a step that runs it with its
 //     context, joins the observation of the run: its RunStarted and RunFinished come between
 //     that step's StepStarted and StepFinished, and its run span's parent is the step's span.
@@ -41,12 +50,12 @@ import (
 //     observers, so the pipelines nested in it redact their events with its Redactor too (see
 //     Redactor); their run spans then have the span of a step no observer saw as their parent.
 //
-// Under Parallel the events of steps that run side by side interleave, but the observer and
-// redactor calls of one observed run, the runs nested in it included, are serialised: no two of
-// them run at once, and every observer of the run sees its events in the same order. Calls are
-// synchronous, so an observer that blocks stalls the run, and it must not wait for another step
-// of the same run. Separate top-level runs call a shared observer concurrently, even when they
-// share a TraceID because their callers gave them the same RunContext, so an observer of a
+// Under Parallel and Map the events of steps that run side by side interleave, but the observer
+// and redactor calls of one observed run, the runs nested in it included, are serialised: no two
+// of them run at once, and every observer of the run sees its events in the same order. Calls
+// are synchronous, so an observer that blocks stalls the run, and it must not wait for another
+// step of the same run. Separate top-level runs call a shared observer concurrently, even when
+// they share a TraceID because their callers gave them the same RunContext, so an observer of a
 // pipeline that runs concurrently must be safe for concurrent use.
 //
 // Observers are called in the order of PipelineSpec.Observers. An observer of a comparable
@@ -70,11 +79,48 @@ import (
 // The values an event carries pass through PipelineSpec.Redactor; see Redactor. Each observer
 // receives its own copy of them, its RunContext's Attributes included, so changing them changes
 // neither the run nor what other observers receive.
+//
+// An observer that also implements TransitionObserver receives the run's transitions too.
 type PipelineObserver interface {
 	RunStarted(ctx context.Context, event RunStartedEvent)
 	StepStarted(ctx context.Context, event StepStartedEvent)
 	StepFinished(ctx context.Context, event StepFinishedEvent)
 	RunFinished(ctx context.Context, event RunFinishedEvent)
+}
+
+// TransitionObserver is a PipelineObserver that also receives the transitions of the runs it
+// observes (see Transition), with the same ordering, serialisation, context and panic rules as
+// the other events: TransitionTaken follows the StepFinished of the last execution of the step
+// the transition leaves, after any RewindRejected for it, and comes before the next StepStarted
+// of the run. RecordingObserver is one.
+type TransitionObserver interface {
+	PipelineObserver
+	TransitionTaken(ctx context.Context, event TransitionTakenEvent)
+	RewindRejected(ctx context.Context, event RewindRejectedEvent)
+}
+
+// TransitionTakenEvent reports that a transition matched after its From step finished.
+type TransitionTakenEvent struct {
+	// RunContext is the RunContext of the run, as RunStarted reported it.
+	RunContext RunContext
+	// From and To name the steps the run moves between; To is End or Fail for those.
+	From string
+	To   string
+	// Rule is the transition's index in PipelineSpec.Transitions.
+	Rule int
+	// Rewind reports a transition to From itself or an earlier step.
+	Rewind bool
+}
+
+// RewindRejectedEvent reports that a rewind's Accept kept the visit before it: the values the
+// rewind's range committed before it are restored and the run goes on past Step.
+type RewindRejectedEvent struct {
+	// RunContext is the RunContext of the run, as RunStarted reported it.
+	RunContext RunContext
+	// Step is the From step of the rejected rewind.
+	Step string
+	// Rule is the rewind's index in PipelineSpec.Transitions.
+	Rule int
 }
 
 // RunStartedEvent reports the start of a pipeline run.
@@ -92,14 +138,18 @@ type RunStartedEvent struct {
 
 // RunFinishedEvent reports the end of a pipeline run.
 type RunFinishedEvent struct {
-	// Span is the run's finished span; its Duration and Usage are the event's, and its Err is
-	// the message of the event's Err.
+	// Span is the run's finished span; its Duration, Usage and Unbudgeted are the event's, and
+	// its Err is the message of the event's Err.
 	Span UsageSpan
 	// RunContext is the run's, as RunStarted reported it.
 	RunContext RunContext
 	Duration   time.Duration
 	// Usage is what the model calls of the run recorded, nested steps and pipelines included.
 	Usage Usage
+	// Unbudgeted is the usage the run recorded with RecordUnbudgetedUsage, such as its tool
+	// calls' ToolResult.UnbudgetedUsage, nested steps and pipelines included. Usage does not
+	// include it, and no budget counts it.
+	Unbudgeted Usage
 	// Err is the run's error, a *StepError without a Redactor; see Redactor.
 	Err error
 }
@@ -112,21 +162,26 @@ type StepStartedEvent struct {
 	// RunContext is the RunContext of the run the step belongs to, as RunStarted reported it.
 	RunContext RunContext
 	Step       string
-	// Attempt counts the step's executions in the run from one, cache hits and skips included.
+	// Attempt counts the step's executions in the run from one, cache hits included.
 	Attempt int
 	// Reads holds the values of the step's declared reads after redaction.
 	Reads map[string]any
 	// Lane names the step of a Parallel the execution belongs to when the execution is that step
-	// or one its step policy runs, such as a retry or an OnErrorFallback step; it is empty
-	// otherwise, for the executions nested in them too. The executions of different lanes of a
+	// or one its step policy runs, such as a retry; it is empty otherwise, for the executions
+	// nested in them too. The executions of different lanes of a
 	// Parallel run side by side, so they may start in any order.
 	Lane string
+	// Attributes describe where the execution runs. "visit" numbers, from one, the visits of the
+	// top-level step it belongs to: a rewind visits a step again (see Transition). "index" is set
+	// for the executions of an element of a Map, those nested in them included, to the element's
+	// index in the list, from zero; above a MaxConcurrency of one, elements start in any order.
+	Attributes map[string]int
 }
 
 // StepFinishedEvent reports the end of one execution of a step.
 type StepFinishedEvent struct {
-	// Span is the execution's finished span; its Duration and Usage are the event's, and its
-	// Err is the message of the event's Err.
+	// Span is the execution's finished span; its Duration, Usage and Unbudgeted are the event's,
+	// and its Err is the message of the event's Err.
 	Span UsageSpan
 	// RunContext is the RunContext of the run the step belongs to, as RunStarted reported it.
 	RunContext RunContext
@@ -135,6 +190,9 @@ type StepFinishedEvent struct {
 	Duration   time.Duration
 	// Usage is what the execution's model calls recorded, nested steps included.
 	Usage Usage
+	// Unbudgeted is the usage the execution recorded with RecordUnbudgetedUsage, nested steps
+	// included. Usage does not include it, and no budget counts it.
+	Unbudgeted Usage
 	// Err is the step's own error, before any enclosing step wraps it; see Redactor.
 	Err error
 	// Details holds the diagnostics the step attached to Err with WithStepDetails, after
@@ -148,13 +206,14 @@ type StepFinishedEvent struct {
 	Writes map[string]any
 	// Cached reports a WithCache hit: the step did not run and its cached writes were committed.
 	Cached bool
-	// Skipped reports a step that skipped on error under OnErrorSkip: the step did not run
-	// again, and Writes holds the defaults it committed.
-	Skipped bool
+	// Attributes are those StepStarted reported, and for a Map or MapCollect also "failed", the
+	// number of its elements that failed.
+	Attributes map[string]int
 	// ToolCalls holds the tool calls the execution made, through the run's ToolSession or any
 	// other, such as an agent's, in the order they finished, after redaction (see Redactor). The
 	// calls of the executions nested in it are in their own events. Each call's usage is part of
-	// Usage already, and a call answered from a ToolPolicy cache is marked Cached and has none.
+	// Usage already and its unbudgeted usage part of Unbudgeted, and a call answered from a
+	// ToolPolicy cache is marked Cached and has neither.
 	ToolCalls []ToolCallRecord
 }
 
@@ -384,16 +443,18 @@ func (r *runObservation) finish(ctx context.Context, err error) {
 		return
 	}
 	duration := time.Since(r.start)
-	usage := usageFrameFrom(ctx).total()
+	frame := usageFrameFrom(ctx)
+	usage, unbudgeted := frame.total(), frame.unbudgetedTotal()
 	r.trace.mu.Lock()
 	defer r.trace.mu.Unlock()
 	for lane := r; lane != nil; lane = lane.recording {
 		laneErr := lane.redactError(err)
 		event := RunFinishedEvent{
-			Span:       finishSpan(lane.span, duration, usage, laneErr),
+			Span:       finishSpan(lane.span, duration, usage, unbudgeted, laneErr),
 			RunContext: lane.runContext,
 			Duration:   duration,
 			Usage:      usage,
+			Unbudgeted: unbudgeted,
 			Err:        laneErr,
 		}
 		observerCtx := lane.observerContext(ctx)
@@ -409,18 +470,21 @@ func (r *runObservation) finish(ctx context.Context, err error) {
 // stepObservation reports one execution of a step, and recording, when set, reports it to an
 // evaluation's RecordingObserver; see runObservation.
 type stepObservation struct {
-	run       *runObservation
-	ctx       context.Context
-	span      UsageSpan
-	step      string
-	reads     map[string]any
-	recording *stepObservation
+	run        *runObservation
+	ctx        context.Context
+	span       UsageSpan
+	step       string
+	reads      map[string]any
+	attributes map[string]int
+	recording  *stepObservation
 }
 
 // observeStep emits StepStarted for an execution of node over values, the state its view
-// reads, when the run in ctx is observed. It returns ctx carrying the execution's span, and
-// nil when nothing observes the run.
-func observeStep(ctx context.Context, node *stepNode, attempt int, values map[string]any) (
+// reads, when the run in ctx is observed. visit is the visit of the top-level step the execution
+// belongs to. The events of a Map's executions, and of those nested in them, hide its elements'
+// items and outputs (see hideElements). It returns ctx carrying the execution's span, and nil
+// when nothing observes the run.
+func observeStep(ctx context.Context, node *stepNode, attempt, visit int, values map[string]any) (
 	context.Context,
 	*stepObservation,
 ) {
@@ -431,14 +495,16 @@ func observeStep(ctx context.Context, node *stepNode, attempt int, values map[st
 	next := &observeScope{}
 	var lanes []*stepObservation
 	if scope.run != nil {
-		span := NewUsageSpan(scope.run.span.TraceID, scope.span, UsageSpanPipelineStep, node.name)
-		next.run, next.span = scope.run, span.ID
-		lanes = append(lanes, &stepObservation{run: scope.run, span: span, step: node.name})
+		run := hideElements(node, scope.run)
+		span := NewUsageSpan(run.span.TraceID, scope.span, UsageSpanPipelineStep, node.name)
+		next.run, next.span = run, span.ID
+		lanes = append(lanes, &stepObservation{run: run, span: span, step: node.name})
 	}
 	if scope.recording != nil {
-		span := NewUsageSpan(scope.recording.span.TraceID, scope.recordingSpan, UsageSpanPipelineStep, node.name)
-		next.recording, next.recordingSpan = scope.recording, span.ID
-		lanes = append(lanes, &stepObservation{run: scope.recording, span: span, step: node.name})
+		recording := hideElements(node, scope.recording)
+		span := NewUsageSpan(recording.span.TraceID, scope.recordingSpan, UsageSpanPipelineStep, node.name)
+		next.recording, next.recordingSpan = recording, span.ID
+		lanes = append(lanes, &stepObservation{run: recording, span: span, step: node.name})
 	}
 	if len(lanes) == 0 {
 		return ctx, nil
@@ -460,6 +526,7 @@ func observeStep(ctx context.Context, node *stepNode, attempt int, values map[st
 		}
 		lane.ctx = ctx
 		lane.reads = lane.run.redactValues(reads)
+		lane.attributes = executionAttributes(ctx, visit)
 		event := StepStartedEvent{
 			Span:       lane.span,
 			RunContext: lane.run.runContext,
@@ -467,12 +534,14 @@ func observeStep(ctx context.Context, node *stepNode, attempt int, values map[st
 			Attempt:    attempt,
 			Reads:      lane.reads,
 			Lane:       scope.lane,
+			Attributes: lane.attributes,
 		}
 		observerCtx := lane.run.observerContext(ctx)
 		lane.run.deliver(func(observer PipelineObserver) {
 			event := event
 			event.RunContext = event.RunContext.clone()
 			event.Reads = copyValues(event.Reads)
+			event.Attributes = maps.Clone(event.Attributes)
 			observer.StepStarted(observerCtx, event)
 		})
 	}
@@ -508,21 +577,27 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 			}
 		}
 		toolCalls := run.redactToolCalls(outcome.ToolCalls)
+		attributes := lane.attributes
+		if len(outcome.Attributes) > 0 {
+			attributes = maps.Clone(attributes)
+			maps.Copy(attributes, outcome.Attributes)
+		}
 		event := StepFinishedEvent{
 			RunContext: run.runContext,
 			Step:       lane.step,
 			Attempt:    outcome.Attempt,
 			Duration:   outcome.Duration,
 			Usage:      outcome.Usage,
+			Unbudgeted: outcome.Unbudgeted,
 			Writes:     run.redactValues(writes),
 			Details:    run.redactDetails(details),
 			Reads:      lane.reads,
 			Cached:     outcome.Cached,
-			Skipped:    outcome.Skipped,
+			Attributes: attributes,
 		}
 		event.ToolCalls = run.scrubToolCalls(toolCalls)
 		event.Err = run.redactError(outcome.Err)
-		event.Span = finishSpan(lane.span, outcome.Duration, outcome.Usage, event.Err)
+		event.Span = finishSpan(lane.span, outcome.Duration, outcome.Usage, outcome.Unbudgeted, event.Err)
 		observerCtx := run.observerContext(lane.ctx)
 		run.deliver(func(observer PipelineObserver) {
 			event := event
@@ -531,7 +606,49 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 			event.Writes = copyValues(event.Writes)
 			event.Details = copyValues(event.Details)
 			event.ToolCalls = cloneRecords(event.ToolCalls)
+			event.Attributes = maps.Clone(event.Attributes)
 			observer.StepFinished(observerCtx, event)
+		})
+	}
+}
+
+// transitionTaken emits TransitionTaken to the observers that are TransitionObservers. ctx is
+// the run's context.
+func (r *runObservation) transitionTaken(ctx context.Context, event TransitionTakenEvent) {
+	r.deliverTransition(ctx, func(observer TransitionObserver, rc RunContext, observerCtx context.Context) {
+		event := event
+		event.RunContext = rc
+		observer.TransitionTaken(observerCtx, event)
+	})
+}
+
+// rewindRejected emits RewindRejected to the observers that are TransitionObservers. ctx is
+// the run's context.
+func (r *runObservation) rewindRejected(ctx context.Context, event RewindRejectedEvent) {
+	r.deliverTransition(ctx, func(observer TransitionObserver, rc RunContext, observerCtx context.Context) {
+		event := event
+		event.RunContext = rc
+		observer.RewindRejected(observerCtx, event)
+	})
+}
+
+// deliverTransition calls call for each TransitionObserver of the run and of its recording, with
+// a copy of the run's RunContext as its events carry it.
+func (r *runObservation) deliverTransition(
+	ctx context.Context,
+	call func(TransitionObserver, RunContext, context.Context),
+) {
+	if r == nil {
+		return
+	}
+	r.trace.mu.Lock()
+	defer r.trace.mu.Unlock()
+	for lane := r; lane != nil; lane = lane.recording {
+		observerCtx := lane.observerContext(ctx)
+		lane.deliver(func(observer PipelineObserver) {
+			if transitions, ok := observer.(TransitionObserver); ok {
+				call(transitions, lane.runContext.clone(), observerCtx)
+			}
 		})
 	}
 }
@@ -547,10 +664,11 @@ func (r *runObservation) deliver(call func(PipelineObserver)) {
 	}
 }
 
-func finishSpan(span UsageSpan, duration time.Duration, usage Usage, err error) UsageSpan {
+func finishSpan(span UsageSpan, duration time.Duration, usage, unbudgeted Usage, err error) UsageSpan {
 	span.EndedAt = span.StartedAt.Add(duration)
 	span.Duration = duration
 	span.Usage = usage
+	span.Unbudgeted = unbudgeted
 	span.Err = errorString(err)
 	return span
 }

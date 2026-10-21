@@ -40,15 +40,22 @@ type ToolProvider interface {
 // Output's JSON. MemoryWrites are applied to the run's ToolMemory only when the call succeeds,
 // and are dropped with the rest of the result when it fails; inside a pipeline they also wait
 // for the step that made the call to commit (see ToolMemory). Provenance says where the result
-// came from. Usage is what the tool spent on model calls it did not record itself: the caller
-// records it with RecordUsage, so it counts against the run's budget; a tool that calls
+// came from and which protected resources it touched; an entry that fails Provenance.Validate
+// fails the call. Usage is what the tool spent on model calls it did not record itself: the
+// caller records it with RecordUsage, so it counts against the run's budget; a tool that calls
 // RecordUsage, for example by running a Predict, must not report the same usage here.
+//
+// UnbudgetedUsage is usage the tool spent that the run must see but must not count against its
+// budget, such as a call billed elsewhere: the caller records it with RecordUnbudgetedUsage, so
+// it reaches the run's usage and step spans but no budget limit. The same rule applies: a tool
+// that records usage itself must not report it again here.
 type ToolResult struct {
-	Output       json.RawMessage `json:"output,omitempty"`
-	Text         string          `json:"text,omitempty"`
-	MemoryWrites map[string]any  `json:"memory_writes,omitempty"`
-	Provenance   []Provenance    `json:"provenance,omitempty"`
-	Usage        Usage           `json:"usage"`
+	Output          json.RawMessage `json:"output,omitempty"`
+	Text            string          `json:"text,omitempty"`
+	MemoryWrites    map[string]any  `json:"memory_writes,omitempty"`
+	Provenance      []Provenance    `json:"provenance,omitempty"`
+	Usage           Usage           `json:"usage"`
+	UnbudgetedUsage Usage           `json:"unbudgeted_usage,omitzero"`
 }
 
 // transcriptText returns what the model sees for the result: Text, or Output's JSON.
@@ -73,12 +80,35 @@ func (r ToolResult) clone() ToolResult {
 	return out
 }
 
-// Provenance records where part of a tool's result came from.
+// Provenance records a protected resource a tool's result touched, where part of the result
+// came from, or both. Validate requires Kind and ID together, or Source, or both pairs.
 type Provenance struct {
+	// Kind and ID name a protected resource for audit, such as "document" and its record id.
+	Kind string `json:"kind,omitempty"`
+	ID   string `json:"id,omitempty"`
 	// Source identifies the origin, such as a URL, a file path or a record id.
-	Source string `json:"source"`
+	Source string `json:"source,omitempty"`
 	// Detail locates or quotes the part of Source used, such as a line range or an excerpt.
 	Detail string `json:"detail,omitempty"`
+}
+
+// Validate reports a provenance that names neither a resource nor a source: Kind without ID or
+// ID without Kind, Detail without Source, or none of Kind, ID and Source. A field that holds
+// only white space counts as missing. The error names the missing field, never a value.
+func (p Provenance) Validate() error {
+	kind, id := strings.TrimSpace(p.Kind) != "", strings.TrimSpace(p.ID) != ""
+	source, detail := strings.TrimSpace(p.Source) != "", strings.TrimSpace(p.Detail) != ""
+	switch {
+	case kind && !id:
+		return errors.New("provenance has Kind but no ID")
+	case id && !kind:
+		return errors.New("provenance has ID but no Kind")
+	case detail && !source:
+		return errors.New("provenance has Detail but no Source")
+	case !kind && !source:
+		return errors.New("provenance is empty: set Kind and ID, or Source")
+	}
+	return nil
 }
 
 // NewTool returns a typed tool. Its schema is JSONSchemaFor[Args], so Args must be a struct
@@ -86,7 +116,9 @@ type Provenance struct {
 // rules Key.Get uses, and arguments that do not decode, or that Args' Validate method rejects,
 // fail the call with ErrInvalidToolArguments without running fn. fn's Out is encoded as JSON
 // into ToolResult.Output; the transcript text is that JSON, or the string itself when Out is
-// a string.
+// a string. fn's context carries the call's Scope in place of any scope it had, so
+// ToolScopeFrom(ctx) returns the run's scope (see WithToolScope), or the decoded scope of a
+// call a remote tool host serves.
 //
 // A schema that cannot be derived, an empty name or description, or a nil fn is reported by
 // the tool's Validate method, so ToolRegistry.Register rejects the tool.
@@ -129,7 +161,8 @@ func (t *typedTool[Args, Out]) Validate() error {
 	return t.schema.Validate()
 }
 
-// Invoke decodes the arguments into Args, runs the function and encodes its result.
+// Invoke decodes the arguments into Args, runs the function with a context that carries the
+// call's scope and encodes its result.
 func (t *typedTool[Args, Out]) Invoke(ctx context.Context, call ToolCall) (ToolResult, error) {
 	if err := t.Validate(); err != nil {
 		return ToolResult{}, err
@@ -138,7 +171,7 @@ func (t *typedTool[Args, Out]) Invoke(ctx context.Context, call ToolCall) (ToolR
 	if err != nil {
 		return ToolResult{}, PermanentError(fmt.Errorf("%w: %w", ErrInvalidToolArguments, err))
 	}
-	out, err := t.fn(ctx, args)
+	out, err := t.fn(WithToolScope(ctx, call.Scope), args)
 	if err != nil {
 		return ToolResult{}, err
 	}

@@ -17,18 +17,22 @@ type evaluationKey struct{}
 const maxProgramDepth = 32
 
 // evaluationCapture collects what ProgramEvaluator needs to redact one evaluated example: the
-// Redactors and key types of the pipelines the programme holds or runs, the values those runs
-// were given, wrote, tried to write or attached to their errors while the capture had a
-// Redactor, the tool calls their steps made, and, when recorder is set, the traces of the
-// top-level runs. Without a Redactor it keeps no values, so an evaluation without one holds no
-// more than it would without the capture; a Redactor that joins when its pipeline runs applies
-// only to values offered after it joined. known holds the pipelines already accounted for, by
-// their first step.
+// Redactors, key types and Maps of the pipelines the programme holds or runs, the values those
+// runs were given, wrote, tried to write or attached to their errors while the capture had a
+// Redactor, the items their Maps gave their elements among them, the tool calls their steps
+// made, and, when recorder is set, the traces of the top-level runs. Without a Redactor it keeps
+// no values, so an evaluation without one holds no more than it would without the capture; a
+// Redactor that joins when its pipeline runs applies only to values offered after it joined.
+// known holds the pipelines already accounted for, by their first step, and mapSteps one Map of
+// each shape in shapes, so a programme that builds a pipeline on each run does not add a Map
+// per run.
 type evaluationCapture struct {
 	recorder  *RecordingObserver
 	mu        sync.Mutex
 	redactors []Redactor
 	types     map[string]reflect.Type
+	mapSteps  []*mapStep
+	shapes    map[elementShape]bool
 	known     map[*stepNode]bool
 	values    []stateWrite
 	details   []stateWrite
@@ -37,10 +41,14 @@ type evaluationCapture struct {
 
 // newEvaluationCapture returns a capture holding the Redactors and key types of every Pipeline
 // program holds, as far as its structure shows them: the programme itself and the pipelines
-// its steps run through NewProgramStep, composite steps and policy fallbacks included. A
+// its steps run through NewProgramStep, composite steps included. A
 // pipeline reached only through another kind of Program joins when it runs.
 func newEvaluationCapture(program Program) *evaluationCapture {
-	capture := &evaluationCapture{types: map[string]reflect.Type{}, known: map[*stepNode]bool{}}
+	capture := &evaluationCapture{
+		types:  map[string]reflect.Type{},
+		shapes: map[elementShape]bool{},
+		known:  map[*stepNode]bool{},
+	}
 	capture.addProgram(program, 0)
 	return capture
 }
@@ -61,6 +69,8 @@ func (c *evaluationCapture) fork(recorder *RecordingObserver) *evaluationCapture
 		recorder:  recorder,
 		redactors: slices.Clone(c.redactors),
 		types:     maps.Clone(c.types),
+		mapSteps:  slices.Clone(c.mapSteps),
+		shapes:    maps.Clone(c.shapes),
 		known:     maps.Clone(c.known),
 	}
 }
@@ -100,9 +110,9 @@ func (c *evaluationCapture) addStep(node *stepNode, depth int) {
 	}
 }
 
-// addPipeline records the Redactor and key types of p unless p is already known, and reports
-// whether it was new. The first pipeline to declare a key gives its type. The caller holds mu
-// when c is shared.
+// addPipeline records the Redactor, key types and Maps of p unless p is already known, and
+// reports whether it was new. The first pipeline to declare a key gives its type. The caller
+// holds mu when c is shared.
 func (c *evaluationCapture) addPipeline(p Pipeline) bool {
 	if len(p.steps) == 0 || c.known[p.steps[0]] {
 		return false
@@ -122,8 +132,24 @@ func (c *evaluationCapture) addPipeline(p Pipeline) bool {
 				c.types[name] = typ
 			}
 		}
+		c.addMaps(node)
 	}
 	return true
+}
+
+// addMaps records the Maps among node and the steps nested in it, but not those of the
+// pipelines they run, which are added as pipelines of their own. A Map of a shape already
+// recorded is not, since hideMapElements hides the same values through it.
+func (c *evaluationCapture) addMaps(node *stepNode) {
+	if m, ok := unwrapComposite(node.step).(*mapStep); ok && !c.shapes[m.elementShape()] {
+		c.shapes[m.elementShape()] = true
+		c.mapSteps = append(c.mapSteps, m)
+	}
+	if composite, ok := node.step.(compositeStep); ok {
+		for _, child := range composite.children() {
+			c.addMaps(child.node)
+		}
+	}
 }
 
 // join records a run of p and returns the recorder a top-level run reports to, if any.
@@ -203,6 +229,7 @@ func (c *evaluationCapture) apply(item EvaluationItem) EvaluationItem {
 	redaction := evaluationRedaction{
 		redactors: slices.Clone(c.redactors),
 		types:     maps.Clone(c.types),
+		mapSteps:  slices.Clone(c.mapSteps),
 		values:    slices.Clone(c.values),
 		details:   slices.Clone(c.details),
 		toolCalls: cloneRecords(c.toolCalls),

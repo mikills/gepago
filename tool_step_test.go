@@ -394,12 +394,23 @@ func TestPipelineStagesToolMemoryWritesUntilTheStepCommits(t *testing.T) {
 	registry, err := NewToolRegistry(rememberTool(nil))
 	require.NoError(t, err)
 	errStep := errors.New("step failed")
-	run := func(t *testing.T, memory ToolMemory, steps ...Step) error {
+	runFlow := func(t *testing.T, memory ToolMemory, flow Flow) error {
 		t.Helper()
-		pipeline, err := PipelineSpec{Steps: steps, Tools: registry}.Build()
+		spec := PipelineSpec{Tools: registry}
+		spec.Add(flow)
+		pipeline, err := spec.Build()
 		require.NoError(t, err)
 		_, err = pipeline.Run(WithToolMemory(context.Background(), memory), NewState(nil))
 		return err
+	}
+	run := func(t *testing.T, memory ToolMemory, steps ...Step) error {
+		t.Helper()
+		return runFlow(t, memory, Flow{Steps: steps})
+	}
+	// passedOver is a flow whose step fails and an OnError transition ends the run, as a step
+	// that skipped on error did in v0.8.0.
+	passedOver := func(step Step) Flow {
+		return Flow{Steps: []Step{step}, Transitions: []Transition{{From: step.Name(), OnError: true, To: End}}}
 	}
 	requireMemory := func(t *testing.T, memory ToolMemory, want map[string]any, absent ...string) {
 		t.Helper()
@@ -462,13 +473,9 @@ func TestPipelineStagesToolMemoryWritesUntilTheStepCommits(t *testing.T) {
 		requireMemory(t, memory, map[string]any{"attempt 2": "2"}, "attempt 1")
 	})
 
-	t.Run("a skipped step's writes are dropped", func(t *testing.T) {
+	t.Run("a step an OnError transition passes over drops its writes", func(t *testing.T) {
 		memory := NewToolMemory()
-		err := run(
-			t,
-			memory,
-			WithPolicy(rememberStep("skipped", "dropped", "1", errStep), StepPolicy{OnError: OnErrorSkip}),
-		)
+		err := runFlow(t, memory, passedOver(rememberStep("skipped", "dropped", "1", errStep)))
 		require.NoError(t, err)
 		requireMemory(t, memory, nil, "dropped")
 	})
@@ -482,17 +489,19 @@ func TestPipelineStagesToolMemoryWritesUntilTheStepCommits(t *testing.T) {
 			<-ctx.Done()
 			return nil
 		})
-		err := run(t, memory, WithPolicy(late, StepPolicy{Timeout: 10 * time.Millisecond, OnError: OnErrorSkip}))
+		err := runFlow(t, memory, passedOver(WithPolicy(late, StepPolicy{Timeout: 10 * time.Millisecond})))
 		require.NoError(t, err)
 		requireMemory(t, memory, nil, "dropped")
 	})
 
 	t.Run("a fallback's writes replace the failed step's", func(t *testing.T) {
 		memory := NewToolMemory()
-		step := WithPolicy(rememberStep("primary", "primary", "1", errStep), StepPolicy{
-			OnError: OnErrorFallback(rememberStep("backup", "backup", "1", nil)),
-		})
-		require.NoError(t, run(t, memory, step))
+		flow := Fallback(
+			"guard",
+			rememberStep("primary", "primary", "1", errStep),
+			rememberStep("backup", "backup", "1", nil),
+		)
+		require.NoError(t, runFlow(t, memory, flow))
 		requireMemory(t, memory, map[string]any{"backup": "1"}, "primary")
 	})
 
@@ -599,16 +608,22 @@ func TestPipelineStagesCachedToolResultsWithTheStep(t *testing.T) {
 		calls   int32
 		records []ToolCallRecord
 	}
-	run := func(t *testing.T, cache bool, steps ...Step) outcome {
+	runFlow := func(t *testing.T, cache bool, flow Flow) outcome {
 		t.Helper()
 		calls := &atomic.Int32{}
 		registry, err := NewToolRegistry(rememberTool(calls))
 		require.NoError(t, err)
-		pipeline, err := PipelineSpec{Steps: steps, Tools: registry, ToolPolicy: ToolPolicy{Cache: cache}}.Build()
+		spec := PipelineSpec{Tools: registry, ToolPolicy: ToolPolicy{Cache: cache}}
+		spec.Add(flow)
+		pipeline, err := spec.Build()
 		require.NoError(t, err)
 		memory := NewToolMemory()
 		_, pipelineRun, err := pipeline.execute(WithToolMemory(context.Background(), memory), nil, Prediction{})
 		return outcome{err: err, memory: memory, calls: calls.Load(), records: pipelineRun.tools.Records()}
+	}
+	run := func(t *testing.T, cache bool, steps ...Step) outcome {
+		t.Helper()
+		return runFlow(t, cache, Flow{Steps: steps})
 	}
 	requireCharged := func(t *testing.T, got outcome) {
 		t.Helper()
@@ -641,18 +656,23 @@ func TestPipelineStagesCachedToolResultsWithTheStep(t *testing.T) {
 	})
 
 	t.Run("a fallback repeats the failed step's call", func(t *testing.T) {
-		got := run(t, true, WithPolicy(rememberStep("primary", "charged", "yes", errStep), StepPolicy{
-			OnError: OnErrorFallback(rememberStep("backup", "charged", "yes", nil)),
-		}))
+		got := runFlow(t, true, Fallback(
+			"guard",
+			rememberStep("primary", "charged", "yes", errStep),
+			rememberStep("backup", "charged", "yes", nil),
+		))
 		requireCharged(t, got)
 		require.EqualValues(t, 2, got.calls)
 	})
 
-	t.Run("a later step repeats a skipped step's call", func(t *testing.T) {
-		got := run(t, true,
-			WithPolicy(rememberStep("skipped", "charged", "yes", errStep), StepPolicy{OnError: OnErrorSkip}),
-			rememberStep("later", "charged", "yes", nil),
-		)
+	t.Run("a later step repeats the call of a step an OnError transition passes over", func(t *testing.T) {
+		got := runFlow(t, true, Flow{
+			Steps: []Step{
+				rememberStep("skipped", "charged", "yes", errStep),
+				rememberStep("later", "charged", "yes", nil),
+			},
+			Transitions: []Transition{{From: "skipped", OnError: true, To: "later"}},
+		})
 		requireCharged(t, got)
 		require.EqualValues(t, 2, got.calls)
 	})
