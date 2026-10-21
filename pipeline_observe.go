@@ -35,11 +35,15 @@ import (
 //     skips over emits nothing (see Transition). An execution nested in a composite step (a
 //     Parallel, an element of a Map, or the fallback step of an OnErrorFallback policy nested in
 //     one) starts after the composite starts and finishes before it finishes.
-//   - The attempts of a step follow each other in order. A skip, or the fallback step of an
+//   - The attempts of a step follow each other in order, except for the steps of a Map's body
+//     above a MaxConcurrency of one (see below). A skip, or the fallback step of an
 //     OnErrorFallback policy, follows the step's last failed attempt.
-//   - The elements of a Map start in input order. With a MaxConcurrency of one or zero each
-//     finishes before the next starts; above one, the events of elements that run side by side
-//     interleave.
+//   - With a MaxConcurrency of zero or one, the elements of a Map run in input order, each
+//     finishing before the next starts, so the attempts of its body follow each other in order.
+//     Above one, its elements start in any order, and the attempts of its body and of the steps
+//     nested in it interleave in any order, those of one element still following each other in
+//     order. The events of an element, and of the executions nested in it, carry its index in
+//     the list under Attributes["index"].
 //   - A pipeline run by a step, through NewProgramStep or a step that runs it with its
 //     context, joins the observation of the run: its RunStarted and RunFinished come between
 //     that step's StepStarted and StepFinished, and its run span's parent is the step's span.
@@ -172,7 +176,7 @@ type StepStartedEvent struct {
 	// Attributes describe where the execution runs. "visit" numbers, from one, the visits of the
 	// top-level step it belongs to: a rewind visits a step again (see Transition). "index" is set
 	// for the executions of an element of a Map, those nested in them included, to the element's
-	// index in the list, from zero.
+	// index in the list, from zero; above a MaxConcurrency of one, elements start in any order.
 	Attributes map[string]int
 }
 
@@ -482,8 +486,9 @@ type stepObservation struct {
 
 // observeStep emits StepStarted for an execution of node over values, the state its view
 // reads, when the run in ctx is observed. visit is the visit of the top-level step the execution
-// belongs to. It returns ctx carrying the execution's span, and nil when nothing observes the
-// run.
+// belongs to. The events of a Map's executions, and of those nested in them, hide its elements'
+// items and outputs (see hideElements). It returns ctx carrying the execution's span, and nil
+// when nothing observes the run.
 func observeStep(ctx context.Context, node *stepNode, attempt, visit int, values map[string]any) (
 	context.Context,
 	*stepObservation,
@@ -495,14 +500,16 @@ func observeStep(ctx context.Context, node *stepNode, attempt, visit int, values
 	next := &observeScope{}
 	var lanes []*stepObservation
 	if scope.run != nil {
-		span := NewUsageSpan(scope.run.span.TraceID, scope.span, UsageSpanPipelineStep, node.name)
-		next.run, next.span = scope.run, span.ID
-		lanes = append(lanes, &stepObservation{run: scope.run, span: span, step: node.name})
+		run := hideElements(node, scope.run)
+		span := NewUsageSpan(run.span.TraceID, scope.span, UsageSpanPipelineStep, node.name)
+		next.run, next.span = run, span.ID
+		lanes = append(lanes, &stepObservation{run: run, span: span, step: node.name})
 	}
 	if scope.recording != nil {
-		span := NewUsageSpan(scope.recording.span.TraceID, scope.recordingSpan, UsageSpanPipelineStep, node.name)
-		next.recording, next.recordingSpan = scope.recording, span.ID
-		lanes = append(lanes, &stepObservation{run: scope.recording, span: span, step: node.name})
+		recording := hideElements(node, scope.recording)
+		span := NewUsageSpan(recording.span.TraceID, scope.recordingSpan, UsageSpanPipelineStep, node.name)
+		next.recording, next.recordingSpan = recording, span.ID
+		lanes = append(lanes, &stepObservation{run: recording, span: span, step: node.name})
 	}
 	if len(lanes) == 0 {
 		return ctx, nil

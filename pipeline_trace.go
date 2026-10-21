@@ -80,8 +80,10 @@ type StepTrace struct {
 	// with each Output compacted as encoding/json writes it, or stored as a JSON string when it
 	// is not JSON.
 	ToolCalls []ToolCallRecord `json:"tool_calls,omitempty"`
-	// Steps holds the executions nested in this one, such as the attempts of a WithPolicy or the steps
-	// of a Parallel, in the order they started.
+	// Steps holds the executions nested in this one, such as the attempts of a WithPolicy, the
+	// steps of a Parallel or the elements of a Map, in the order they started. A Map's elements
+	// start in input order only at a MaxConcurrency of zero or one, and in any order above it, so
+	// each carries its index in the list under Attributes["index"] (see PipelineObserver).
 	Steps []StepTrace `json:"steps,omitempty"`
 	// Runs holds the pipeline runs this execution started, such as the run of a pipeline
 	// adapted with NewProgramStep.

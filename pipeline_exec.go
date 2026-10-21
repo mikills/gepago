@@ -459,8 +459,9 @@ func (h *finishHold) release(err error) bool {
 // execution ends, given the step's scope, which holds the values the step wrote or tried to
 // write and the attributes it reported. An execution directly inside a top-level wrapper
 // reports a success through the wrapper's hold (see finishHold); the executions inside it
-// report their own. An execution that an element of a Map runs itself adds its usage to the
-// element's when it ends, whether or not a hold delays its report, so the usage counts once.
+// report their own. An execution that an element of a Map runs itself adds its usage, budgeted
+// and unbudgeted, to the element's when it ends, whether or not a hold delays its report, so
+// the usage counts once.
 func beginExecution(ctx context.Context, node *stepNode, values map[string]any) (
 	context.Context,
 	func(stepResult, error, *stepScope),
@@ -489,7 +490,7 @@ func beginExecution(ctx context.Context, node *stepNode, values map[string]any) 
 			ToolCalls:  frame.toolCallRecords(),
 			Attributes: scope.reported(),
 		}
-		element.add(outcome.Usage)
+		element.add(outcome.Usage.Add(outcome.Unbudgeted))
 		hold.finish(outcome, result, func(outcome stepOutcome, result stepResult) {
 			run.record(outcome)
 			capture.offerStep(attempted, outcome.Err)
@@ -544,13 +545,19 @@ func beginStandIn(ctx context.Context, kind standIn, node *stepNode, values map[
 // stepCanStart reports why a step must not start: its context has ended or a budget that
 // covers it is spent.
 func stepCanStart(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		if cause := stopCause(ctx); cause != nil {
-			return cause
-		}
-		return err
+	if ctx.Err() != nil {
+		return contextEnd(ctx)
 	}
 	return usageFrameFrom(ctx).check()
+}
+
+// contextEnd returns the error a step reports because ctx has ended: the cause the pipeline
+// reports in place of a step's own error (see stopCause), or else ctx.Err().
+func contextEnd(ctx context.Context) error {
+	if cause := stopCause(ctx); cause != nil {
+		return cause
+	}
+	return ctx.Err()
 }
 
 // stopCause returns the cause of ctx ending when the pipeline reports it in place of a step's

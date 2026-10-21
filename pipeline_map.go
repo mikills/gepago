@@ -22,9 +22,10 @@ type MapOptions struct {
 
 // MapResult is what MapCollect writes for one element: its Index in the list, the body's output
 // as Value and an empty Error when it succeeded, and otherwise the zero Value and the element's
-// error message as Error, as the run's events carry it (see Redactor). Usage is what the
-// element's model calls recorded, its unbudgeted usage apart, and Duration how long it ran.
-// Error is a string so results serialise into traces and artefacts.
+// error message as Error, as the run's events carry it (see Redactor). Usage is the element's
+// total usage, budgeted and unbudgeted together as RunWithUsage reports a run's, attempts and
+// nested steps included, and Duration how long it ran. Error is a string so results serialise
+// into traces and artefacts.
 type MapResult[Out any] struct {
 	Index    int           `json:"index"`
 	Value    Out           `json:"value"`
@@ -47,15 +48,16 @@ type MapResult[Out any] struct {
 // it is not a top-level step, and its policy may not skip on error. A rewind that runs the Map
 // again runs every element again.
 //
-// Elements run at most opts.MaxConcurrency at a time, one at a time when it is zero, and must be
-// safe to run concurrently with each other. More than opts.MaxItems items, when it is set, fail
-// the step with a Permanent error before any element runs. The first element to fail cancels
-// the context of those still running, no further element starts, and once the running ones
-// return the Map fails with an error naming the element's index and body, and commits nothing:
-// neither results nor what any element staged for tools, its tool memory writes and cached tool
-// results. When every element succeeds the Map commits results, and what every element staged
-// for tools in input order. A panic in an element is that element's error, with the stack under
-// Details["stack"].
+// Elements run at most opts.MaxConcurrency at a time, and must be safe to run concurrently with
+// each other. At zero or one they run one at a time in input order; above one they start, and
+// report their events, in any order (see PipelineObserver). More than opts.MaxItems items, when
+// it is set, fail the step with a Permanent error before any element runs. The first element to
+// fail cancels the context of those still running, no further element starts, and once the
+// running ones return the Map fails with an error naming the element's index and body, and
+// commits nothing: neither results nor what any element staged for tools, its tool memory writes
+// and cached tool results. When every element succeeds the Map commits results, and what every
+// element staged for tools in input order. A panic in an element is that element's error, with
+// the stack under Details["stack"].
 //
 // Elements share the run's budget, tool session and tool scope (see WithToolScope). Their usage
 // counts once in the Map's and against the Map's PerStepTokens limit; body's own PerStepTokens
@@ -63,9 +65,13 @@ type MapResult[Out any] struct {
 // Map's execution, whose StepStarted and StepFinished events carry the element's index, from
 // zero, under Attributes["index"] beside "visit", as do the executions nested in it, and whose
 // StepPathFrom is "<map>.<body>". The Map's StepFinished carries under Attributes["failed"] how
-// many elements failed. An element's events carry its element under the item key and its output
-// under the key body writes, and a Redactor sees them under those keys (see Redactor), so one
-// that hides the list under items should hide the item key too.
+// many elements failed.
+//
+// An element's events carry its element under the item key and its output under the key body
+// writes. A Redactor that hides the list under items hides every element's item, and one that
+// hides results every element's output: the events of the Map and of every execution and run
+// nested in it carry RedactedText in their place, and their text is removed from error
+// messages, MapCollect's included (see Redactor).
 //
 // body is a nested step: its name must be unique in the pipeline and its components are scoped
 // as "<map>.<body>.<component>", one set that every element shares. The Map is a ComponentStep
@@ -84,8 +90,10 @@ func Map[In, Out any](
 // MapCollect is Map, except that it runs every element whatever the others do and writes a
 // MapResult for each, in input order, so a later step can tell which elements are missing. Only
 // what the elements that succeeded staged for tools commits. A Budget error (see IsBudget) in an
-// element, or the end of the context the MapCollect runs under, still stops it as an element's
-// failure stops a Map: no further element starts and the step fails.
+// element still stops it as an element's failure stops a Map: no further element starts and the
+// step fails with that element's error. So does the end of the context the MapCollect runs
+// under, but the step then fails with that end, as a step that cannot start because of it does,
+// whatever error the elements it stopped returned.
 func MapCollect[In, Out any](
 	name string,
 	items Key[[]In],
@@ -118,6 +126,7 @@ func newMapStep[In any](
 		opts:    opts,
 		collect: collect,
 		split:   splitList[In],
+		single:  singleList[In],
 		join:    join,
 	}
 	others := slices.DeleteFunc(slices.Clone(m.body.reads), func(key KeyRef) bool { return key.Name == m.item.Name })
@@ -136,6 +145,12 @@ func splitList[In any](value any) ([]any, bool) {
 		elements[i] = element
 	}
 	return elements, true
+}
+
+// singleList returns a []In holding only value, or the zero In when value is not one.
+func singleList[In any](value any) any {
+	element, _ := value.(In)
+	return []In{element}
 }
 
 // joinValues returns the outputs of every element as a []Out.
@@ -164,8 +179,8 @@ func joinResults[Out any](outcomes []elementOutcome) any {
 }
 
 // mapStep is a Map or, with collect set, a MapCollect. out is the type body writes, split
-// returns the elements of the list under items, and join builds the value of results from the
-// outcome of every element.
+// returns the elements of the list under items, single a list of the items' type holding only
+// one value, and join builds the value of results from the outcome of every element.
 type mapStep struct {
 	name    string
 	items   KeyRef
@@ -177,6 +192,7 @@ type mapStep struct {
 	collect bool
 	reads   []KeyRef
 	split   func(any) ([]any, bool)
+	single  func(any) any
 	join    func([]elementOutcome) any
 }
 
@@ -305,8 +321,9 @@ func (m *mapStep) runCandidate(ctx context.Context, candidate Candidate, s State
 }
 
 // runElements runs body over elements, at most MaxConcurrency at a time, and returns the
-// outcome of each, or the error that stopped the map: the failure of the first element that
-// stops it, or the end of ctx, the context the map runs under, before every element started.
+// outcome of each, or the error that stopped the map: the error of the first element that
+// stops it (see stopsWith), or the end of ctx, the context the map runs under, before every
+// element started.
 func (m *mapStep) runElements(ctx context.Context, candidate Candidate, elements []any, values map[string]any) (
 	[]elementOutcome,
 	error,
@@ -328,12 +345,13 @@ func (m *mapStep) runElements(ctx context.Context, candidate Candidate, elements
 			defer func() { <-slots }()
 			outcome := m.runElement(elementsCtx, candidate, i, element, values)
 			outcomes[i] = outcome
-			if outcome.err == nil || !m.stops(ctx, outcome.err) {
+			failure := m.stopsWith(ctx, outcome)
+			if failure == nil {
 				return
 			}
 			mu.Lock()
 			if stop == nil {
-				stop = outcome.failure
+				stop = failure
 			}
 			mu.Unlock()
 			cancel(errMapElementFailed)
@@ -344,10 +362,7 @@ func (m *mapStep) runElements(ctx context.Context, candidate Candidate, elements
 	case stop != nil:
 		return outcomes, stop
 	case started < len(elements):
-		if cause := stopCause(ctx); cause != nil {
-			return outcomes, cause
-		}
-		return outcomes, ctx.Err()
+		return outcomes, contextEnd(ctx)
 	}
 	return outcomes, nil
 }
@@ -367,10 +382,20 @@ func takeSlot(ctx context.Context, slots chan struct{}) bool {
 	return true
 }
 
-// stops reports whether an element's error stops the map: any error stops a Map, and a Budget
-// error or the end of ctx, the context the map runs under, stops a MapCollect too.
-func (m *mapStep) stops(ctx context.Context, err error) bool {
-	return !m.collect || IsBudget(err) || ctx.Err() != nil
+// stopsWith returns the error an element that ended with outcome stops the map with, or nil
+// when the map goes on. Any failure stops a Map, and a Budget error a MapCollect, with the
+// element's failure. Once ctx, the context the map runs under, has ended, any failure stops a
+// MapCollect with that end, as stepCanStart reports it.
+func (m *mapStep) stopsWith(ctx context.Context, outcome elementOutcome) error {
+	switch {
+	case outcome.err == nil:
+		return nil
+	case !m.collect || IsBudget(outcome.err):
+		return outcome.failure
+	case ctx.Err() != nil:
+		return contextEnd(ctx)
+	}
+	return nil
 }
 
 // runElement runs body once, over element, on a view holding the element under the item key

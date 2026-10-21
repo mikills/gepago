@@ -232,6 +232,99 @@ func TestMapConcurrencyLimit(t *testing.T) {
 	}
 }
 
+// retriedMeasure is a Map body that fails each element's first attempt with a transient error,
+// which its policy retries, after a pause that is longer for shorter words.
+func retriedMeasure() Step {
+	var mu sync.Mutex
+	tried := map[string]bool{}
+	flaky := measureWith(func(_ context.Context, word string) (int, error) {
+		time.Sleep(time.Duration(5-len(word)) * 2 * time.Millisecond)
+		mu.Lock()
+		first := !tried[word]
+		tried[word] = true
+		mu.Unlock()
+		if first {
+			return 0, errRateLimited
+		}
+		return len(word), nil
+	})
+	return WithPolicy(flaky, StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}})
+}
+
+func TestMapRunsElementsInInputOrderUpToAConcurrencyOfOne(t *testing.T) {
+	for _, limit := range []int{0, 1} {
+		t.Run(fmt.Sprintf("MaxConcurrency %d", limit), func(t *testing.T) {
+			log := &eventLog{}
+			pipeline := mapPipeline(t, lengthsOf(retriedMeasure(), MapOptions{MaxConcurrency: limit}), log)
+
+			got, err := pipeline.RunCandidate(context.Background(), nil, wordsInput("a", "bb", "ccc"))
+
+			require.NoError(t, err)
+			require.Equal(t, Prediction{"lengths": []int{1, 2, 3}}, got)
+			require.Equal(t, []string{
+				"start run",
+				"start lengths#1 in run",
+				"start measure#1 in lengths#1",
+				"finish measure#1 err: rate limited",
+				"start measure#2 in lengths#1",
+				"finish measure#2",
+				"start measure#3 in lengths#1",
+				"finish measure#3 err: rate limited",
+				"start measure#4 in lengths#1",
+				"finish measure#4",
+				"start measure#5 in lengths#1",
+				"finish measure#5 err: rate limited",
+				"start measure#6 in lengths#1",
+				"finish measure#6",
+				"finish lengths#1",
+				"finish run",
+			}, log.Lines(), "each element, attempts included, finishes before the next starts")
+			var indices []int
+			for _, event := range log.stepsStarted[1:] {
+				indices = append(indices, event.Attributes["index"])
+			}
+			require.Equal(t, []int{0, 0, 1, 1, 2, 2}, indices, "the elements start in input order")
+		})
+	}
+}
+
+func TestMapElementsAboveAConcurrencyOfOneCarryTheirIndex(t *testing.T) {
+	log := &eventLog{}
+	traces := &RecordingObserver{}
+	pipeline := mapPipeline(t, lengthsOf(retriedMeasure(), MapOptions{MaxConcurrency: 4}), log, traces)
+
+	got, err := pipeline.RunCandidate(context.Background(), nil, wordsInput("a", "bb", "ccc", "dddd"))
+
+	require.NoError(t, err)
+	require.Equal(t, Prediction{"lengths": []int{1, 2, 3, 4}}, got)
+	started := map[string]StepStartedEvent{}
+	for _, event := range log.stepsStarted {
+		started[event.Span.ID] = event
+	}
+	elements := map[int][]StepFinishedEvent{}
+	for _, event := range log.finishedOf("measure") {
+		index := event.Attributes["index"]
+		require.Equal(t, index, started[event.Span.ID].Attributes["index"], "StepStarted and StepFinished agree")
+		elements[index] = append(elements[index], event)
+	}
+	require.Len(t, elements, 4)
+	for index, events := range elements {
+		require.Len(t, events, 2, "element %d", index)
+		require.Error(t, events[0].Err, "element %d fails first", index)
+		require.NoError(t, events[1].Err, "element %d", index)
+		require.Less(t, events[0].Attempt, events[1].Attempt, "the attempts of one element follow each other in order")
+	}
+
+	trace := onlyRecordedTrace(t, traces)
+	require.Len(t, trace.Steps, 1)
+	var traced []int
+	for _, element := range trace.Steps[0].Steps {
+		traced = append(traced, element.Attributes["index"])
+	}
+	slices.Sort(traced)
+	require.Equal(t, []int{0, 0, 1, 1, 2, 2, 3, 3}, traced, "the trace finds every element by its index")
+}
+
 func TestMapFailureCancelsSiblingsAndCommitsNothing(t *testing.T) {
 	var started sync.WaitGroup
 	started.Add(3)
@@ -610,24 +703,53 @@ func TestMapBudgetErrorStopsLaterElements(t *testing.T) {
 }
 
 func TestMapCollectFailsWhenItsContextEnds(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	var ran atomic.Int32
-	body := measureWith(func(_ context.Context, word string) (int, error) {
-		ran.Add(1)
-		if word == "stop" {
-			cancel()
-		}
-		return len(word), nil
-	})
-	pipeline := mapPipeline(t, collectLengths(body, MapOptions{}))
+	tests := []struct {
+		name  string
+		fails bool
+		words []string
+		opts  MapOptions
+	}{
+		{name: "no element starts once the run is cancelled", words: []string{"a", "stop", "b"}},
+		{
+			name:  "an element that fails once the run is cancelled reports the cancellation",
+			fails: true,
+			words: []string{"a", "stop"},
+		},
+		{
+			name:  "so does one running beside others",
+			fails: true,
+			words: []string{"a", "stop", "b"},
+			opts:  MapOptions{MaxConcurrency: 3},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var ran atomic.Int32
+			body := measureWith(func(_ context.Context, word string) (int, error) {
+				ran.Add(1)
+				if word != "stop" {
+					return len(word), nil
+				}
+				cancel()
+				if tt.fails {
+					return 0, errors.New("a failure of its own, which MapCollect tolerates")
+				}
+				return len(word), nil
+			})
+			pipeline := mapPipeline(t, collectLengths(body, tt.opts))
 
-	got, err := pipeline.RunCandidate(ctx, nil, wordsInput("a", "stop", "b"))
+			got, err := pipeline.RunCandidate(ctx, nil, wordsInput(tt.words...))
 
-	require.EqualError(t, err, `pipeline step "lengths": context canceled`)
-	require.ErrorIs(t, err, context.Canceled)
-	require.Equal(t, Prediction{}, got)
-	require.Equal(t, int32(2), ran.Load(), "no element starts once the run is cancelled")
+			require.EqualError(t, err, `pipeline step "lengths": context canceled`)
+			require.ErrorIs(t, err, context.Canceled)
+			require.Equal(t, Prediction{}, got)
+			if tt.opts.MaxConcurrency == 0 {
+				require.Equal(t, int32(2), ran.Load(), "no element starts once the run is cancelled")
+			}
+		})
+	}
 }
 
 func TestMapCollectRedactsElementErrors(t *testing.T) {
@@ -1017,6 +1139,58 @@ func TestMapUnbudgetedToolUsageInARewoundRange(t *testing.T) {
 	requireTraceRoundTrip(t, trace)
 }
 
+func TestMapResultUsageIsTheElementsTotal(t *testing.T) {
+	search := NewToolFunc(
+		Tool{Name: "search", Description: "search", Parameters: []byte(`{"type":"object"}`)},
+		func(_ context.Context, call ToolCall) (ToolResult, error) {
+			if strings.Contains(call.Arguments, "broken") {
+				return ToolResult{Usage: Usage{TotalTokens: 1}, UnbudgetedUsage: Usage{TotalTokens: 20}},
+					errors.New("search failed")
+			}
+			return ToolResult{
+				Output:          []byte(`{"hits":"found"}`),
+				Usage:           Usage{TotalTokens: 3},
+				UnbudgetedUsage: Usage{TotalTokens: 50},
+			}, nil
+		},
+	)
+	registry, err := NewToolRegistry(search)
+	require.NoError(t, err)
+	queries, query := Key[[]string]{Name: "queries"}, Key[string]{Name: "query"}
+	hits, collected := Key[string]{Name: "hits"}, Key[[]MapResult[string]]{Name: "collected_hits"}
+	pipeline, err := PipelineSpec{
+		Inputs: refs(queries.Ref()),
+		Steps: []Step{
+			MapCollect("searches", queries, query, ToolStep("search", "search", refs(query.Ref()), refs(hits.Ref())),
+				collected, MapOptions{MaxConcurrency: 2}),
+		},
+		Tools:  registry,
+		Budget: RunBudget{MaxTokens: 10},
+	}.Build()
+	require.NoError(t, err)
+
+	got, usage, err := CompiledProgram{Program: pipeline, Candidate: pipeline.SeedCandidate()}.RunWithUsage(
+		context.Background(),
+		Prediction{"queries": []string{"a", "broken", "c"}},
+	)
+
+	require.NoError(t, err, "the budget counts only the 7 budgeted tokens")
+	require.Equal(t, Usage{TotalTokens: 127}, usage)
+	results, ok := got["collected_hits"].([]MapResult[string])
+	require.True(t, ok)
+	results = withoutDurations(t, results, 0)
+	require.Equal(t, []MapResult[string]{
+		{Index: 0, Value: "found", Usage: Usage{TotalTokens: 53}},
+		{Index: 1, Error: `tool "search": search failed`, Usage: Usage{TotalTokens: 21}},
+		{Index: 2, Value: "found", Usage: Usage{TotalTokens: 53}},
+	}, results, "each element's budgeted and unbudgeted usage, failed ones included")
+	var total Usage
+	for _, result := range results {
+		total = total.Add(result.Usage)
+	}
+	require.Equal(t, usage, total, "the elements' usage adds up to RunWithUsage")
+}
+
 func TestMapStagedToolResultsCommitOnlyForSuccessfulElements(t *testing.T) {
 	var mu sync.Mutex
 	invoked := map[string]int{}
@@ -1156,6 +1330,45 @@ func TestMapRunsOutsideAPipeline(t *testing.T) {
 	lengths, err := mapLengthsKey.Get(state)
 	require.NoError(t, err)
 	require.Equal(t, []int{1, 2}, lengths)
+}
+
+func TestMapFailsWithoutAListUnderItems(t *testing.T) {
+	tests := []struct {
+		name   string
+		values Prediction
+		want   []string
+	}{
+		{name: "missing", values: Prediction{}, want: []string{`state key "words" is missing`}},
+		{name: "not a list", values: Prediction{"words": 5}, want: []string{`state key "words"`, "[]string"}},
+		{
+			name:   "a list that does not convert",
+			values: Prediction{"words": []any{"a", 3}},
+			want:   []string{`state key "words"`, "[]string"},
+		},
+	}
+	for _, tt := range tests {
+		for name, mapOf := range map[string]func(Step, MapOptions) Step{"map": lengthsOf, "collect": collectLengths} {
+			t.Run(name+" "+tt.name, func(t *testing.T) {
+				var ran atomic.Int32
+				body := measureWith(func(_ context.Context, word string) (int, error) {
+					ran.Add(1)
+					return len(word), nil
+				})
+				state := NewState(tt.values)
+
+				err := mapOf(body, MapOptions{}).Run(context.Background(), state)
+
+				require.Error(t, err)
+				for _, want := range tt.want {
+					require.ErrorContains(t, err, want)
+				}
+				require.Zero(t, ran.Load(), "no element runs")
+				written := state.Prediction()
+				require.NotContains(t, written, mapLengthsKey.Name, "nothing is written")
+				require.NotContains(t, written, mapCollectedKey.Name, "nothing is written")
+			})
+		}
+	}
 }
 
 func TestMapOverMap(t *testing.T) {

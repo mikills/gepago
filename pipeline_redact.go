@@ -56,6 +56,15 @@ import (
 // whose text changes becoming a string, and object keys are kept; the JSON is written again,
 // compact and in its order, when a value changes.
 //
+// Under a Map or MapCollect, the events of the Map and of every execution and run nested in it
+// carry each element's item under the Map's item key and its output under the key the body
+// writes. Such a value passes through the Redactor under its own key and then again under the
+// Map's items key, as a list holding only it, or under its results key, as the results of such
+// a list. When the Redactor changes that list, the events carry RedactedText in place of the
+// value, which is removed from error messages like any other redacted value. So a Redactor that
+// hides a Map's items hides every element's item, and one that hides its results every element's
+// output, in MapResult.Error too.
+//
 // The Attributes of the RunContext that every event carries pass through the Redactor when a
 // run starts, before RunStarted, each under the key "attribute:<name>", where <name> is the
 // attribute's, with its value as a string; its events then carry the result. A result that is
