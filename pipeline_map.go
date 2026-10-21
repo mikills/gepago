@@ -71,7 +71,8 @@ type MapResult[Out any] struct {
 // writes. A Redactor that hides the list under items hides every element's item, and one that
 // hides results every element's output: the events of the Map and of every execution and run
 // nested in it carry RedactedText in their place, and their text is removed from error
-// messages, MapCollect's included (see Redactor).
+// messages, MapCollect's included (see Redactor). ProgramEvaluator hides them from reflection
+// in the same way.
 //
 // body is a nested step: its name must be unique in the pipeline and its components are scoped
 // as "<map>.<body>.<component>", one set that every element shares. The Map is a ComponentStep
@@ -134,17 +135,15 @@ func newMapStep[In any](
 	return asComponentStep(m, m.body)
 }
 
-// splitList returns the elements of a []In.
-func splitList[In any](value any) ([]any, bool) {
-	list, ok := value.([]In)
-	if !ok {
-		return nil, false
-	}
+// splitList returns the elements of value, a []In as convertStateValue gives it for the items
+// key.
+func splitList[In any](value any) []any {
+	list, _ := value.([]In)
 	elements := make([]any, len(list))
 	for i, element := range list {
 		elements[i] = element
 	}
-	return elements, true
+	return elements
 }
 
 // singleList returns a []In holding only value, or the zero In when value is not one.
@@ -191,7 +190,7 @@ type mapStep struct {
 	opts    MapOptions
 	collect bool
 	reads   []KeyRef
-	split   func(any) ([]any, bool)
+	split   func(any) []any
 	single  func(any) any
 	join    func([]elementOutcome) any
 }
@@ -288,11 +287,8 @@ func (m *mapStep) runCandidate(ctx context.Context, candidate Candidate, s State
 	if err != nil {
 		return err
 	}
-	elements, ok := m.split(list)
-	switch {
-	case !ok:
-		return fmt.Errorf("state key %q holds %T, want %s", m.items.Name, list, m.items.Type)
-	case m.opts.MaxItems > 0 && len(elements) > m.opts.MaxItems:
+	elements := m.split(list)
+	if m.opts.MaxItems > 0 && len(elements) > m.opts.MaxItems {
 		return PermanentError(fmt.Errorf(
 			"%q holds %d items, more than MaxItems %d",
 			m.items.Name,
@@ -399,7 +395,8 @@ func (m *mapStep) stopsWith(ctx context.Context, outcome elementOutcome) error {
 }
 
 // runElement runs body once, over element, on a view holding the element under the item key
-// and the other keys body reads from values.
+// and the other keys body reads from values. Under ProgramEvaluator the element counts among the
+// values the run was given, so reflection removes its text where the events do.
 func (m *mapStep) runElement(ctx context.Context, candidate Candidate, index int, element any, values map[string]any) (
 	outcome elementOutcome,
 ) {
@@ -410,6 +407,7 @@ func (m *mapStep) runElement(ctx context.Context, candidate Candidate, index int
 		}
 	}
 	view[m.item.Name] = element
+	evaluationCaptureFrom(ctx).offer(map[string]any{m.item.Name: element})
 	usage := &elementUsage{}
 	start := time.Now()
 	defer func() {

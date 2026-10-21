@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -229,4 +230,75 @@ func TestMapRedactorThatHidesResultsHidesEveryOutput(t *testing.T) {
 		require.Equal(t, want, run.trace.Steps[0].Details, "the map's own execution")
 		require.Equal(t, want, run.trace.Steps[0].Steps[0].Details, "the element's")
 	})
+}
+
+// redactionWork runs a MapCollect over n items under a Redactor that hides the list, with a
+// body that fails naming its item, and returns the work its trace did to remove redacted text
+// (see redactedText). The items are ints when ints is set, so each adds text to remove, and
+// otherwise strings, whose text the list's own redaction already removes.
+func redactionWork(t *testing.T, n int, ints bool) int {
+	t.Helper()
+	var trace *traceObservation
+	var once sync.Once
+	fail := func(ctx context.Context, item any) error {
+		once.Do(func() { trace = observeScopeFrom(ctx).run.trace })
+		return fmt.Errorf("cannot use %v", item)
+	}
+	nums := make([]int, n)
+	words := make([]string, n)
+	for i := range n {
+		nums[i], words[i] = i, fmt.Sprintf("item-%06d-secret", i)
+	}
+	use := NewStep(
+		"use",
+		refs(mapNumKey.Ref()),
+		refs(mapDoubleKey.Ref()),
+		func(ctx context.Context, s State) error {
+			num, err := mapNumKey.Get(s)
+			if err != nil {
+				return err
+			}
+			return fail(ctx, num)
+		},
+	)
+	spec, input := PipelineSpec{
+		Inputs: refs(mapNumsKey.Ref()),
+		Steps: []Step{
+			MapCollect("doubles", mapNumsKey, mapNumKey, use, Key[[]MapResult[int]]{Name: "doubled"}, MapOptions{}),
+		},
+		Redactor: hiding("nums"),
+	}, Prediction{"nums": nums}
+	if !ints {
+		measure := measureWith(func(ctx context.Context, word string) (int, error) { return 0, fail(ctx, word) })
+		spec, input = PipelineSpec{
+			Inputs:   refs(mapWordsKey.Ref()),
+			Steps:    []Step{collectLengths(measure, MapOptions{})},
+			Redactor: hiding("words"),
+		}, wordsInput(words...)
+	}
+	pipeline, err := spec.Build()
+	require.NoError(t, err)
+
+	_, err = pipeline.RunCandidate(context.Background(), nil, input)
+
+	require.NoError(t, err)
+	require.NotNil(t, trace)
+	trace.mu.Lock()
+	defer trace.mu.Unlock()
+	return trace.work
+}
+
+// TestMapRedactionWorkGrowsLinearlyWithTheList checks that the work of removing redacted text
+// from a run's errors grows in proportion to the list a MapCollect runs over under a Redactor
+// that hides the list, whether or not each element adds text to remove.
+func TestMapRedactionWorkGrowsLinearlyWithTheList(t *testing.T) {
+	for name, ints := range map[string]bool{"int items": true, "string items": false} {
+		t.Run(name, func(t *testing.T) {
+			small, large := redactionWork(t, 400, ints), redactionWork(t, 800, ints)
+
+			t.Logf("work over 400 items %d, over 800 items %d", small, large)
+			require.Positive(t, small)
+			require.Less(t, large, 3*small, "twice the items cost about twice the work, not four times")
+		})
+	}
 }

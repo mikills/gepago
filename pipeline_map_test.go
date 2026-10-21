@@ -1339,11 +1339,15 @@ func TestMapFailsWithoutAListUnderItems(t *testing.T) {
 		want   []string
 	}{
 		{name: "missing", values: Prediction{}, want: []string{`state key "words" is missing`}},
-		{name: "not a list", values: Prediction{"words": 5}, want: []string{`state key "words"`, "[]string"}},
+		{
+			name:   "not a list",
+			values: Prediction{"words": 5},
+			want:   []string{`state key "words": decode as []string: `, "number", "[]string"},
+		},
 		{
 			name:   "a list that does not convert",
 			values: Prediction{"words": []any{"a", 3}},
-			want:   []string{`state key "words"`, "[]string"},
+			want:   []string{`state key "words": decode as []string: `, "number", "type string"},
 		},
 	}
 	for _, tt := range tests {

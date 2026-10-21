@@ -2,6 +2,7 @@ package gepa_test
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -98,4 +99,56 @@ func TestMapElementsAnswerFromTheirStepScript(t *testing.T) {
 		"sequential elements take the step's replies in input order",
 	)
 	require.Empty(t, lm.Unmatched())
+}
+
+// TestMapCompileReflectionPromptsHideElements checks that the reflection prompts of Compile show
+// neither an element's item nor its output when a Redactor hides the Map's list or its results,
+// whichever dataset builder reads the evaluation.
+func TestMapCompileReflectionPromptsHideElements(t *testing.T) {
+	nums, num := gepa.Key[[]int]{Name: "nums"}, gepa.Key[int]{Name: "num"}
+	double, doubles := gepa.Key[int]{Name: "double"}, gepa.Key[[]int]{Name: "doubles"}
+	tests := []struct {
+		name   string
+		hidden string
+		answer string
+		secret string
+	}{
+		{name: "an item", hidden: "nums", answer: `{"double": "none"}`, secret: "987654321"},
+		{name: "an output", hidden: "doubles", answer: `{"double": "SECRET-OUT"}`, secret: "SECRET-OUT"},
+	}
+	for _, tt := range tests {
+		for _, builder := range []gepa.ReflectiveDatasetBuilder{nil, gepa.TraceDatasetBuilder{}} {
+			t.Run(fmt.Sprintf("%s %T", tt.name, builder), func(t *testing.T) {
+				step := modelStep("double", tenTokenModel(tt.answer), num.Ref(), double.Ref())
+				pipeline := fpBuild(t, gepa.PipelineSpec{
+					Inputs:   refs(nums.Ref()),
+					Steps:    []gepa.Step{gepa.Map("doubles", nums, num, step, doubles, gepa.MapOptions{})},
+					Redactor: hideKey(tt.hidden, "[hidden]"),
+				})
+				examples := []gepa.Example{gepa.NewIOExample(
+					"one",
+					gepa.Prediction{"nums": []int{987654321}},
+					gepa.Prediction{"doubles": []int{1}},
+				)}
+				reflection := reflectionModel()
+
+				_, _, err := gepa.Compile(context.Background(), gepa.CompileConfig{
+					Program:        pipeline,
+					Trainset:       examples,
+					Valset:         examples,
+					Metric:         gepa.ExactMatchMetric{Fields: []string{"doubles"}},
+					ReflectionLM:   reflection,
+					Objective:      "double numbers",
+					MaxMetricCalls: 4,
+					MinibatchSize:  1,
+					DatasetBuilder: builder,
+				})
+
+				require.NoError(t, err)
+				prompts := allPrompts(reflection)
+				require.Contains(t, prompts, "invalid programme output", "the failed element is reflected on")
+				require.NotContains(t, prompts, tt.secret)
+			})
+		}
+	}
 }

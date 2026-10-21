@@ -27,19 +27,58 @@ func hideElements(node *stepNode, run *runObservation) *runObservation {
 // hidden as RedactedText; otherwise it is left as it is.
 func (m *mapStep) elementRedactor(redactors []Redactor) Redactor {
 	return func(key string, value any) any {
-		var under string
-		var list any
-		switch {
-		case key == m.item.Name:
-			under, list = m.items.Name, m.single(value)
-		case len(m.body.writeNames) == 1 && key == m.body.writeNames[0]:
-			under, list = m.results.Name, m.join([]elementOutcome{{value: value}})
-		default:
-			return value
-		}
-		if reflect.DeepEqual(applyRedactors(redactors, under, deepCopy(list)), list) {
+		under, list, ok := m.element(key, value)
+		if !ok || reflect.DeepEqual(applyRedactors(redactors, under, deepCopy(list)), list) {
 			return value
 		}
 		return RedactedText
+	}
+}
+
+// element returns what a value under key passes through the redactors as to tell whether the
+// map's events hide it: under the items key, a list holding only it, when key is the item key,
+// and under the results key, the results of such a list, when key is the key body writes. ok is
+// false for any other key.
+func (m *mapStep) element(key string, value any) (under string, list any, ok bool) {
+	switch {
+	case key == m.item.Name:
+		return m.items.Name, m.single(value), true
+	case len(m.body.writeNames) == 1 && key == m.body.writeNames[0]:
+		return m.results.Name, m.join([]elementOutcome{{value: value}}), true
+	}
+	return "", nil, false
+}
+
+// hideMapElements returns the Redactor that follows redactors, those of the pipelines an
+// evaluated programme holds or ran, when ProgramEvaluator redacts what reflection reads, so
+// that it hides what the events of maps, the Maps of those pipelines, hide. A value under the
+// item key of one of maps, or under the key its body writes, is hidden as RedactedText when
+// redactors, followed by this Redactor, change it as that map's elementRedactor passes it
+// through them; following itself, it hides the item of a Map nested in another's elements when
+// the outer Map's items are hidden. Unlike elementRedactor, it applies wherever the key
+// appears, since what reflection reads does not say which execution it came from, so a value
+// under such a key outside the map's executions may be hidden too. A key that is already being
+// checked further up is not checked again, so names that refer to each other end.
+func hideMapElements(redactors []Redactor, maps []*mapStep) Redactor {
+	var hide func(key string, value any, checking []string) any
+	hide = func(key string, value any, checking []string) any {
+		if slices.Contains(checking, key) {
+			return value
+		}
+		checking = append(slices.Clip(checking), key)
+		for _, m := range maps {
+			under, list, ok := m.element(key, value)
+			if !ok {
+				continue
+			}
+			redacted := hide(under, applyRedactors(redactors, under, deepCopy(list)), checking)
+			if !reflect.DeepEqual(redacted, list) {
+				return RedactedText
+			}
+		}
+		return value
+	}
+	return func(key string, value any) any {
+		return hide(key, value, nil)
 	}
 }
