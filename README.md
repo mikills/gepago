@@ -261,7 +261,7 @@ pipeline, err := gepa.PipelineSpec{
 - An earlier target, or `From` itself, is a rewind: the run goes back and runs every step from the target to `From` again. The target needs a `MaxVisits` of at least 2, and a rewind that would exceed it fails `From` with `ErrMaxVisits`, which an `OnError` transition can catch.
 - One rewind range at a time: two rewinds must have the same target and `From`, or ranges that do not overlap; nested ranges are not supported. Transitions name top-level steps only.
 
-A step that a transition skips over, or that has an `OnError` transition to a later step or `End`, may not write. A key is guaranteed at a step when it is an input, has a `Default` or is written by an earlier step that always writes, and `Build` fails on any read of a key that is not guaranteed, naming the step and the key. Above, `review` may be skipped, so `decide` can read `approved` only because it has a default.
+A step that a transition skips over, or that has an `OnError` transition to a later step or `End`, may not write. A key is guaranteed at a step when it is an input, has a `Default` or is written by an earlier step that always writes, and `Build` fails on any read of a key that is not guaranteed, naming the step and the key. A key written by a step that may not write needs a `Default` if any later step reads it, even when another step always writes it. Above, `review` may be skipped, so `decide` can read `approved` only because it has a default.
 
 On a rewind, `Amend` may set only the keys the target declared with `WithAmendable`; the target reads them on its next visit only, and they are never committed. When the run reaches `From` again, `Accept(prev, next)` compares the values the range wrote before and after: true keeps the new ones, false restores the old ones, emits `RewindRejected` and goes on past `From`. The usage of every visit counts. Step events carry the visit in `Attributes["visit"]`, and a `TransitionObserver`, such as `RecordingObserver`, also receives `TransitionTaken` and `RewindRejected`.
 
@@ -303,7 +303,7 @@ readPage := gepa.NewProgramStep("read_page", pageProgram, []gepa.KeyRef{page.Ref
 read := gepa.MapCollect("read", pages, page, readPage, readings, gepa.MapOptions{MaxConcurrency: 4, MaxItems: 200})
 ```
 
-The body reads the element under `page` and writes exactly one key; each element runs on its own view of that key and the guaranteed keys the body reads, at most `MaxConcurrency` at a time, and more than `MaxItems` elements fail the step before any runs. `Map` writes the outputs in input order and fails fast: the first failure cancels the other elements and commits nothing. `MapCollect` runs every element and writes a `MapResult{Index, Value, Error, Usage, Duration}` for each, so a later step can tell what is missing. Elements share the run's budget and tool scope, and their events carry `Attributes["index"]`. A body has no transitions; a rewind that reaches the Map runs every element again.
+The body reads the element under `page` and writes exactly one key; each element runs on its own view of that key and the guaranteed keys the body reads, at most `MaxConcurrency` at a time, and more than `MaxItems` elements fail the step before any runs. `Map` writes the outputs in input order and fails fast: the first failure cancels the other elements and commits nothing. `MapCollect` runs every element and writes a `MapResult{Index, Value, Error, Usage, Duration}` for each, so a later step can tell what is missing, except that a `Budget` error in an element or the end of the run's context fails the step. Elements share the run's budget and tool scope, and their events carry `Attributes["index"]`. A `Redactor` that hides the items key hides each element's item, and one that hides the results key each element's output, in events and reflection. A body has no transitions; a rewind that reaches the Map runs every element again.
 
 [`examples/map_reduce`](examples/map_reduce) puts skips, `MapCollect`, a rewind with `Amend` and `Accept`, and a scoped tool into one runnable pipeline.
 
@@ -401,7 +401,7 @@ artifact := compiled.Artifact("internal-program")
 err := gepa.SaveProgramArtifact("internal-program.program.json", artifact)
 ```
 
-`compiled.Artifact` records the programme's fingerprint. `Pipeline.Fingerprint()` is derived from the step names, keys and types, and every loader refuses an artefact whose fingerprint differs from the programme's with a `*FingerprintMismatchError` that shows both, so a renamed key or step never silently picks up a stale prompt. Artefacts saved before v0.8.0 have no fingerprint and still load. To load an artefact across a shape change you know is compatible, record the same `ProgramVersion` on the artefact and pass it to `LoadCompiledProgramVersion` or `LoadCompiledVersion`.
+`compiled.Artifact` records the programme's fingerprint. `Pipeline.Fingerprint()` is derived from the step names, keys and types, the transitions, `MaxVisits`, amendable keys and each `Map`'s keys and `MapOptions` (so changing `MaxConcurrency` changes it), and every loader refuses an artefact whose fingerprint differs from the programme's with a `*FingerprintMismatchError` that shows both, so a renamed key or step never silently picks up a stale prompt. Artefacts saved before v0.8.0 have no fingerprint and still load. To load an artefact across a shape change you know is compatible, record the same `ProgramVersion` on the artefact and pass it to `LoadCompiledProgramVersion` or `LoadCompiledVersion`.
 
 At runtime, register factories that inject app dependencies such as models, tools, stores, or retrievers:
 
@@ -440,11 +440,11 @@ Lower-level optimiser APIs remain available when you need full control.
 
 ## Test kit
 
-Package `gepatest` provides `FakeGenerator`, a model with scripted replies, usage, finish reasons and errors per call, and `AssertTrace`, which compares a recorded run's steps, the order they ran in, their errors, usage, attributes and transitions.
+Package `gepatest` provides `FakeGenerator`, a model with scripted replies, usage, finish reasons and errors per call, and `AssertTrace`, which compares a recorded run's steps, the order they ran in, their errors, usage, attributes and transitions; the steps of a pipeline that a Map element runs take that element's index.
 
-A call takes the next reply of the script for its Map element (`OnElement`), else its visit (`OnVisit`), else its step (`OnStep`), each tried by step path, as `gepa.StepPathFrom` reports it, and then by step name; else the first prompt substring it contains, else the default. A script repeats its last reply once used up. `Calls` returns every call the fake received, `Unmatched` the calls no script answered (an `OnError` transition or a `Fallback` can hide their error), and `Plain` hides its structured and chat methods to test the prompt-only path.
+A call takes the next reply of the script for its Map element (`OnElement`), else its visit (`OnVisit`), else its step (`OnStep`), each tried by step path, as `gepa.StepPathFrom` reports it, and then by step name; else the first prompt substring it contains, else the default. `OnElement` does not match the calls of a pipeline that an element runs; script those by step path. A script repeats its last reply once used up. `Chat` refuses a request no provider accepts with `ErrInvalidChatRequest`. `Calls` returns every call the fake received, `Unmatched` the calls no script answered (an `OnError` transition can hide their error), and `Plain` hides its structured and chat methods to test the prompt-only path.
 
-`CheckToolProvider(t, provider)` and `CheckChatClient(t, client)` are contract tests for your own tools and chat clients: they drive one through invalid input, a panic, usage on failure, an ended context, a cache hit and concurrent calls, and report each requirement it breaks.
+`CheckToolProvider(t, provider, options...)` and `CheckChatClient(t, client)` are contract tests for your own tools and chat clients: they drive one through invalid input, a panic, usage on failure, an ended context, a cache hit and concurrent calls, and report each requirement it breaks. Pass `ToolArguments(...)` to a tool that refuses the arguments the check derives from its schema, and `ToolScope(...)` to one that needs a scope.
 
 ## Key extension points
 
