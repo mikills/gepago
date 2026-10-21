@@ -17,7 +17,8 @@ import (
 // so a hit is a repeat of the same step in the same run with the same reads: for example a
 // retry of an enclosing WithPolicy, where a Parallel that failed in one part does
 // not repeat the model calls of the parts that already succeeded. Failed executions are not
-// cached. Concurrent runs and nested pipelines have caches of their own.
+// cached, among them a visit of a top-level step that a transition from it fails (see
+// Transition). Concurrent runs and nested pipelines have caches of their own.
 //
 // The cache never makes a working step fail: when the key cannot be built, because key returns
 // an error, panics or tries to read or write a key outside step's reads, or because JSON cannot
@@ -65,8 +66,11 @@ func (c *cacheStep) runCandidate(ctx context.Context, candidate Candidate, s Sta
 	if err != nil {
 		return err
 	}
-	if keyErr == nil {
-		run.storeCached(c.child.name, key, result)
+	if keyErr == nil && run != nil {
+		// as a top-level step, the execution ends once the pipeline has checked its result, which
+		// a transition of the step may fail; the copy is taken now, before anything commits it.
+		stored := result.clone()
+		finishHoldFrom(ctx).whenSucceeded(func() { run.storeCached(c.child.name, key, stored) })
 	}
 	result.commitTo(s, c.child)
 	return nil

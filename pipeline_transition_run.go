@@ -241,9 +241,10 @@ func (f *flowRun) decide(i int, visit *stepVisit, pending map[string]any) error 
 func (f *flowRun) succeeded(i int, visit stepVisit) (int, error) {
 	node := f.p.steps[i]
 	rule := visit.rule
+	reads := visit.view
 	if r := f.rewind; r != nil && r.rule.from == i {
 		if visit.rejected {
-			f.rejectRewind(i, true)
+			reads = f.rejectRewind(i, visit)
 		} else {
 			if rule == nil || rule.to != failTarget {
 				f.commit(visit)
@@ -259,7 +260,7 @@ func (f *flowRun) succeeded(i int, visit stepVisit) (int, error) {
 	f.taken(rule)
 	switch {
 	case rule.to == failTarget:
-		return 0, failStep(node, visit.view, PermanentError(fmt.Errorf("%s to %s", rule.describe(f.p.steps), Fail)))
+		return 0, failStep(node, reads, PermanentError(fmt.Errorf("%s to %s", rule.describe(f.p.steps), Fail)))
 	case rule.to == endTarget:
 		return len(f.p.steps), nil
 	case rule.rewind:
@@ -279,16 +280,17 @@ func (f *flowRun) succeeded(i int, visit stepVisit) (int, error) {
 // that way.
 func (f *flowRun) failed(i int, visit stepVisit) (int, error) {
 	node := f.p.steps[i]
+	reads := visit.view
 	if r := f.rewind; r != nil && r.rule.from == i {
 		if visit.rejected || visit.acceptFailed {
-			f.rejectRewind(i, visit.rejected)
+			reads = f.rejectRewind(i, visit)
 		} else {
 			f.endRewind(true)
 		}
 	}
 	err := visit.err
 	if f.ctx.Err() != nil {
-		return 0, failStep(node, visit.view, err)
+		return 0, failStep(node, reads, err)
 	}
 	view := readOnlyView(visit.view, node.readTypes)
 	exhausted := visit.maxed
@@ -300,7 +302,7 @@ evaluate:
 			}
 			match, whenErr := callWhen(rule, f.p.steps, view, err)
 			if whenErr != nil {
-				return 0, failStep(node, visit.view, fmt.Errorf("%w; %w", err, whenErr))
+				return 0, failStep(node, reads, fmt.Errorf("%w; %w", err, whenErr))
 			}
 			if !match {
 				continue
@@ -313,13 +315,13 @@ evaluate:
 				}
 				var amendErr error
 				if amended, amendErr = f.callAmend(rule, visit.view, node.readTypes); amendErr != nil {
-					return 0, failStep(node, visit.view, fmt.Errorf("%w; %w", err, amendErr))
+					return 0, failStep(node, reads, fmt.Errorf("%w; %w", err, amendErr))
 				}
 			}
 			f.taken(rule)
 			switch {
 			case rule.to == failTarget:
-				return 0, failStep(node, visit.view, PermanentError(
+				return 0, failStep(node, reads, PermanentError(
 					fmt.Errorf("%s to %s: %w", rule.describe(f.p.steps), Fail, err),
 				))
 			case rule.to == endTarget:
@@ -329,20 +331,24 @@ evaluate:
 			}
 			return rule.to, nil
 		}
-		return 0, failStep(node, visit.view, err)
+		return 0, failStep(node, reads, err)
 	}
 }
 
 // rejectRewind ends the running rewind, whose From is step i, without the range's new visit:
 // it restores the snapshot, drops what the range staged for tools and, when Accept returned
-// false rather than failed, reports RewindRejected.
-func (f *flowRun) rejectRewind(i int, rejected bool) {
+// false rather than failed, reports RewindRejected. It returns the values of the step's reads
+// that visit's view held before the restore, which changes the state the view may share, for
+// the step's StepError.
+func (f *flowRun) rejectRewind(i int, visit stepVisit) map[string]any {
+	reads := keyValues(visit.view, f.p.steps[i].readTypes)
 	r := f.rewind
 	restoreValues(f.state.values, f.defaulted, r.prev, r.rule.keys)
 	f.endRewind(false)
-	if rejected {
+	if visit.rejected {
 		f.observed.rewindRejected(f.ctx, RewindRejectedEvent{Step: f.p.steps[i].name, Rule: r.rule.index})
 	}
+	return reads
 }
 
 // commit makes a successful visit's writes part of the state and commits what it staged for

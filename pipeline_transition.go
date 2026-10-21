@@ -264,7 +264,12 @@ type rewindRange struct {
 // rule that takes the step forward, successMin the smallest index a rule may continue the run at
 // after the step succeeds, and closed whether a rule without When closes its success rules;
 // target marks the steps a rewind lands on and amended those a rewind with an Amend lands on.
+//
+// work counts the iterations of both passes and of every loop over rules or steps inside them,
+// each such loop adding one per iteration, so a test can hold Build to a small multiple of the
+// steps plus the transitions; a walk over the steps between a rule's From and To breaks that.
 type transitionFacts struct {
+	work       int
 	rules      []*transitionRule
 	skips      []int
 	ranges     []int
@@ -289,6 +294,7 @@ func (f *transitionFacts) reach(i int) int {
 // it only to word an error.
 func (f *transitionFacts) unwrittenReason(i int) string {
 	for _, rule := range f.rules {
+		f.work++
 		if !rule.rewind && rule.skips(i, len(f.onErrorBy)) {
 			return fmt.Sprintf("transition %d skips over it", rule.index)
 		}
@@ -301,6 +307,7 @@ func (f *transitionFacts) unwrittenReason(i int) string {
 func (f *transitionFacts) overlapError(i int, steps []*stepNode) error {
 	var first *transitionRule
 	for _, rule := range f.rules {
+		f.work++
 		switch {
 		case !rule.rewind || i < rule.to || i > rule.from:
 			continue
@@ -327,6 +334,7 @@ func (f *transitionFacts) overlapError(i int, steps []*stepNode) error {
 // ranges hold, and counts the rewind targets up to it.
 func (b *pipelineBuilder) enter(i int, steps []*stepNode) error {
 	f := b.flow
+	f.work++
 	b.index = i
 	b.skipped += f.skips[i]
 	b.covered += f.ranges[i]
@@ -379,7 +387,18 @@ func (b *pipelineBuilder) checkTransitions(
 		target:    make([]bool, n),
 		amendable: make([]map[string]reflect.Type, n),
 	}
+	facts := &transitionFacts{
+		skips:      make([]int, n+1),
+		ranges:     make([]int, n+1),
+		rangeAt:    make([]*rewindRange, n),
+		onErrorBy:  slices.Repeat([]int{-1}, n),
+		successMin: slices.Repeat([]int{math.MaxInt}, n),
+		closed:     make([]bool, n),
+		target:     table.target,
+		amended:    make([]bool, n),
+	}
 	for _, name := range slices.Sorted(maps.Keys(maxVisits)) {
+		facts.work++
 		i, ok := index[strings.TrimSpace(name)]
 		switch {
 		case !ok || strings.TrimSpace(name) == "":
@@ -399,21 +418,12 @@ func (b *pipelineBuilder) checkTransitions(
 		}
 		table.maxVisits[i] = maxVisits[name]
 	}
-	facts := &transitionFacts{
-		skips:      make([]int, n+1),
-		ranges:     make([]int, n+1),
-		rangeAt:    make([]*rewindRange, n),
-		onErrorBy:  slices.Repeat([]int{-1}, n),
-		successMin: slices.Repeat([]int{math.MaxInt}, n),
-		closed:     make([]bool, n),
-		target:     table.target,
-		amended:    make([]bool, n),
-	}
 	// spans holds each distinct rewind range once, by target and From, so rewinds with the same
 	// range share it and only different ranges count as overlapping.
 	spans := map[[2]int]*rewindRange{}
 	rules := make([]*transitionRule, 0, len(transitions))
 	for i, transition := range transitions {
+		facts.work++
 		rule, err := compileTransition(i, transition, index, steps, table)
 		if err != nil {
 			return transitionTable{}, err
@@ -446,6 +456,7 @@ func (b *pipelineBuilder) checkTransitions(
 		}
 	}
 	for _, name := range slices.Sorted(maps.Keys(maxVisits)) {
+		facts.work++
 		if i := index[strings.TrimSpace(name)]; !table.target[i] {
 			return transitionTable{}, fmt.Errorf(
 				"MaxVisits[%q] is unused: no transition rewinds to %q",

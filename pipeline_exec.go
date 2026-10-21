@@ -103,13 +103,14 @@ func (r *pipelineRun) cached(step, key string) (stepResult, bool) {
 	return result.clone(), ok
 }
 
+// storeCached caches result, a copy that nothing else holds, for step under key.
 func (r *pipelineRun) storeCached(step, key string, result stepResult) {
 	if r == nil {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.cache[stepCacheKey{step: step, key: key}] = result.clone()
+	r.cache[stepCacheKey{step: step, key: key}] = result
 }
 
 // stepResult is what a successful step leaves to commit: its pending writes, already copies
@@ -409,12 +410,15 @@ type finishHoldKey struct{}
 
 // finishHold holds the report of the latest successful execution directly inside a top-level
 // wrapper, so the execution ends with the pipeline's check of the wrapper's result and a failed
-// transition fails it instead of adding an execution. It is safe for concurrent use.
+// transition fails it instead of adding an execution. succeeded holds what waits for the held
+// execution to end as a success, such as WithCache storing its result. It is safe for concurrent
+// use.
 type finishHold struct {
-	mu     sync.Mutex
-	report func(stepOutcome, stepResult)
-	held   stepOutcome
-	result stepResult
+	mu        sync.Mutex
+	report    func(stepOutcome, stepResult)
+	held      stepOutcome
+	result    stepResult
+	succeeded []func()
 }
 
 // finishHoldFrom returns the hold of the wrapper that ctx runs directly inside, if any.
@@ -437,11 +441,12 @@ func (h *finishHold) finish(outcome stepOutcome, result stepResult, report func(
 }
 
 // release reports the held execution, failed with err when err is not nil, and returns whether
-// one was held.
+// one was held. What waits for the execution to succeed runs when it ends as a success and is
+// dropped otherwise.
 func (h *finishHold) release(err error) bool {
 	h.mu.Lock()
-	report, outcome, result := h.report, h.held, h.result
-	h.report = nil
+	report, outcome, result, succeeded := h.report, h.held, h.result, h.succeeded
+	h.report, h.succeeded = nil, nil
 	h.mu.Unlock()
 	if report == nil {
 		return false
@@ -450,7 +455,24 @@ func (h *finishHold) release(err error) bool {
 		outcome.Err, result = err, stepResult{}
 	}
 	report(outcome, result)
+	if err == nil {
+		for _, do := range succeeded {
+			do()
+		}
+	}
 	return true
+}
+
+// whenSucceeded runs do once the execution that h holds ends as a success, or at once when h is
+// nil, as outside a top-level wrapper, where an execution that succeeded has ended.
+func (h *finishHold) whenSucceeded(do func()) {
+	if h == nil {
+		do()
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.succeeded = append(h.succeeded, do)
 }
 
 // beginExecution starts one execution of node over values, the state its view reads: it

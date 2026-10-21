@@ -600,7 +600,9 @@ func (b *pipelineBuilder) checkWrites(node *stepNode) error {
 }
 
 // checkLabel refuses a key that has the name of a Branch other than as the label key the
-// Branch's routing step writes: a pipeline input, a Default or another step's write.
+// Branch's routing step writes: a pipeline input or another step's write. A Default for the
+// label key is allowed, so a step can read the label after a run that did not route, and
+// checkWrites checks its type as any write's.
 func (b *pipelineBuilder) checkLabel(node *stepNode, key KeyRef) error {
 	route, ok := node.step.(*branchRoute)
 	if !ok || key.Name != route.name {
@@ -622,8 +624,6 @@ func (b *pipelineBuilder) checkLabel(node *stepNode, key KeyRef) error {
 		clash = "which is a pipeline input"
 	case ok && source.step != "":
 		clash = fmt.Sprintf("which step %q also writes", source.step)
-	case ok:
-		clash = "which has a Default"
 	}
 	if clash != "" {
 		return fmt.Errorf(

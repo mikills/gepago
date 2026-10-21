@@ -423,6 +423,12 @@ func (s keySource) describe(key string) string {
 // NewProgramStep, names must be registered on Tools, and every such tool allowed by
 // ToolPolicy; a ToolStep's keys must also fit its tool (see ToolStep).
 func (s PipelineSpec) Build() (Pipeline, error) {
+	return s.build(nil)
+}
+
+// build is Build. When work is not nil, it receives the iterations that Build's passes over the
+// transitions and the steps made (see transitionFacts), which a test bounds.
+func (s PipelineSpec) build(work *int) (Pipeline, error) {
 	if len(s.Steps) == 0 {
 		return Pipeline{}, errors.New("pipeline requires at least one step")
 	}
@@ -463,6 +469,13 @@ func (s PipelineSpec) Build() (Pipeline, error) {
 	}
 	builder := newPipelineBuilder(inputs, merges, defaults)
 	builder.tools, builder.toolPolicy = s.Tools, s.ToolPolicy
+	if work != nil {
+		defer func() {
+			if builder.flow != nil {
+				*work = builder.flow.work
+			}
+		}()
+	}
 	// the one pass over transitions, then the one pass over steps.
 	flow, err := builder.checkTransitions(s.Transitions, s.MaxVisits, steps, index)
 	if err != nil {

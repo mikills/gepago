@@ -156,6 +156,113 @@ func TestTransitionRejectedVisitNeverCommitsOnTheErrorPath(t *testing.T) {
 	})
 }
 
+// The StepError of a visit that ends a rewind holds what the step read on that visit, although
+// the restore of the rewind's snapshot has changed the state since.
+func TestTransitionStepErrorReadsAreWhatTheStepReadBeforeARestore(t *testing.T) {
+	reject := func(State, State) bool { return false }
+	tests := []struct {
+		name    string
+		rules   []Transition
+		wantErr string
+	}{
+		{
+			name: "Accept panics",
+			rules: []Transition{
+				{From: "b", When: amountIs(10), To: "a", Accept: func(State, State) bool { panic("cannot compare") }},
+			},
+			wantErr: `pipeline step "b": transition 0 from "b": Accept panicked: cannot compare`,
+		},
+		{
+			name: "a When panics after a rejection",
+			rules: []Transition{
+				{From: "b", When: amountIs(10), To: "a", Accept: reject},
+				{From: "b", When: func(State, error) bool { panic("route broke") }, To: End},
+			},
+			wantErr: `pipeline step "b": transition 1 from "b": When panicked: route broke`,
+		},
+		{
+			name: "a rejected visit goes to Fail",
+			rules: []Transition{
+				{From: "b", When: amountIs(10), To: "a", Accept: reject},
+				{From: "b", To: Fail},
+			},
+			wantErr: `pipeline step "b": transition 1 from "b" to $fail`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := &stepCalls{}
+			_, state, _, err := buildRun(t, PipelineSpec{
+				Steps:       []Step{countedStep(calls, "a", nil, amountKey), describeAmount(calls, "b")},
+				Transitions: tt.rules,
+				MaxVisits:   map[string]int{"a": 2},
+			}, Prediction{})
+
+			require.EqualError(t, err, tt.wantErr)
+			require.Equal(t, 10, state.values["amount"], "the snapshot is restored")
+			var stepErr *StepError
+			require.ErrorAs(t, err, &stepErr)
+			require.Equal(t, map[string]any{"amount": 20}, stepErr.Reads, "b's second visit read 20")
+		})
+	}
+}
+
+// A visit of a WithCache step that a transition of the step fails is a failed execution, so its
+// result is not cached: the next visit runs the step, and only a visit after a successful one is
+// served from the cache.
+func TestWithCacheDoesNotCacheAVisitATransitionFails(t *testing.T) {
+	key := func(State) (string, error) { return "k", nil }
+	retry := StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}}
+	tests := []struct {
+		name string
+		wrap func(Step) Step
+	}{
+		{name: "WithCache", wrap: func(step Step) Step { return WithCache(step, key) }},
+		{
+			name: "WithCache inside WithPolicy",
+			wrap: func(step Step) Step { return WithPolicy(WithCache(step, key), retry) },
+		},
+		{
+			name: "WithPolicy inside WithCache",
+			wrap: func(step Step) Step { return WithCache(WithPolicy(step, retry), key) },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := &stepCalls{}
+			whens := 0
+			_, state, run, err := buildRun(t, PipelineSpec{
+				Steps: []Step{tt.wrap(countedStep(calls, "a", nil, amountKey)), describeAmount(calls, "b")},
+				Transitions: []Transition{
+					{From: "a", When: func(State, error) bool {
+						if whens++; whens == 1 {
+							panic("router not ready")
+						}
+						return false
+					}, To: End},
+					{From: "a", OnError: true, To: "b"},
+					{From: "b", When: func(State, error) bool { return calls.of("b") < 3 }, To: "a"},
+				},
+				MaxVisits: map[string]int{"a": 3},
+				Defaults:  []Default{DefaultValue(amountKey, 0)},
+			}, Prediction{})
+
+			require.NoError(t, err)
+			require.Equal(t, 2, calls.of("a"), "the second visit runs a, the third is served from the cache")
+			require.Equal(t, []string{
+				`a#1 err: transition 0 from "a": When panicked: router not ready`,
+				"b#1",
+				"a#2",
+				"b#2",
+				"a#3 cached",
+				"b#3",
+			}, outcomeSummary(run))
+			require.Equal(t, 20, state.values["amount"], "the cache holds the second visit's write")
+			require.Equal(t, "amount 20", state.values["decision"])
+		})
+	}
+}
+
 func TestTransitionFailGivesAStepErrorNamingFrom(t *testing.T) {
 	t.Run("on success", func(t *testing.T) {
 		calls := &stepCalls{}

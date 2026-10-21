@@ -4,53 +4,82 @@ import (
 	"context"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 )
 
-// TestBuildIsLinearInStepsAndTransitions builds pipelines of many steps whose transitions skip
-// or rewind over most of them. Build makes one pass over the steps and one over the
-// transitions, recording the steps a rule skips or rewinds as the bounds of difference arrays,
-// so each build takes a small multiple of the time without transitions; walking the steps
-// between each rule's From and To would make it quadratic, hundreds of times slower here.
+// TestBuildIsLinearInStepsAndTransitions builds pipelines of growing size whose transitions skip
+// or rewind over most of their steps, and bounds the iterations of Build's pass over the
+// transitions and its pass over the steps, which count every loop over rules or steps inside
+// them (see transitionFacts). Build records the steps a rule skips or rewinds as the bounds of
+// difference arrays, so the count stays between the steps plus the transitions and a small
+// multiple of them; walking the steps between each rule's From and To, or looking through every
+// rule at each step, would make it quadratic. A count makes the check independent of the
+// machine's load.
 func TestBuildIsLinearInStepsAndTransitions(t *testing.T) {
-	if testing.Short() {
-		t.Skip("builds pipelines of 40,000 steps")
+	name := func(i int) string { return fmt.Sprintf("s%d", i) }
+	// the forward rules are declared from the last step back, so the first rule that skips over a
+	// step is declared late and a search through the rules for one is long.
+	shapes := []struct {
+		name        string
+		transitions func(n int) ([]Transition, map[string]int)
+	}{
+		{
+			// each step may end the run, so every rule skips over the steps after its From, and every
+			// step but the first may not write.
+			name: "an End rule per step",
+			transitions: func(n int) ([]Transition, map[string]int) {
+				rules := make([]Transition, n)
+				for i := range rules {
+					rules[i] = Transition{From: name(n - 1 - i), When: amountIs(1), To: End}
+				}
+				return rules, nil
+			},
+		},
+		{
+			name: "an OnError rule per step to the last",
+			transitions: func(n int) ([]Transition, map[string]int) {
+				rules := make([]Transition, n-1)
+				for i := range rules {
+					rules[i] = Transition{From: name(n - 2 - i), OnError: true, To: name(n - 1)}
+				}
+				return rules, nil
+			},
+		},
+		{
+			name: "a rewind of every step",
+			transitions: func(n int) ([]Transition, map[string]int) {
+				rules := make([]Transition, n)
+				for i := range rules {
+					rules[i] = Transition{From: name(n - 1), When: amountIs(i), To: name(0)}
+				}
+				return rules, map[string]int{name(0): 2}
+			},
+		},
 	}
-	const n = 40000
-	// the steps write nothing, so a quadratic build costs time rather than memory.
-	steps := make([]Step, n)
-	for i := range steps {
-		steps[i] = NewStep(fmt.Sprintf("s%d", i), nil, nil, func(context.Context, State) error { return nil })
-	}
-	// each step may end the run, so every rule skips over the steps after its From.
-	ends := make([]Transition, n)
-	for i := range ends {
-		ends[i] = Transition{From: fmt.Sprintf("s%d", i), When: amountIs(1), To: End}
-	}
-	// every rule rewinds the whole pipeline.
-	rewinds := make([]Transition, n)
-	for i := range rewinds {
-		rewinds[i] = Transition{From: fmt.Sprintf("s%d", n-1), When: amountIs(i), To: "s0"}
-	}
-	build := func(transitions []Transition, maxVisits map[string]int) time.Duration {
-		fastest := time.Duration(1 << 62)
-		for range 3 {
-			start := time.Now()
-			_, err := PipelineSpec{Steps: steps, Transitions: transitions, MaxVisits: maxVisits}.Build()
-			require.NoError(t, err)
-			fastest = min(fastest, time.Since(start))
-		}
-		return fastest
-	}
+	for _, shape := range shapes {
+		t.Run(shape.name, func(t *testing.T) {
+			for _, n := range []int{100, 1000, 10000} {
+				// each step writes a key of its own, which no step reads, so the steps that may not
+				// write need no Default.
+				steps := make([]Step, n)
+				for i := range steps {
+					key := Key[int]{Name: fmt.Sprintf("k%d", i)}
+					steps[i] = NewStep(name(i), nil, refs(key.Ref()), func(_ context.Context, s State) error {
+						key.Set(s, i)
+						return nil
+					})
+				}
+				transitions, maxVisits := shape.transitions(n)
+				var work int
+				_, err := PipelineSpec{Steps: steps, Transitions: transitions, MaxVisits: maxVisits}.build(&work)
+				require.NoError(t, err)
 
-	plain := build(nil, nil)
-	for name, took := range map[string]time.Duration{
-		"an End rule per step":   build(ends, nil),
-		"a rewind of every step": build(rewinds, map[string]int{"s0": 2}),
-	} {
-		t.Logf("%s: %v, without transitions %v", name, took, plain)
-		require.Less(t, took, 4*plain+20*time.Millisecond, "%s", name)
+				size := n + len(transitions)
+				t.Logf("%d steps, %d transitions: %d iterations", n, len(transitions), work)
+				require.GreaterOrEqual(t, work, size, "each pass counts its iterations")
+				require.LessOrEqual(t, work, 2*size, "%d steps", n)
+			}
+		})
 	}
 }

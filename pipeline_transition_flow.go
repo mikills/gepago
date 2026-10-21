@@ -36,8 +36,10 @@ func (s *PipelineSpec) Add(flows ...Flow) {
 //
 // Its transitions go from the routing step to the arm whose label the routing step wrote and
 // from each arm but the last to name+"_end". The label key is part of the run's output, and a
-// later step may read it; Build refuses a pipeline input, a Default or another step's write
-// with the Branch's name.
+// later step may read it. When a transition skips over the routing step, or takes it forward on
+// error, the routing step may not write, so such a reader needs a Default for the label key,
+// which the routing step's write replaces when it runs. Build refuses a pipeline input or
+// another step's write with the Branch's name.
 //
 // Every arm is a top-level step: its name must be unique in the pipeline, its components are
 // scoped as "<arm>.<component>", and the transitions skip over it, so it may not write: a later

@@ -288,6 +288,65 @@ func TestBranchLabelKey(t *testing.T) {
 		require.Equal(t, []string{"chose a"}, got["notes"])
 	})
 
+	// a transition that skips over the Branch, or one forward from its routing step on error,
+	// makes the routing step may-not-write, so a later reader of the label needs a Default for
+	// it, which the routing step's write replaces when it runs.
+	report := NewStep("report", refs(label.Ref()), refs(notesKey.Ref()), func(_ context.Context, s State) error {
+		chosen, err := label.Get(s)
+		if err != nil {
+			return err
+		}
+		notesKey.Set(s, []string{"chose " + chosen})
+		return nil
+	})
+	defaulted := []struct {
+		name       string
+		cond       func(State) (string, error)
+		transition Transition
+		route      string
+	}{
+		{
+			name:       "a Default is read after a skip over the Branch",
+			cond:       always,
+			transition: Transition{From: "parse", When: amountIs(10), To: "report"},
+			route:      "none",
+		},
+		{
+			name:       "the routing step's write replaces the Default",
+			cond:       always,
+			transition: Transition{From: "parse", When: amountIs(1), To: "report"},
+			route:      "a",
+		},
+		{
+			name:       "a Default is read after an OnError transition forward from the routing step",
+			cond:       func(State) (string, error) { return "", errFlaky },
+			transition: Transition{From: "route", OnError: true, To: "report"},
+			route:      "none",
+		},
+	}
+	for _, tt := range defaulted {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := flowSpec(nil, Branch("route", tt.cond, arms()), writeAmount("parse", 10))
+			spec.Steps = append(spec.Steps, report)
+			spec.Transitions = append(spec.Transitions, tt.transition)
+			_, err := spec.Build()
+			require.ErrorContains(
+				t,
+				err,
+				`pipeline step "report" reads "route" (string), which step "route" may not write`,
+			)
+			require.ErrorContains(t, err, `declare a Default for "route"`)
+
+			spec.Defaults = []Default{DefaultValue(label, "none")}
+			pipeline, err := spec.Build()
+			require.NoError(t, err)
+			got, err := pipeline.RunCandidate(context.Background(), nil, Prediction{})
+			require.NoError(t, err)
+			require.Equal(t, tt.route, got["route"])
+			require.Equal(t, []string{"chose " + tt.route}, got["notes"])
+		})
+	}
+
 	clash := func(name string) Step {
 		return NewStep(name, nil, refs(label.Ref()), func(_ context.Context, s State) error {
 			label.Set(s, name)
@@ -308,14 +367,34 @@ func TestBranchLabelKey(t *testing.T) {
 				`"route" (string), which is a pipeline input; rename the Branch or the key`,
 		},
 		{
-			name: "a default",
+			name: "a default of another type",
 			spec: func() PipelineSpec {
 				spec := flowSpec(nil, Branch("route", always, arms()), writeAmount("parse", 10))
+				spec.Defaults = []Default{DefaultValue(Key[int]{Name: "route"}, 0)}
+				return spec
+			},
+			wantErr: `default for "route" has type int, but step "route" writes it as string`,
+		},
+		{
+			name: "a default and an earlier writer",
+			spec: func() PipelineSpec {
+				spec := flowSpec(nil, Branch("route", always, arms()), writeAmount("parse", 10), clash("earlier"))
 				spec.Defaults = []Default{DefaultValue(label, "")}
 				return spec
 			},
 			wantErr: `pipeline step "route", which routes Branch "route", writes the chosen label to state key ` +
-				`"route" (string), which has a Default; rename the Branch or the key`,
+				`"route" (string), which step "earlier" also writes; rename the Branch or the key`,
+		},
+		{
+			name: "a default and a later writer",
+			spec: func() PipelineSpec {
+				spec := flowSpec(nil, Branch("route", always, arms()), writeAmount("parse", 10))
+				spec.Steps = append(spec.Steps, clash("later"))
+				spec.Defaults = []Default{DefaultValue(label, "")}
+				return spec
+			},
+			wantErr: `pipeline step "later" writes "route" (string), the state key Branch "route" writes its ` +
+				`chosen label to; rename the Branch or the key`,
 		},
 		{
 			name: "an earlier writer",
