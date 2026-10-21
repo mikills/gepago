@@ -3,7 +3,7 @@ module github.com/mikills/gepago/programs/crucible
 go 1.27.1
 
 require (
-	github.com/mikills/gepago v0.8.0
+	github.com/mikills/gepago v0.9.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	github.com/stretchr/testify v1.12.1
 )
