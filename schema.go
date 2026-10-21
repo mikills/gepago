@@ -25,20 +25,24 @@ import (
 //   - []byte is a (base64) string, a map is an object whose additionalProperties hold the
 //     element schema, and an array [N]T has exactly N items (minItems and maxItems);
 //   - a field with the ",string" tag option is a string with a pattern for the JSON encoding
-//     of its value, such as "12" for an int or "\"bob\"" for a string;
+//     of its value, such as "12" for an int or "\"bob\"" for a string; a json.Number, whose
+//     kind is string, has a string's pattern, such as "\"12\"";
 //   - a field's description tag becomes its property's description.
 //
 // A value Get accepts with every field present matches the schema, and a value that matches
-// the schema decodes with Get, except where the schema is unconstrained and where a number does
-// not fit its type (300 for an int8, 1e39 or 1e-50 for a float32), which Get refuses. The
-// array bounds and patterns fall outside the strict subset (see StrictJSONSchema), so
-// providers do not enforce them.
+// the schema decodes with Get, except where the schema is unconstrained, where a number does
+// not fit its type (300 for an int8, 1e39 or 1e-50 for a float32), which Get refuses, and in a
+// ",string" json.Number, where Get also takes the number without inner quotes ("12") and
+// refuses a string that holds no number ("\"x\""). The array bounds and patterns fall outside
+// the strict subset (see StrictJSONSchema), so providers do not enforce them.
 //
 // Channels, functions, complex numbers and maps whose keys cannot come from a JSON object key
 // have no JSON form and return an error. So does a struct whose definition encoding/json/v2
 // refuses, such as one with an unexported field that has a json tag or a malformed tag option,
-// or with a ",string" field that is not a boolean, number or string (or an unnamed pointer to
-// one) or whose type has its own unmarshal method, at any depth, since Get refuses every object
+// or that has a json tag option other than omitempty, omitzero and string (encoding/json ignored
+// the others, and v2 may apply them), the tag `json:"-,"`, which v2 refuses, or a ",string"
+// field that is not a boolean, number or string (or an unnamed pointer to one) or whose type
+// has its own unmarshal method (json.Number aside), at any depth, since Get refuses every object
 // for it.
 func JSONSchemaFor[T any]() (json.RawMessage, error) {
 	typ := reflect.TypeFor[T]()

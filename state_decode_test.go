@@ -450,8 +450,8 @@ func TestDecodeTimeDurationNumberAndBytes(t *testing.T) {
 	require.Equal(t, time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC), got)
 }
 
-// conflictingNames and stringSlice are built at run time because vet and staticcheck refuse
-// their tags, which are the misuse under test.
+// conflictingNames, stringSlice and dashNamed are built at run time because vet and staticcheck
+// refuse their tags, which are the misuse under test.
 var (
 	conflictingNames = reflect.StructOf([]reflect.StructField{
 		{Name: "A", Type: reflect.TypeFor[int](), Tag: `json:"x"`},
@@ -461,6 +461,7 @@ var (
 	stringSlice = reflect.StructOf([]reflect.StructField{
 		{Name: "A", Type: reflect.TypeFor[[]int](), Tag: `json:"a,string"`},
 	})
+	dashNamed = structWithTag("A", reflect.TypeFor[int](), `json:"-,"`)
 )
 
 var errRefusedLabel = errors.New("label refused")
@@ -546,6 +547,32 @@ func TestDecodeDiffersFromV080(t *testing.T) {
 			wantErr: "json: cannot unmarshal object into Go value of type " + stringSlice.String() +
 				": struct field A of type []int cannot have the `string` tag option, " +
 				"which applies only to booleans, numbers and strings",
+		},
+		{
+			// v0.8.0 ignored a tag option encoding/json did not define.
+			name:  "a tag option encoding/json ignored",
+			typ:   reflect.TypeFor[stateCaseIgnored](),
+			value: map[string]any{"name": "x"},
+			wantErr: "json: cannot unmarshal object into Go value of type gepa.stateCaseIgnored" +
+				": struct field Name of type string cannot have the `case:ignore` tag option, " +
+				"which encoding/json ignored and encoding/json/v2 may apply; " +
+				"only omitempty, omitzero and string are allowed",
+		},
+		{
+			// v0.8.0 decoded the member "-".
+			name:  `the tag json:"-,"`,
+			typ:   dashNamed,
+			value: map[string]any{"-": 1},
+			wantErr: "json: cannot unmarshal object into Go value of type " + dashNamed.String() +
+				": struct field A of type int cannot be named \"-\" by the tag `json:\"-,\"`, " +
+				"which encoding/json/v2 refuses; v2 names a field \"-\" only with the omitempty, omitzero or string option",
+		},
+		{
+			// v0.8.0 kept the text as it was.
+			name:    `a ",string" json.Number holding text that is not a JSON number`,
+			typ:     reflect.TypeFor[stateQuotedNumber](),
+			value:   map[string]any{"n": "0x10"},
+			wantErr: `field "n" is "0x10", which is not a JSON number`,
 		},
 		{
 			// v0.8.0 returned the method's error alone.
@@ -986,7 +1013,7 @@ func TestDecodeRefusesStructsJSONV2Refuses(t *testing.T) {
 		{Name: "Name", Type: reflect.TypeFor[string](), Tag: `json:"name"`},
 		{Name: "secret", PkgPath: "github.com/mikills/gepago", Type: reflect.TypeFor[string](), Tag: `json:"secret"`},
 	})
-	str, at := reflect.TypeFor[string](), reflect.TypeFor[time.Time]()
+	str := reflect.TypeFor[string]()
 	id := map[string]any{"id": "x"}
 	tests := []struct {
 		name  string
@@ -1014,19 +1041,6 @@ func TestDecodeRefusesStructsJSONV2Refuses(t *testing.T) {
 			reason: "Go struct field stateRef cannot have any options other than `embed` specified",
 		},
 		{
-			name:  "space before an option",
-			typ:   structWithTag("ID", str, `json:"id, omitempty"`),
-			value: id,
-			reason: "Go struct field ID has malformed `json` tag: " +
-				"invalid character ' ' at start of option (expecting Unicode letter)",
-		},
-		{
-			name:   "option in the wrong case",
-			typ:    structWithTag("ID", str, `json:"id,omitEmpty"`),
-			value:  id,
-			reason: "Go struct field ID has invalid appearance of `omitEmpty` tag option; specify `omitempty` instead",
-		},
-		{
 			name:   "repeated option",
 			typ:    structWithTag("ID", str, `json:"id,omitempty,omitempty"`),
 			value:  id,
@@ -1037,12 +1051,6 @@ func TestDecodeRefusesStructsJSONV2Refuses(t *testing.T) {
 			typ:    structWithTag("ID", str, `json:"id,"`),
 			value:  id,
 			reason: "Go struct field ID has malformed `json` tag: invalid trailing ',' character",
-		},
-		{
-			name:   "format option",
-			typ:    structWithTag("At", at, `json:"at,format:RFC3339"`),
-			value:  map[string]any{"at": "2026-06-30T10:00:00Z"},
-			reason: "Go struct field At has unsupported `format` tag option",
 		},
 		{
 			name:   "two fields with one JSON name",
@@ -1124,6 +1132,329 @@ func TestDecodeRefusesStructsJSONV2Refuses(t *testing.T) {
 	}
 }
 
+// stateEmbedsTagged has an `embed` field, which encoding/json ignored and v2 applies: v2 reads
+// the members of Inner as members of stateEmbedsTagged.
+type stateEmbedsTagged struct {
+	Inner stateRef `json:",embed"`
+	Y     int      `json:"y"`
+}
+
+type stateHoldsEmbedsTagged struct {
+	V *stateEmbedsTagged `json:"v"`
+}
+
+// stateCatchAll's Extra collects every unknown member in v2.
+type stateCatchAll struct {
+	A     int             `json:"a"`
+	Extra json.RawMessage `json:",embed"`
+}
+
+// stateCaseIgnored matches its member name in any case in v2.
+type stateCaseIgnored struct {
+	Name string `json:"name,omitempty,case:ignore"`
+}
+
+type stateEmbedsCaseIgnored struct {
+	stateCaseIgnored
+	Y int `json:"y"`
+}
+
+// StateInlined is exported so a struct built at run time can embed it.
+type StateInlined struct {
+	X int `json:"x"`
+}
+
+// optionRefused is the reason a struct is refused for a field with a tag option that
+// encoding/json did not define.
+func optionRefused(field string, typ reflect.Type, option string) string {
+	return fmt.Sprintf(
+		"struct field %s of type %s cannot have the `%s` tag option, which encoding/json ignored and "+
+			"encoding/json/v2 may apply; only omitempty, omitzero and string are allowed",
+		field,
+		typ,
+		option,
+	)
+}
+
+// TestDecodeRefusesTagOptionsEncodingJSONIgnored checks that a struct with a json tag that
+// encoding/json and encoding/json/v2 read differently is refused up front by JSONSchemaFor,
+// NewTool and TypedPredict, and for every object by Get, naming the field and the option: a tag
+// option other than omitempty, omitzero and string, which encoding/json ignored and v2 may apply
+// (`embed` moves members or collects unknown ones, `case:` changes name matching), and the tag
+// `json:"-,"`, which named a field "-" and which v2 refuses. Each value is one v0.8.0 decoded.
+func TestDecodeRefusesTagOptionsEncodingJSONIgnored(t *testing.T) {
+	str, at := reflect.TypeFor[string](), reflect.TypeFor[time.Time]()
+	inlined := reflect.TypeFor[StateInlined]()
+	tests := []struct {
+		name  string
+		typ   reflect.Type
+		value map[string]any
+		// reason is the refusal of typ.
+		reason string
+	}{
+		{
+			name:   "embed on a struct",
+			typ:    structWithTag("Inner", inlined, `json:",embed"`),
+			value:  map[string]any{"Inner": map[string]any{"x": 1}},
+			reason: optionRefused("Inner", inlined, "embed"),
+		},
+		{
+			name:   "embed on a map",
+			typ:    structWithTag("Extra", reflect.TypeFor[map[string]int](), `json:",embed"`),
+			value:  map[string]any{"Extra": map[string]any{"a": 1}},
+			reason: optionRefused("Extra", reflect.TypeFor[map[string]int](), "embed"),
+		},
+		{
+			name:   "embed on a raw message",
+			typ:    structWithTag("Extra", reflect.TypeFor[json.RawMessage](), `json:",embed"`),
+			value:  map[string]any{"Extra": map[string]any{"q": 1}},
+			reason: optionRefused("Extra", reflect.TypeFor[json.RawMessage](), "embed"),
+		},
+		{
+			name: "inline on an embedded struct",
+			typ: reflect.StructOf([]reflect.StructField{
+				{Name: "StateInlined", Type: inlined, Anonymous: true, Tag: `json:",inline"`},
+			}),
+			value:  map[string]any{"x": 1},
+			reason: optionRefused("StateInlined", inlined, "inline"),
+		},
+		{
+			name:   "unknown",
+			typ:    structWithTag("Extra", reflect.TypeFor[map[string]any](), `json:",unknown"`),
+			value:  map[string]any{"Extra": map[string]any{"a": 1}},
+			reason: optionRefused("Extra", reflect.TypeFor[map[string]any](), "unknown"),
+		},
+		{
+			name:   "case:ignore",
+			typ:    structWithTag("Name", str, `json:"name,case:ignore"`),
+			value:  map[string]any{"name": "x"},
+			reason: optionRefused("Name", str, "case:ignore"),
+		},
+		{
+			name:   "case:strict after a known option",
+			typ:    structWithTag("N", reflect.TypeFor[int](), `json:"n,string,case:strict"`),
+			value:  map[string]any{"n": "1"},
+			reason: optionRefused("N", reflect.TypeFor[int](), "case:strict"),
+		},
+		{
+			name:   "format",
+			typ:    structWithTag("At", at, `json:"at,format:RFC3339"`),
+			value:  map[string]any{"at": "2026-06-30T10:00:00Z"},
+			reason: optionRefused("At", at, "format:RFC3339"),
+		},
+		{
+			name:   "format holding a comma",
+			typ:    structWithTag("At", at, `json:"at,format:'2006-01-02, 15:04'"`),
+			value:  map[string]any{"at": "2026-06-30T10:00:00Z"},
+			reason: optionRefused("At", at, "format:'2006-01-02, 15:04'"),
+		},
+		{
+			name:   "an option neither package defines",
+			typ:    structWithTag("N", reflect.TypeFor[int](), `json:"n,foo"`),
+			value:  map[string]any{"n": 1},
+			reason: optionRefused("N", reflect.TypeFor[int](), "foo"),
+		},
+		{
+			name:   "an option in the wrong case",
+			typ:    structWithTag("ID", str, `json:"id,omitEmpty"`),
+			value:  map[string]any{"id": "x"},
+			reason: optionRefused("ID", str, "omitEmpty"),
+		},
+		{
+			name:   "a space before an option",
+			typ:    structWithTag("ID", str, `json:"id, omitempty"`),
+			value:  map[string]any{"id": "x"},
+			reason: optionRefused("ID", str, " omitempty"),
+		},
+		{
+			name:  `the tag json:"-,"`,
+			typ:   dashNamed,
+			value: map[string]any{"-": 1},
+			reason: "struct field A of type int cannot be named \"-\" by the tag `json:\"-,\"`, which encoding/json/v2 " +
+				"refuses; v2 names a field \"-\" only with the omitempty, omitzero or string option",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := decodeJSONValue(tt.typ, tt.value)
+			require.EqualError(
+				t,
+				err,
+				"json: cannot unmarshal object into Go value of type "+tt.typ.String()+": "+tt.reason,
+			)
+
+			_, _, err = newSchemaBuilder().typeSchema(tt.typ, "")
+			require.EqualError(t, err, tt.typ.String()+" cannot be decoded from JSON: "+tt.reason)
+		})
+	}
+
+	t.Run("a field named - with an option", func(t *testing.T) {
+		dash := structWithTag("A", reflect.TypeFor[int](), `json:"-,omitempty"`)
+		got, err := decodeJSONValue(dash, map[string]any{"-": 1})
+		require.NoError(t, err)
+		require.Equal(t, 1, reflect.ValueOf(got).Field(0).Interface())
+		_, _, err = newSchemaBuilder().typeSchema(dash, "")
+		require.NoError(t, err)
+	})
+
+	embedReason := optionRefused("Inner", reflect.TypeFor[stateRef](), "embed")
+	catchAllReason := optionRefused("Extra", reflect.TypeFor[json.RawMessage](), "embed")
+	caseReason := optionRefused("Name", str, "case:ignore")
+	embeds := "gepa.stateEmbedsTagged cannot be decoded from JSON: " + embedReason
+	catchAll := "gepa.stateCatchAll cannot be decoded from JSON: " + catchAllReason
+	caseIgnored := "gepa.stateCaseIgnored cannot be decoded from JSON: " + caseReason
+	t.Run("schema, tool and typed predict", func(t *testing.T) {
+		_, err := JSONSchemaFor[stateEmbedsTagged]()
+		require.EqualError(t, err, "json schema for gepa.stateEmbedsTagged: "+embeds)
+		_, err = JSONSchemaFor[stateHoldsEmbedsTagged]()
+		require.EqualError(t, err, `json schema for gepa.stateHoldsEmbedsTagged: field "v": `+embeds)
+
+		tool := NewTool("t", "d", func(context.Context, stateCaseIgnored) (string, error) { return "", nil })
+		_, err = NewToolRegistry(tool)
+		require.EqualError(t, err, `register tool: tool "t": json schema for gepa.stateCaseIgnored: `+caseIgnored)
+
+		lm := textModel(nil)
+		require.EqualError(
+			t,
+			TypedPredict[stateObligation, stateCatchAll]{LM: lm}.Validate(),
+			"typed predict outputs: "+catchAll,
+		)
+		require.EqualError(
+			t,
+			TypedPredict[stateEmbedsCaseIgnored, stateObligation]{LM: lm}.Validate(),
+			"typed predict inputs: "+caseIgnored,
+		)
+		given := Signature{Inputs: []Field{{Name: "v"}}}
+		require.EqualError(
+			t,
+			TypedPredict[stateHolder[stateCatchAll], stateObligation]{Signature: given, LM: lm}.Validate(),
+			`typed predict inputs: field "v": `+catchAll,
+		)
+	})
+
+	// Get refuses each value, which v0.8.0 decoded or refused as an unknown member and v2 alone
+	// decodes differently or accepts, even when v2 meets an unknown member first.
+	const refused = "json: cannot unmarshal object into Go value of type "
+	for name, tt := range map[string]struct {
+		get     func(State) error
+		value   string
+		wantErr string
+	}{
+		"the object the schema described": {
+			get:     getError[stateEmbedsTagged],
+			value:   `{"Inner":{"ref":"r"},"y":2}`,
+			wantErr: "decode as gepa.stateEmbedsTagged: " + refused + "gepa.stateEmbedsTagged: " + embedReason,
+		},
+		"the object v2 expects": {
+			get:     getError[stateEmbedsTagged],
+			value:   `{"ref":"r","y":2}`,
+			wantErr: "decode as gepa.stateEmbedsTagged: " + refused + "gepa.stateEmbedsTagged: " + embedReason,
+		},
+		"a nested object": {
+			get:   getError[stateHoldsEmbedsTagged],
+			value: `{"v":{"Inner":{"ref":"r"},"y":2}}`,
+			wantErr: "decode as gepa.stateHoldsEmbedsTagged: json: cannot unmarshal object into Go struct field " +
+				"stateHoldsEmbedsTagged.v of type gepa.stateEmbedsTagged: " + embedReason,
+		},
+		"a raw message v2 fills with the whole object": {
+			get:     getError[stateCatchAll],
+			value:   `{"a":1,"Extra":{"q":1}}`,
+			wantErr: "decode as gepa.stateCatchAll: " + refused + "gepa.stateCatchAll: " + catchAllReason,
+		},
+		"an unknown member v2 collects": {
+			get:     getError[stateCatchAll],
+			value:   `{"a":1,"Extra":{},"zzz":5}`,
+			wantErr: "decode as gepa.stateCatchAll: " + refused + "gepa.stateCatchAll: " + catchAllReason,
+		},
+		"a name in the wrong case": {
+			get:     getError[stateCaseIgnored],
+			value:   `{"NAME":"x"}`,
+			wantErr: "decode as gepa.stateCaseIgnored: " + refused + "gepa.stateCaseIgnored: " + caseReason,
+		},
+		"an unknown member after a name in the wrong case": {
+			get:     getError[stateCaseIgnored],
+			value:   `{"NAME":"x","zzz":1}`,
+			wantErr: "decode as gepa.stateCaseIgnored: " + refused + "gepa.stateCaseIgnored: " + caseReason,
+		},
+		"an embedded struct": {
+			get:     getError[stateEmbedsCaseIgnored],
+			value:   `{"name":"x","y":1}`,
+			wantErr: "decode as gepa.stateEmbedsCaseIgnored: " + refused + "gepa.stateCaseIgnored: " + caseReason,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := tt.get(NewState(Prediction{"k": json.RawMessage(tt.value)}))
+			require.EqualError(t, err, `state key "k": `+tt.wantErr)
+		})
+	}
+}
+
+// getError returns the error Key[T].Get returns for the key "k" of s.
+func getError[T any](s State) error {
+	_, err := Key[T]{Name: "k"}.Get(s)
+	return err
+}
+
+// TestRefusedDefinitionOnPath checks which struct refusedDefinitionOnPath finds on the way to
+// the value an error is about, and where it locates it.
+func TestRefusedDefinitionOnPath(t *testing.T) {
+	unknownAt := func(pointer string) error {
+		return &jsonv2.SemanticError{JSONPointer: jsontext.Pointer(pointer), Err: jsonv2.ErrUnknownName}
+	}
+	tests := []struct {
+		name string
+		typ  reflect.Type
+		err  error
+		// at is where the refusal is located; empty for none.
+		at     string
+		goType reflect.Type
+	}{
+		{name: "not a semantic error", typ: reflect.TypeFor[stateCaseIgnored](), err: errors.New("boom")},
+		{name: "valid structs", typ: reflect.TypeFor[nestedObligations](), err: unknownAt("/items/0/note")},
+		{
+			name:   "the top",
+			typ:    reflect.TypeFor[stateCaseIgnored](),
+			err:    unknownAt("/zzz"),
+			at:     "",
+			goType: reflect.TypeFor[stateCaseIgnored](),
+		},
+		{
+			name:   "behind a pointer",
+			typ:    reflect.TypeFor[stateHoldsEmbedsTagged](),
+			err:    unknownAt("/v/Inner"),
+			at:     "/v",
+			goType: reflect.TypeFor[stateEmbedsTagged](),
+		},
+		{
+			name:   "in a map of slices",
+			typ:    reflect.TypeFor[map[string][]stateCatchAll](),
+			err:    unknownAt("/a/1/zzz"),
+			at:     "/a/1",
+			goType: reflect.TypeFor[stateCatchAll](),
+		},
+		{
+			name: "inside a type with its own method",
+			typ:  reflect.TypeFor[stateHolder[celsius]](),
+			err:  unknownAt("/v/x"),
+		},
+		{name: "past a number", typ: reflect.TypeFor[stateHolder[int]](), err: unknownAt("/v/x/y")},
+		{name: "past an unknown member", typ: reflect.TypeFor[stateHolder[stateCatchAll]](), err: unknownAt("/w/a")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := refusedDefinitionOnPath(tt.typ, tt.err)
+			if tt.goType == nil {
+				require.NoError(t, err)
+				return
+			}
+			var semantic *jsonv2.SemanticError
+			require.ErrorAs(t, err, &semantic)
+			require.Equal(t, jsontext.Pointer(tt.at), semantic.JSONPointer)
+			require.Equal(t, tt.goType, semantic.GoType)
+		})
+	}
+}
+
 // rawCount decodes itself from a bare JSON number with UnmarshalJSON, so a quoted number is an
 // error.
 type rawCount int
@@ -1176,22 +1507,31 @@ func (l *fromLevel) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	return nil
 }
 
-// stateQuotedNumber has a ",string" json.Number, which encoding/json unquoted and v2 decodes
-// with json.Number's own method, ignoring the option.
+// stateQuotedNumber has a ",string" json.Number, which encoding/json read from a JSON number in
+// a string, or a JSON string holding one, and which decodeQuotedNumber reads the same way.
 type stateQuotedNumber struct {
 	N json.Number `json:"n,string"`
 }
 
-type stateHoldsQuoted struct {
-	Quoted *stateQuotedNumber `json:"quoted"`
+// stateQuotedCount has a ",string" rawCount, which encoding/json unquoted before calling its
+// UnmarshalJSON and v2 decodes with the method, ignoring the option.
+type stateQuotedCount struct {
+	N rawCount `json:"n,string"`
 }
+
+type stateHoldsQuotedCount struct {
+	Quoted *stateQuotedCount `json:"quoted"`
+}
+
+// stateIntPointer is a named pointer, to which encoding/json did not apply the ",string" option.
+type stateIntPointer *int
 
 // TestDecodeRefusesStringOptionV2DoesNotApply checks that a struct with a ",string" field that
 // encoding/json/v2 does not decode as v0.8.0 did is refused up front by JSONSchemaFor, NewTool
 // and TypedPredict, and for every object by Get: a field that is not a boolean, number or
-// string, which v0.8.0 decoded ignoring the option and v2 refuses only when the field is
-// present, and a field whose type has its own unmarshal method, which v0.8.0 unquoted before
-// calling the method and v2 decodes with the method, ignoring the option.
+// string, or an unnamed pointer to one, which v0.8.0 decoded ignoring the option and v2 refuses
+// only when the field is present, and a field whose type has its own unmarshal method, which
+// v0.8.0 unquoted before calling the method and v2 decodes with the method, ignoring the option.
 func TestDecodeRefusesStringOptionV2DoesNotApply(t *testing.T) {
 	const notScalar = "which applies only to booleans, numbers and strings"
 	tests := []struct {
@@ -1208,16 +1548,10 @@ func TestDecodeRefusesStringOptionV2DoesNotApply(t *testing.T) {
 		{"struct", reflect.TypeFor[stateRef](), `json:"v,string"`, map[string]any{"ref": "r"}, notScalar},
 		{"bytes", reflect.TypeFor[[]byte](), `json:"v,string"`, "aGk=", notScalar},
 		{"double pointer", reflect.TypeFor[**int](), `json:"v,string"`, 1, notScalar},
+		{"named pointer", reflect.TypeFor[stateIntPointer](), `json:"v,string"`, 1, notScalar},
 		{"interface", reflect.TypeFor[any](), `json:"v,string"`, "x", notScalar},
 		{"time", reflect.TypeFor[time.Time](), `json:"v,string"`, "2026-06-30T10:00:00Z", notScalar},
 		{"slice left out", reflect.TypeFor[[]string](), `json:"v,omitempty,string"`, nil, notScalar},
-		{
-			"json.Number",
-			reflect.TypeFor[json.Number](),
-			`json:"v,string"`,
-			"1",
-			"since json.Number has its own unmarshal method",
-		},
 		{
 			"UnmarshalJSON",
 			reflect.TypeFor[rawCount](),
@@ -1268,50 +1602,51 @@ func TestDecodeRefusesStringOptionV2DoesNotApply(t *testing.T) {
 		})
 	}
 
-	const reason = "struct field N of type json.Number cannot have the `string` tag option, " +
-		"since json.Number has its own unmarshal method"
-	const quoted = "gepa.stateQuotedNumber cannot be decoded from JSON: " + reason
-	_, err := JSONSchemaFor[stateQuotedNumber]()
-	require.EqualError(t, err, "json schema for gepa.stateQuotedNumber: "+quoted)
-	_, err = JSONSchemaFor[stateHoldsQuoted]()
-	require.EqualError(t, err, `json schema for gepa.stateHoldsQuoted: field "quoted": `+quoted)
+	const reason = "struct field N of type gepa.rawCount cannot have the `string` tag option, " +
+		"since gepa.rawCount has its own unmarshal method"
+	const quoted = "gepa.stateQuotedCount cannot be decoded from JSON: " + reason
+	_, err := JSONSchemaFor[stateQuotedCount]()
+	require.EqualError(t, err, "json schema for gepa.stateQuotedCount: "+quoted)
+	_, err = JSONSchemaFor[stateHoldsQuotedCount]()
+	require.EqualError(t, err, `json schema for gepa.stateHoldsQuotedCount: field "quoted": `+quoted)
 
-	tool := NewTool("t", "d", func(context.Context, stateQuotedNumber) (string, error) { return "", nil })
+	tool := NewTool("t", "d", func(context.Context, stateQuotedCount) (string, error) { return "", nil })
 	_, err = NewToolRegistry(tool)
-	require.EqualError(t, err, `register tool: tool "t": json schema for gepa.stateQuotedNumber: `+quoted)
+	require.EqualError(t, err, `register tool: tool "t": json schema for gepa.stateQuotedCount: `+quoted)
 
 	lm := textModel(nil)
 	require.EqualError(
 		t,
-		TypedPredict[stateObligation, stateQuotedNumber]{LM: lm}.Validate(),
+		TypedPredict[stateObligation, stateQuotedCount]{LM: lm}.Validate(),
 		"typed predict outputs: "+quoted,
 	)
 	require.EqualError(
 		t,
-		TypedPredict[stateQuotedNumber, stateObligation]{LM: lm}.Validate(),
+		TypedPredict[stateQuotedCount, stateObligation]{LM: lm}.Validate(),
 		"typed predict inputs: "+quoted,
 	)
 
+	const held = `decode as gepa.stateHoldsQuotedCount: json: cannot unmarshal object into Go struct field ` +
+		"stateHoldsQuotedCount.quoted of type gepa.stateQuotedCount: " + reason
 	state := NewState(Prediction{
 		"bare":   map[string]any{"n": "1"},
 		"held":   map[string]any{"quoted": map[string]any{"n": "1"}},
 		"absent": map[string]any{"quoted": nil},
+		// an unknown member ahead of n, inside the refused object, does not hide the refusal.
+		"unknown": json.RawMessage(`{"quoted":{"zzz":1,"n":"1"}}`),
 	})
-	_, err = Key[stateQuotedNumber]{Name: "bare"}.Get(state)
+	_, err = Key[stateQuotedCount]{Name: "bare"}.Get(state)
 	require.EqualError(
 		t,
 		err,
-		`state key "bare": decode as gepa.stateQuotedNumber: `+
-			"json: cannot unmarshal object into Go value of type gepa.stateQuotedNumber: "+reason,
+		`state key "bare": decode as gepa.stateQuotedCount: `+
+			"json: cannot unmarshal object into Go value of type gepa.stateQuotedCount: "+reason,
 	)
-	_, err = Key[stateHoldsQuoted]{Name: "held"}.Get(state)
-	require.EqualError(
-		t,
-		err,
-		`state key "held": decode as gepa.stateHoldsQuoted: json: cannot unmarshal object into Go struct field `+
-			"stateHoldsQuoted.quoted of type gepa.stateQuotedNumber: "+reason,
-	)
-	got, err := Key[stateHoldsQuoted]{Name: "absent"}.Get(state)
+	_, err = Key[stateHoldsQuotedCount]{Name: "held"}.Get(state)
+	require.EqualError(t, err, `state key "held": `+held)
+	_, err = Key[stateHoldsQuotedCount]{Name: "unknown"}.Get(state)
+	require.EqualError(t, err, `state key "unknown": `+held)
+	got, err := Key[stateHoldsQuotedCount]{Name: "absent"}.Get(state)
 	require.NoError(t, err, "a struct that holds no such object decodes, as v2 checks definitions lazily")
 	require.Nil(t, got.Quoted)
 }
@@ -1414,6 +1749,156 @@ func TestDecodeJSONNumberAsV080(t *testing.T) {
 			require.EqualError(t, err, tt.wantErr)
 		})
 	}
+}
+
+// stateQuotedNumbers holds ",string" json.Numbers, behind a pointer and in structs in a slice
+// and a map.
+type stateQuotedNumbers struct {
+	N      json.Number                  `json:"n,string"`
+	Maybe  *json.Number                 `json:"maybe,omitempty,string"`
+	List   []stateQuotedNumber          `json:"list"`
+	ByName map[string]stateQuotedNumber `json:"by_name"`
+}
+
+// TestDecodeQuotedJSONNumberAsV080 checks that a ",string" json.Number, which v0.8.0 decoded,
+// is accepted by JSONSchemaFor, NewTool and TypedPredict with v0.8.0's schema, which is that of
+// a ",string" string, and that Get decodes a JSON number in a string, or a JSON string holding
+// one, which is the form that schema describes, to the number's text as v0.8.0 did, plain and
+// inside pointers, slices and maps. Text that is not a JSON number, which v0.8.0 kept, is
+// refused, and so is what v0.8.0 refused.
+func TestDecodeQuotedJSONNumberAsV080(t *testing.T) {
+	type quotedString struct {
+		N string `json:"n,string"`
+	}
+	schema, err := JSONSchemaFor[stateQuotedNumber]()
+	require.NoError(t, err)
+	stringSchema, err := JSONSchemaFor[quotedString]()
+	require.NoError(t, err)
+	require.JSONEq(t, string(stringSchema), string(schema))
+	var parsed struct {
+		Properties map[string]struct{ Pattern string }
+	}
+	require.NoError(t, json.Unmarshal(schema, &parsed))
+	require.Regexp(t, parsed.Properties["n"].Pattern, `"5"`)
+
+	tool := NewTool("t", "d", func(context.Context, stateQuotedNumbers) (string, error) { return "", nil })
+	_, err = NewToolRegistry(tool)
+	require.NoError(t, err)
+	lm := textModel(nil)
+	require.NoError(t, TypedPredict[stateObligation, stateQuotedNumbers]{LM: lm}.Validate())
+	require.NoError(t, TypedPredict[stateQuotedNumbers, stateObligation]{LM: lm}.Validate())
+
+	for value, want := range map[string]json.Number{
+		`"5"`:              "5",
+		`"-2.5e3"`:         "-2.5e3",
+		`"-0"`:             "-0",
+		`"1e400"`:          "1e400",
+		`"\"5\""`:          "5",
+		`"\"-1.5E+2\""`:    "-1.5E+2",
+		`"\"\\u0037\""`:    "7",
+		`"0.000000000001"`: "0.000000000001",
+	} {
+		state := NewState(Prediction{"k": json.RawMessage(`{"n":` + value + `}`)})
+		got, err := Key[stateQuotedNumber]{Name: "k"}.Get(state)
+		require.NoError(t, err, value)
+		require.Equal(t, want, got.N, value)
+	}
+
+	maybe := json.Number("7")
+	want := stateQuotedNumbers{
+		N:      "1",
+		Maybe:  &maybe,
+		List:   []stateQuotedNumber{{N: "2"}, {N: "3"}},
+		ByName: map[string]stateQuotedNumber{"a": {N: "4"}},
+	}
+	for name, value := range map[string]any{
+		"raw JSON": json.RawMessage(`{"n":"1","maybe":"\"7\"","list":[{"n":"2"},{"n":"\"3\""}],"by_name":{"a":{"n":"4"}}}`),
+		"model reply": map[string]any{
+			"n":       "1",
+			"maybe":   "7",
+			"list":    []any{map[string]any{"n": "2"}, map[string]any{"n": `"3"`}},
+			"by_name": map[string]any{"a": map[string]any{"n": "4"}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := Key[stateQuotedNumbers]{Name: "k"}.Get(NewState(Prediction{"k": value}))
+			require.NoError(t, err)
+			require.Equal(t, want, got)
+		})
+	}
+	for _, value := range []string{
+		`{"n":"1","list":null,"by_name":null}`,
+		`{"n":"1","maybe":null,"list":[],"by_name":{}}`,
+	} {
+		got, err := Key[stateQuotedNumbers]{Name: "k"}.Get(NewState(Prediction{"k": json.RawMessage(value)}))
+		require.NoError(t, err, value)
+		require.Nil(t, got.Maybe, value)
+	}
+
+	refused := []struct {
+		name    string
+		value   string
+		wantErr string
+	}{
+		// v0.8.0 kept these.
+		{"hexadecimal", `{"n":"0x10"}`, `field "n" is "0x10", which is not a JSON number`},
+		{"a leading zero", `{"n":"01"}`, `field "n" is "01", which is not a JSON number`},
+		{"no fraction digits", `{"n":"1."}`, `field "n" is "1.", which is not a JSON number`},
+		{"infinity", `{"n":"-Inf"}`, `field "n" is "-Inf", which is not a JSON number`},
+		{"a trailing space", `{"n":"5 "}`, `field "n" is "5 ", which is not a JSON number`},
+		// v0.8.0 refused these too.
+		{"a string holding text", `{"n":"\"x\""}`, `field "n" is "\"x\"", which is not a JSON number`},
+		{"a string holding a leading zero", `{"n":"\"01\""}`, `field "n" is "\"01\"", which is not a JSON number`},
+		{"a boolean in a string", `{"n":"true"}`, `field "n" is "true", which is not a JSON number`},
+		{
+			"the string null",
+			`{"n":"null"}`,
+			`field "n" is the string "null", which a ",string" field decodes as no value`,
+		},
+		{
+			"a number without quotes",
+			`{"n":5}`,
+			"json: cannot unmarshal number into Go struct field stateQuotedNumber.n of type json.Number",
+		},
+		{"null", `{"n":null}`, `field "n" is null`},
+	}
+	for _, tt := range refused {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := decodeJSONValue(reflect.TypeFor[stateQuotedNumber](), json.RawMessage(tt.value))
+			require.EqualError(t, err, tt.wantErr)
+		})
+	}
+	_, err = decodeJSONValue(
+		reflect.TypeFor[stateQuotedNumbers](),
+		json.RawMessage(`{"n":"1","list":[{"n":"x"}],"by_name":null}`),
+	)
+	require.EqualError(t, err, `field "list[0].n" is "x", which is not a JSON number`)
+}
+
+// TestDecodeQuotedNumber checks decodeQuotedNumber on its own: json.Number's method refuses the
+// JSON string holding a number that it accepts, and it refuses what is not a number with the
+// error json.Number's method gives.
+func TestDecodeQuotedNumber(t *testing.T) {
+	var number stateQuotedNumber
+	data := []byte(`{"n":"\"5\""}`)
+	require.Error(t, jsonv2.Unmarshal(data, &number), "json.Number's own method")
+	require.NoError(t, jsonv2.Unmarshal(data, &number, decodeOptions))
+	require.Equal(t, json.Number("5"), number.N)
+
+	err := jsonv2.Unmarshal([]byte(`{"n":"0x10"}`), &number, decodeOptions)
+	var semantic *jsonv2.SemanticError
+	require.ErrorAs(t, err, &semantic)
+	require.Equal(t, jsonNumberType, semantic.GoType)
+	require.Equal(t, jsontext.Value(`"0x10"`), semantic.JSONValue)
+	require.ErrorIs(t, err, strconv.ErrSyntax)
+
+	err = jsonv2.Unmarshal([]byte(`{"n":"\q"}`), &number, decodeOptions)
+	var syntactic *jsontext.SyntacticError
+	require.ErrorAs(t, err, &syntactic)
+
+	var plain json.Number
+	require.NoError(t, jsonv2.Unmarshal([]byte(`"5"`), &plain, decodeOptions), "outside a \",string\" field")
+	require.Error(t, jsonv2.Unmarshal([]byte(`"\"5\""`), &plain, decodeOptions))
 }
 
 // stateHolder holds a value of T as the JSON field "v".

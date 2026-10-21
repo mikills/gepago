@@ -206,10 +206,12 @@ func (s State) store(key string, typ reflect.Type, value any, fresh bool) {
 // unmarshaler, times that are not RFC 3339 and base64 with line breaks are errors rather than
 // zero values. Types with their own UnmarshalJSON, UnmarshalJSONFrom or UnmarshalText are
 // decoded as they define, except as map keys, which are decoded as encoding/json decoded them:
-// with UnmarshalJSON or UnmarshalText for a text unmarshaler, and otherwise by kind. A struct
-// that encoding/json/v2 refuses by its definition, or with a ",string" field that is not a
-// boolean, number or string or whose type has its own unmarshal method, is refused for every
-// object.
+// with UnmarshalJSON or UnmarshalText for a text unmarshaler, and otherwise by kind. A ",string"
+// json.Number field holds a JSON number in a string, or a JSON string holding one, as
+// encoding/json read it ("5" or "\"5\""). A struct that encoding/json/v2 refuses by its
+// definition, with a json tag option other than omitempty, omitzero and string, with the tag
+// `json:"-,"`, or with a ",string" field that is not a boolean, number or string or whose type
+// has its own unmarshal method (json.Number aside), is refused for every object.
 //
 // If T or *T has a Validate() error method, Get calls it on every value it returns (except a
 // nil pointer) and returns its error, so a value that decodes but breaks T's invariants is
@@ -286,7 +288,8 @@ func convertStateValue(key string, typ reflect.Type, value any) (any, error) {
 // writes and gepago's JSON Schema still describes. v2 refuses each of them by default: the
 // ",string" option on a bool or string field, a time.Duration as a number of nanoseconds, a
 // [N]byte as an array of numbers and a []~byte as base64. A map key whose type has its own
-// unmarshal method is decoded as encoding/json decoded it (see decodeMapKey).
+// unmarshal method is decoded as encoding/json decoded it (see decodeMapKey), and so is a
+// json.Number in a ",string" field (see decodeQuotedNumber).
 var decodeOptions = jsonv2.JoinOptions(
 	jsonv2.RejectUnknownMembers(true),
 	json.StringifyWithLegacySemantics(true),
@@ -297,8 +300,49 @@ var decodeOptions = jsonv2.JoinOptions(
 		jsonv2.UnmarshalFromFunc(decodeMethodMapKey[json.Unmarshaler]),
 		jsonv2.UnmarshalFromFunc(decodeMethodMapKey[jsonv2.UnmarshalerFrom]),
 		jsonv2.UnmarshalFromFunc(decodeMethodMapKey[encoding.TextUnmarshaler]),
+		jsonv2.UnmarshalFromFunc(decodeQuotedNumber),
 	)),
 )
+
+// decodeQuotedNumber is called by encoding/json/v2 before it decodes a json.Number. In a
+// ",string" field it decodes a JSON string as encoding/json did: holding a JSON number, such as
+// "5", or a JSON string that holds one, such as "\"5\"", which is the form the field's schema
+// describes. json.Number's own method takes only the first. Any other value, and a json.Number
+// outside a ",string" field, is left to that method (errors.ErrUnsupported).
+func decodeQuotedNumber(dec *jsontext.Decoder, number *json.Number) error {
+	stringify, _ := jsonv2.GetOption(dec.Options(), jsonv2.StringifyNumbers)
+	kind, length := dec.StackIndex(dec.StackDepth())
+	if !stringify || dec.PeekKind() != '"' || kind == '{' && length%2 == 0 {
+		return errors.ErrUnsupported
+	}
+	value, err := dec.ReadValue()
+	if err != nil {
+		return err
+	}
+	// a value ReadValue returns with kind '"' is a valid JSON string, so it unquotes.
+	text, _ := jsontext.AppendUnquote(nil, value)
+	digits, ok := quotedNumber(string(text))
+	if !ok {
+		return &jsonv2.SemanticError{
+			JSONKind:  '"',
+			JSONValue: value.Clone(),
+			GoType:    jsonNumberType,
+			Err:       strconv.ErrSyntax,
+		}
+	}
+	*number = json.Number(digits)
+	return nil
+}
+
+// quotedNumber returns the JSON number that text, the content of a ",string" json.Number
+// field's string, holds as encoding/json read it: text itself, or the content of text when text
+// is a JSON string. It reports false when neither is a JSON number.
+func quotedNumber(text string) (string, bool) {
+	if inner, err := jsontext.AppendUnquote(nil, text); err == nil {
+		text = string(inner)
+	}
+	return text, jsonNumber.MatchString(text)
+}
 
 // decodeMethodMapKey is called by encoding/json/v2 before it decodes a value of a type with
 // its own unmarshal method, with a pointer to the value. At an object name, which is a map
@@ -363,8 +407,9 @@ func decodeMapKey(dec *jsontext.Decoder, key reflect.Value) error {
 // ",string" option encoding/json/v2 does not apply as encoding/json did. On a field that is not
 // a boolean, number or string, or an unnamed pointer to one, encoding/json ignored the option
 // and v2 refuses every value. On a field whose type has its own UnmarshalJSON,
-// UnmarshalJSONFrom or UnmarshalText method, such as json.Number, encoding/json unquoted the
-// value before calling the method and v2 calls the method on the quoted value.
+// UnmarshalJSONFrom or UnmarshalText method, encoding/json unquoted the value before calling the
+// method and v2 calls the method on the quoted value. json.Number is the exception (see
+// customJSON): its method and decodeQuotedNumber read a ",string" field as encoding/json did.
 func stringOptionError(typ reflect.Type) error {
 	fields := jsonFields(typ)
 	for _, name := range jsonFieldOrder(fields) {
@@ -385,7 +430,7 @@ func stringOptionError(typ reflect.Type) error {
 				goName,
 				field.typ,
 			)
-		case ownUnmarshaler(value):
+		case customJSON(value):
 			return fmt.Errorf(
 				"struct field %s of type %s cannot have the `string` tag option, "+
 					"since %s has its own unmarshal method",
@@ -401,11 +446,11 @@ func stringOptionError(typ reflect.Type) error {
 // structDefinitionError returns the error encoding/json/v2 gives for every JSON object decoded
 // into the struct type typ when it refuses typ's definition, which encoding/json accepted: an
 // unexported field with a json tag, an embedded non-struct type without a JSON name, an
-// embedded struct with tag options or marshal methods, a malformed, repeated or unsupported tag
-// option, two fields with one JSON name, or no exported fields at all; or a field with a
-// ",string" option that v2 does not apply as encoding/json did (see stringOptionError). It
-// returns nil when typ decodes. The error names the struct type and the reason, as
-// definitionError finds them.
+// embedded struct with tag options or marshal methods, a malformed or repeated tag option, two
+// fields with one JSON name, or no exported fields at all. It also refuses a json tag that the
+// two read differently (see tagOptionError) and a field with a ",string" option that v2 does not
+// apply as encoding/json did (see stringOptionError). It returns nil when typ decodes. The error
+// names the struct type and the reason, as definitionError finds them.
 func structDefinitionError(typ reflect.Type) error {
 	if refused := definitionError(typ); refused != nil {
 		return fmt.Errorf("%s cannot be decoded from JSON: %w", refused.GoType, refused.Err)
@@ -418,27 +463,100 @@ var definitionErrors sync.Map
 
 // definitionError returns the error, without a position, that checkJSONShape gives for every
 // JSON object for the struct type typ when its definition is refused (see
-// structDefinitionError), and nil when typ decodes. v2 itself is asked first, by decoding {}
-// into typ: that reads no member, so it fails only on the definition of typ and the structs it
-// embeds, not of the types of its fields. GoType is the struct v2 refused, which may be one
-// that typ embeds.
+// structDefinitionError), and nil when typ decodes. The json tags of typ and the structs it
+// embeds are checked first (see tagOptionError), then v2 itself is asked, by decoding {} into
+// typ: that reads no member, so it fails only on the definition of typ and the structs it
+// embeds, not of the types of its fields. GoType is the struct refused, which may be one that
+// typ embeds.
 func definitionError(typ reflect.Type) *jsonv2.SemanticError {
 	if cached, ok := definitionErrors.Load(typ); ok {
 		return cached.(*jsonv2.SemanticError)
 	}
-	var refused, semantic *jsonv2.SemanticError
+	refused := findDefinitionError(typ)
+	definitionErrors.Store(typ, refused)
+	return refused
+}
+
+// findDefinitionError computes definitionError.
+func findDefinitionError(typ reflect.Type) *jsonv2.SemanticError {
+	if declaring, reason := tagOptionError(typ); reason != nil {
+		return &jsonv2.SemanticError{JSONKind: '{', GoType: declaring, Err: reason}
+	}
+	var semantic *jsonv2.SemanticError
 	err := jsonv2.Unmarshal([]byte("{}"), reflect.New(typ).Interface(), decodeOptions)
 	if errors.As(err, &semantic) {
-		refused = &jsonv2.SemanticError{
+		return &jsonv2.SemanticError{
 			JSONKind: '{',
 			GoType:   cmp.Or(semantic.GoType, typ),
 			Err:      cmp.Or(semantic.Err, err),
 		}
-	} else if reason := stringOptionError(typ); reason != nil {
-		refused = &jsonv2.SemanticError{JSONKind: '{', GoType: typ, Err: reason}
 	}
-	definitionErrors.Store(typ, refused)
-	return refused
+	if reason := stringOptionError(typ); reason != nil {
+		return &jsonv2.SemanticError{JSONKind: '{', GoType: typ, Err: reason}
+	}
+	return nil
+}
+
+// encodingJSONTagOptions are the json tag options encoding/json defined. It ignored any other,
+// which encoding/json/v2 may apply instead: `embed` moves a field's members into its parent or
+// makes the field collect unknown members, `case:ignore` matches names in any case, and
+// `format:` changes a value's JSON form.
+var encodingJSONTagOptions = []string{"omitempty", "omitzero", "string"}
+
+// tagOptionError returns the first struct field, in the struct type typ and the structs it
+// embeds, whose json tag encoding/json and encoding/json/v2 read differently, with the struct
+// that declares it: a tag option encoding/json did not define, which it ignored and v2 may
+// apply, or the tag `json:"-,"`, which names a field "-" in encoding/json and which v2 refuses.
+// An empty option, as in `json:"a,"`, is left to v2, which refuses it as malformed.
+func tagOptionError(typ reflect.Type) (reflect.Type, error) {
+	queue, seen := []reflect.Type{typ}, map[reflect.Type]bool{typ: true}
+	for len(queue) > 0 {
+		structType := queue[0]
+		queue = queue[1:]
+		for i := range structType.NumField() {
+			field := structType.Field(i)
+			tag := field.Tag.Get("json")
+			if tag == "-" || !field.Anonymous && !field.IsExported() {
+				continue
+			}
+			if tag == "-," {
+				return structType, fmt.Errorf(
+					"struct field %s of type %s cannot be named \"-\" by the tag `json:\"-,\"`, which "+
+						"encoding/json/v2 refuses; v2 names a field \"-\" only with the omitempty, omitzero or "+
+						"string option",
+					field.Name,
+					field.Type,
+				)
+			}
+			name, options, _ := strings.Cut(tag, ",")
+			for options != "" {
+				option, rest, _ := strings.Cut(options, ",")
+				if strings.HasPrefix(option, "format:") {
+					// v2 takes the rest of the tag as the format, which may hold commas.
+					option, rest = options, ""
+				}
+				if option != "" && !slices.Contains(encodingJSONTagOptions, option) {
+					return structType, fmt.Errorf(
+						"struct field %s of type %s cannot have the `%s` tag option, which encoding/json "+
+							"ignored and encoding/json/v2 may apply; only omitempty, omitzero and string are allowed",
+						field.Name,
+						field.Type,
+						option,
+					)
+				}
+				options = rest
+			}
+			inner := field.Type
+			if inner.Kind() == reflect.Pointer && inner.Name() == "" {
+				inner = inner.Elem()
+			}
+			if field.Anonymous && name == "" && inner.Kind() == reflect.Struct && !seen[inner] {
+				seen[inner] = true
+				queue = append(queue, inner)
+			}
+		}
+	}
+	return nil, nil
 }
 
 func decodeJSONValue(typ reflect.Type, value any) (any, error) {
@@ -454,8 +572,12 @@ func decodeJSONValue(typ reflect.Type, value any) (any, error) {
 	}
 	out := reflect.New(typ)
 	err = jsonv2.Unmarshal(data, out.Interface(), decodeOptions)
-	// an unknown member, such as a renamed field, explains a missing field, so it comes first.
+	// an unknown member, such as a renamed field, explains a missing field, so it comes first,
+	// unless it is inside an object for a struct whose definition is refused, which explains it.
 	if errors.Is(err, jsonv2.ErrUnknownName) {
+		if refused := refusedDefinitionOnPath(typ, err); refused != nil {
+			return nil, decodeError(typ, refused)
+		}
 		return nil, decodeError(typ, err)
 	}
 	if err := checkJSONShape(typ, generic, jsonPath{}); err != nil {
@@ -465,6 +587,40 @@ func decodeJSONValue(typ reflect.Type, value any) (any, error) {
 		return nil, decodeError(typ, err)
 	}
 	return out.Elem().Interface(), nil
+}
+
+// refusedDefinitionOnPath returns the refusal (see definitionError) of the first struct, from
+// the top, whose definition is refused and whose object holds the value err is about, located
+// at that object; nil when there is none. err is an error from decoding into typ.
+func refusedDefinitionOnPath(typ reflect.Type, err error) error {
+	var semantic *jsonv2.SemanticError
+	if !errors.As(err, &semantic) {
+		return nil
+	}
+	var at jsontext.Pointer
+	for token := range semantic.JSONPointer.Tokens() {
+		for typ != nil && typ.Kind() == reflect.Pointer {
+			typ = typ.Elem()
+		}
+		if typ == nil || customJSON(typ) {
+			return nil
+		}
+		switch typ.Kind() {
+		case reflect.Struct:
+			if refused := definitionError(typ); refused != nil {
+				located := *refused
+				located.JSONPointer = at
+				return &located
+			}
+			typ = jsonFields(typ)[token].typ
+		case reflect.Slice, reflect.Array, reflect.Map:
+			typ = typ.Elem()
+		default:
+			return nil
+		}
+		at = at.AppendToken(token)
+	}
+	return nil
 }
 
 // decodeError words an error from decoding into typ as gepago did before encoding/json/v2: an
@@ -774,7 +930,9 @@ var jsonNumber = regexp.MustCompile(jsonNumberPattern)
 // value, leaving a zero or a nil pointer, parses a number there with strconv, which admits
 // text JSON does not, such as "01", "1." or "-Inf", and decodes a float in it that underflows
 // as 0. All three are rejected, as the field's schema pattern rejects the first two and Get
-// rejects an unquoted underflow.
+// rejects an unquoted underflow. A json.Number there must hold a JSON number, or a JSON string
+// holding one (see decodeQuotedNumber): encoding/json kept other text that starts like a
+// number, such as "0x10", "01" or "1.", as it was.
 func checkJSONField(field jsonField, value any, path jsonPath) error {
 	text, isString := value.(string)
 	if !isString || !field.quoted || !quotable(field.typ) {
@@ -786,6 +944,12 @@ func checkJSONField(field jsonField, value any, path jsonPath) error {
 	typ := field.typ
 	if typ.Kind() == reflect.Pointer {
 		typ = typ.Elem()
+	}
+	if typ == jsonNumberType {
+		if _, ok := quotedNumber(text); !ok {
+			return fmt.Errorf("field %q is %q, which is not a JSON number", path.text, text)
+		}
+		return nil
 	}
 	switch typ.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
