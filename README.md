@@ -196,9 +196,11 @@ pipeline, err := gepa.PipelineSpec{
 
 Steps declare the keys they read and write as `KeyRef`s, which carry the value type. `Build` checks the contract once:
 
-- every key a step reads is a pipeline input or written by an earlier step, with the same type
-- a key written by more than one step needs a `MergeRule`
-- pipeline inputs are read-only
+- every key a step reads is a pipeline input, has a `Default` or is written by an earlier step, with the same type
+- a key written by more than one step needs a `MergeRule`, unless transitions keep any run from committing both writes
+- pipeline inputs are read-only, and no `Default` may name one
+
+`PipelineSpec.Defaults` seed keys before the first step, so every step sees a default until a committed write replaces it; each run gets its own copy. A `MergeRule` combines writes only: the first write of a key replaces its default rather than merging with it.
 
 At run time each step only sees the keys it declared. Its writes must have the declared type, and they are copied into state only when the step succeeds. Values are copied whenever they cross into or out of state, so a step cannot change an input or an earlier result through a shared map or slice. A run fails when its inputs hold a key not declared in `Inputs`, unless `AllowExtraInputs` is set, and input values are converted to their declared types before the first step runs.
 
@@ -206,7 +208,7 @@ At run time each step only sees the keys it declared. Its writes must have the d
 
 `Key.Get` converts model output into `T` strictly: unknown fields, fields that match only by case, missing fields not tagged `omitempty` and nulls in non-nullable positions are errors, not zero values. If `T` has a `Validate() error` method, `Get` calls it too.
 
-`Run` and `RunCandidate`, which `Compile` uses, return only the values the steps wrote; `RunState` also returns the inputs. A failed run returns what was accumulated before the failing step together with a `*StepError` naming it and holding the values it read. A step can attach diagnostics with `WithStepDetails`, a panicking step's stack is kept under `Details["stack"]`, and usage from a failed model call is still recorded.
+`Run` and `RunCandidate`, which `Compile` uses, return the state without the inputs: the values the steps wrote and the defaults no write replaced; `RunState` also returns the inputs. A failed run returns that state as it stood before the failing step, defaults included, together with a `*StepError` naming it and holding the values it read. A step can attach diagnostics with `WithStepDetails`, a panicking step's stack is kept under `Details["stack"]`, and usage from a failed model call is still recorded.
 
 This mirrors the GEPA paper's compound-system formulation `Φ = (M, C, X, Y)`: the `Pipeline` is `Φ`, each step is a language module `Mᵢ`, each wrapped `Predict` carries the prompt and local input/output schema `(πᵢ, Xᵢ, Yᵢ)`, and the steps and their control flow are `C`.
 
@@ -234,12 +236,12 @@ pipeline, err := spec.Build()
 ```
 
 - `Transitions` move a run from a top-level step to a later one (skipping those between), back to an earlier one (a rewind, bounded by `MaxVisits`, with `Amend` and `Accept`), to `End` or to `Fail`. A step a transition skips over may not write, so a later reader of its keys needs a `Default`, which seeds the key before the first step.
-- `Branch` and `Fallback` build a `Flow` of ordinary steps and transitions that `PipelineSpec.Add` appends: `Branch` runs one of several arms that write the same keys, and `Fallback` runs a secondary step when the primary fails with a non-permanent error.
+- `Branch` and `Fallback` build a `Flow` of ordinary steps and transitions that `PipelineSpec.Add` appends: `Branch` calls its condition once, writes the chosen label to a string key named after the branch and runs the arm with that label, all arms writing the same keys, and `Fallback` runs a secondary step when the primary fails with a non-permanent error. Budget their arms or steps by name; the steps a flow adds for routing and joining spend nothing.
 - `WithPolicy` gives a step a per-attempt `Timeout`, retries (of transient errors unless `RetryIf` says otherwise) and an action for when it still fails: `OnErrorFail`, `OnErrorSkip` or `OnErrorFallback(step)`.
 - `Parallel` runs steps with disjoint writes concurrently and commits them together, and `WithCache` reuses a step's result within a run when its key function returns a key it has seen.
 - `RunBudget` limits a run's duration, model calls, tokens and tokens per step; exceeding a limit fails with a `Budget` error naming it. A step reads what is left with `gepa.BudgetFrom(ctx).Remaining()`.
 
-`Build` checks all of this before the first run: transitions that name unknown steps or overlap as rewinds, reads of keys a step may not write without a default, arms that disagree, overlapping parallel writes, a skippable write with neither a default nor a later writer, and budgets that name unknown steps all fail it.
+`Build` checks all of this before the first run: transitions that name unknown steps or overlap as rewinds, an `Accept` on an `OnError` rewind, reads of keys a step may not write without a default, arms that disagree, overlapping parallel writes, a skippable write with neither a default nor a later writer, and budgets that name unknown steps or a flow's routing and joining steps all fail it.
 
 ## Tools
 

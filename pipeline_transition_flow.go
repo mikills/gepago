@@ -28,22 +28,23 @@ func (s *PipelineSpec) Add(flows ...Flow) {
 }
 
 // Branch returns a Flow that runs one of arms, chosen by cond. Its steps are a routing step
-// named name that reads reads and calls cond, the arms in the order of their labels, and a step
-// named name+"_end", which does nothing, where they meet. cond sees a State limited to reads and
-// returns the label of the arm to run; it cannot write. The routing step fails with cond's
-// error, or with a Permanent error naming the label when no arm has it.
+// named name that reads reads, calls cond and writes the chosen label to the string key name,
+// the arms in the order of their labels, and a step named name+"_end", which does nothing,
+// where they meet. cond sees a State limited to reads and returns the label of the arm to run;
+// it cannot write, and it runs once each time the routing step runs. The routing step fails
+// with cond's error, or with a Permanent error naming the label when no arm has it.
 //
-// Its transitions go from the routing step to the chosen arm and from each arm but the last to
-// name+"_end". Each transition from the routing step calls cond again until one matches, so cond
-// must return the same label for the same reads; should none match, the last transition fails
-// the run.
+// Its transitions go from the routing step to the arm whose label the routing step wrote and
+// from each arm but the last to name+"_end". The label key is part of the run's output, and a
+// later step may read it; Build refuses a pipeline input, a Default or another step's write
+// with the Branch's name.
 //
 // Every arm is a top-level step: its name must be unique in the pipeline, its components are
 // scoped as "<arm>.<component>", and the transitions skip over it, so it may not write: a later
 // step that reads an arm's write needs a Default for the key (see PipelineSpec.Defaults). Arms
 // never commit their writes in the same run, so they need no MergeRule for the keys they share.
-// Build requires a condition, at least one arm, no empty label, and every arm to write the same
-// keys with the same types.
+// A RunBudget.PerStepTokens limit names an arm, not the Branch. Build requires a condition, at
+// least one arm, no empty label, and every arm to write the same keys with the same types.
 func Branch(name string, cond func(State) (string, error), arms map[string]Step, reads ...KeyRef) Flow {
 	route := &branchRoute{
 		name:   strings.TrimSpace(name),
@@ -52,6 +53,7 @@ func Branch(name string, cond func(State) (string, error), arms map[string]Step,
 		labels: slices.Sorted(maps.Keys(arms)),
 		arms:   make(map[string]*stepNode, len(arms)),
 	}
+	route.label = Key[string]{Name: route.name}
 	route.types, route.readsErr = stateKeyTypes(route.reads)
 	end := route.name + "_end"
 	flow := Flow{Steps: []Step{route}}
@@ -64,41 +66,54 @@ func Branch(name string, cond func(State) (string, error), arms map[string]Step,
 		}
 		flow.Steps = append(flow.Steps, node.step)
 		exits = append(exits, node.name)
-		if route.name != "" && cond != nil {
-			flow.Transitions = append(flow.Transitions, Transition{
-				From: route.name,
-				When: func(s State, _ error) bool {
-					chosen, err := cond(s)
-					return err == nil && chosen == label
-				},
-				To: node.name,
-			})
+		if route.name != "" {
+			flow.Transitions = append(
+				flow.Transitions,
+				Transition{From: route.name, When: route.chose(label), To: node.name},
+			)
 		}
-	}
-	if route.name != "" && cond != nil {
-		flow.Transitions = append(flow.Transitions, Transition{From: route.name, To: Fail})
 	}
 	for _, exit := range exits[:max(len(exits)-1, 0)] {
 		flow.Transitions = append(flow.Transitions, Transition{From: exit, To: end})
 	}
-	flow.Steps = append(flow.Steps, joinStep{name: end})
+	flow.Steps = append(flow.Steps, joinStep{name: end, route: route})
 	return flow
 }
 
-// branchRoute is the routing step of a Branch: it checks the Branch's arms and calls cond.
+// branchRoute is the routing step of a Branch: it checks the Branch's arms, calls cond and
+// writes the chosen label.
 type branchRoute struct {
 	name     string
 	cond     func(State) (string, error)
 	reads    []KeyRef
 	types    map[string]reflect.Type
 	readsErr error
+	label    Key[string]
 	labels   []string
 	arms     map[string]*stepNode
 }
 
 func (b *branchRoute) Name() string     { return b.name }
 func (b *branchRoute) Reads() []KeyRef  { return slices.Clone(b.reads) }
-func (b *branchRoute) Writes() []KeyRef { return nil }
+func (b *branchRoute) Writes() []KeyRef { return []KeyRef{b.label.Ref()} }
+
+// chose returns the When of the transition to the arm with label: it matches when the routing
+// step wrote label.
+func (b *branchRoute) chose(label string) func(State, error) bool {
+	return func(s State, _ error) bool {
+		chosen, err := b.label.Get(s)
+		return err == nil && chosen == label
+	}
+}
+
+// armNames returns the names of the arms in the order of their labels.
+func (b *branchRoute) armNames() []string {
+	names := make([]string, 0, len(b.labels))
+	for _, label := range b.labels {
+		names = append(names, b.arms[label].name)
+	}
+	return names
+}
 
 func (b *branchRoute) Validate() error {
 	switch {
@@ -138,6 +153,7 @@ func (b *branchRoute) Run(_ context.Context, s State) error {
 	if _, ok := b.arms[label]; !ok {
 		return PermanentError(fmt.Errorf("branch condition chose arm %q, which is not one of %q", label, b.labels))
 	}
+	b.label.Set(s, label)
 	return nil
 }
 
@@ -154,8 +170,9 @@ func (b *branchRoute) Run(_ context.Context, s State) error {
 // components are scoped as "<step>.<component>". A transition skips over secondary and primary
 // has an OnError transition forward, so neither may write: a later step that reads their write
 // needs a Default for the key (see PipelineSpec.Defaults). They never both commit, so they need
-// no MergeRule for the keys they share. Build requires both steps to write the same keys with
-// the same types.
+// no MergeRule for the keys they share. A RunBudget.PerStepTokens limit names primary or
+// secondary, not the Fallback. Build requires both steps to write the same keys with the same
+// types.
 func Fallback(name string, primary, secondary Step) Flow {
 	join := fallbackJoin{
 		name:      strings.TrimSpace(name),
@@ -210,9 +227,10 @@ func (f fallbackJoin) Validate() error {
 	)
 }
 
-// joinStep is the step where the arms of a Branch meet.
+// joinStep is the step where the arms of a Branch meet; route is the Branch's routing step.
 type joinStep struct {
-	name string
+	name  string
+	route *branchRoute
 }
 
 func (j joinStep) Name() string                     { return j.name }

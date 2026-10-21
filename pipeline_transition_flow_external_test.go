@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -95,7 +96,8 @@ func TestComposedPipelineWithFlowsConcurrentRuns(t *testing.T) {
 		if i%2 == 1 {
 			want = "odd"
 		}
-		require.Equal(t, gepa.Prediction{"a": "done", "b": "done", "decision": want, "amount": 1}, got)
+		// v0.9.0: the Branch writes its chosen label.
+		require.Equal(t, gepa.Prediction{"a": "done", "b": "done", "decision": want, "amount": 1, "route": want}, got)
 	}
 	require.Equal(t, int32(32), calls(lm))
 }
@@ -347,9 +349,10 @@ func TestRecordingObserverRecordsFailuresOfFlowSteps(t *testing.T) {
 		return gepa.NewStep(name, nil, nil, func(context.Context, gepa.State) error { return errors.New("") })
 	}
 	recorder := &gepa.RecordingObserver{}
+	started := &startedSteps{lanes: map[string]string{}}
 	// v0.9.0: a Fallback is a run of top-level steps, so it follows the Parallel instead of being in it.
 	pipeline, err := withFlows(
-		gepa.PipelineSpec{Observers: []gepa.PipelineObserver{recorder}},
+		gepa.PipelineSpec{Observers: []gepa.PipelineObserver{recorder, started}},
 		gepa.Parallel("fan",
 			gepa.WithPolicy(noop("left"), gepa.StepPolicy{Retry: gepa.RetryPolicy{MaxAttempts: 2}}),
 			gepa.WithPolicy(silent("shaky"), gepa.StepPolicy{OnError: gepa.OnErrorFallback(noop("spare"))}),
@@ -362,16 +365,40 @@ func TestRecordingObserverRecordsFailuresOfFlowSteps(t *testing.T) {
 	_, err = pipeline.Run(context.Background(), gepa.NewState(nil))
 
 	require.Error(t, err)
+	// v0.9.0: guard and its steps are top-level steps, outside the Parallel, so none has a lane.
+	require.Equal(t, map[string]string{
+		"fan": "", "left": "left", "guard": "", "quiet": "", "backup": "", "shaky": "shaky", "spare": "shaky",
+		"last": "",
+	}, started.lanes, "a step of a Parallel and its policy's fallback share a lane, and the steps nested in them have none")
 	trace := onlyTrace(t, recorder)
 	require.True(t, trace.Failed)
+	// v0.9.0: the Fallback's steps are top-level, after fan and before last.
+	require.Equal(t, []string{"fan", "quiet", "backup", "guard", "last"}, stepNames(trace.Steps))
+	fan, last := trace.Steps[0], trace.Steps[4]
+	require.False(t, fan.Failed)
+	require.Empty(t, fan.Lane)
+	byName := func(name string) gepa.StepTrace {
+		return fan.Steps[slices.IndexFunc(fan.Steps, func(step gepa.StepTrace) bool { return step.Step == name })]
+	}
+	guard := trace.Steps[3]
+	require.Empty(t, guard.Lane)
+	require.False(t, guard.Failed)
 	quiet := trace.Steps[1]
 	require.Equal(t, "quiet", quiet.Step)
 	require.True(t, quiet.Failed, "a step that fails with an empty message failed")
 	require.Empty(t, quiet.Err)
+	require.Empty(t, quiet.Lane)
 	require.Equal(t, &gepa.TransitionTrace{From: "quiet", To: "backup", Rule: 1}, quiet.Transition)
+	require.Equal(t, "shaky", byName("shaky").Lane)
+	require.True(t, byName("shaky").Failed)
+	require.Equal(t, "shaky", byName("spare").Lane)
+	require.True(t, last.Failed)
+	require.Empty(t, last.Err)
 
 	data, err := json.Marshal(trace)
 	require.NoError(t, err)
+	require.Contains(t, string(data), `"failed":true`)
+	require.Contains(t, string(data), `"lane":"shaky"`)
 	var decoded gepa.PipelineTrace
 	require.NoError(t, json.Unmarshal(data, &decoded))
 	require.Equal(t, trace, decoded)
@@ -477,9 +504,24 @@ func TestStepPathFromNamesEveryFlowStepAsTheTraceDoes(t *testing.T) {
 	paths := &pathRecorder{paths: map[string][]string{}}
 	answer := gepa.Key[string]{Name: "answer"}
 	left, right := gepa.Key[string]{Name: "left"}, gepa.Key[string]{Name: "right"}
+	innerOut := gepa.Key[string]{Name: "inner_out"}
+	inner, err := gepa.PipelineSpec{Steps: []gepa.Step{paths.step("inner", innerOut.Ref())}}.Build()
+	require.NoError(t, err)
+	flaky := 0
+	failsOnce := gepa.NewStep("flaky", nil, nil, func(ctx context.Context, _ gepa.State) error {
+		path, _ := gepa.StepPathFrom(ctx)
+		paths.mu.Lock()
+		paths.paths["flaky"] = append(paths.paths["flaky"], path)
+		paths.mu.Unlock()
+		if flaky++; flaky == 1 {
+			return gepa.TransientError(errors.New("busy"))
+		}
+		return nil
+	})
 	recorder := &gepa.RecordingObserver{}
+	observer := &stepPathObserver{}
 	pipeline, err := withFlows(
-		gepa.PipelineSpec{Observers: []gepa.PipelineObserver{recorder}},
+		gepa.PipelineSpec{Observers: []gepa.PipelineObserver{recorder, observer}},
 		paths.step("first"),
 		gepa.Branch(
 			"route",
@@ -487,6 +529,8 @@ func TestStepPathFromNamesEveryFlowStepAsTheTraceDoes(t *testing.T) {
 			map[string]gepa.Step{"summary": paths.step("summarise", answer.Ref())},
 		),
 		gepa.Parallel("fan", paths.step("left", left.Ref()), paths.step("right", right.Ref())),
+		gepa.WithPolicy(failsOnce, gepa.StepPolicy{Retry: gepa.RetryPolicy{MaxAttempts: 2}}),
+		gepa.NewProgramStep("outer", inner, nil, []gepa.KeyRef{innerOut.Ref()}),
 	).Build()
 	require.NoError(t, err)
 
@@ -499,7 +543,11 @@ func TestStepPathFromNamesEveryFlowStepAsTheTraceDoes(t *testing.T) {
 		"summarise": {"summarise"},
 		"left":      {"fan.left"},
 		"right":     {"fan.right"},
+		"flaky":     {"flaky", "flaky"},
+		"inner":     {"outer.inner"},
 	}, paths.paths)
+	require.False(t, observer.sawPath(), "an observer's context is not a step's")
+	// v0.9.0: the arm is a top-level step after the routing step, and route_end is where the arms meet.
 	gepatest.AssertTrace(t, onlyTrace(t, recorder), gepatest.ExpectedTrace{Steps: []gepatest.ExpectedStep{
 		{Step: "first"},
 		{Step: "route"},
@@ -508,5 +556,9 @@ func TestStepPathFromNamesEveryFlowStepAsTheTraceDoes(t *testing.T) {
 		{Step: "fan"},
 		{Step: "fan.left"},
 		{Step: "fan.right"},
+		{Step: "flaky", Attempt: 1, Err: "busy", ErrKind: gepa.Transient},
+		{Step: "flaky", Attempt: 2},
+		{Step: "outer"},
+		{Step: "outer.inner"},
 	}})
 }

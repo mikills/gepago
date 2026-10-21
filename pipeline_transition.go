@@ -33,24 +33,34 @@ import (
 // resets them to what they were before the target last ran, so the steps run again as they ran
 // the first time. Each run of a step is a visit, numbered from one in StepStartedEvent and
 // StepFinishedEvent's Attributes["visit"]; the target needs PipelineSpec.MaxVisits of at least
-// 2, and a rewind that would exceed it fails From with ErrMaxVisits. When the run reaches From
-// again and From succeeds, Accept decides between the two visits: true keeps the new writes, and
-// false restores the snapshot, emits RewindRejected and goes on past From, evaluating only From's
-// transitions that are not rewinds, against the restored values. If the run leaves the range
-// before From succeeds again, through a skip past From, End, Fail or a failure, Accept is not
-// called and the new writes stand. Usage of every visit, rejected ones included, counts in the
-// run's usage, trace and budget; a PerStepTokens limit counts the tokens of all the visits of a
-// step together.
+// 2. When a matching rewind would exceed it, From fails with an error that wraps ErrMaxVisits,
+// and From's own error when From failed, and From's OnError transitions are evaluated on that
+// error, a rewind to a target that has used its visits never matching; so an OnError transition
+// with a When that checks for ErrMaxVisits takes the run on once the range has run MaxVisits
+// times.
+//
+// When the run reaches From again and From succeeds, Accept decides between the two visits: true
+// keeps the new writes, and false restores the snapshot, emits RewindRejected and goes on past
+// From, evaluating only From's transitions that are not rewinds, against the restored values. A
+// rejected visit never commits: should a When of From then fail From, the snapshot is restored
+// all the same before From's OnError transitions are evaluated, and so it is when Accept itself
+// panics. If the run leaves the range before From succeeds again, through a skip past From, End,
+// Fail or a failure, Accept is not called and the new writes stand. Usage of every visit,
+// rejected ones included, counts in the run's usage, trace and budget; a PerStepTokens limit
+// counts the tokens of all the visits of a step together.
 //
 // Build checks every transition: From and To name top-level steps, End or Fail; a rewind's
-// target has MaxVisits of at least 2; Amend and Accept are set only on rewinds, and Amend only
-// when the target has amendable keys (see WithAmendable); and no two rewinds with different From
-// overlap, because one rewind range runs at a time and nested ranges are not supported in this
-// release. A step that a transition skips over, or that has an OnError transition to a later
-// step or End, may not write: a later step can read its writes only through a Default.
+// target has MaxVisits of at least 2; Amend and Accept are set only on rewinds, Accept only on
+// one without OnError, since a failed From has no writes for Accept to keep or restore, and
+// Amend only when the target has amendable keys (see WithAmendable); and any two rewinds have
+// the same target and From or ranges that do not overlap, because one rewind range runs at a time
+// and nested ranges are not supported in this release. A step that a transition skips over, or
+// that has an OnError transition to a later step or End, may not write: a later step can read
+// its writes only through a Default. No step may be named End or Fail.
 //
 // When, Amend and Accept run on the run's goroutine. One that panics fails From with the panic's
-// value in the error and the stack under Details["stack"], as a panicking step does.
+// value in the error and the stack under Details["stack"], as a panicking step does; From's
+// execution, the last attempt under a WithPolicy, ends with that error.
 type Transition struct {
 	// From names the top-level step whose finish the transition follows.
 	From string
@@ -69,9 +79,9 @@ type Transition struct {
 	// only, and they are never committed. It sees From's view as When does, and setting any key
 	// that is not an amendable key of the target, or returning an error, fails From.
 	Amend func(s State) error
-	// Accept, on a rewind only, decides between the visits once From succeeds again: prev holds
-	// the values the steps from the target through From had committed when the rewind was taken,
-	// next their values now, both read-only. Nil means accept.
+	// Accept, on a rewind without OnError only, decides between the visits once From succeeds
+	// again: prev holds the values the steps from the target through From had committed when the
+	// rewind was taken, next their values now, both read-only. Nil means accept.
 	Accept func(prev, next State) bool
 }
 
@@ -83,7 +93,8 @@ const (
 )
 
 // ErrMaxVisits marks the failure of a step whose rewind would visit its target more often than
-// PipelineSpec.MaxVisits allows. The error is Permanent.
+// PipelineSpec.MaxVisits allows. The error is Permanent, and the step's OnError transitions see
+// it (see Transition).
 var ErrMaxVisits = errors.New("max visits exceeded")
 
 // WithAmendable returns step with keys declared amendable: a rewind to the step may set them
@@ -184,7 +195,8 @@ const (
 
 // transitionRule is a Transition as Build checked it, with the steps it names as indexes.
 // keys holds, for a rewind, the declared writes of the steps from its target through From, the
-// values a rewind snapshots and resets.
+// values a rewind snapshots and resets; rewinds with the same range share it, and Build's pass
+// over steps fills it.
 type transitionRule struct {
 	index   int
 	from    int
@@ -213,6 +225,18 @@ func (r *transitionRule) target(steps []*stepNode) string {
 	return steps[r.to].name
 }
 
+// skips reports whether the rule, which is not a rewind, skips over step i of n steps. A rule to
+// Fail skips nothing, since the run ends with an error.
+func (r *transitionRule) skips(i, n int) bool {
+	switch r.to {
+	case failTarget:
+		return false
+	case endTarget:
+		return r.from < i && i < n
+	}
+	return r.from < i && i < r.to
+}
+
 // transitionTable is what a run needs of a pipeline's transitions: every rule in declaration
 // order and, by top-level step index, the rules to evaluate on success and on failure, the
 // MaxVisits of each step, whether a rewind may land on it, and its amendable keys.
@@ -225,13 +249,26 @@ type transitionTable struct {
 	amendable []map[string]reflect.Type
 }
 
+// rewindRange is the steps from a rewind's target, start, through its From, end, which the
+// rewind runs again, and the keys they declare as writes.
+type rewindRange struct {
+	start int
+	end   int
+	keys  map[string]reflect.Type
+}
+
 // transitionFacts is what Build's pass over transitions leaves for its pass over steps, by
-// top-level step index: the first rule that skips over each step, the first OnError rule that
-// takes it forward, the smallest index a rule may continue the run at after the step succeeds,
-// whether a rule without When closes its success rules, whether a rewind lands on the step and
-// whether a rewind to it has an Amend.
+// top-level step index. skips and ranges are difference arrays, which the pass over steps sums
+// as it goes: skips counts the rules that skip over each step, and ranges the distinct rewind
+// ranges that hold it, rangeAt being the range that starts at it. onErrorBy is the first OnError
+// rule that takes the step forward, successMin the smallest index a rule may continue the run at
+// after the step succeeds, and closed whether a rule without When closes its success rules;
+// target marks the steps a rewind lands on and amended those a rewind with an Amend lands on.
 type transitionFacts struct {
-	skippedBy  []int
+	rules      []*transitionRule
+	skips      []int
+	ranges     []int
+	rangeAt    []*rewindRange
 	onErrorBy  []int
 	successMin []int
 	closed     []bool
@@ -248,29 +285,85 @@ func (f *transitionFacts) reach(i int) int {
 	return min(f.successMin[i], i+1)
 }
 
-// unwritten returns why step i may not write, or "" when it always writes.
-func (f *transitionFacts) unwritten(i int) string {
-	switch {
-	case f.skippedBy[i] >= 0:
-		return fmt.Sprintf("transition %d skips over it", f.skippedBy[i])
-	case f.onErrorBy[i] >= 0:
-		return fmt.Sprintf("its OnError transition %d goes forward", f.onErrorBy[i])
+// unwrittenReason returns why step i may not write. It looks through every rule, so Build calls
+// it only to word an error.
+func (f *transitionFacts) unwrittenReason(i int) string {
+	for _, rule := range f.rules {
+		if !rule.rewind && rule.skips(i, len(f.onErrorBy)) {
+			return fmt.Sprintf("transition %d skips over it", rule.index)
+		}
 	}
-	return ""
+	return fmt.Sprintf("its OnError transition %d goes forward", f.onErrorBy[i])
 }
 
-// enter starts the check of the top-level step at index i, counting the rewind targets up to
-// it.
-func (b *pipelineBuilder) enter(i int) {
+// overlapError returns the error for two rewinds with different ranges that both hold step i.
+// It looks through every rule, so Build calls it only when the pass over steps found them.
+func (f *transitionFacts) overlapError(i int, steps []*stepNode) error {
+	var first *transitionRule
+	for _, rule := range f.rules {
+		switch {
+		case !rule.rewind || i < rule.to || i > rule.from:
+			continue
+		case first == nil:
+			first = rule
+			continue
+		case rule.to == first.to && rule.from == first.from:
+			continue
+		}
+		return fmt.Errorf(
+			"%s rewinds to %q, but that overlaps the rewind of %s to %q; "+
+				"nested or overlapping rewind ranges are not supported in this release",
+			rule.describe(steps),
+			steps[rule.to].name,
+			first.describe(steps),
+			steps[first.to].name,
+		)
+	}
+	return nil
+}
+
+// enter starts the check of the top-level step at index i: it adds the step's entries in the
+// difference arrays the pass over transitions left, refuses a step that two different rewind
+// ranges hold, and counts the rewind targets up to it.
+func (b *pipelineBuilder) enter(i int, steps []*stepNode) error {
+	f := b.flow
 	b.index = i
-	if b.flow.target[i] {
+	b.skipped += f.skips[i]
+	b.covered += f.ranges[i]
+	if b.covered > 1 {
+		return f.overlapError(i, steps)
+	}
+	if r := f.rangeAt[i]; r != nil {
+		b.current = r
+	}
+	if f.target[i] {
 		b.rewinds++
+	}
+	return nil
+}
+
+// mayNotWrite reports whether the current top-level step may not write: a transition skips over
+// it or it has an OnError transition forward.
+func (b *pipelineBuilder) mayNotWrite() bool {
+	return b.skipped > 0 || b.flow.onErrorBy[b.index] >= 0
+}
+
+// leave records the writes of the current top-level step in the rewind range that holds it.
+func (b *pipelineBuilder) leave(node *stepNode) {
+	r := b.current
+	if r == nil {
+		return
+	}
+	maps.Copy(r.keys, node.writeTypes)
+	if r.end == b.index {
+		b.current = nil
 	}
 }
 
 // checkTransitions is Build's one pass over the transitions: it checks each rule against the
-// top-level steps, which index maps by name, compiles it for runs, and records for the pass over
-// steps which steps may not write and where a run may continue after each step. MaxVisits
+// top-level steps, which index maps by name, compiles it for runs, and records what the pass
+// over steps needs, the steps a rule skips over and the steps a rewind runs again as the bounds
+// of difference arrays, so neither pass walks the steps between a rule's From and To. MaxVisits
 // entries are checked against the steps before the pass and against the rewinds after it.
 func (b *pipelineBuilder) checkTransitions(
 	transitions []Transition,
@@ -294,22 +387,31 @@ func (b *pipelineBuilder) checkTransitions(
 				"MaxVisits names %q, which is not a top-level step of this pipeline",
 				name,
 			)
-		case maxVisits[name] < 1:
-			return transitionTable{}, fmt.Errorf("MaxVisits[%q] must be positive", name)
+		case table.maxVisits[i] != 0:
+			return transitionTable{}, fmt.Errorf("MaxVisits names step %q twice", steps[i].name)
+		case maxVisits[name] < 2:
+			return transitionTable{}, fmt.Errorf(
+				"MaxVisits[%q] is %d, but a step a rewind lands on needs at least 2: "+
+					"its first visit and one after the rewind",
+				name,
+				maxVisits[name],
+			)
 		}
 		table.maxVisits[i] = maxVisits[name]
 	}
 	facts := &transitionFacts{
-		skippedBy:  slices.Repeat([]int{-1}, n),
+		skips:      make([]int, n+1),
+		ranges:     make([]int, n+1),
+		rangeAt:    make([]*rewindRange, n),
 		onErrorBy:  slices.Repeat([]int{-1}, n),
 		successMin: slices.Repeat([]int{math.MaxInt}, n),
 		closed:     make([]bool, n),
 		target:     table.target,
 		amended:    make([]bool, n),
 	}
-	// cover maps each step inside a rewind range to the rule whose range it is, so ranges with
-	// different From that overlap are found without comparing every pair of rules.
-	cover := slices.Repeat([]int{-1}, n)
+	// spans holds each distinct rewind range once, by target and From, so rewinds with the same
+	// range share it and only different ranges count as overlapping.
+	spans := map[[2]int]*rewindRange{}
 	rules := make([]*transitionRule, 0, len(transitions))
 	for i, transition := range transitions {
 		rule, err := compileTransition(i, transition, index, steps, table)
@@ -317,19 +419,18 @@ func (b *pipelineBuilder) checkTransitions(
 			return transitionTable{}, err
 		}
 		if rule.rewind {
-			for k := rule.to; k <= rule.from; k++ {
-				if other := cover[k]; other >= 0 && rules[other].from != rule.from {
-					return transitionTable{}, fmt.Errorf(
-						"%s rewinds to %q, but that overlaps the rewind of %s to %q; "+
-							"nested or overlapping rewind ranges are not supported in this release",
-						rule.describe(steps),
-						steps[rule.to].name,
-						rules[other].describe(steps),
-						steps[rules[other].to].name,
-					)
+			span := [2]int{rule.to, rule.from}
+			r, ok := spans[span]
+			if !ok {
+				r = &rewindRange{start: rule.to, end: rule.from, keys: map[string]reflect.Type{}}
+				spans[span] = r
+				facts.ranges[r.start]++
+				facts.ranges[r.end+1]--
+				if facts.rangeAt[r.start] == nil {
+					facts.rangeAt[r.start] = r
 				}
-				cover[k] = len(rules)
 			}
+			rule.keys = r.keys
 			table.target[rule.to] = true
 			if rule.amend != nil {
 				facts.amended[rule.to] = true
@@ -354,6 +455,7 @@ func (b *pipelineBuilder) checkTransitions(
 		}
 	}
 	table.rules = rules
+	facts.rules = rules
 	b.flow = facts
 	return table, nil
 }
@@ -406,6 +508,14 @@ func compileTransition(
 		return rule, nil
 	}
 	target := steps[rule.to].name
+	if rule.onError && rule.accept != nil {
+		return nil, fmt.Errorf(
+			"%s rewinds to %q on error with an Accept; Accept applies only to a rewind taken when "+
+				"its From succeeds, since a failed From has no writes for a rejection to restore",
+			rule.describe(steps),
+			target,
+		)
+	}
 	if table.maxVisits[rule.to] < 2 {
 		return nil, fmt.Errorf(
 			"%s rewinds to %q, which needs MaxVisits[%q] of at least 2",
@@ -424,16 +534,12 @@ func compileTransition(
 			target,
 		)
 	}
-	rule.keys = map[string]reflect.Type{}
-	for k := rule.to; k <= rule.from; k++ {
-		maps.Copy(rule.keys, steps[k].writeTypes)
-	}
 	return rule, nil
 }
 
 // mark records what a rule that is not a rewind means for the pass over steps: the steps it
-// skips over, whether it takes a failed step forward, and where the run may continue after a
-// successful step. A rule to Fail skips nothing, since the run ends with an error.
+// skips over, as the bounds of a difference array, whether it takes a failed step forward, and
+// where the run may continue after a successful step.
 func (f *transitionFacts) mark(rule *transitionRule, n int) {
 	to := rule.to
 	switch to {
@@ -445,10 +551,9 @@ func (f *transitionFacts) mark(rule *transitionRule, n int) {
 	case endTarget:
 		to = n
 	}
-	for k := rule.from + 1; k < to; k++ {
-		if f.skippedBy[k] < 0 {
-			f.skippedBy[k] = rule.index
-		}
+	if rule.from+1 < to {
+		f.skips[rule.from+1]++
+		f.skips[to]--
 	}
 	if rule.onError {
 		if f.onErrorBy[rule.from] < 0 {

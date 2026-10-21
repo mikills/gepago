@@ -31,30 +31,24 @@ const pipelineFingerprintVersion = 1
 //   - for a NewProgramStep whose programme is a Fingerprinter, such as a nested Pipeline, that
 //     programme's fingerprint;
 //   - the transitions, in order, by From, To, OnError and whether When, Amend and Accept are
-//     set; MaxVisits; the keys of Defaults, by name and type; and the amendable keys of each step
-//     (see WithAmendable).
+//     set; MaxVisits; and the amendable keys of each step (see WithAmendable).
 //
 // Everything else is left out because it does not change which trained candidate fits the
 // pipeline: candidate components and their text (instructions, demos and other prompts), the
 // Go type and code of each step, the code of a transition's When, Amend and Accept, a programme
-// that is not a Fingerprinter, merge functions, the values of Defaults, Budget,
-// AllowExtraInputs, the timeout, retries and error action of a WithPolicy apart from its
-// fallback step, and WithCache, which adds nothing to the step it wraps. Reads, writes, default
-// keys and the steps of a Parallel are taken in name order, so declaring them in another order
-// keeps the fingerprint. A named type is identified by its package path and name, not by its
-// definition, so changing the fields of a named struct type keeps the fingerprint; give the
-// artefact and the loader a ProgramVersion when such a change matters. A pipeline without
-// transitions, MaxVisits, defaults or amendable keys has the fingerprint v0.8.0 gave it, so its
-// artefacts still load.
+// that is not a Fingerprinter, merge functions, Defaults, Budget, AllowExtraInputs, the
+// timeout, retries and error action of a WithPolicy apart from its fallback step, and
+// WithCache, which adds nothing to the step it wraps. Reads, writes and the steps of a Parallel
+// are taken in name order, so declaring them in another order keeps the fingerprint. A named
+// type is identified by its package path and name, not by its definition, so changing the
+// fields of a named struct type keeps the fingerprint; give the artefact and the loader a
+// ProgramVersion when such a change matters. A pipeline without transitions, MaxVisits or
+// amendable keys has the fingerprint v0.8.0 gave it, so its artefacts still load.
 func (p Pipeline) Fingerprint() string {
 	if p.Validate() != nil {
 		return ""
 	}
-	shape := pipelineShape{
-		Version:  pipelineFingerprintVersion,
-		Inputs:   keyShapes(p.inputs),
-		Defaults: keyShapes(p.defaultKeys),
-	}
+	shape := pipelineShape{Version: pipelineFingerprintVersion, Inputs: keyShapes(p.inputs)}
 	for _, node := range p.steps {
 		shape.Steps = append(shape.Steps, shapeOf(node))
 	}
@@ -85,7 +79,6 @@ type pipelineShape struct {
 	Version     int               `json:"version"`
 	Inputs      []keyShape        `json:"inputs"`
 	Steps       []stepShape       `json:"steps"`
-	Defaults    []keyShape        `json:"defaults,omitempty"`
 	Transitions []transitionShape `json:"transitions,omitempty"`
 	MaxVisits   []visitsShape     `json:"max_visits,omitempty"`
 }

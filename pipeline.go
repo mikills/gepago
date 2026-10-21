@@ -320,7 +320,8 @@ type PipelineSpec struct {
 	Transitions []Transition
 	// MaxVisits bounds how often a run visits a top-level step, by name. A step a transition
 	// rewinds to needs at least 2; a rewind that would exceed it fails the step that rewinds
-	// with ErrMaxVisits. Build refuses an entry for a step no transition rewinds to.
+	// with ErrMaxVisits (see Transition). Build refuses an entry for a step that is not a
+	// top-level step or that no transition rewinds to, and one below 2.
 	MaxVisits map[string]int
 	Merges    []MergeRule
 	Defaults  []Default
@@ -371,7 +372,6 @@ type Pipeline struct {
 	flow             transitionTable
 	merges           map[string]func(prev, next any) (any, error)
 	defaults         map[string]any
-	defaultKeys      []KeyRef
 	budget           RunBudget
 	tools            *ToolRegistry
 	toolPolicy       ToolPolicy
@@ -468,7 +468,9 @@ func (s PipelineSpec) Build() (Pipeline, error) {
 		return Pipeline{}, err
 	}
 	for i, node := range steps {
-		builder.enter(i)
+		if err := builder.enter(i, steps); err != nil {
+			return Pipeline{}, err
+		}
 		if err := builder.checkStep(node, topLevelPosition(i)); err != nil {
 			return Pipeline{}, err
 		}
@@ -489,14 +491,12 @@ func (s PipelineSpec) Build() (Pipeline, error) {
 	if err := builder.checkDefaults(); err != nil {
 		return Pipeline{}, err
 	}
-	if err := builder.checkBudget(s.Budget); err != nil {
+	if err := builder.checkBudget(s.Budget, steps, index); err != nil {
 		return Pipeline{}, err
 	}
 	defaultValues := make(map[string]any, len(defaults))
-	defaultKeys := make([]KeyRef, 0, len(defaults))
 	for name, def := range defaults {
 		defaultValues[name] = def.Value
-		defaultKeys = append(defaultKeys, def.Key)
 	}
 	return Pipeline{
 		inputs:           slices.Clone(s.Inputs),
@@ -506,7 +506,6 @@ func (s PipelineSpec) Build() (Pipeline, error) {
 		flow:             flow,
 		merges:           merges,
 		defaults:         defaultValues,
-		defaultKeys:      defaultKeys,
 		budget:           s.Budget.clone(),
 		tools:            s.Tools,
 		toolPolicy:       s.ToolPolicy.clone(),
@@ -622,9 +621,9 @@ func (p Pipeline) SeedCandidate() Candidate {
 	return seedChildren(p.steps...)
 }
 
-// Run executes the pipeline with its seed candidate and returns the values the steps wrote,
-// without the inputs, as RunCandidate does. When a step fails it returns the values written
-// so far together with a *StepError.
+// Run executes the pipeline with its seed candidate and returns the state without the inputs,
+// as RunCandidate does: the values the steps wrote and the Defaults no write replaced. When a
+// step fails it returns that state as it stood, defaults included, together with a *StepError.
 func (p Pipeline) Run(ctx context.Context, inputs State) (State, error) {
 	state, err := p.RunState(ctx, inputs)
 	if state.values == nil {
@@ -638,8 +637,9 @@ func (p Pipeline) RunState(ctx context.Context, inputs State) (State, error) {
 	return p.run(ctx, p.SeedCandidate(), inputs.Prediction())
 }
 
-// RunCandidate executes the pipeline with a specific candidate and returns the values the
-// steps wrote, without the inputs. When a step fails it returns the values written so far
+// RunCandidate executes the pipeline with a specific candidate and returns the state without
+// the inputs: the values the steps wrote, a Branch's chosen label among them, and the Defaults
+// no write replaced. When a step fails it returns that state as it stood, defaults included,
 // together with a *StepError.
 func (p Pipeline) RunCandidate(ctx context.Context, candidate Candidate, inputs Prediction) (Prediction, error) {
 	state, err := p.run(ctx, candidate, inputs)

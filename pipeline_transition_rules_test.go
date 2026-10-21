@@ -51,13 +51,108 @@ func TestTransitionWhenPanicFailsTheStep(t *testing.T) {
 
 	t.Run("in Accept", func(t *testing.T) {
 		calls := &stepCalls{}
-		pipeline, state, _, err := buildRun(t, rewindPipeline(calls, &eventLog{}, func(State, State) bool {
+		log := &eventLog{}
+		pipeline, state, _, err := buildRun(t, rewindPipeline(calls, log, func(State, State) bool {
 			panic("cannot compare")
 		}), Prediction{})
 
 		require.EqualError(t, err, `pipeline step "b": transition 0 from "b": Accept panicked: cannot compare`)
-		require.Equal(t, Prediction{"amount": 20}, pipeline.written(state),
-			"the rewind reset the first decision and the failed visit commits none")
+		require.Equal(t, Prediction{"amount": 10, "decision": "amount 10"}, pipeline.written(state),
+			"a failed Accept restores the snapshot, so neither the range's new writes nor b's commit")
+		require.NotContains(t, log.Lines(), "rewind 0 rejected at b", "Accept decided nothing")
+	})
+}
+
+func TestTransitionRejectedVisitNeverCommitsOnTheErrorPath(t *testing.T) {
+	reject := func(State, State) bool { return false }
+	// b rewinds to a once, Accept rejects the second visit, and then a When of b panics on that
+	// visit, failing b after the rejection.
+	spec := func(calls *stepCalls, log *eventLog, onError ...Transition) PipelineSpec {
+		return PipelineSpec{
+			Steps: []Step{countedStep(calls, "a", nil, amountKey), describeAmount(calls, "b")},
+			Transitions: append([]Transition{
+				{From: "b", When: amountIs(10), To: "a", Accept: reject},
+				{From: "b", When: func(State, error) bool {
+					if calls.of("b") == 2 {
+						panic("route broke")
+					}
+					return false
+				}, To: End},
+			}, onError...),
+			MaxVisits: map[string]int{"a": 2},
+			Observers: []PipelineObserver{log},
+		}
+	}
+
+	t.Run("the run fails with the snapshot restored", func(t *testing.T) {
+		calls, log := &stepCalls{}, &eventLog{}
+		pipeline, state, _, err := buildRun(t, spec(calls, log), Prediction{})
+
+		require.EqualError(t, err, `pipeline step "b": transition 1 from "b": When panicked: route broke`)
+		require.Equal(t, 2, calls.of("a"))
+		require.Equal(t, Prediction{"amount": 10, "decision": "amount 10"}, pipeline.written(state),
+			"the rejected visit's write of a (20) does not stand")
+		require.Equal(t, []string{
+			"finish b#2 err: transition 1 from \"b\": When panicked: route broke",
+			"rewind 0 rejected at b",
+			"finish run err: pipeline step \"b\": transition 1 from \"b\": When panicked: route broke",
+		}, log.Lines()[len(log.Lines())-3:])
+	})
+
+	t.Run("an OnError transition goes on from the snapshot", func(t *testing.T) {
+		calls := &stepCalls{}
+		pipeline, state, _, err := buildRun(
+			t,
+			spec(calls, &eventLog{}, Transition{From: "b", OnError: true, To: End}),
+			Prediction{},
+		)
+
+		require.NoError(t, err)
+		require.Equal(t, Prediction{"amount": 10, "decision": "amount 10"}, pipeline.written(state))
+	})
+
+	t.Run("the rejected visit's tool memory writes are dropped", func(t *testing.T) {
+		remember := func(name string) Step {
+			return NewStep(name, nil, refs(Key[int]{Name: name}.Ref()), func(ctx context.Context, s State) error {
+				memory := ToolMemoryFrom(ctx)
+				previous, _ := memory.Get(name)
+				count, _ := previous.(int)
+				memory.Set(name, count+1)
+				Key[int]{Name: name}.Set(s, count+1)
+				return nil
+			})
+		}
+		visits := 0
+		pipeline, err := PipelineSpec{
+			Steps: []Step{remember("a"), remember("b")},
+			Transitions: []Transition{
+				{From: "b", To: "a", When: func(s State, _ error) bool {
+					count, err := Key[int]{Name: "b"}.Get(s)
+					return err == nil && count == 1
+				}, Accept: reject},
+				{From: "b", When: func(State, error) bool {
+					if visits++; visits == 1 {
+						panic("route broke")
+					}
+					return false
+				}, To: End},
+				{From: "b", OnError: true, To: End},
+			},
+			MaxVisits:  map[string]int{"a": 2},
+			ToolPolicy: ToolPolicy{MaxCalls: 10},
+		}.Build()
+		require.NoError(t, err)
+		memory := NewToolMemory()
+
+		got, err := pipeline.RunCandidate(WithToolMemory(context.Background(), memory), nil, Prediction{})
+
+		require.NoError(t, err)
+		require.Equal(t, Prediction{"a": 1, "b": 1}, got)
+		for _, name := range []string{"a", "b"} {
+			value, ok := memory.Get(name)
+			require.True(t, ok)
+			require.Equal(t, 1, value, "memory of %s", name)
+		}
 	})
 }
 
@@ -151,6 +246,27 @@ func TestTransitionNestedRewindFailsBuild(t *testing.T) {
 			wantErr: `transition 1 from "c" rewinds to "a", but that overlaps the rewind of transition 0 from "d" ` +
 				`to "c"; nested or overlapping rewind ranges are not supported in this release`,
 		},
+		{
+			name:        "a range around another from the same step",
+			transitions: []Transition{{From: "d", To: "c"}, {From: "d", OnError: true, To: "a"}},
+			maxVisits:   map[string]int{"a": 2, "c": 2},
+			wantErr: `transition 1 from "d" rewinds to "a", but that overlaps the rewind of transition 0 from "d" ` +
+				`to "c"; nested or overlapping rewind ranges are not supported in this release`,
+		},
+		{
+			name:        "a rewind to its own step inside another from it",
+			transitions: []Transition{{From: "d", To: "d"}, {From: "d", To: "c"}},
+			maxVisits:   map[string]int{"c": 2, "d": 2},
+			wantErr: `transition 1 from "d" rewinds to "c", but that overlaps the rewind of transition 0 from "d" ` +
+				`to "d"; nested or overlapping rewind ranges are not supported in this release`,
+		},
+		{
+			name:        "ranges that share their last step",
+			transitions: []Transition{{From: "b", To: "a"}, {From: "c", To: "b"}},
+			maxVisits:   map[string]int{"a": 2, "b": 2},
+			wantErr: `transition 1 from "c" rewinds to "b", but that overlaps the rewind of transition 0 from "b" ` +
+				`to "a"; nested or overlapping rewind ranges are not supported in this release`,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -159,15 +275,16 @@ func TestTransitionNestedRewindFailsBuild(t *testing.T) {
 		})
 	}
 
-	t.Run("rewinds from one step and disjoint ranges are allowed", func(t *testing.T) {
+	t.Run("rewinds with the same range and disjoint ranges are allowed", func(t *testing.T) {
 		_, err := PipelineSpec{
 			Steps: steps(),
 			Transitions: []Transition{
 				{From: "b", When: amountIs(0), To: "a"},
 				{From: "d", When: amountIs(0), To: "c"},
-				{From: "d", When: amountIs(0), To: "d"},
+				{From: "d", OnError: true, To: "c"},
+				{From: "b", When: amountIs(1), To: "a", Accept: func(State, State) bool { return true }},
 			},
-			MaxVisits: map[string]int{"a": 2, "c": 2, "d": 2},
+			MaxVisits: map[string]int{"a": 2, "c": 2},
 		}.Build()
 		require.NoError(t, err)
 	})
@@ -175,12 +292,44 @@ func TestTransitionNestedRewindFailsBuild(t *testing.T) {
 
 func TestTransitionTargets(t *testing.T) {
 	t.Run("from the last step", func(t *testing.T) {
-		for _, to := range []string{End, Fail} {
-			_, err := PipelineSpec{
-				Steps:       []Step{writeAmount("a", 1), readAmount("b")},
-				Transitions: []Transition{{From: "b", When: amountIs(2), To: to}},
-			}.Build()
-			require.NoError(t, err, to)
+		tests := []struct {
+			to      string
+			amount  int
+			want    Prediction
+			wantErr string
+			lines   []string
+		}{
+			{to: End, amount: 1, want: Prediction{"amount": 1, "decision": "amount 1"}},
+			{to: End, amount: 2, want: Prediction{"amount": 2, "decision": "amount 2"},
+				lines: []string{"finish b#1", "transition 0 b -> $end", "finish run"}},
+			{to: Fail, amount: 1, want: Prediction{"amount": 1, "decision": "amount 1"}},
+			{to: Fail, amount: 2, want: Prediction{"amount": 2},
+				wantErr: `pipeline step "b": transition 0 from "b" to $fail`,
+				lines: []string{"finish b#1", "transition 0 b -> $fail",
+					`finish run err: pipeline step "b": transition 0 from "b" to $fail`}},
+		}
+		for _, tt := range tests {
+			t.Run(fmt.Sprintf("%s amount %d", tt.to, tt.amount), func(t *testing.T) {
+				log := &eventLog{}
+				pipeline, state, _, err := buildRun(t, PipelineSpec{
+					Steps:       []Step{writeAmount("a", tt.amount), readAmount("b")},
+					Transitions: []Transition{{From: "b", When: amountIs(2), To: tt.to}},
+					Observers:   []PipelineObserver{log},
+				}, Prediction{})
+
+				require.Equal(t, tt.want, pipeline.written(state))
+				if tt.wantErr != "" {
+					require.EqualError(t, err, tt.wantErr)
+				} else {
+					require.NoError(t, err)
+				}
+				lines := log.Lines()
+				if tt.lines == nil {
+					require.NotContains(t, strings.Join(lines, "\n"), "transition", "the When did not match")
+					return
+				}
+				require.Equal(t, tt.lines, lines[len(lines)-len(tt.lines):])
+			})
 		}
 	})
 
@@ -385,28 +534,37 @@ func TestTransitionsAreNotEvaluatedOnceTheRunEnded(t *testing.T) {
 
 func TestTransitionCommitSemantics(t *testing.T) {
 	t.Run("a failed attempt of a visit commits nothing", func(t *testing.T) {
+		// each attempt writes a note of its own and the MergeRule appends every committed note, so
+		// a failed attempt whose write leaked would show in the result.
 		attempts := 0
-		flaky := NewStep("a", nil, refs(amountKey.Ref()), func(_ context.Context, s State) error {
+		flaky := NewStep("a", nil, refs(notesKey.Ref()), func(_ context.Context, s State) error {
 			attempts++
-			amountKey.Set(s, attempts*100)
-			if attempts == 1 {
+			notesKey.Set(s, []string{fmt.Sprint("attempt ", attempts)})
+			if attempts%2 == 1 {
 				return errRateLimited
 			}
 			return nil
 		})
-		calls := &stepCalls{}
+		var seen []string
 		pipeline, state, _, err := buildRun(t, PipelineSpec{
 			Steps: []Step{
+				writeNotes("first", "first"),
 				WithPolicy(flaky, StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}}),
-				describeAmount(calls, "b"),
+				NewStep("b", refs(notesKey.Ref()), nil, func(_ context.Context, s State) error {
+					notes, err := notesKey.Get(s)
+					seen = append(seen, fmt.Sprint(notes))
+					return err
+				}),
 			},
-			Transitions: []Transition{{From: "b", When: amountIs(200), To: "a"}},
+			Transitions: []Transition{{From: "b", When: func(State, error) bool { return attempts == 2 }, To: "a"}},
 			MaxVisits:   map[string]int{"a": 2},
+			Merges:      []MergeRule{MergeWith(notesKey, appendNotes)},
 		}, Prediction{})
 
 		require.NoError(t, err)
-		require.Equal(t, 3, attempts)
-		require.Equal(t, Prediction{"amount": 300, "decision": "amount 300"}, pipeline.written(state))
+		require.Equal(t, 4, attempts, "a failed once on each visit")
+		require.Equal(t, []string{"[first attempt 2]", "[first attempt 4]"}, seen)
+		require.Equal(t, Prediction{"notes": []string{"first", "attempt 4"}}, pipeline.written(state))
 	})
 
 	t.Run("amended keys are never committed", func(t *testing.T) {
@@ -568,14 +726,68 @@ func TestTransitionBuildErrors(t *testing.T) {
 			wantErr: `MaxVisits names "b", which is not a top-level step of this pipeline`,
 		},
 		{
-			name:    "MaxVisits not positive",
-			spec:    PipelineSpec{Steps: []Step{writeAmount("a", 1)}, MaxVisits: map[string]int{"a": 0}},
-			wantErr: `MaxVisits["a"] must be positive`,
+			name: "MaxVisits of zero",
+			spec: PipelineSpec{Steps: []Step{writeAmount("a", 1)}, MaxVisits: map[string]int{"a": 0}},
+			wantErr: `MaxVisits["a"] is 0, but a step a rewind lands on needs at least 2: ` +
+				`its first visit and one after the rewind`,
+		},
+		{
+			name: "MaxVisits of one for a rewind target",
+			spec: PipelineSpec{
+				Steps:       []Step{writeAmount("a", 1), readAmount("b")},
+				Transitions: []Transition{{From: "b", To: "a"}},
+				MaxVisits:   map[string]int{"a": 1},
+			},
+			wantErr: `MaxVisits["a"] is 1, but a step a rewind lands on needs at least 2: ` +
+				`its first visit and one after the rewind`,
+		},
+		{
+			name: "MaxVisits names a step twice",
+			spec: PipelineSpec{
+				Steps:       []Step{writeAmount("a", 1), readAmount("b")},
+				Transitions: []Transition{{From: "b", To: "a"}},
+				MaxVisits:   map[string]int{"a": 2, " a": 3},
+			},
+			wantErr: `MaxVisits names step "a" twice`,
 		},
 		{
 			name:    "MaxVisits no rewind uses",
 			spec:    PipelineSpec{Steps: []Step{writeAmount("a", 1)}, MaxVisits: map[string]int{"a": 2}},
 			wantErr: `MaxVisits["a"] is unused: no transition rewinds to "a"`,
+		},
+		{
+			name: "Accept on an OnError rewind",
+			spec: PipelineSpec{
+				Steps: []Step{writeAmount("a", 1), readAmount("b")},
+				Transitions: []Transition{
+					{From: "b", OnError: true, To: "a", Accept: func(State, State) bool { return true }},
+				},
+				MaxVisits: map[string]int{"a": 2},
+			},
+			wantErr: `transition 0 from "b" rewinds to "a" on error with an Accept; Accept applies only to a ` +
+				`rewind taken when its From succeeds, since a failed From has no writes for a rejection to restore`,
+		},
+		{
+			name: "Accept on an OnError rewind to its own step",
+			spec: PipelineSpec{
+				Steps: []Step{writeAmount("a", 1), readAmount("b")},
+				Transitions: []Transition{
+					{From: "a", OnError: true, To: "a", Accept: func(State, State) bool { return false }},
+				},
+				MaxVisits: map[string]int{"a": 2},
+			},
+			wantErr: `transition 0 from "a" rewinds to "a" on error with an Accept; Accept applies only to a ` +
+				`rewind taken when its From succeeds, since a failed From has no writes for a rejection to restore`,
+		},
+		{
+			name:    "a step named End",
+			spec:    PipelineSpec{Steps: []Step{writeAmount("a", 1), writeNotes(End)}},
+			wantErr: `pipeline step "$end" has a name reserved for Transition.To; rename it`,
+		},
+		{
+			name:    "a nested step named Fail",
+			spec:    PipelineSpec{Steps: []Step{Parallel("fan", writeAmount(Fail, 1))}},
+			wantErr: `pipeline step "$fail" has a name reserved for Transition.To; rename it`,
 		},
 	}
 	for _, tt := range tests {

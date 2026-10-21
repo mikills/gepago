@@ -93,6 +93,7 @@ func fpSpec(t *testing.T, o fpOptions) PipelineSpec {
 	var defaults []Default
 	if o.skip {
 		score = WithPolicy(score, StepPolicy{OnError: OnErrorSkip})
+		defaults = append(defaults, DefaultValue(fpScore, 0))
 	}
 	if o.scoreDef != nil {
 		defaults = append(defaults, DefaultValue(fpScore, *o.scoreDef))
@@ -140,11 +141,14 @@ func TestPipelineFingerprintIsStable(t *testing.T) {
 
 func TestPipelineFingerprintLeavesOutValuesOutsideTheShape(t *testing.T) {
 	base := fpOf(t, fpSpec(t, fpOptions{instruction: "seed"}))
+	five := 5
 	variants := map[string]fpOptions{
 		"prompt":            {instruction: "a trained instruction"},
 		"candidate demos":   {instruction: "seed", demos: []Demo{{Inputs: Prediction{"document": "x"}}}},
 		"declaration order": {instruction: "seed", reverse: true},
 		"policy values":     {instruction: "seed", timeout: time.Minute, retries: 3},
+		"skip on error":     {instruction: "seed", skip: true},
+		"default":           {instruction: "seed", scoreDef: &five},
 		"cache":             {instruction: "seed", cache: true},
 		"budget": {instruction: "seed", budget: RunBudget{
 			MaxModelCalls: 3,
@@ -157,20 +161,6 @@ func TestPipelineFingerprintLeavesOutValuesOutsideTheShape(t *testing.T) {
 			for range 5 {
 				require.Equal(t, base, fpOf(t, fpSpec(t, options)))
 			}
-		})
-	}
-	// v0.9.0: the keys of Defaults are part of the shape, so the skip, which needs a default, is
-	// compared with the same pipeline and default without it; a default's value is left out.
-	zero, five := 0, 5
-	defaulted := fpOf(t, fpSpec(t, fpOptions{instruction: "seed", scoreDef: &zero}))
-	require.NotEqual(t, base, defaulted)
-	defaultVariants := map[string]fpOptions{
-		"skip on error": {instruction: "seed", skip: true, scoreDef: &zero},
-		"default value": {instruction: "seed", scoreDef: &five},
-	}
-	for name, options := range defaultVariants {
-		t.Run(name, func(t *testing.T) {
-			require.Equal(t, defaulted, fpOf(t, fpSpec(t, options)))
 		})
 	}
 }

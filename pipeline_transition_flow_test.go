@@ -35,7 +35,8 @@ func TestBranchRunsTheChosenArm(t *testing.T) {
 	for route, want := range map[string]string{"approve": "approved", "review": "needs review"} {
 		got, run, err := pipeline.execute(context.Background(), nil, Prediction{"route": route})
 		require.NoError(t, err)
-		require.Equal(t, Prediction{"amount": 10, "decision": want}, pipeline.written(got))
+		// v0.9.0: the Branch writes the chosen label to the key named after it.
+		require.Equal(t, Prediction{"amount": 10, "decide": route, "decision": want}, pipeline.written(got))
 		// v0.9.0: the routing step finishes before its arm, and the arms meet at decide_end.
 		require.Equal(t, []string{"parse#1", "decide#1", route + "#1", "decide_end#1"}, outcomeSummary(run))
 	}
@@ -66,7 +67,12 @@ func TestBranchArmsNeedADefaultForALaterReader(t *testing.T) {
 	require.NoError(t, err)
 	got, err := pipeline.RunCandidate(context.Background(), nil, Prediction{"route": "review"})
 	require.NoError(t, err)
-	require.Equal(t, Prediction{"amount": 10, "decision": "needs review", "notes": []string{"needs review"}}, got)
+	require.Equal(t, Prediction{
+		"amount":   10,
+		"decide":   "review",
+		"decision": "needs review",
+		"notes":    []string{"needs review"},
+	}, got)
 }
 
 func TestBranchFailures(t *testing.T) {
@@ -76,6 +82,7 @@ func TestBranchFailures(t *testing.T) {
 		cond    func(State) (string, error)
 		arms    map[string]Step
 		wantErr string
+		want    Prediction
 	}{
 		{
 			name:    "unknown arm",
@@ -116,8 +123,10 @@ func TestBranchFailures(t *testing.T) {
 			) error {
 				return errFlaky
 			})},
-			// v0.9.0: the arm is a top-level step, so no StepError for the Branch wraps its own.
+			// v0.9.0: the arm is a top-level step, so no StepError for the Branch wraps its own,
+			// and the routing step has written the chosen label.
 			wantErr: `pipeline step "approve": flaky`,
+			want:    Prediction{"amount": 10, "decide": "approve"},
 		},
 	}
 	for _, tt := range tests {
@@ -131,7 +140,11 @@ func TestBranchFailures(t *testing.T) {
 
 			got, err := pipeline.RunCandidate(context.Background(), nil, Prediction{"route": "approve"})
 			require.EqualError(t, err, tt.wantErr)
-			require.Equal(t, Prediction{"amount": 10}, got)
+			want := tt.want
+			if want == nil {
+				want = Prediction{"amount": 10}
+			}
+			require.Equal(t, want, got)
 		})
 	}
 
@@ -147,24 +160,188 @@ func TestBranchFailures(t *testing.T) {
 		require.True(t, IsPermanent(err))
 	})
 
-	t.Run("a condition that changes its mind fails the run", func(t *testing.T) {
-		calls := 0
-		fickle := func(State) (string, error) {
-			calls++
-			if calls == 1 {
-				return "approve", nil
-			}
-			return "reject", nil
-		}
-		pipeline, err := flowSpec(nil, Branch("decide", fickle, map[string]Step{
-			"approve": writeDecision("approve", "approved"),
-			"review":  writeDecision("review", "needs review"),
-		}), writeAmount("parse", 10)).Build()
+	t.Run("the condition's error is in the chain", func(t *testing.T) {
+		pipeline, err := flowSpec(nil, Branch("decide", func(State) (string, error) {
+			return "", errFlaky
+		}, arms), writeAmount("parse", 10)).Build()
 		require.NoError(t, err)
 
 		_, err = pipeline.RunCandidate(context.Background(), nil, Prediction{})
-		require.EqualError(t, err, `pipeline step "decide": transition 2 from "decide" to $fail`)
+		require.EqualError(t, err, `pipeline step "decide": branch condition: flaky`)
+		require.ErrorIs(t, err, errFlaky)
 	})
+}
+
+func TestBranchCallsItsConditionOncePerVisit(t *testing.T) {
+	t.Run("whichever arm it chooses", func(t *testing.T) {
+		arms := map[string]Step{
+			"a": writeDecision("arm_a", "a"),
+			"b": writeDecision("arm_b", "b"),
+			"c": writeDecision("arm_c", "c"),
+		}
+		for _, label := range []string{"a", "b", "c"} {
+			calls := 0
+			cond := func(State) (string, error) {
+				calls++
+				return label, nil
+			}
+			log := &eventLog{}
+			spec := flowSpec(nil, Branch("route", cond, arms), writeAmount("parse", 10))
+			spec.Observers = []PipelineObserver{log}
+			pipeline, err := spec.Build()
+			require.NoError(t, err)
+
+			got, err := pipeline.RunCandidate(context.Background(), nil, Prediction{})
+			require.NoError(t, err)
+			require.Equal(t, 1, calls, "arm %s", label)
+			require.Equal(t, Prediction{"amount": 10, "route": label, "decision": label}, got)
+			require.Contains(t, log.Lines(), "start arm_"+label+"#1 in run")
+		}
+	})
+
+	t.Run("a condition that would change its mind is not asked again", func(t *testing.T) {
+		errLookup := errors.New("lookup timed out")
+		calls := 0
+		cond := func(State) (string, error) {
+			if calls++; calls > 1 {
+				return "", errLookup
+			}
+			return "b", nil
+		}
+		pipeline, err := flowSpec(nil, Branch("route", cond, map[string]Step{
+			"a": writeDecision("arm_a", "a"),
+			"b": writeDecision("arm_b", "b"),
+		}), writeAmount("parse", 10)).Build()
+		require.NoError(t, err)
+
+		got, err := pipeline.RunCandidate(context.Background(), nil, Prediction{})
+		require.NoError(t, err)
+		require.Equal(t, 1, calls)
+		require.Equal(t, Prediction{"amount": 10, "route": "b", "decision": "b"}, got)
+	})
+
+	t.Run("again on each visit of a rewind", func(t *testing.T) {
+		calls := 0
+		cond := func(State) (string, error) {
+			calls++
+			return []string{"a", "b"}[calls-1], nil
+		}
+		spec := flowSpec(nil, Branch("route", cond, map[string]Step{
+			"a": writeDecision("arm_a", "a"),
+			"b": writeDecision("arm_b", "b"),
+		}), writeAmount("parse", 10))
+		spec.Steps = append(spec.Steps, readDecision("check"))
+		spec.Transitions = append(spec.Transitions, Transition{
+			From: "check",
+			When: func(State, error) bool { return calls == 1 },
+			To:   "route",
+		})
+		spec.MaxVisits = map[string]int{"route": 2}
+		spec.Defaults = []Default{DefaultValue(decisionKey, "")}
+		pipeline, err := spec.Build()
+		require.NoError(t, err)
+
+		got, err := pipeline.RunCandidate(context.Background(), nil, Prediction{})
+		require.NoError(t, err)
+		require.Equal(t, 2, calls)
+		require.Equal(t, Prediction{"amount": 10, "route": "b", "decision": "b", "notes": []string{"b"}}, got)
+	})
+}
+
+// readDecision reads decision and writes it to notes.
+func readDecision(name string) Step {
+	return NewStep(name, refs(decisionKey.Ref()), refs(notesKey.Ref()), func(_ context.Context, s State) error {
+		decision, err := decisionKey.Get(s)
+		if err != nil {
+			return err
+		}
+		notesKey.Set(s, []string{decision})
+		return nil
+	})
+}
+
+func TestBranchLabelKey(t *testing.T) {
+	arms := func() map[string]Step {
+		return map[string]Step{"a": writeDecision("arm_a", "a"), "b": writeDecision("arm_b", "b")}
+	}
+	always := func(State) (string, error) { return "a", nil }
+	label := Key[string]{Name: "route"}
+
+	t.Run("a later step reads it", func(t *testing.T) {
+		spec := flowSpec(nil, Branch("route", always, arms()), writeAmount("parse", 10))
+		spec.Steps = append(spec.Steps, NewStep("report", refs(label.Ref()), refs(notesKey.Ref()), func(
+			_ context.Context,
+			s State,
+		) error {
+			chosen, err := label.Get(s)
+			if err != nil {
+				return err
+			}
+			notesKey.Set(s, []string{"chose " + chosen})
+			return nil
+		}))
+		pipeline, err := spec.Build()
+		require.NoError(t, err)
+
+		got, err := pipeline.RunCandidate(context.Background(), nil, Prediction{})
+		require.NoError(t, err)
+		require.Equal(t, []string{"chose a"}, got["notes"])
+	})
+
+	clash := func(name string) Step {
+		return NewStep(name, nil, refs(label.Ref()), func(_ context.Context, s State) error {
+			label.Set(s, name)
+			return nil
+		})
+	}
+	tests := []struct {
+		name    string
+		spec    func() PipelineSpec
+		wantErr string
+	}{
+		{
+			name: "a pipeline input",
+			spec: func() PipelineSpec {
+				return flowSpec(refs(label.Ref()), Branch("route", always, arms()), writeAmount("parse", 10))
+			},
+			wantErr: `pipeline step "route", which routes Branch "route", writes the chosen label to state key ` +
+				`"route" (string), which is a pipeline input; rename the Branch or the key`,
+		},
+		{
+			name: "a default",
+			spec: func() PipelineSpec {
+				spec := flowSpec(nil, Branch("route", always, arms()), writeAmount("parse", 10))
+				spec.Defaults = []Default{DefaultValue(label, "")}
+				return spec
+			},
+			wantErr: `pipeline step "route", which routes Branch "route", writes the chosen label to state key ` +
+				`"route" (string), which has a Default; rename the Branch or the key`,
+		},
+		{
+			name: "an earlier writer",
+			spec: func() PipelineSpec {
+				return flowSpec(nil, Branch("route", always, arms()), writeAmount("parse", 10), clash("earlier"))
+			},
+			wantErr: `pipeline step "route", which routes Branch "route", writes the chosen label to state key ` +
+				`"route" (string), which step "earlier" also writes; rename the Branch or the key`,
+		},
+		{
+			name: "a later writer",
+			spec: func() PipelineSpec {
+				spec := flowSpec(nil, Branch("route", always, arms()), writeAmount("parse", 10))
+				spec.Steps = append(spec.Steps, Parallel("fan", clash("later")))
+				return spec
+			},
+			wantErr: `pipeline step "later" writes "route" (string), the state key Branch "route" writes its ` +
+				`chosen label to; rename the Branch or the key`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := tt.spec().Build()
+			require.EqualError(t, err, tt.wantErr)
+		})
+	}
 }
 
 func TestBranchBuildErrors(t *testing.T) {
@@ -296,7 +473,7 @@ func TestFallback(t *testing.T) {
 		})
 	}
 
-	t.Run("both errors are kept", func(t *testing.T) {
+	t.Run("when both fail the run has the secondary's error and the primary's is in its event", func(t *testing.T) {
 		errSpare := errors.New("spare broke")
 		log := &eventLog{}
 		spec := flowSpec(
@@ -311,6 +488,7 @@ func TestFallback(t *testing.T) {
 		// v0.9.0: the run fails with the secondary's error; the primary's is in its own event.
 		require.EqualError(t, err, `pipeline step "secondary": spare broke`)
 		require.ErrorIs(t, err, errSpare)
+		require.NotErrorIs(t, err, errRateLimited)
 		require.ErrorIs(t, log.finishedStep(t, "primary", 1).Err, errRateLimited)
 		require.Equal(t, Prediction{}, got)
 	})
@@ -388,6 +566,59 @@ func TestFallbackBuildErrors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := flowSpec(nil, tt.flow).Build()
+			require.EqualError(t, err, tt.wantErr)
+		})
+	}
+}
+
+func TestPerStepTokensOfAFlowNameItsSteps(t *testing.T) {
+	always := func(State) (string, error) { return "a", nil }
+	branch := func() Flow {
+		return Branch("decide", always, map[string]Step{
+			"a": writeDecision("approve", "x"),
+			"b": writeDecision("review", "y"),
+		})
+	}
+	fallback := func() Flow { return Fallback("guard", writeNotes("primary"), writeNotes("secondary")) }
+	tests := []struct {
+		name    string
+		flow    Flow
+		step    string
+		wantErr string
+	}{
+		{
+			name: "the routing step of a Branch",
+			flow: branch(),
+			step: "decide",
+			wantErr: `run budget PerStepTokens names "decide", the routing step of Branch "decide", which spends ` +
+				`no tokens; limit its arms ["approve" "review"] instead`,
+		},
+		{
+			name: "where the arms of a Branch meet",
+			flow: branch(),
+			step: "decide_end",
+			wantErr: `run budget PerStepTokens names "decide_end", the step where the arms of Branch "decide" ` +
+				`meet, which spends no tokens; limit its arms ["approve" "review"] instead`,
+		},
+		{
+			name: "where the steps of a Fallback meet",
+			flow: fallback(),
+			step: "guard",
+			wantErr: `run budget PerStepTokens names "guard", the step where the steps of Fallback "guard" ` +
+				`meet, which spends no tokens; limit its steps "primary" and "secondary" instead`,
+		},
+		{name: "an arm", flow: branch(), step: "review"},
+		{name: "a Fallback's secondary step", flow: fallback(), step: "secondary"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := flowSpec(nil, tt.flow, writeAmount("parse", 10))
+			spec.Budget = RunBudget{PerStepTokens: map[string]int{tt.step: 5}}
+			_, err := spec.Build()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
 			require.EqualError(t, err, tt.wantErr)
 		})
 	}

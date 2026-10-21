@@ -312,8 +312,10 @@ func runChild(ctx context.Context, candidate Candidate, parent string, child *st
 // already carries it, so a step that finishes late still fails and its writes are dropped.
 //
 // commit, when set, checks the result before the execution ends, so an error it returns fails
-// the execution and drops what it staged; a wrapper, which has no execution of its own, records
-// the failure as an execution that commits nothing.
+// the execution and drops what it staged. A wrapper has no execution of its own, so the last
+// execution inside it that succeeds is held until commit has checked the result: it fails with
+// an error commit marks with failsExecution, and otherwise ends as it did and the failure is
+// recorded as an execution that commits nothing.
 func runNode(
 	ctx context.Context,
 	candidate Candidate,
@@ -323,6 +325,12 @@ func runNode(
 ) (result stepResult, err error) {
 	if node.step == nil {
 		return stepResult{}, errors.New("step is nil")
+	}
+	var hold *finishHold
+	if commit != nil && isWrapper(node.step) {
+		hold = &finishHold{}
+		ctx = context.WithValue(ctx, finishHoldKey{}, hold)
+		defer hold.release(nil)
 	}
 	var scope *stepScope
 	if !isWrapper(node.step) {
@@ -372,7 +380,12 @@ func runNode(
 		return result, nil
 	}
 	if err := commit(result); err != nil {
-		if isWrapper(node.step) {
+		own, failsOwn := err.(failsExecution)
+		if failsOwn {
+			err = own.err
+		}
+		if hold != nil && !(failsOwn && hold.release(err)) {
+			hold.release(nil)
 			beginStandIn(ctx, commitFailed, node, values)(stepResult{}, err)
 		}
 		return stepResult{}, err
@@ -380,10 +393,70 @@ func runNode(
 	return result, nil
 }
 
+// failsExecution marks an error of runNode's commit that fails the execution whose result it
+// checks, such as a transition's When that panics: inside a wrapper, the last execution that
+// succeeded fails with it. Any other commit error, such as a failed merge, fails a wrapper as
+// an execution of its own after that one.
+type failsExecution struct {
+	err error
+}
+
+func (e failsExecution) Error() string { return e.err.Error() }
+
+type finishHoldKey struct{}
+
+// finishHold holds the report of the latest successful execution directly inside a top-level
+// wrapper, so the execution ends with the pipeline's check of the wrapper's result and a failed
+// transition fails it instead of adding an execution. It is safe for concurrent use.
+type finishHold struct {
+	mu     sync.Mutex
+	report func(stepOutcome, stepResult)
+	held   stepOutcome
+	result stepResult
+}
+
+// finishHoldFrom returns the hold of the wrapper that ctx runs directly inside, if any.
+func finishHoldFrom(ctx context.Context) *finishHold {
+	hold, _ := ctx.Value(finishHoldKey{}).(*finishHold)
+	return hold
+}
+
+// finish reports an execution's outcome, or holds it when h is not nil and the execution
+// succeeded, reporting any execution held before it.
+func (h *finishHold) finish(outcome stepOutcome, result stepResult, report func(stepOutcome, stepResult)) {
+	if h == nil || outcome.Err != nil {
+		report(outcome, result)
+		return
+	}
+	h.release(nil)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.report, h.held, h.result = report, outcome, result
+}
+
+// release reports the held execution, failed with err when err is not nil, and returns whether
+// one was held.
+func (h *finishHold) release(err error) bool {
+	h.mu.Lock()
+	report, outcome, result := h.report, h.held, h.result
+	h.report = nil
+	h.mu.Unlock()
+	if report == nil {
+		return false
+	}
+	if err != nil {
+		outcome.Err, result = err, stepResult{}
+	}
+	report(outcome, result)
+	return true
+}
+
 // beginExecution starts one execution of node over values, the state its view reads: it
 // numbers the attempt, reports the start to the run's observers, opens a usage frame, which also
 // collects the execution's tool calls, and returns a function that records the outcome when the
-// execution ends, given the values the step wrote or tried to write.
+// execution ends, given the values the step wrote or tried to write. An execution directly
+// inside a top-level wrapper reports a success through the wrapper's hold (see finishHold); the
+// executions inside it report their own.
 func beginExecution(ctx context.Context, node *stepNode, values map[string]any) (
 	context.Context,
 	func(stepResult, error, []stateWrite),
@@ -391,6 +464,10 @@ func beginExecution(ctx context.Context, node *stepNode, values map[string]any) 
 	run := pipelineRunFrom(ctx)
 	attempt := run.nextAttempt(node.name)
 	capture := evaluationCaptureFrom(ctx)
+	hold := finishHoldFrom(ctx)
+	if hold != nil {
+		ctx = context.WithValue(ctx, finishHoldKey{}, (*finishHold)(nil))
+	}
 	ctx, observed := observeStep(ctx, node, attempt, visitFrom(ctx), values)
 	ctx, frame, release := usageFrameFrom(ctx).enterStep(ctx, node.name)
 	start := time.Now()
@@ -405,10 +482,12 @@ func beginExecution(ctx context.Context, node *stepNode, values map[string]any) 
 			Err:        err,
 			ToolCalls:  frame.toolCallRecords(),
 		}
-		run.record(outcome)
-		capture.offerStep(attempted, err)
-		capture.offerToolCalls(outcome.ToolCalls)
-		observed.finish(outcome, result, attempted)
+		hold.finish(outcome, result, func(outcome stepOutcome, result stepResult) {
+			run.record(outcome)
+			capture.offerStep(attempted, outcome.Err)
+			capture.offerToolCalls(outcome.ToolCalls)
+			observed.finish(outcome, result, attempted)
+		})
 	}
 }
 
@@ -426,11 +505,14 @@ const (
 )
 
 // beginStandIn starts an execution of node over values that does not run the step, and
-// returns a function that records it with the writes it committed or its error.
+// returns a function that records it with the writes it committed or its error. Like
+// beginExecution, it reports a success directly inside a top-level wrapper through the
+// wrapper's hold.
 func beginStandIn(ctx context.Context, kind standIn, node *stepNode, values map[string]any) func(stepResult, error) {
 	run := pipelineRunFrom(ctx)
 	attempt := run.nextAttempt(node.name)
 	capture := evaluationCaptureFrom(ctx)
+	hold := finishHoldFrom(ctx)
 	_, observed := observeStep(ctx, node, attempt, visitFrom(ctx), values)
 	start := time.Now()
 	return func(result stepResult, err error) {
@@ -442,10 +524,12 @@ func beginStandIn(ctx context.Context, kind standIn, node *stepNode, values map[
 			Skipped:  kind == skippedOnError,
 			Err:      err,
 		}
-		run.record(outcome)
-		capture.offer(result.writes)
-		capture.offerStep(nil, err)
-		observed.finish(outcome, result, nil)
+		hold.finish(outcome, result, func(outcome stepOutcome, result stepResult) {
+			run.record(outcome)
+			capture.offer(result.writes)
+			capture.offerStep(nil, outcome.Err)
+			observed.finish(outcome, result, nil)
+		})
 	}
 }
 

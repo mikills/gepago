@@ -67,6 +67,7 @@ func TestFlowStepsScopeTheirCandidates(t *testing.T) {
 	require.Equal(t, Prediction{
 		"fact":    "estimate",
 		"left":    "left",
+		"route":   "x", // v0.9.0: the Branch writes its chosen label.
 		"routed":  "arm",
 		"notes":   []string{"no components"},
 		"guarded": "spare",
@@ -182,12 +183,15 @@ func TestFlowStepPanicBecomesAStepError(t *testing.T) {
 		name    string
 		flow    Flow
 		wantErr string
+		want    Prediction
 	}{
 		{
 			name: "inside a Branch arm",
 			flow: Branch("route", func(State) (string, error) { return "a", nil }, map[string]Step{"a": boom}),
-			// v0.9.0: the arm is top-level, so no StepError for the Branch wraps its own.
+			// v0.9.0: the arm is top-level, so no StepError for the Branch wraps its own, and the
+			// routing step has written the chosen label.
 			wantErr: `pipeline step "boom": step panicked: kaboom`,
+			want:    Prediction{"route": "a"},
 		},
 		{
 			name: "inside a Branch condition",
@@ -195,6 +199,7 @@ func TestFlowStepPanicBecomesAStepError(t *testing.T) {
 				"a": writeAmount("a", 1),
 			}),
 			wantErr: `pipeline step "route": step panicked: no route`,
+			want:    Prediction{},
 		},
 	}
 	for _, tt := range tests {
@@ -205,7 +210,7 @@ func TestFlowStepPanicBecomesAStepError(t *testing.T) {
 			got, err := pipeline.RunCandidate(context.Background(), nil, Prediction{})
 
 			require.EqualError(t, err, tt.wantErr)
-			require.Equal(t, Prediction{}, got)
+			require.Equal(t, tt.want, got)
 			var stepErr *StepError
 			require.ErrorAs(t, err, &stepErr)
 			require.Contains(t, stepErr.Details["stack"], "TestFlowStepPanicBecomesAStepError")
@@ -214,16 +219,49 @@ func TestFlowStepPanicBecomesAStepError(t *testing.T) {
 }
 
 func TestFlowStepsRunOutsideAPipeline(t *testing.T) {
-	// v0.9.0: a flow is not a step, so only its own steps run outside a pipeline.
+	// v0.9.0: a flow is not a step, so its steps run outside a pipeline one by one, in the order
+	// its transitions would take them, to the result the v0.8.0 composite gave, plus the label.
+	ctx := context.Background()
 	route := func(s State) (string, error) { return routeKey.Get(s) }
-	branch := Branch("decide", route, map[string]Step{"a": writeAmount("a", 1)}, routeKey.Ref())
-	require.NoError(t, branch.Steps[0].Run(context.Background(), NewState(Prediction{"route": "a"})))
-	err := branch.Steps[0].Run(context.Background(), NewState(Prediction{"route": "b"}))
-	require.EqualError(t, err, `branch condition chose arm "b", which is not one of ["a"]`)
+	branch := Branch(
+		"decide",
+		route,
+		map[string]Step{"a": writeAmount("a", 1), "b": writeAmount("b", 2)},
+		routeKey.Ref(),
+	)
+	require.Equal(t, []string{"decide", "a", "b", "decide_end"}, stepNamesOf(branch.Steps))
+	state := NewState(Prediction{"route": "a"})
+	for _, step := range []Step{branch.Steps[0], branch.Steps[1], branch.Steps[3]} {
+		require.NoError(t, step.Run(ctx, state), step.Name())
+	}
+	require.Equal(t, Prediction{"route": "a", "decide": "a", "amount": 1}, state.Prediction())
+	err := branch.Steps[0].Run(ctx, NewState(Prediction{"route": "c"}))
+	require.EqualError(t, err, `branch condition chose arm "c", which is not one of ["a" "b"]`)
 	require.True(t, IsPermanent(err))
-	require.NoError(t, branch.Steps[len(branch.Steps)-1].Run(context.Background(), NewState(nil)))
-	fallback := Fallback("guard", writeAmount("a", 1), writeAmount("b", 2))
-	require.NoError(t, fallback.Steps[2].Run(context.Background(), NewState(nil)))
+
+	seen := &sync.Map{}
+	fallback := Fallback(
+		"guard",
+		scopedStep(seen, "main", "out", errRateLimited),
+		scopedStep(seen, "spare", "out", nil),
+	)
+	require.Equal(t, []string{"main", "spare", "guard"}, stepNamesOf(fallback.Steps))
+	state = NewState(Prediction{"document": "doc"})
+	require.ErrorIs(t, fallback.Steps[0].Run(ctx, state), errRateLimited)
+	require.NoError(t, fallback.Steps[1].Run(ctx, state))
+	require.NoError(t, fallback.Steps[2].Run(ctx, state))
+	require.Equal(t, Prediction{"document": "doc", "out": "spare"}, state.Prediction())
+	spare, ok := seen.Load("spare")
+	require.True(t, ok)
+	require.Equal(t, Candidate{InstructionComponent: "spare seed"}, spare)
+}
+
+func stepNamesOf(steps []Step) []string {
+	names := make([]string, 0, len(steps))
+	for _, step := range steps {
+		names = append(names, step.Name())
+	}
+	return names
 }
 
 func TestPipelineObserverFlowSequence(t *testing.T) {
@@ -272,9 +310,10 @@ func TestPipelineObserverFlowSequence(t *testing.T) {
 
 	got, err := pipeline.Run(context.Background(), NewState(Prediction{"document": "d"}))
 	require.NoError(t, err)
+	// v0.9.0: the Branch writes its chosen label.
 	require.Equal(
 		t,
-		Prediction{"decision": "brief", "amount": 7, "notes": []string{"none"}, "verdict": "ok"},
+		Prediction{"decision": "brief", "amount": 7, "notes": []string{"none"}, "verdict": "ok", "route": "short"},
 		got.Prediction(),
 	)
 	// v0.9.0: every step of a flow is a top-level execution, and the transitions are events too.
@@ -289,7 +328,7 @@ func TestPipelineObserverFlowSequence(t *testing.T) {
 		"finish route_end#1",
 		"start primary#1 in run",
 		"finish primary#1 err: down",
-		"transition 5 primary -> secondary",
+		"transition 4 primary -> secondary",
 		"start secondary#1 in run",
 		"finish secondary#1",
 		"start fb#1 in run",
@@ -520,10 +559,6 @@ func TestPipelineFingerprintCoversFlowsAndTransitions(t *testing.T) {
 				return true
 			}}}, map[string]int{"a": 2}),
 		},
-		"default added": {
-			spec(plain, nil, nil),
-			spec(plain, nil, nil, DefaultValue(decisionKey, "")),
-		},
 		"amendable keys added": {
 			spec(hinted, []Transition{{From: "b", When: amountIs(1), To: "a"}}, map[string]int{"a": 2},
 				DefaultValue(hint, "")),
@@ -551,40 +586,43 @@ func TestPipelineFingerprintCoversFlowsAndTransitions(t *testing.T) {
 	})
 
 	t.Run("a v0.8.0 artefact loads into a pipeline without transitions", func(t *testing.T) {
-		spec := fpSpec(t, fpOptions{instruction: "seed"})
-		pipeline := fpBuild(t, spec)
-		candidate, err := json.Marshal(pipeline.SeedCandidate())
-		require.NoError(t, err)
-		// fpGolden is the fingerprint v0.8.0 gave this pipeline.
-		saved := fmt.Sprintf(`{"format_version": 1, "name": "fp", "fingerprint": %q, "candidate": %s,
-			"created_at": "2026-01-02T03:04:05Z"}`, fpGolden, candidate)
-		path := filepath.Join(t.TempDir(), "fp.json")
-		require.NoError(t, os.WriteFile(path, []byte(saved), 0o600))
+		// fpGolden is the fingerprint v0.8.0 gave both pipelines; the second has Defaults.
+		for _, options := range []fpOptions{{instruction: "seed"}, {instruction: "seed", skip: true}} {
+			spec := fpSpec(t, options)
+			pipeline := fpBuild(t, spec)
+			candidate, err := json.Marshal(pipeline.SeedCandidate())
+			require.NoError(t, err)
+			saved := fmt.Sprintf(`{"format_version": 1, "name": "fp", "fingerprint": %q, "candidate": %s,
+				"created_at": "2026-01-02T03:04:05Z"}`, fpGolden, candidate)
+			path := filepath.Join(t.TempDir(), "fp.json")
+			require.NoError(t, os.WriteFile(path, []byte(saved), 0o600))
 
-		_, artifact, err := LoadCompiledProgram(path, pipeline)
-		require.NoError(t, err)
-		require.Equal(t, fpGolden, artifact.Fingerprint)
+			_, artifact, err := LoadCompiledProgram(path, pipeline)
+			require.NoError(t, err, "defaults %v", spec.Defaults)
+			require.Equal(t, fpGolden, artifact.Fingerprint)
 
-		spec.Transitions = []Transition{{From: "nested", To: End}}
-		_, _, err = LoadCompiledProgram(path, fpBuild(t, spec))
-		var mismatch *FingerprintMismatchError
-		require.ErrorAs(t, err, &mismatch, "a transition changes the shape the artefact was trained for")
+			spec.Transitions = []Transition{{From: "nested", To: End}}
+			_, _, err = LoadCompiledProgram(path, fpBuild(t, spec))
+			var mismatch *FingerprintMismatchError
+			require.ErrorAs(t, err, &mismatch, "a transition changes the shape the artefact was trained for")
+		}
 	})
 
 	t.Run("values left out", func(t *testing.T) {
-		withValue := func(value string, when func(State, error) bool) PipelineSpec {
-			return spec(
-				plain,
-				[]Transition{{From: "route", When: when, To: "b"}},
-				nil,
-				DefaultValue(decisionKey, value),
-			)
+		withValue := func(when func(State, error) bool, defaults ...Default) PipelineSpec {
+			return spec(plain, []Transition{{From: "route", When: when, To: "b"}}, nil, defaults...)
 		}
 		require.Equal(
 			t,
-			fpOf(t, withValue("", amountIs(1))),
-			fpOf(t, withValue("other", amountIs(2))),
+			fpOf(t, withValue(amountIs(1), DefaultValue(decisionKey, ""))),
+			fpOf(t, withValue(amountIs(2), DefaultValue(decisionKey, "other"))),
 			"a default's value and a When's code are left out",
+		)
+		require.Equal(
+			t,
+			fpOf(t, spec(plain, nil, nil)),
+			fpOf(t, spec(plain, nil, nil, DefaultValue(decisionKey, ""))),
+			"Defaults are left out, as v0.8.0 left them out",
 		)
 	})
 }

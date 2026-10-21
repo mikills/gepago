@@ -249,10 +249,14 @@ type skippableStep struct {
 // the steps checked so far; maybeAbsent maps a key to the step that may skip writing it when
 // nothing guarantees the key exists afterwards.
 //
-// The rest is what the pass over transitions leaves for the pass over steps (see
-// checkTransitions): unwritten maps a key to an earlier step that may not write it, for keys
-// without a default; writers records, for each key a step has written, what the merge rule
-// check needs; used marks the defaults a step reads or writes.
+// The rest is what the pass over steps derives from what the pass over transitions left (see
+// checkTransitions): skipped and covered are the running sums of its difference arrays at the
+// current step, the number of rules that skip over it and of rewind ranges that hold it, and
+// current the rewind range that holds it; rewinds counts the rewind targets so far; unwritten
+// maps a key to an earlier step that may not write it, for keys without a default; writers
+// records, for each key a step has written, what the merge rule check needs; used marks the
+// defaults a step reads or writes; labels maps the label key of each Branch checked so far to
+// the Branch.
 type pipelineBuilder struct {
 	inputs      map[string]reflect.Type
 	merges      map[string]func(prev, next any) (any, error)
@@ -268,16 +272,20 @@ type pipelineBuilder struct {
 	optional map[string]map[string]bool
 
 	flow      *transitionFacts
+	skipped   int
+	covered   int
+	current   *rewindRange
 	rewinds   int
 	unwritten map[string]unwrittenKey
 	writers   map[string]writerFacts
 	used      map[string]bool
+	labels    map[string]string
 }
 
-// unwrittenKey names a step that may not write a key and why.
+// unwrittenKey names a top-level step that may not write a key, and its index.
 type unwrittenKey struct {
-	step   string
-	reason string
+	step  string
+	index int
 }
 
 // writerFacts summarises the top-level steps that have written a key so far: the smallest index
@@ -311,6 +319,7 @@ func newPipelineBuilder(
 		unwritten:   map[string]unwrittenKey{},
 		writers:     map[string]writerFacts{},
 		used:        map[string]bool{},
+		labels:      map[string]string{},
 	}
 }
 
@@ -447,7 +456,7 @@ func (b *pipelineBuilder) checkReads(node *stepNode) error {
 				key.Name,
 				key.Type,
 				unwritten.step,
-				unwritten.reason,
+				b.flow.unwrittenReason(unwritten.index),
 				key.Name,
 			)
 		}
@@ -466,6 +475,9 @@ func (b *pipelineBuilder) checkReads(node *stepNode) error {
 
 func (b *pipelineBuilder) checkWrites(node *stepNode) error {
 	for _, key := range node.writes {
+		if err := b.checkLabel(node, key); err != nil {
+			return err
+		}
 		if b.inputs[key.Name] != nil {
 			return fmt.Errorf(
 				"pipeline step %q writes pipeline input %q, which is read-only",
@@ -508,6 +520,47 @@ func (b *pipelineBuilder) checkWrites(node *stepNode) error {
 	return nil
 }
 
+// checkLabel refuses a key that has the name of a Branch other than as the label key the
+// Branch's routing step writes: a pipeline input, a Default or another step's write.
+func (b *pipelineBuilder) checkLabel(node *stepNode, key KeyRef) error {
+	route, ok := node.step.(*branchRoute)
+	if !ok || key.Name != route.name {
+		if branch, ok := b.labels[key.Name]; ok {
+			return fmt.Errorf(
+				"pipeline step %q writes %q (%s), the state key Branch %q writes its chosen label to; "+
+					"rename the Branch or the key",
+				node.name,
+				key.Name,
+				key.Type,
+				branch,
+			)
+		}
+		return nil
+	}
+	var clash string
+	switch source, ok := b.sources[key.Name]; {
+	case b.inputs[key.Name] != nil:
+		clash = "which is a pipeline input"
+	case ok && source.step != "":
+		clash = fmt.Sprintf("which step %q also writes", source.step)
+	case ok:
+		clash = "which has a Default"
+	}
+	if clash != "" {
+		return fmt.Errorf(
+			"pipeline step %q, which routes Branch %q, writes the chosen label to state key %q (%s), %s; "+
+				"rename the Branch or the key",
+			node.name,
+			route.name,
+			key.Name,
+			key.Type,
+			clash,
+		)
+	}
+	b.labels[key.Name] = route.name
+	return nil
+}
+
 // bothCommit reports whether a run may commit a write of key by an earlier top-level step and
 // then one by the current step: one of the earlier writers may continue at or before the
 // current step after it succeeds, or a rewind lands after the first of them and at or before
@@ -533,7 +586,8 @@ func (b *pipelineBuilder) register(node *stepNode) {
 			}
 		}
 	}
-	reach, unwritten := b.flow.reach(b.index), b.flow.unwritten(b.index)
+	reach, unwritten := b.flow.reach(b.index), b.mayNotWrite()
+	b.leave(node)
 	for _, key := range node.writes {
 		source, existed := b.sources[key.Name]
 		_, wasAbsent := b.maybeAbsent[key.Name]
@@ -542,9 +596,9 @@ func (b *pipelineBuilder) register(node *stepNode) {
 		} else {
 			delete(b.maybeAbsent, key.Name)
 		}
-		if _, ok := b.defaults[key.Name]; !ok && unwritten != "" {
+		if _, ok := b.defaults[key.Name]; !ok && unwritten {
 			if _, ok := b.unwritten[key.Name]; !ok {
-				b.unwritten[key.Name] = unwrittenKey{step: node.name, reason: unwritten}
+				b.unwritten[key.Name] = unwrittenKey{step: node.name, index: b.index}
 			}
 		}
 		if facts, ok := b.writers[key.Name]; ok {
@@ -622,11 +676,38 @@ func (b *pipelineBuilder) checkMerges(rules []MergeRule) error {
 	return nil
 }
 
-func (b *pipelineBuilder) checkBudget(budget RunBudget) error {
+// checkBudget requires each PerStepTokens entry to name a step of the pipeline that can spend
+// tokens, which rules out the steps Branch and Fallback add: they call no model, so a limit on
+// one would limit nothing.
+func (b *pipelineBuilder) checkBudget(budget RunBudget, steps []*stepNode, index map[string]int) error {
 	for _, name := range slices.Sorted(maps.Keys(budget.PerStepTokens)) {
 		if !b.names[name] {
 			return fmt.Errorf("run budget PerStepTokens names %q, which is not a step of this pipeline", name)
 		}
+		i, ok := index[name]
+		if !ok {
+			continue
+		}
+		var what, limit string
+		switch step := steps[i].step.(type) {
+		case *branchRoute:
+			what = fmt.Sprintf("the routing step of Branch %q", step.name)
+			limit = fmt.Sprintf("its arms %q", step.armNames())
+		case joinStep:
+			what = fmt.Sprintf("the step where the arms of Branch %q meet", step.route.name)
+			limit = fmt.Sprintf("its arms %q", step.route.armNames())
+		case fallbackJoin:
+			what = fmt.Sprintf("the step where the steps of Fallback %q meet", step.name)
+			limit = fmt.Sprintf("its steps %q and %q", step.primary.name, step.secondary.name)
+		default:
+			continue
+		}
+		return fmt.Errorf(
+			"run budget PerStepTokens names %q, %s, which spends no tokens; limit %s instead",
+			name,
+			what,
+			limit,
+		)
 	}
 	return nil
 }
@@ -691,6 +772,8 @@ func validateStepName(name string, position stepPosition, seen map[string]bool) 
 		return errors.New(position.describe("name is required"))
 	case strings.Contains(name, "."):
 		return fmt.Errorf("pipeline step %q name cannot contain '.'", name)
+	case name == End || name == Fail:
+		return fmt.Errorf("pipeline step %q has a name reserved for Transition.To; rename it", name)
 	case seen[name]:
 		return fmt.Errorf("pipeline step %q is duplicated", name)
 	}

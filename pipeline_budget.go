@@ -39,7 +39,9 @@ type RunBudget struct {
 	// summed over all its executions in the run, so over every visit a rewind makes (see
 	// Transition) as over every retry. A name may be a nested step's. A step's
 	// OnErrorFallback step is not part of it: the fallback is limited by its own entry, under
-	// its own name, and by the run limits.
+	// its own name, and by the run limits. The steps a Branch or a Fallback adds where the run
+	// is routed or where its steps meet spend no tokens, so Build refuses a limit for one: limit
+	// the arms, or the primary and secondary steps, instead.
 	PerStepTokens map[string]int
 }
 
