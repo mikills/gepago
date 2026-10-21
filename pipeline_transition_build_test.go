@@ -174,6 +174,35 @@ func (b *pipelineBuilder) bothCommit(key string) bool {
 				},
 			},
 			{
+				// the index varies whether the loop steps it in its body or an outer loop does.
+				name: "loops that pass a method an index they step in the body or around a nested loop",
+				mutation: `
+func (f *transitionFacts) skipsAt(k int) int { return f.skips[k] }
+
+func (f *transitionFacts) mayNotWrite(i int) bool {
+	skipping, k := 0, 0
+	for k <= i {
+		skipping += f.skipsAt(k)
+		k++
+	}
+	return skipping > 0 || f.onErrorBy[i] >= 0
+}
+
+func (b *pipelineBuilder) register(node *stepNode) {
+	for k := range b.index {
+		for _, key := range node.writes {
+			b.flow.addWriter(key.Name, b.flow.reach(k))
+		}
+	}
+}`,
+				want: []string{
+					"mutation.go:7:2: transitionFacts.mayNotWrite calls transitionFacts.skipsAt in a loop; " +
+						loopAdvice,
+					"mutation.go:15:2: pipelineBuilder.register calls transitionFacts.reach in a loop; " +
+						loopAdvice,
+				},
+			},
+			{
 				name: "a walk by recursion or goto",
 				mutation: `
 func skippedThrough(f *transitionFacts, k int) int {
@@ -200,6 +229,50 @@ next:
 				},
 			},
 			{
+				// a selector that is not a fact may follow the one that is.
+				name: "recursion through a method that reads the facts",
+				mutation: `
+func (b *pipelineBuilder) bothCommit(key string) bool {
+	earlier := b.flow.writtenBy[key]
+	return earlier.reach <= b.index || b.flow.rewinds > earlier.rewinds || b.reachedBefore(0)
+}
+
+func (b *pipelineBuilder) reachedBefore(k int) bool {
+	return k < b.index && (b.flow.reach(k) <= b.index || b.reachedBefore(k+1))
+}`,
+				want: []string{"mutation.go:9:55: pipelineBuilder.reachedBefore calls itself; " + loopAdvice},
+			},
+			{
+				name: "goto through a method that reads the facts",
+				mutation: `
+func (b *pipelineBuilder) bothCommit(key string) bool {
+	earlier := b.flow.writtenBy[key]
+	return earlier.reach <= b.index || b.flow.rewinds > earlier.rewinds || b.reachedBefore()
+}
+
+func (b *pipelineBuilder) reachedBefore() bool {
+	k := 0
+next:
+	if k < b.index {
+		if b.flow.reach(k) <= b.index {
+			return true
+		}
+		k++
+		goto next
+	}
+	return false
+}`,
+				want: []string{"mutation.go:16:3: pipelineBuilder.reachedBefore uses goto; " + loopAdvice},
+			},
+			{
+				name: "recursion that compares a fact with the step's index",
+				mutation: `
+func skippedThrough(f *transitionFacts, b *pipelineBuilder, k int) bool {
+	return k >= 0 && (f.skips[k] > b.index || skippedThrough(f, b, k-1))
+}`,
+				want: []string{"mutation.go:4:44: skippedThrough calls itself; " + loopAdvice},
+			},
+			{
 				name: "a helper that walks the facts it is passed",
 				mutation: `
 func (f *transitionFacts) skip(start, end int) {
@@ -217,6 +290,31 @@ func walkSkips(skips []int, start, end int) {
 }`,
 				want: []string{
 					"mutation.go:6:13: transitionFacts.skip passes transitionFacts.skips to walkSkips, " +
+						"where a loop over it goes uncounted; " + loopAdvice,
+				},
+			},
+			{
+				name: "a range taken from the facts at a local index and passed on",
+				mutation: `
+func (b *pipelineBuilder) leave(node *stepNode) {
+	for key, typ := range node.writeTypes {
+		b.flow.addRangeKey(key, typ)
+	}
+	i := b.index
+	walkRange(b.flow.rangeAt[i])
+}
+
+func walkRange(r *rewindRange) int {
+	n := 0
+	if r != nil {
+		for range r.keys {
+			n++
+		}
+	}
+	return n
+}`,
+				want: []string{
+					"mutation.go:8:12: pipelineBuilder.leave passes transitionFacts.rangeAt to walkRange, " +
 						"where a loop over it goes uncounted; " + loopAdvice,
 				},
 			},
@@ -353,6 +451,48 @@ func (f *transitionFacts) addRangeKey(key string, typ reflect.Type) {
 	}
 }`,
 			},
+			{
+				// a loop over a step's keys may call a method of the facts with the step's index.
+				name: "methods of the facts called in a loop with an index it does not change",
+				mutation: `
+func (b *pipelineBuilder) register(node *stepNode) {
+	b.leave(node)
+	for _, key := range node.writes {
+		source, existed := b.sources[key.Name]
+		if _, ok := b.defaults[key.Name]; !ok && b.flow.mayNotWrite(b.index) {
+			b.flow.markUnwritten(key.Name, node.name, b.index)
+		}
+		b.flow.addWriter(key.Name, b.flow.reach(b.index))
+		if !existed || source.writers == 0 {
+			b.sources[key.Name] = keySource{typ: key.Type, step: node.name, def: existed, writers: 1}
+			continue
+		}
+		source.writers++
+		b.sources[key.Name] = source
+	}
+}`,
+			},
+			{
+				// it may also call one with each key, a lookup in a map of the facts.
+				name: "a method of the facts called in a loop with each key",
+				mutation: `
+import "fmt"
+
+func (f *transitionFacts) bothCommit(key string, i int) bool {
+	earlier := f.writtenBy[key]
+	return earlier.reach <= i || f.rewinds > earlier.rewinds
+}
+
+func (b *pipelineBuilder) checkWrites(node *stepNode) error {
+	for _, key := range node.writes {
+		source, ok := b.sources[key.Name]
+		if ok && source.writers > 0 && b.merges[key.Name] == nil && b.flow.bothCommit(key.Name, b.index) {
+			return fmt.Errorf("pipeline steps %q and %q both write %q", source.step, node.name, key.Name)
+		}
+	}
+	return nil
+}`,
+			},
 		}
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
@@ -441,9 +581,10 @@ func loadPackageSource(t *testing.T) packageSource {
 //   - a method of factWriters that loops or does not add to work;
 //   - outside factLoopers and the passes, a loop that walks the facts: a range over, or a for
 //     whose header uses, a field of transitionFacts or a value taken from one, or a loop whose
-//     body indexes a slice of the facts or names a method of transitionFacts other than
-//     factWriters and factLoopers, which may read any fact; and such a loop of factLoopers that
-//     does not add to work;
+//     body indexes a slice of the facts or calls a method of transitionFacts other than
+//     factWriters and factLoopers, which may read any fact, with an integer that uses a variable
+//     the loop changes, such as its index; and such a loop of factLoopers that does not add to
+//     work;
 //   - outside factLoopers, a slice, map or pointer taken from the facts that is passed to a
 //     function other than len, cap, delete or append's first argument, returned, or stored
 //     anywhere but a local variable or the facts, since a loop over it there would go unseen;
@@ -452,12 +593,13 @@ func loadPackageSource(t *testing.T) packageSource {
 //
 // Selectors are resolved by type, so a field of another type is never taken for a fact. The
 // check guards against the likely regressions and is not a proof. It does not see a walk that
-// reaches the facts in other ways: through recursion across functions; through a function
-// value, an interface or a closure; through a method called on a value taken from them, such
-// as a rule's skips, which the check does not follow; or through another name for a slice the
-// facts were given, as table holds target and rules. Nor does it see a loop over something
-// else, such as the keys a step reads, that looks the facts up in a map by each element, which
-// is linear only when what it walks is.
+// reaches the facts in other ways: through recursion across functions, or a generic function
+// calling itself with explicit type arguments; through a function value, an interface or a
+// closure; through a method called on a value taken from them, such as a rule's skips, which the
+// check does not follow; or through another name for a slice the facts were given, as table
+// holds target and rules. Nor does it see a loop over something else, such as the keys a step
+// reads, that looks the facts up by each element, in a map or through a method, which is linear
+// only when what it walks is.
 func (s packageSource) factProblems(t *testing.T, mutation string) []string {
 	t.Helper()
 	files := s.files
@@ -688,7 +830,7 @@ func (c *factChecker) touches(body *ast.BlockStmt) bool {
 	found := false
 	ast.Inspect(body, func(node ast.Node) bool {
 		if selector, ok := node.(*ast.SelectorExpr); ok {
-			found = c.facts[c.field(selector)] != "" || c.onFacts(c.info.Uses[selector.Sel])
+			found = found || c.facts[c.field(selector)] != "" || c.onFacts(c.info.Uses[selector.Sel])
 		}
 		return !found
 	})
@@ -774,7 +916,9 @@ func (c *factChecker) takenFrom(node ast.Node, tainted map[types.Object]*types.V
 				from = field
 			}
 		case *ast.Ident:
-			from = tainted[c.info.Uses[node]]
+			if field := tainted[c.info.Uses[node]]; field != nil {
+				from = field
+			}
 		}
 		return from == nil
 	})
@@ -972,24 +1116,83 @@ func (c *factChecker) checkLoop(f *funcFacts, loop ast.Stmt) {
 }
 
 // readerIn returns the method of transitionFacts other than factWriters and factLoopers that
-// loop names, outside the loops in it, or "" when it names none. Such a method may read any of
-// the facts, so a call of it is taken for a read.
+// loop calls with an integer that uses a variable the loop varies, or "" when it calls none.
+// Such a method may read any fact of the step or rule at that index, so the call is taken for a
+// walk; a call with a key, or with an index the loop does not change, is a lookup.
 func (c *factChecker) readerIn(loop ast.Stmt) string {
+	varied := c.varies(loop)
 	reader := ""
 	ast.Inspect(loop, func(node ast.Node) bool {
-		switch node := node.(type) {
-		case *ast.ForStmt, *ast.RangeStmt:
-			return node == loop
-		case *ast.SelectorExpr:
-			name := node.Sel.Name
-			if c.onFacts(c.info.Uses[node.Sel]) && !slices.Contains(factWriters, name) &&
-				!slices.Contains(factLoopers, name) {
-				reader = "transitionFacts." + name
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return reader == ""
+		}
+		method := c.callee(call)
+		if method == nil || !c.onFacts(method) || slices.Contains(factWriters, method.Name()) ||
+			slices.Contains(factLoopers, method.Name()) {
+			return true
+		}
+		for _, arg := range call.Args {
+			if basic, ok := c.info.TypeOf(arg).Underlying().(*types.Basic); ok && basic.Info()&types.IsInteger != 0 &&
+				c.usesAny(arg, varied) {
+				reader = "transitionFacts." + method.Name()
 			}
 		}
 		return reader == ""
 	})
 	return reader
+}
+
+// varies returns the variables and fields loop changes from one iteration to the next, outside
+// the loops in it, which vary with theirs: its index, the key and value it ranges over, and what
+// it assigns.
+func (c *factChecker) varies(loop ast.Stmt) map[types.Object]bool {
+	varied := map[types.Object]bool{}
+	add := func(expr ast.Expr) {
+		switch expr := ast.Unparen(expr).(type) {
+		case *ast.SelectorExpr:
+			varied[c.info.ObjectOf(expr.Sel)] = true
+		case *ast.Ident:
+			varied[c.info.ObjectOf(expr)] = true
+		}
+	}
+	ast.Inspect(loop, func(node ast.Node) bool {
+		switch node := node.(type) {
+		case *ast.ForStmt:
+			return node == loop
+		case *ast.RangeStmt:
+			if node != loop {
+				return false
+			}
+			add(node.Key)
+			add(node.Value)
+		case *ast.AssignStmt:
+			for _, lhs := range node.Lhs {
+				add(lhs)
+			}
+		case *ast.IncDecStmt:
+			add(node.X)
+		case *ast.ValueSpec:
+			for _, name := range node.Names {
+				add(name)
+			}
+		}
+		return true
+	})
+	delete(varied, nil)
+	return varied
+}
+
+// usesAny reports whether expr names a variable or field in objs.
+func (c *factChecker) usesAny(expr ast.Expr, objs map[types.Object]bool) bool {
+	found := false
+	ast.Inspect(expr, func(node ast.Node) bool {
+		if ident, ok := node.(*ast.Ident); ok {
+			found = found || objs[c.info.ObjectOf(ident)]
+		}
+		return !found
+	})
+	return found
 }
 
 // indexedFact returns the field of transitionFacts whose slice or array body indexes, outside
