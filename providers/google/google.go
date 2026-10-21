@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"math"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -178,11 +179,11 @@ func NewChatClient(config Config) (*ChatClient, error) {
 
 // Chat sends one Gemini generateContent request and returns a provider-neutral agent response.
 // A request Gemini cannot take fails with a Permanent error before it is sent: a message whose
-// role is none of gepa's four, a tool whose parameters are not a JSON object, or a response
-// format, when the request has no tools, whose schema is set but not a JSON object. Failures are
-// classified: 429, 5xx, dropped connections and network timeouts are transient; other 4xx and
-// TLS, host or URL misconfiguration are permanent; a cancelled or expired ctx returns ctx.Err()
-// unwrapped. The API key, which travels in the request URL, is redacted
+// role is none of gepa's four, a tool whose parameters are not a JSON object, a response
+// format, when the request has no tools, whose schema is set, even to spaces, but not a JSON
+// object, or a Temperature that is NaN or infinite. Failures are classified: 429, 5xx, dropped
+// connections and network timeouts are transient; other 4xx and TLS, host or URL
+// misconfiguration are permanent; a cancelled or expired ctx returns ctx.Err() unwrapped. The API key, which travels in the request URL, is redacted
 // from every error. A response without candidates still returns its usage with the error.
 func (c *ChatClient) Chat(ctx context.Context, req gepa.ChatRequest) (gepa.ChatResponse, error) {
 	return providerlog.Chat(ctx, c.logger, c.logCall("chat", req), func() (gepa.ChatResponse, error) {
@@ -230,8 +231,9 @@ func (c *ChatClient) chat(ctx context.Context, req gepa.ChatRequest) (gepa.ChatR
 }
 
 // checkGoogleRequest returns why Gemini cannot take req, or nil: a message whose role is none
-// of gepa's four, a tool whose parameters are not a JSON object, or a response format that is
-// sent, since the request has no tools, whose schema is set but not a JSON object.
+// of gepa's four, a tool whose parameters are not a JSON object, a response format that is
+// sent, since the request has no tools, whose schema is set, even to spaces, but not a JSON
+// object, or a temperature that is NaN or infinite, which JSON cannot carry.
 func checkGoogleRequest(req gepa.ChatRequest) error {
 	for i, message := range req.Messages {
 		switch message.Role {
@@ -245,9 +247,12 @@ func checkGoogleRequest(req gepa.ChatRequest) error {
 			return fmt.Errorf("tool %q: parameters must be a JSON object", tool.Name)
 		}
 	}
-	if format := req.ResponseFormat; format != nil && len(req.Tools) == 0 && len(bytes.TrimSpace(format.Schema)) > 0 &&
+	if format := req.ResponseFormat; format != nil && len(req.Tools) == 0 && len(format.Schema) > 0 &&
 		!jsonObject(format.Schema) {
 		return fmt.Errorf("response format %q: schema must be a JSON object", format.Name)
+	}
+	if t := req.Temperature; t != nil && (math.IsNaN(*t) || math.IsInf(*t, 0)) {
+		return fmt.Errorf("temperature %v is not a finite number", *t)
 	}
 	return nil
 }

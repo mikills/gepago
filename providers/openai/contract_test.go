@@ -4,36 +4,33 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
+	"math"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 
 	gepa "github.com/mikills/gepago"
 	"github.com/mikills/gepago/gepatest"
+	"github.com/mikills/gepago/internal/providertest"
 	"github.com/stretchr/testify/require"
 )
 
-// helloServer answers every chat completion with a reply, reporting a prompt cache read from
-// the second request on, and counts the requests.
+// helloServer answers every chat completion with a reply, reporting a prompt cache read of 8 of
+// its 12 prompt tokens when the same request came before, and counts the requests.
 func helloServer(t *testing.T) (*httptest.Server, *atomic.Int32) {
 	t.Helper()
-	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	return providertest.PromptCacheServer(t, func(hit bool) string {
 		cached := 0
-		if requests.Add(1) > 1 {
+		if hit {
 			cached = 8
 		}
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{
+		return fmt.Sprintf(`{
 			"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-test",
 			"choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],
 			"usage":{"prompt_tokens":12,"completion_tokens":2,"total_tokens":14,
 				"prompt_tokens_details":{"cached_tokens":%d},"completion_tokens_details":{"reasoning_tokens":1}}
 		}`, cached)
-	}))
-	t.Cleanup(server.Close)
-	return server, &requests
+	})
 }
 
 func TestLanguageModelMeetsTheChatContract(t *testing.T) {
@@ -65,6 +62,10 @@ func TestChatRefusesEveryRequestTheFakeGeneratorRefuses(t *testing.T) {
 		"tool parameters that are a string": {Messages: user, Tools: tool(`"object"`)},
 		"a strict format that is not JSON":  {Messages: user, ResponseFormat: strict(`{"type":`)},
 		"a strict format of plain text":     {Messages: user, ResponseFormat: strict(`not json`)},
+		"a strict format of spaces":         {Messages: user, ResponseFormat: strict(" \n")},
+		"a NaN temperature":                 {Messages: user, Temperature: floatPtr(math.NaN())},
+		"an infinite temperature":           {Messages: user, Temperature: floatPtr(math.Inf(1))},
+		"a temperature of minus infinity":   {Messages: user, Temperature: floatPtr(math.Inf(-1))},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := fake.Chat(context.Background(), req)
@@ -86,6 +87,7 @@ func TestChatRefusesEveryRequestTheFakeGeneratorRefuses(t *testing.T) {
 		"a number no float64 holds": {Messages: user, Tools: tool(
 			`{"type":"object","properties":{"n":{"type":"number","maximum":1e400}}}`,
 		)},
+		"the largest finite temperature": {Messages: user, Temperature: floatPtr(math.MaxFloat64)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := fake.Chat(context.Background(), req)

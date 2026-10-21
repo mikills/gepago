@@ -4,36 +4,35 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
+	"math"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 
 	gepa "github.com/mikills/gepago"
 	"github.com/mikills/gepago/gepatest"
+	"github.com/mikills/gepago/internal/providertest"
 	"github.com/stretchr/testify/require"
 )
 
-// helloServer answers every Messages API request with a reply, reporting a prompt cache read
-// from the second request on, and counts the requests.
+// helloServer answers every Messages API request with a reply, reporting a prompt cache write
+// of 8 of its 12 input tokens, or a read of them when the same request came before, and counts
+// the requests.
 func helloServer(t *testing.T) (*httptest.Server, *atomic.Int32) {
 	t.Helper()
-	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		cached := 0
-		if requests.Add(1) > 1 {
-			cached = 8
+	return providertest.PromptCacheServer(t, func(hit bool) string {
+		read, written := 0, 8
+		if hit {
+			read, written = 8, 0
 		}
-		w.Header().Set("Content-Type", "application/json")
-		// the Messages API counts cache reads apart from input_tokens; the client adds them back.
-		fmt.Fprintf(w, `{
+		// the Messages API counts cache reads and writes apart from input_tokens; the client adds
+		// them back.
+		return fmt.Sprintf(`{
 			"id":"msg_1","type":"message","role":"assistant","model":"claude-test",
 			"content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn",
-			"usage":{"input_tokens":4,"output_tokens":2,"cache_read_input_tokens":%d,"cache_creation_input_tokens":1}
-		}`, cached)
-	}))
-	t.Cleanup(server.Close)
-	return server, &requests
+			"usage":{"input_tokens":4,"output_tokens":2,"cache_read_input_tokens":%d,"cache_creation_input_tokens":%d}
+		}`, read, written)
+	})
 }
 
 func TestLanguageModelMeetsTheChatContract(t *testing.T) {
@@ -57,6 +56,7 @@ func TestChatRefusesEveryRequestTheFakeGeneratorRefuses(t *testing.T) {
 	format := func(schema string, strict bool) *gepa.ResponseFormat {
 		return &gepa.ResponseFormat{Name: "answer", Schema: json.RawMessage(schema), Strict: strict}
 	}
+	temperature := func(value float64) *float64 { return &value }
 
 	for name, req := range map[string]gepa.ChatRequest{
 		"an unknown role":                   {Messages: []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}, {Role: "narrator"}}},
@@ -65,6 +65,10 @@ func TestChatRefusesEveryRequestTheFakeGeneratorRefuses(t *testing.T) {
 		"tool parameters that are a string": {Messages: user, Tools: tool(`"object"`)},
 		"a strict format that is not JSON":  {Messages: user, ResponseFormat: format(`{"type":`, true)},
 		"a strict format of plain text":     {Messages: user, ResponseFormat: format(`not json`, true)},
+		"a strict format of spaces":         {Messages: user, ResponseFormat: format(" \n", true)},
+		"a NaN temperature":                 {Messages: user, Temperature: temperature(math.NaN())},
+		"an infinite temperature":           {Messages: user, Temperature: temperature(math.Inf(1))},
+		"a temperature of minus infinity":   {Messages: user, Temperature: temperature(math.Inf(-1))},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := fake.Chat(context.Background(), req)
@@ -84,6 +88,8 @@ func TestChatRefusesEveryRequestTheFakeGeneratorRefuses(t *testing.T) {
 	for name, req := range map[string]gepa.ChatRequest{
 		"a format that is not strict, of an array": {Messages: user, ResponseFormat: format(`[1]`, false)},
 		"a format that is not strict, of text":     {Messages: user, ResponseFormat: format(`{"type":`, false)},
+		"a format that is not strict, of spaces":   {Messages: user, ResponseFormat: format(" \n", false)},
+		"the largest finite temperature":           {Messages: user, Temperature: temperature(math.MaxFloat64)},
 		"a number no float64 holds": {Messages: user, Tools: tool(
 			`{"type":"object","properties":{"n":{"type":"number","maximum":1e400}}}`,
 		)},

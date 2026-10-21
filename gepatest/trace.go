@@ -1,6 +1,7 @@
 package gepatest
 
 import (
+	"cmp"
 	"fmt"
 	"maps"
 	"slices"
@@ -58,8 +59,9 @@ type ExpectedStep struct {
 	// element's body runs, is instead numbered from one among the executions of its element with
 	// its path, in the order they ran, so its number does not depend on the order the elements
 	// started in; see Attributes. Executions of elements with one index in the Maps that the
-	// elements of an enclosing Map run are numbered in the order of the enclosing elements'
-	// indices.
+	// elements of an enclosing Map run are numbered in the order the executions of the enclosing
+	// Map ran, such as its visits or attempts, and within one of them in the order of the
+	// enclosing elements' indices.
 	Attempt int `json:"attempt,omitempty"`
 	// Attributes are attributes the execution must have, each with the value given, as
 	// gepa.StepStartedEvent and gepa.StepFinishedEvent report them: "visit", the visit of the
@@ -202,14 +204,25 @@ func (r expectedRow) label() string { return r.key.label() }
 
 // recordedRow is an execution of a trace with its key, the nodes that contain it, outermost
 // first and its own last, and the index of the expected row that stands for it, or -1. For an
-// execution of a Map element or one nested in it, outer holds the indices of the elements of
-// enclosing Maps that contain its element, outermost first.
+// execution of a Map element or one nested in it, outer holds the elements of enclosing Maps
+// that contain its element, outermost first.
 type recordedRow struct {
 	key   rowKey
 	step  gepa.StepTrace
 	chain []*traceNode
-	outer []int
+	outer []elementLevel
 	match int
+}
+
+// elementLevel is a Map element that contains an execution: the place among the recorded rows
+// of the execution whose elements it is one of, such as one visit of a Map, and its index.
+type elementLevel struct {
+	owner, index int
+}
+
+// compareLevels orders elements by the place of their Map's execution and then by index.
+func compareLevels(a, b elementLevel) int {
+	return cmp.Or(cmp.Compare(a.owner, b.owner), cmp.Compare(a.index, b.index))
 }
 
 func (r recordedRow) label() string { return r.key.label() }
@@ -250,10 +263,14 @@ func expectedRows(steps []ExpectedStep) []expectedRow {
 // steps of a pipeline the element runs.
 func recordedRows(trace gepa.PipelineTrace) []recordedRow {
 	var rows []recordedRow
-	// elements holds the indices of the Map elements that contain steps, outermost first, and
+	// elements holds the Map elements that contain steps, outermost first, parent is the place
+	// among rows of the execution whose steps or runs they are, -1 for the trace's own, and
 	// inMap reports that steps are the executions of a Map's elements.
-	var walk func(steps []gepa.StepTrace, prefix string, chain []*traceNode, elements []int, inMap bool)
-	walk = func(steps []gepa.StepTrace, prefix string, chain []*traceNode, elements []int, inMap bool) {
+	var walk func(steps []gepa.StepTrace, prefix string, chain []*traceNode, elements []elementLevel, parent int,
+		inMap bool)
+	walk = func(steps []gepa.StepTrace, prefix string, chain []*traceNode, elements []elementLevel, parent int,
+		inMap bool,
+	) {
 		for i, step := range steps {
 			path := prefix + step.Step
 			node := &traceNode{
@@ -268,36 +285,39 @@ func recordedRows(trace gepa.PipelineTrace) []recordedRow {
 				node.element = index
 				// an execution nested in an element repeats its index, unless it is an element
 				// of a Map the element runs.
-				if n := len(elements); n == 0 || inMap || elements[n-1] != index {
-					own = append(slices.Clip(elements), index)
+				if n := len(elements); n == 0 || inMap || elements[n-1].index != index {
+					own = append(slices.Clip(elements), elementLevel{owner: parent, index: index})
 				}
 			}
 			row := recordedRow{key: rowKey{path: path, attempt: step.Attempt}, step: step, match: -1}
 			if n := len(own); n > 0 {
-				row.key.element, row.key.index, row.outer = true, own[n-1], own[:n-1]
+				row.key.element, row.key.index, row.outer = true, own[n-1].index, own[:n-1]
 			}
 			row.chain = append(slices.Clip(chain), node)
+			self := len(rows)
 			rows = append(rows, row)
 			// only a Map reports how many of its elements failed.
 			_, isMap := step.Attributes["failed"]
-			walk(step.Steps, path+".", row.chain, own, isMap)
+			walk(step.Steps, path+".", row.chain, own, self, isMap)
 			for j, run := range step.Runs {
 				runNode := &traceNode{index: len(step.Steps) + j, start: run.StartedAt, end: run.EndedAt, element: -1}
-				walk(run.Steps, path+".", append(slices.Clip(row.chain), runNode), own, false)
+				walk(run.Steps, path+".", append(slices.Clip(row.chain), runNode), own, self, false)
 			}
 		}
 	}
-	walk(trace.Steps, "", nil, nil, false)
+	walk(trace.Steps, "", nil, nil, -1, false)
 	numberElements(rows)
 	return rows
 }
 
 // numberElements replaces the attempt of each key of an execution of a Map element, or one
 // nested in it, with its number among the executions of its element with its path, from one, in
-// the order of the indices of the elements of enclosing Maps that contain its element and then
-// in the order recordedRows lists them, which is the order they started in: the executions of
-// one element with one path run one after another, unless a step of the element runs a
-// pipeline several times at once.
+// the order of the elements of enclosing Maps that contain its element, outermost first, each
+// placed by the execution of its Map and then by its index, and then in the order recordedRows
+// lists them, which is the order they started in. Executions of one Map at one place, such as
+// its visits, and the executions of one element with one path run one after another, unless a
+// step runs a pipeline several times at once, so the numbers do not depend on the order the
+// elements of a Map started in.
 func numberElements(rows []recordedRow) {
 	type element struct {
 		path  string
@@ -311,7 +331,9 @@ func numberElements(rows []recordedRow) {
 		}
 	}
 	for _, members := range groups {
-		slices.SortStableFunc(members, func(a, b int) int { return slices.Compare(rows[a].outer, rows[b].outer) })
+		slices.SortStableFunc(members, func(a, b int) int {
+			return slices.CompareFunc(rows[a].outer, rows[b].outer, compareLevels)
+		})
 		for n, i := range members {
 			rows[i].key.attempt = n + 1
 		}

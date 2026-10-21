@@ -159,11 +159,14 @@ func TestAssertTraceNumbersTheStepsOfAPipelineAnElementRunsWhicheverElementStart
 		"  + sizes.nest.deep[0] #1 ok usage{total=1}\n", "the nested step is labelled with its element")
 }
 
-// mapInMapPipeline returns a pipeline whose Map "outer" runs, two elements at a time, a body
-// "split" that runs a pipeline: "letters" splits its token into letters, and a Map "inner" runs
-// "leaf" on each letter, two at a time, which records as many tokens as the letter's position
-// in the alphabet.
-func mapInMapPipeline(t *testing.T, recorder *gepa.RecordingObserver) gepa.Pipeline {
+// mapInMapResults is the key the Map of mapInMap writes.
+var mapInMapResults = gepa.Key[[][]int]{Name: "results"}
+
+// mapInMap returns a Map "outer" that runs, two elements at a time, a body "split" that runs a
+// pipeline: "letters" splits its token into letters, and a Map "inner" runs "leaf" on each
+// letter, two at a time, which records as many tokens as the letter's position in the
+// alphabet. It writes mapInMapResults.
+func mapInMap(t *testing.T) gepa.Step {
 	t.Helper()
 	letters := gepa.Key[[]string]{Name: "letters"}
 	letter := gepa.Key[string]{Name: "letter"}
@@ -195,12 +198,17 @@ func mapInMapPipeline(t *testing.T, recorder *gepa.RecordingObserver) gepa.Pipel
 		},
 	}.Build()
 	require.NoError(t, err)
-	results := gepa.Key[[][]int]{Name: "results"}
+	return gepa.Map("outer", tokenList, tokenItem,
+		gepa.NewProgramStep("split", inner, []gepa.KeyRef{tokenItem.Ref()}, []gepa.KeyRef{tokenSizes.Ref()}),
+		mapInMapResults, gepa.MapOptions{MaxConcurrency: 2})
+}
+
+// mapInMapPipeline returns a pipeline that runs the Map of mapInMap.
+func mapInMapPipeline(t *testing.T, recorder *gepa.RecordingObserver) gepa.Pipeline {
+	t.Helper()
 	pipeline, err := gepa.PipelineSpec{
-		Inputs: []gepa.KeyRef{tokenList.Ref()},
-		Steps: []gepa.Step{gepa.Map("outer", tokenList, tokenItem,
-			gepa.NewProgramStep("split", inner, []gepa.KeyRef{tokenItem.Ref()}, []gepa.KeyRef{tokenSizes.Ref()}),
-			results, gepa.MapOptions{MaxConcurrency: 2})},
+		Inputs:    []gepa.KeyRef{tokenList.Ref()},
+		Steps:     []gepa.Step{mapInMap(t)},
 		Observers: []gepa.PipelineObserver{recorder},
 	}.Build()
 	require.NoError(t, err)
@@ -249,5 +257,126 @@ func TestAssertTraceNumbersTheElementsOfAMapInAnElementByTheirEnclosingElement(t
 			Steps: late,
 			Usage: tokensUsage(6),
 		}), "letters ran before inner in each element")
+	}
+}
+
+// rewoundMapInMapPipeline returns a pipeline that runs the Map of mapInMap and then "judge",
+// which rewinds the run to the Map on its first visit, so the Map runs twice.
+func rewoundMapInMapPipeline(t *testing.T, recorder *gepa.RecordingObserver) gepa.Pipeline {
+	t.Helper()
+	verdict := gepa.Key[string]{Name: "verdict"}
+	judge := gepa.NewStep("judge", []gepa.KeyRef{mapInMapResults.Ref()}, []gepa.KeyRef{verdict.Ref()},
+		func(ctx context.Context, s gepa.State) error {
+			attributes, _ := gepa.StepAttributesFrom(ctx)
+			if attributes["visit"] == 1 {
+				verdict.Set(s, "again")
+			} else {
+				verdict.Set(s, "done")
+			}
+			return nil
+		})
+	again := func(s gepa.State, _ error) bool {
+		got, err := verdict.Get(s)
+		return err == nil && got == "again"
+	}
+	pipeline, err := gepa.PipelineSpec{
+		Inputs:      []gepa.KeyRef{tokenList.Ref()},
+		Steps:       []gepa.Step{mapInMap(t), judge},
+		Transitions: []gepa.Transition{{From: "judge", When: again, To: "outer"}},
+		MaxVisits:   map[string]int{"outer": 2},
+		Observers:   []gepa.PipelineObserver{recorder},
+	}.Build()
+	require.NoError(t, err)
+	return pipeline
+}
+
+// rewoundMapInMapSteps lists the executions of rewoundMapInMapPipeline over "a" and "cb", the
+// outer elements of each visit in the order orders gives, with leaf[0] in outer element e of
+// visit v numbered leafNumber(v, e).
+func rewoundMapInMapSteps(orders [2][]int, leafNumber func(visit, element int) int) []gepatest.ExpectedStep {
+	index := func(i int) map[string]int { return map[string]int{"index": i} }
+	var steps []gepatest.ExpectedStep
+	for visit := 1; visit <= 2; visit++ {
+		steps = append(steps, gepatest.ExpectedStep{
+			Step:       "outer",
+			Attempt:    visit,
+			Attributes: map[string]int{"visit": visit},
+			Usage:      tokensUsage(6),
+		})
+		for _, element := range orders[visit-1] {
+			usage := tokensUsage([]int{1, 5}[element])
+			steps = append(
+				steps,
+				gepatest.ExpectedStep{
+					Step:       "outer.split",
+					Attempt:    visit,
+					Attributes: map[string]int{"visit": visit, "index": element},
+					Usage:      usage,
+				},
+				gepatest.ExpectedStep{Step: "outer.split.letters", Attempt: visit, Attributes: index(element)},
+				gepatest.ExpectedStep{
+					Step:       "outer.split.inner",
+					Attempt:    visit,
+					Attributes: index(element),
+					Usage:      usage,
+				},
+				gepatest.ExpectedStep{
+					Step:       "outer.split.inner.leaf",
+					Attempt:    leafNumber(visit, element),
+					Attributes: index(0),
+					Usage:      tokensUsage([]int{1, 3}[element]),
+				},
+			)
+			if element == 1 {
+				steps = append(steps, gepatest.ExpectedStep{
+					Step:       "outer.split.inner.leaf",
+					Attempt:    visit,
+					Attributes: index(1),
+					Usage:      tokensUsage(2),
+				})
+			}
+		}
+		judge := gepatest.ExpectedStep{Step: "judge", Attempt: visit, Attributes: map[string]int{"visit": visit}}
+		if visit == 1 {
+			judge.Transition = &gepa.TransitionTrace{From: "judge", To: "outer", Rewind: true}
+		}
+		steps = append(steps, judge)
+	}
+	return steps
+}
+
+func TestAssertTraceNumbersTheElementsOfAMapInAnElementByTheVisitTheyRanIn(t *testing.T) {
+	recorder := &gepa.RecordingObserver{}
+	pipeline := rewoundMapInMapPipeline(t, recorder)
+	const runs = 200
+	for range runs {
+		_, err := pipeline.Run(context.Background(), gepa.NewState(gepa.Prediction{"tokens": []string{"a", "cb"}}))
+		require.NoError(t, err)
+	}
+	require.Len(t, recorder.Traces(), runs)
+	// leaf[0] #1 and #2 belong to outer elements 0 and 1 of the first visit, #3 and #4 to those
+	// of the second, whichever element of a visit started first.
+	runOrder := func(visit, element int) int { return 2*(visit-1) + element + 1 }
+	// numbering by the outer element alone would give element 0 #1 and #2 and element 1 #3 and
+	// #4, one of each to each visit.
+	byElement := func(visit, element int) int { return 2*element + visit }
+
+	for _, trace := range recorder.Traces() {
+		for _, orders := range [][2][]int{{{0, 1}, {0, 1}}, {{1, 0}, {0, 1}}, {{0, 1}, {1, 0}}, {{1, 0}, {1, 0}}} {
+			recording := &recordingT{}
+			require.True(t, gepatest.AssertTrace(recording, trace, gepatest.ExpectedTrace{
+				Steps: rewoundMapInMapSteps(orders, runOrder),
+				Usage: tokensUsage(12),
+			}), "outer elements listed in the orders %v: %q", orders, recording.errors)
+		}
+
+		recording := &recordingT{}
+		require.False(t, gepatest.AssertTrace(recording, trace, gepatest.ExpectedTrace{
+			Steps: rewoundMapInMapSteps([2][]int{{0, 1}, {0, 1}}, byElement),
+			Usage: tokensUsage(12),
+		}))
+		require.Len(t, recording.errors, 1)
+		require.Contains(t, recording.errors[0], "outer.split.inner.leaf[0] #2 ok usage{total=3}",
+			"the first visit's outer element 1 runs leaf[0] #2")
 	}
 }

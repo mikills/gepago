@@ -551,8 +551,9 @@ func checkToolConcurrency(
 // calls t.Helper when t has that method. A client that answers from a script, such as a
 // FakeGenerator, must answer every request the check sends, for example with a Default reply,
 // and one that talks to a provider should talk to a fake of it, such as an
-// httptest.Server, since the check sends several requests. The requirements follow from
-// gepa.ChatClient, gepa.ChatResponse and gepa.Usage:
+// httptest.Server, since the check sends several requests; a fake that reports a prompt cache
+// read on a repeated request, as the provider would, exercises the cache hit requirement. The
+// requirements follow from gepa.ChatClient, gepa.ChatResponse and gepa.Usage:
 //
 //   - invalid request: Chat refuses a request that no provider accepts, before sending it: one
 //     with a message whose role is none of gepa's four, one with a tool whose parameters are
@@ -570,10 +571,14 @@ func checkToolConcurrency(
 //   - ended context: Chat with a context already cancelled, and with one past its deadline,
 //     fails within five seconds with an error that wraps the context's error, and reports no
 //     usage.
-//   - valid request: a request of a system and a user message succeeds, and so does the same
-//     request sent again, which a provider may answer from its prompt cache (see usage); each
-//     response's message has the assistant role, and its FinishReason is empty or one of gepa's
-//     four.
+//   - valid request: a request of a system and a user message succeeds; its message has the
+//     assistant role, and its FinishReason is empty or one of gepa's four.
+//   - cache hit: the same request sent again, which a provider may answer from its prompt
+//     cache, succeeds as the first did and reports the same PromptTokens, since PromptTokens
+//     counts every input token once, those read from or written to a prompt cache included,
+//     whether the request hit the cache or not. gepa keeps no cache of chat replies, and the
+//     check cannot make a provider read its cache; it sends the request again once the valid
+//     request has succeeded.
 //   - concurrent calls: the valid request sent several times at once succeeds every time, as
 //     gepa.ChatClient requires of a client shared between goroutines; run the test with -race
 //     to catch the data races too.
@@ -632,6 +637,16 @@ func validChatRequest() gepa.ChatRequest {
 		{Role: gepa.RoleSystem, Content: "You answer gepatest's contract check in one word."},
 		{Role: gepa.RoleUser, Content: "Say hello."},
 	}}
+}
+
+// oddChatRequest returns a valid request with another prompt than validChatRequest's, for the
+// odd requests to build on: a provider that leaves out a part of an odd request, as Claude does
+// a format that is not strict, then still sends something other than the valid request, so a
+// fake prompt cache that keys on the request misses on the valid request's first send.
+func oddChatRequest() gepa.ChatRequest {
+	req := validChatRequest()
+	req.Messages[1].Content = "Say goodbye."
+	return req
 }
 
 // lookupTool is a valid tool for the requests the check sends.
@@ -693,7 +708,7 @@ func checkChatInvalidRequests(client gepa.ChatClient, found *problems) {
 
 // checkChatOddRequests sends requests a client must survive, whatever it answers.
 func checkChatOddRequests(client gepa.ChatClient, found *problems) {
-	badArguments := validChatRequest()
+	badArguments := oddChatRequest()
 	badArguments.Tools = []gepa.Tool{lookupTool}
 	badArguments.Messages = append(
 		badArguments.Messages,
@@ -703,14 +718,14 @@ func checkChatOddRequests(client gepa.ChatClient, found *problems) {
 		},
 		gepa.Message{Role: gepa.RoleTool, ToolCallID: "call-1", Content: "no record"},
 	)
-	orphan := validChatRequest()
+	orphan := oddChatRequest()
 	orphan.Messages = append(
 		orphan.Messages,
 		gepa.Message{Role: gepa.RoleTool, ToolCallID: "call-9", Content: "orphan"},
 	)
-	bareTool := validChatRequest()
+	bareTool := oddChatRequest()
 	bareTool.Tools = []gepa.Tool{{Name: "ping", Description: "Check the service is up."}}
-	bareFormat := validChatRequest()
+	bareFormat := oddChatRequest()
 	bareFormat.ResponseFormat = &gepa.ResponseFormat{Name: "answer"}
 	for _, odd := range []struct {
 		what string
@@ -781,19 +796,22 @@ func (o chatOutcome) validResponse(requirement, what string, found *problems) bo
 	return true
 }
 
-// checkChatValidRequests checks the valid request requirement and returns whether the first
-// request succeeded.
+// checkChatValidRequests checks the valid request requirement and, once the request
+// succeeds, the cache hit requirement, and returns whether the first request succeeded.
 func checkChatValidRequests(client gepa.ChatClient, found *problems) bool {
-	ok := chat(
-		context.Background(),
-		client,
-		validChatRequest(),
-	).validResponse(requireValidRequest, "on a valid request", found)
-	if ok {
-		chat(context.Background(), client, validChatRequest()).
-			validResponse(requireValidRequest, "on the same request sent again", found)
+	first := chat(context.Background(), client, validChatRequest())
+	if !first.validResponse(requireValidRequest, "on a valid request", found) {
+		return false
 	}
-	return ok
+	again := chat(context.Background(), client, validChatRequest())
+	if again.validResponse(requireCacheHit, "on the same request sent again", found) &&
+		again.resp.Usage.PromptTokens != first.resp.Usage.PromptTokens {
+		found.add(requireCacheHit,
+			"Chat reported %d prompt tokens for a valid request and %d for the same request sent again, "+
+				"which may read a prompt cache: PromptTokens counts every input token once, cached ones included",
+			first.resp.Usage.PromptTokens, again.resp.Usage.PromptTokens)
+	}
+	return true
 }
 
 // checkChatConcurrency checks the concurrent calls requirement.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -768,7 +769,7 @@ func TestCheckChatClientFindsEachBrokenRequirement(t *testing.T) {
 				resp.Message.Role = ""
 				return resp, err
 			},
-			requirements: []string{"valid request", "concurrent calls"},
+			requirements: []string{"valid request", "cache hit", "concurrent calls"},
 		},
 		{
 			name: "a finish reason gepa does not define",
@@ -777,7 +778,7 @@ func TestCheckChatClientFindsEachBrokenRequirement(t *testing.T) {
 				resp.FinishReason = "end_turn"
 				return resp, err
 			},
-			requirements: []string{"valid request", "concurrent calls"},
+			requirements: []string{"valid request", "cache hit", "concurrent calls"},
 		},
 		{
 			name: "failing the same request sent again",
@@ -790,7 +791,52 @@ func TestCheckChatClientFindsEachBrokenRequirement(t *testing.T) {
 					return base.Chat(ctx, req)
 				}
 			}(),
-			requirements: []string{"valid request", "concurrent calls"},
+			requirements: []string{"cache hit", "concurrent calls"},
+		},
+		{
+			name: "counting the tokens read from the cache again on a repeated request",
+			wrap: func() func(context.Context, gepa.ChatRequest, gepa.ChatClient, int) (gepa.ChatResponse, error) {
+				var plainCalls atomic.Int32
+				return func(ctx context.Context, req gepa.ChatRequest, base gepa.ChatClient, _ int) (gepa.ChatResponse, error) {
+					resp, err := base.Chat(ctx, req)
+					if err == nil && plain(req) && plainCalls.Add(1) > 1 {
+						resp.Usage.PromptTokens += resp.Usage.CachedInputTokens
+						resp.Usage.TotalTokens += resp.Usage.CachedInputTokens
+					}
+					return resp, err
+				}
+			}(),
+			requirements: []string{"cache hit"},
+		},
+		{
+			name: "leaving the tokens read from the cache out of a repeated request's prompt tokens",
+			wrap: func() func(context.Context, gepa.ChatRequest, gepa.ChatClient, int) (gepa.ChatResponse, error) {
+				var plainCalls atomic.Int32
+				return func(ctx context.Context, req gepa.ChatRequest, base gepa.ChatClient, _ int) (gepa.ChatResponse, error) {
+					resp, err := base.Chat(ctx, req)
+					if err != nil || !plain(req) {
+						return resp, err
+					}
+					// the first request writes 8 of its 12 input tokens to the cache, and later ones
+					// read them, which the client leaves out of PromptTokens.
+					resp.Usage = gepa.Usage{
+						PromptTokens:        12,
+						CompletionTokens:    2,
+						TotalTokens:         14,
+						CacheCreationTokens: 8,
+					}
+					if plainCalls.Add(1) > 1 {
+						resp.Usage = gepa.Usage{
+							PromptTokens:      4,
+							CompletionTokens:  2,
+							TotalTokens:       6,
+							CachedInputTokens: 8,
+						}
+					}
+					return resp, nil
+				}
+			}(),
+			requirements: []string{"cache hit", "usage"},
 		},
 		{
 			name: "refusing concurrent requests",
@@ -851,6 +897,9 @@ func strictFormat(schema string) *gepa.ResponseFormat {
 	return &gepa.ResponseFormat{Name: "answer", Schema: json.RawMessage(schema), Strict: true}
 }
 
+// temperature returns a pointer to value, for a request's Temperature.
+func temperature(value float64) *float64 { return &value }
+
 func TestFakeGeneratorRefusesARequestNoProviderAccepts(t *testing.T) {
 	for name, req := range map[string]gepa.ChatRequest{
 		"an unknown role": {Messages: []gepa.Message{{Role: "narrator", Content: "hi"}}},
@@ -865,6 +914,22 @@ func TestFakeGeneratorRefusesARequestNoProviderAccepts(t *testing.T) {
 		"a strict format schema that is not JSON": {
 			Messages:       []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}},
 			ResponseFormat: &gepa.ResponseFormat{Name: "answer", Schema: json.RawMessage(`{"type":`), Strict: true},
+		},
+		"a strict format schema of spaces": {
+			Messages:       []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}},
+			ResponseFormat: strictFormat(" \n"),
+		},
+		"a NaN temperature": {
+			Messages:    []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}},
+			Temperature: temperature(math.NaN()),
+		},
+		"an infinite temperature": {
+			Messages:    []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}},
+			Temperature: temperature(math.Inf(1)),
+		},
+		"a temperature of minus infinity": {
+			Messages:    []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}},
+			Temperature: temperature(math.Inf(-1)),
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -895,20 +960,22 @@ func TestFakeGeneratorRefusesARequestNoProviderAccepts(t *testing.T) {
 	user := []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}}
 	tools := []gepa.Tool{{Name: "lookup", Description: "Look up."}}
 	for name, req := range map[string]gepa.ChatRequest{
-		"a zero request":               {},
-		"a message without a role":     {Messages: []gepa.Message{{Content: "a message without a role"}}},
-		"a format without a schema":    {Messages: user, Tools: tools, ResponseFormat: &gepa.ResponseFormat{Name: "a"}},
-		"a strict format without one":  {Messages: user, ResponseFormat: &gepa.ResponseFormat{Name: "a", Strict: true}},
-		"a strict format of spaces":    {Messages: user, ResponseFormat: strictFormat(" \n")},
-		"a strict format of null":      {Messages: user, ResponseFormat: strictFormat(`null`)},
-		"a strict format of an array":  {Messages: user, ResponseFormat: strictFormat(`[1]`)},
-		"a format that is not strict":  {Messages: user, ResponseFormat: &gepa.ResponseFormat{Name: "a", Schema: []byte(`[1]`)}},
-		"a format of text, not strict": {Messages: user, ResponseFormat: &gepa.ResponseFormat{Name: "a", Schema: []byte(`{"t`)}},
-		"a strict format with tools":   {Messages: user, Tools: tools, ResponseFormat: strictFormat(`{"type":`)},
-		"tool parameters of null":      {Messages: user, Tools: []gepa.Tool{{Name: "t", Description: "d", Parameters: []byte(`null`)}}},
+		"a zero request":                       {},
+		"a message without a role":             {Messages: []gepa.Message{{Content: "a message without a role"}}},
+		"a format without a schema":            {Messages: user, Tools: tools, ResponseFormat: &gepa.ResponseFormat{Name: "a"}},
+		"a strict format without one":          {Messages: user, ResponseFormat: &gepa.ResponseFormat{Name: "a", Strict: true}},
+		"a format of spaces, not strict":       {Messages: user, ResponseFormat: &gepa.ResponseFormat{Name: "a", Schema: []byte(" \n")}},
+		"a strict format of spaces with tools": {Messages: user, Tools: tools, ResponseFormat: strictFormat(" \n")},
+		"a strict format of null":              {Messages: user, ResponseFormat: strictFormat(`null`)},
+		"a strict format of an array":          {Messages: user, ResponseFormat: strictFormat(`[1]`)},
+		"a format that is not strict":          {Messages: user, ResponseFormat: &gepa.ResponseFormat{Name: "a", Schema: []byte(`[1]`)}},
+		"a format of text, not strict":         {Messages: user, ResponseFormat: &gepa.ResponseFormat{Name: "a", Schema: []byte(`{"t`)}},
+		"a strict format with tools":           {Messages: user, Tools: tools, ResponseFormat: strictFormat(`{"type":`)},
+		"tool parameters of null":              {Messages: user, Tools: []gepa.Tool{{Name: "t", Description: "d", Parameters: []byte(`null`)}}},
 		"a number no float64 holds": {Messages: user, Tools: []gepa.Tool{{Name: "t", Description: "d", Parameters: []byte(
 			`{"type":"object","properties":{"n":{"type":"number","maximum":1e400}}}`,
 		)}}},
+		"the largest finite temperature": {Messages: user, Temperature: temperature(math.MaxFloat64)},
 	} {
 		t.Run("accepts "+name, func(t *testing.T) {
 			_, err := fake.Chat(context.Background(), req)

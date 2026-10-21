@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -36,12 +37,13 @@ var ErrToolCallsInGenerate = errors.New("gepatest: scripted reply has tool calls
 // refuses as a provider does, before any script answers it. The chat clients of
 // providers/openai, providers/claude and providers/google each refuse such a request before
 // sending it (providers/pi has none): one with a message whose role is set but none of gepa's
-// four, one with a tool whose parameters are not a JSON object, and one without tools whose
-// response format is strict and has a schema that is neither blank nor valid JSON. A request
+// four, one with a tool whose parameters are not a JSON object, one without tools whose
+// response format is strict and has a schema that is neither empty nor valid JSON, such as one
+// of spaces, and one whose Temperature is NaN or infinite, which JSON cannot carry. A request
 // that a provider sends passes, even when its API may refuse it: Claude sends no format that is
-// not strict, Gemini sends no format in a request with tools, and OpenAI sends a strict schema
-// that is valid JSON but not an object. An empty role passes too, since tests that script
-// replies often leave it out. It is a Permanent error.
+// not strict, Gemini sends no format in a request with tools and sends one without a schema,
+// and OpenAI sends a strict schema that is valid JSON but not an object. An empty role passes
+// too, since tests that script replies often leave it out. It is a Permanent error.
 var ErrInvalidChatRequest = errors.New("gepatest: invalid chat request")
 
 // Method names the FakeGenerator method a Call went through.
@@ -556,9 +558,11 @@ func checkChatRequest(req gepa.ChatRequest) error {
 		}
 	}
 	format := req.ResponseFormat
-	if format != nil && format.Strict && len(req.Tools) == 0 && len(bytes.TrimSpace(format.Schema)) > 0 &&
-		!json.Valid(format.Schema) {
+	if format != nil && format.Strict && len(req.Tools) == 0 && len(format.Schema) > 0 && !json.Valid(format.Schema) {
 		return fmt.Errorf("strict response format %q: schema is not valid JSON", format.Name)
+	}
+	if t := req.Temperature; t != nil && (math.IsNaN(*t) || math.IsInf(*t, 0)) {
+		return fmt.Errorf("temperature %v is not a finite number", *t)
 	}
 	return nil
 }

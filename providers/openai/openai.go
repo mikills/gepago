@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 
@@ -299,6 +300,9 @@ func (m *LanguageModel) chatParams(req gepa.ChatRequest) (openai.ChatCompletionN
 	if temperature := req.Temperature; temperature != nil || m.temperature != nil {
 		if temperature == nil {
 			temperature = m.temperature
+		}
+		if math.IsNaN(*temperature) || math.IsInf(*temperature, 0) {
+			return params, fmt.Errorf("temperature %v is not a finite number", *temperature)
 		}
 		params.Temperature = openai.Float(*temperature)
 	}

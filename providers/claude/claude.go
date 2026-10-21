@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"math"
 	"net/http"
 	"strings"
 
@@ -283,8 +284,11 @@ func (m *LanguageModel) chatParams(req gepa.ChatRequest) (anthropic.MessageNewPa
 		maxTokens = *req.MaxTokens
 	}
 	params := anthropic.MessageNewParams{Model: anthropic.Model(model), MaxTokens: int64(maxTokens)}
-	if req.Temperature != nil {
-		params.Temperature = anthropic.Float(*req.Temperature)
+	if t := req.Temperature; t != nil {
+		if math.IsNaN(*t) || math.IsInf(*t, 0) {
+			return params, fmt.Errorf("temperature %v is not a finite number", *t)
+		}
+		params.Temperature = anthropic.Float(*t)
 	}
 	var system []string
 	for _, message := range req.Messages {
