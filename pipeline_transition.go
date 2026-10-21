@@ -280,8 +280,9 @@ type rewindRange struct {
 // writes a fact for each step between a rule's From and To, or copies a range's keys once for
 // each rule that shares it, makes work grow with their product whether or not its loop counts
 // its own iterations. The passes also add one per iteration, and the methods that word an error
-// one per rule they look through. TestBuildIsLinearInStepsAndTransitions bounds work and checks
-// that nothing else writes the fields.
+// one per rule they look through. TestBuildIsLinearInStepsAndTransitions bounds work and checks,
+// on the type-checked source, that nothing else writes the fields and that no loop but the
+// passes and those methods walks them.
 type transitionFacts struct {
 	work        int
 	rules       []*transitionRule

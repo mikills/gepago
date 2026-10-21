@@ -329,6 +329,122 @@ func TestWithCacheDropsWhatTheVisitsOfARejectedRewindCached(t *testing.T) {
 	}
 }
 
+// What the elements of a Map or the parts of a Parallel cache during the visits Accept rejects
+// is dropped as well, though no top-level execution holds them: a later visit of the target with
+// the same reads, through an OnError rewind with the same amendment, runs each of them again.
+func TestWithCacheDropsWhatTheNestedStepsOfARejectedRewindCached(t *testing.T) {
+	hint := Key[string]{Name: "hint"}
+	// transitions rewinds from b to target with hint set on b's first visit, rejects b's second,
+	// on which a When of b panics, and rewinds to target again from b's failure with the same
+	// hint.
+	transitions := func(calls *stepCalls, target string, accept func(prev, next State) bool) []Transition {
+		amend := func(s State) error {
+			hint.Set(s, "try again")
+			return nil
+		}
+		return []Transition{
+			{
+				From:   "b",
+				When:   func(State, error) bool { return calls.of("b") == 1 },
+				To:     target,
+				Amend:  amend,
+				Accept: accept,
+			},
+			{From: "b", When: func(State, error) bool {
+				if calls.of("b") == 2 {
+					panic("route broke")
+				}
+				return false
+			}, To: End},
+			{From: "b", OnError: true, To: target, Amend: amend},
+		}
+	}
+
+	items, item := Key[[]int]{Name: "items"}, Key[int]{Name: "item"}
+	out, outs := Key[int]{Name: "out"}, Key[[]int]{Name: "outs"}
+	for _, concurrency := range []int{0, 1, 3} {
+		t.Run(fmt.Sprintf("Map with MaxConcurrency %d", concurrency), func(t *testing.T) {
+			calls := &stepCalls{}
+			// each element writes its item and the number of the body's runs, so no two runs write
+			// the same.
+			body := NewStep(
+				"body",
+				refs(item.Ref(), hint.Ref()),
+				refs(out.Ref()),
+				func(_ context.Context, s State) error {
+					value, err := item.Get(s)
+					if err != nil {
+						return err
+					}
+					out.Set(s, value*1000+calls.add("body"))
+					return nil
+				},
+			)
+			options := MapOptions{MaxConcurrency: concurrency}
+			elements := Map("elements", items, item, WithCache(body, nil), outs, options)
+			b := NewStep("b", refs(outs.Ref()), refs(decisionKey.Ref()), func(_ context.Context, s State) error {
+				calls.add("b")
+				decisionKey.Set(s, "done")
+				return nil
+			})
+			var rejected []int
+			_, state, run, err := buildRun(t, PipelineSpec{
+				Inputs: refs(items.Ref()),
+				Steps:  []Step{WithAmendable(elements, hint.Ref()), b},
+				Transitions: transitions(calls, "elements", func(_, next State) bool {
+					rejected, _ = outs.Get(next)
+					return false
+				}),
+				MaxVisits: map[string]int{"elements": 3},
+				Defaults:  []Default{DefaultValue(hint, "")},
+			}, Prediction{"items": []int{1, 2, 3}})
+
+			require.NoError(t, err)
+			require.Equal(t, 9, calls.of("body"), "the third visit runs every element again")
+			require.NotContains(t, strings.Join(outcomesOf(run, "body"), " "), "cached")
+			final, err := outs.Get(state)
+			require.NoError(t, err)
+			require.Len(t, rejected, 3)
+			for _, value := range final {
+				require.NotContains(t, rejected, value, "the final writes are none of the rejected visit's")
+			}
+		})
+	}
+
+	t.Run("Parallel", func(t *testing.T) {
+		calls := &stepCalls{}
+		first, second := Key[int]{Name: "first"}, Key[int]{Name: "second"}
+		part := func(name string, key Key[int]) Step {
+			return WithCache(NewStep(name, refs(hint.Ref()), refs(key.Ref()), func(_ context.Context, s State) error {
+				key.Set(s, calls.add(name))
+				return nil
+			}), nil)
+		}
+		b := NewStep(
+			"b",
+			refs(first.Ref(), second.Ref()),
+			refs(decisionKey.Ref()),
+			func(_ context.Context, s State) error {
+				calls.add("b")
+				decisionKey.Set(s, "done")
+				return nil
+			},
+		)
+		_, state, run, err := buildRun(t, PipelineSpec{
+			Steps:       []Step{WithAmendable(Parallel("both", part("x", first), part("y", second)), hint.Ref()), b},
+			Transitions: transitions(calls, "both", func(State, State) bool { return false }),
+			MaxVisits:   map[string]int{"both": 3},
+			Defaults:    []Default{DefaultValue(hint, "")},
+		}, Prediction{})
+
+		require.NoError(t, err)
+		require.Equal(t, []string{"x#1", "x#2", "x#3"}, outcomesOf(run, "x"), "the third visit runs x again")
+		require.Equal(t, []string{"y#1", "y#2", "y#3"}, outcomesOf(run, "y"), "the third visit runs y again")
+		require.Equal(t, 3, state.values["first"])
+		require.Equal(t, 3, state.values["second"])
+	})
+}
+
 // A visit of a top-level WithCache step whose writes cannot be merged into the state fails, so
 // its result is not cached and the next visit runs the step.
 func TestWithCacheDoesNotCacheAVisitWhoseMergeFails(t *testing.T) {
