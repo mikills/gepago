@@ -576,9 +576,12 @@ func checkToolConcurrency(
 //   - cache hit: the same request sent again, which a provider may answer from its prompt
 //     cache, succeeds as the first did and reports the same PromptTokens, since PromptTokens
 //     counts every input token once, those read from or written to a prompt cache included,
-//     whether the request hit the cache or not. gepa keeps no cache of chat replies, and the
-//     check cannot make a provider read its cache; it sends the request again once the valid
-//     request has succeeded.
+//     whether the request hit the cache or not. A client that answers it from a cache of its
+//     own replies, without calling the provider, may report zero Usage instead, since a
+//     response reports the tokens its call used. Equal counts catch only counting that differs
+//     between a cache miss and a hit, not cached tokens left out of PromptTokens on both. gepa
+//     keeps no cache of chat replies, and the check cannot make a provider read its cache; it
+//     sends the request again once the valid request has succeeded.
 //   - concurrent calls: the valid request sent several times at once succeeds every time, as
 //     gepa.ChatClient requires of a client shared between goroutines; run the test with -race
 //     to catch the data races too.
@@ -804,11 +807,13 @@ func checkChatValidRequests(client gepa.ChatClient, found *problems) bool {
 		return false
 	}
 	again := chat(context.Background(), client, validChatRequest())
+	// zero usage is a repeat the client answered from its own cache, which used no tokens.
 	if again.validResponse(requireCacheHit, "on the same request sent again", found) &&
-		again.resp.Usage.PromptTokens != first.resp.Usage.PromptTokens {
+		again.resp.Usage != (gepa.Usage{}) && again.resp.Usage.PromptTokens != first.resp.Usage.PromptTokens {
 		found.add(requireCacheHit,
 			"Chat reported %d prompt tokens for a valid request and %d for the same request sent again, "+
-				"which may read a prompt cache: PromptTokens counts every input token once, cached ones included",
+				"which may read a prompt cache: PromptTokens counts every input token once, cached ones included, "+
+				"and only a reply answered without calling the provider reports zero usage",
 			first.resp.Usage.PromptTokens, again.resp.Usage.PromptTokens)
 	}
 	return true

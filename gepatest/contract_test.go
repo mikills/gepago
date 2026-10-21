@@ -630,6 +630,50 @@ func TestCheckChatClientPassesTheRepositoryClients(t *testing.T) {
 	}
 }
 
+// replyCache answers a request it answered before from a cache of its own replies, without
+// calling base, and reports the tokens that call used: none.
+type replyCache struct {
+	base    gepa.ChatClient
+	mu      sync.Mutex
+	replies map[string]gepa.ChatResponse
+	hits    int
+}
+
+func (c *replyCache) Chat(ctx context.Context, req gepa.ChatRequest) (gepa.ChatResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return gepa.ChatResponse{}, err
+	}
+	key, keyErr := json.Marshal(req)
+	if keyErr == nil {
+		c.mu.Lock()
+		resp, ok := c.replies[string(key)]
+		if ok {
+			c.hits++
+		}
+		c.mu.Unlock()
+		if ok {
+			resp.Usage = gepa.Usage{}
+			return resp, nil
+		}
+	}
+	resp, err := c.base.Chat(ctx, req)
+	if err == nil && keyErr == nil {
+		c.mu.Lock()
+		c.replies[string(key)] = resp
+		c.mu.Unlock()
+	}
+	return resp, err
+}
+
+func TestCheckChatClientPassesAClientThatAnswersARepeatFromItsOwnCache(t *testing.T) {
+	client := &replyCache{base: helloFake(), replies: map[string]gepa.ChatResponse{}}
+	recorder := &recordingT{}
+
+	require.True(t, gepatest.CheckChatClient(recorder, client), "%q", recorder.errors)
+
+	require.Positive(t, client.hits, "the cache answered the repeated request")
+}
+
 func TestCheckChatClientFindsEachBrokenRequirement(t *testing.T) {
 	restore := gepatest.SetCheckWait(50 * time.Millisecond)
 	defer restore()
@@ -837,6 +881,20 @@ func TestCheckChatClientFindsEachBrokenRequirement(t *testing.T) {
 				}
 			}(),
 			requirements: []string{"cache hit", "usage"},
+		},
+		{
+			name: "reporting a repeated request's completion tokens without its prompt tokens",
+			wrap: func() func(context.Context, gepa.ChatRequest, gepa.ChatClient, int) (gepa.ChatResponse, error) {
+				var plainCalls atomic.Int32
+				return func(ctx context.Context, req gepa.ChatRequest, base gepa.ChatClient, _ int) (gepa.ChatResponse, error) {
+					resp, err := base.Chat(ctx, req)
+					if err == nil && plain(req) && plainCalls.Add(1) > 1 {
+						resp.Usage = gepa.Usage{CompletionTokens: 2, TotalTokens: 2}
+					}
+					return resp, err
+				}
+			}(),
+			requirements: []string{"cache hit"},
 		},
 		{
 			name: "refusing concurrent requests",

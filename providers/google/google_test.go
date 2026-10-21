@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -113,6 +114,39 @@ func TestLanguageModel(t *testing.T) {
 		Model:        "gemini-resolved",
 		FinishReason: gepa.FinishStop,
 	}, got)
+}
+
+func TestLanguageModelRefusesAConfiguredTemperatureThatIsNotFinite(t *testing.T) {
+	user := gepa.ChatRequest{Messages: []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}}}
+	for name, value := range map[string]float64{"NaN": math.NaN(), "+Inf": math.Inf(1), "-Inf": math.Inf(-1)} {
+		t.Run(name, func(t *testing.T) {
+			baseURL, requests := recordingServer(t, okReply)
+			lm, err := NewLanguageModel(Config{APIKey: "secret", BaseURL: baseURL, Model: "m", Temperature: &value})
+			require.NoError(t, err)
+			reason := fmt.Sprintf("google chat: temperature %v is not a finite number", value)
+
+			generation, err := lm.Generate(context.Background(), "prompt")
+
+			require.EqualError(t, err, "google reflection completion: "+reason)
+			require.True(t, gepa.IsPermanent(err))
+			require.Equal(t, gepa.Generation{}, generation)
+
+			resp, err := lm.Chat(context.Background(), user)
+
+			require.EqualError(t, err, reason)
+			require.True(t, gepa.IsPermanent(err))
+			require.Equal(t, gepa.ChatResponse{}, resp)
+			require.Empty(t, *requests, "no request was sent")
+
+			own, half := user, 0.5
+			own.Temperature = &half
+			_, err = lm.Chat(context.Background(), own)
+
+			require.NoError(t, err, "a request's own temperature replaces the configured one")
+			require.Len(t, *requests, 1)
+			require.Equal(t, 0.5, (*requests)[0]["generationConfig"].(map[string]any)["temperature"])
+		})
+	}
 }
 
 // googleServer answers every request with one generateContent body.
