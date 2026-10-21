@@ -3,6 +3,7 @@ package gepa
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -34,6 +35,19 @@ func useWith(write func(int) int) Step {
 // doublesOf is a Map named "doubles" from nums to doubles.
 func doublesOf(body Step) Step {
 	return Map("doubles", mapNumsKey, mapNumKey, body, mapDoublesKey, MapOptions{MaxConcurrency: 2})
+}
+
+// builtOnEachRun is a Program that, on each run, builds a pipeline from nums to doubles holding
+// doublesOf the step body returns, and runs it, as a programme that builds its pipelines as it
+// goes does.
+func builtOnEachRun(body func() Step) Program {
+	return programFunc(func(ctx context.Context, inputs Prediction) (Prediction, error) {
+		pipeline, err := PipelineSpec{Inputs: refs(mapNumsKey.Ref()), Steps: []Step{doublesOf(body())}}.Build()
+		if err != nil {
+			return nil, err
+		}
+		return pipeline.RunCandidate(ctx, pipeline.SeedCandidate(), inputs)
+	})
 }
 
 // mapReflectionCase is a pipeline holding a Map under a Redactor, an example whose secret the
@@ -173,6 +187,32 @@ func mapReflectionCases(t *testing.T) []mapReflectionCase {
 			secret:   "987654321",
 			check:    itemHidden,
 		},
+		{
+			name: "an int item of a map in pipelines built on each run",
+			spec: PipelineSpec{
+				Inputs: refs(groups.Ref()),
+				Steps: []Step{
+					Map(
+						"outer",
+						groups,
+						mapNumsKey,
+						NewProgramStep(
+							"built",
+							builtOnEachRun(func() Step { return useWith(nil) }),
+							refs(mapNumsKey.Ref()),
+							refs(mapDoublesKey.Ref()),
+						),
+						Key[[][]int]{Name: "totals"},
+						MapOptions{},
+					),
+				},
+				Redactor: hiding("groups"),
+			},
+			inputs:   Prediction{"groups": [][]int{{item}}},
+			expected: Prediction{"totals": [][]int{{1}}},
+			secret:   "987654321",
+			check:    itemHidden,
+		},
 	}
 }
 
@@ -307,4 +347,100 @@ func TestHideMapElementsEndsWhenMapsReferToEachOther(t *testing.T) {
 	require.Equal(t, "visible", hideMapElements([]Redactor{hiding("unrelated")}, maps)("x", "visible"))
 	require.Equal(t, RedactedText, hideMapElements([]Redactor{hiding("xs")}, maps)("x", "hidden"))
 	require.Equal(t, RedactedText, hideMapElements([]Redactor{hiding("x")}, maps)("xs", "hidden"))
+}
+
+// TestHideMapElementsChecksEveryMapOfAKey checks that hideMapElements checks a value against
+// every Map whose item key, or whose body's only key, is its key, and against no other.
+func TestHideMapElementsChecksEveryMapOfAKey(t *testing.T) {
+	writing := func(outs ...string) Step {
+		writes := make([]KeyRef, len(outs))
+		for i, out := range outs {
+			writes[i] = Key[int]{Name: out}.Ref()
+		}
+		return NewStep("use", refs(mapNumKey.Ref()), writes, func(context.Context, State) error { return nil })
+	}
+	var maps []*mapStep
+	for _, step := range []Step{
+		Map("first", mapNumsKey, mapNumKey, writing("double"), mapDoublesKey, MapOptions{}),
+		Map("second", Key[[]int]{Name: "others"}, mapNumKey, writing("triple"), Key[[]int]{Name: "triples"},
+			MapOptions{}),
+		Map("third", Key[[]int]{Name: "thirds"}, Key[int]{Name: "third"}, writing("a", "b"), Key[[]int]{Name: "abs"},
+			MapOptions{}),
+	} {
+		maps = append(maps, unwrapComposite(step).(*mapStep))
+	}
+
+	for _, tt := range []struct {
+		hidden, key string
+		want        any
+	}{
+		{hidden: "nums", key: "num", want: RedactedText},
+		{hidden: "others", key: "num", want: RedactedText},
+		{hidden: "doubles", key: "double", want: RedactedText},
+		{hidden: "triples", key: "triple", want: RedactedText},
+		{hidden: "thirds", key: "third", want: RedactedText},
+		{hidden: "doubles", key: "triple", want: 7},
+		{hidden: "nums", key: "double", want: 7},
+		{hidden: "abs", key: "a", want: 7},
+		{hidden: "unrelated", key: "num", want: 7},
+	} {
+		got := hideMapElements([]Redactor{hiding(tt.hidden)}, maps)(tt.key, 7)
+		require.Equal(t, tt.want, got, "%s under %s hidden", tt.key, tt.hidden)
+	}
+}
+
+// freshMapRedactorCalls evaluates a Map over runs lists of one int whose body runs a pipeline
+// built on each run, holding a Map, under a Redactor that hides nothing, and counts the
+// Redactor's calls.
+func freshMapRedactorCalls(t *testing.T, runs int) int64 {
+	t.Helper()
+	var calls atomic.Int64
+	double := func() Step {
+		return NewStep(
+			"double",
+			refs(mapNumKey.Ref()),
+			refs(mapDoubleKey.Ref()),
+			func(_ context.Context, s State) error {
+				num, err := mapNumKey.Get(s)
+				if err != nil {
+					return err
+				}
+				mapDoubleKey.Set(s, 2*num)
+				return nil
+			},
+		)
+	}
+	groups := Key[[][]int]{Name: "groups"}
+	body := NewProgramStep("built", builtOnEachRun(double), refs(mapNumsKey.Ref()), refs(mapDoublesKey.Ref()))
+	pipeline, err := PipelineSpec{
+		Inputs: refs(groups.Ref()),
+		Steps:  []Step{Map("outer", groups, mapNumsKey, body, Key[[][]int]{Name: "totals"}, MapOptions{})},
+		Redactor: func(_ string, value any) any {
+			calls.Add(1)
+			return value
+		},
+	}.Build()
+	require.NoError(t, err)
+	list := make([][]int, runs)
+	for i := range list {
+		list[i] = []int{i}
+	}
+	evaluator := ProgramEvaluator{Program: pipeline, Metric: ExactMatchMetric{Fields: []string{"totals"}}}
+	examples := []Example{NewIOExample("1", Prediction{"groups": list}, Prediction{"totals": [][]int{{1}}})}
+
+	_, err = evaluator.Evaluate(context.Background(), nil, examples, false)
+
+	require.NoError(t, err)
+	return calls.Load()
+}
+
+// TestMapReflectionWorkGrowsLinearlyWithPipelinesBuiltOnEachRun checks that the Redactor calls
+// of an evaluated example grow in proportion to the runs of a Map's body that builds a pipeline
+// holding a Map on each run, though each run brings a Map of its own.
+func TestMapReflectionWorkGrowsLinearlyWithPipelinesBuiltOnEachRun(t *testing.T) {
+	small, large := freshMapRedactorCalls(t, 200), freshMapRedactorCalls(t, 400)
+
+	t.Logf("redactor calls over 200 runs %d, over 400 runs %d", small, large)
+	require.Positive(t, small)
+	require.Less(t, large, 3*small, "twice the runs cost about twice the calls, not four times")
 }

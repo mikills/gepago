@@ -40,13 +40,46 @@ func (m *mapStep) elementRedactor(redactors []Redactor) Redactor {
 // and under the results key, the results of such a list, when key is the key body writes. ok is
 // false for any other key.
 func (m *mapStep) element(key string, value any) (under string, list any, ok bool) {
-	switch {
-	case key == m.item.Name:
+	if key == m.item.Name {
 		return m.items.Name, m.single(value), true
-	case len(m.body.writeNames) == 1 && key == m.body.writeNames[0]:
+	}
+	if write, writes := m.write(); writes && key == write {
 		return m.results.Name, m.join([]elementOutcome{{value: value}}), true
 	}
 	return "", nil, false
+}
+
+// write returns the key the map's body writes, and whether it writes exactly one.
+func (m *mapStep) write() (string, bool) {
+	if len(m.body.writeNames) != 1 {
+		return "", false
+	}
+	return m.body.writeNames[0], true
+}
+
+// elementShape is all that element looks at: the names of a map's items, item and results keys
+// and of the key its body writes, if exactly one, the types of its items and of what its body
+// writes, and whether it collects. Maps of one shape hide the same values.
+type elementShape struct {
+	items, item, results string
+	write                string
+	writes               bool
+	in, out              reflect.Type
+	collect              bool
+}
+
+func (m *mapStep) elementShape() elementShape {
+	write, writes := m.write()
+	return elementShape{
+		items:   m.items.Name,
+		item:    m.item.Name,
+		results: m.results.Name,
+		write:   write,
+		writes:  writes,
+		in:      m.item.Type,
+		out:     m.out,
+		collect: m.collect,
+	}
 }
 
 // hideMapElements returns the Redactor that follows redactors, those of the pipelines an
@@ -58,15 +91,23 @@ func (m *mapStep) element(key string, value any) (under string, list any, ok boo
 // the outer Map's items are hidden. Unlike elementRedactor, it applies wherever the key
 // appears, since what reflection reads does not say which execution it came from, so a value
 // under such a key outside the map's executions may be hidden too. A key that is already being
-// checked further up is not checked again, so names that refer to each other end.
+// checked further up is not checked again, so names that refer to each other end. A value is
+// checked against only the maps whose item key or body's key is its key, in the order of maps.
 func hideMapElements(redactors []Redactor, maps []*mapStep) Redactor {
+	byKey := map[string][]*mapStep{}
+	for _, m := range maps {
+		byKey[m.item.Name] = append(byKey[m.item.Name], m)
+		if write, writes := m.write(); writes && write != m.item.Name {
+			byKey[write] = append(byKey[write], m)
+		}
+	}
 	var hide func(key string, value any, checking []string) any
 	hide = func(key string, value any, checking []string) any {
 		if slices.Contains(checking, key) {
 			return value
 		}
 		checking = append(slices.Clip(checking), key)
-		for _, m := range maps {
+		for _, m := range byKey[key] {
 			under, list, ok := m.element(key, value)
 			if !ok {
 				continue

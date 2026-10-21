@@ -23,13 +23,16 @@ const maxProgramDepth = 32
 // made, and, when recorder is set, the traces of the top-level runs. Without a Redactor it keeps
 // no values, so an evaluation without one holds no more than it would without the capture; a
 // Redactor that joins when its pipeline runs applies only to values offered after it joined.
-// known holds the pipelines already accounted for, by their first step.
+// known holds the pipelines already accounted for, by their first step, and mapSteps one Map of
+// each shape in shapes, so a programme that builds a pipeline on each run does not add a Map
+// per run.
 type evaluationCapture struct {
 	recorder  *RecordingObserver
 	mu        sync.Mutex
 	redactors []Redactor
 	types     map[string]reflect.Type
 	mapSteps  []*mapStep
+	shapes    map[elementShape]bool
 	known     map[*stepNode]bool
 	values    []stateWrite
 	details   []stateWrite
@@ -41,7 +44,11 @@ type evaluationCapture struct {
 // its steps run through NewProgramStep, composite steps and policy fallbacks included. A
 // pipeline reached only through another kind of Program joins when it runs.
 func newEvaluationCapture(program Program) *evaluationCapture {
-	capture := &evaluationCapture{types: map[string]reflect.Type{}, known: map[*stepNode]bool{}}
+	capture := &evaluationCapture{
+		types:  map[string]reflect.Type{},
+		shapes: map[elementShape]bool{},
+		known:  map[*stepNode]bool{},
+	}
 	capture.addProgram(program, 0)
 	return capture
 }
@@ -63,6 +70,7 @@ func (c *evaluationCapture) fork(recorder *RecordingObserver) *evaluationCapture
 		redactors: slices.Clone(c.redactors),
 		types:     maps.Clone(c.types),
 		mapSteps:  slices.Clone(c.mapSteps),
+		shapes:    maps.Clone(c.shapes),
 		known:     maps.Clone(c.known),
 	}
 }
@@ -130,9 +138,11 @@ func (c *evaluationCapture) addPipeline(p Pipeline) bool {
 }
 
 // addMaps records the Maps among node and the steps nested in it, but not those of the
-// pipelines they run, which are added as pipelines of their own.
+// pipelines they run, which are added as pipelines of their own. A Map of a shape already
+// recorded is not, since hideMapElements hides the same values through it.
 func (c *evaluationCapture) addMaps(node *stepNode) {
-	if m, ok := unwrapComposite(node.step).(*mapStep); ok && !slices.Contains(c.mapSteps, m) {
+	if m, ok := unwrapComposite(node.step).(*mapStep); ok && !c.shapes[m.elementShape()] {
+		c.shapes[m.elementShape()] = true
 		c.mapSteps = append(c.mapSteps, m)
 	}
 	if composite, ok := node.step.(compositeStep); ok {
