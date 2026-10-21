@@ -2,6 +2,7 @@ package gepa
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -261,6 +262,108 @@ func TestWithCacheDoesNotCacheAVisitATransitionFails(t *testing.T) {
 			require.Equal(t, "amount 20", state.values["decision"])
 		})
 	}
+}
+
+// The visits of a rewind's range that Accept rejects, or fails on, leave nothing in the WithCache
+// cache: a later visit of the target with the same reads, here through an OnError rewind with
+// the same amendment, runs the step again. An accepted rewind keeps what its visits cached.
+func TestWithCacheDropsWhatTheVisitsOfARejectedRewindCached(t *testing.T) {
+	hint := Key[string]{Name: "hint"}
+	amend := func(s State) error {
+		hint.Set(s, "try again")
+		return nil
+	}
+	tests := []struct {
+		name       string
+		accept     func(prev, next State) bool
+		wantA      []string
+		wantAmount int
+	}{
+		{
+			name:       "Accept false, then a When fails From",
+			accept:     func(State, State) bool { return false },
+			wantA:      []string{"a#1", "a#2", "a#3"},
+			wantAmount: 30,
+		},
+		{
+			name:       "Accept panics",
+			accept:     func(State, State) bool { panic("cannot compare") },
+			wantA:      []string{"a#1", "a#2", "a#3"},
+			wantAmount: 30,
+		},
+		{
+			name:       "Accept true, then a When fails From",
+			accept:     func(State, State) bool { return true },
+			wantA:      []string{"a#1", "a#2", "a#3 cached"},
+			wantAmount: 20,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := &stepCalls{}
+			a := NewStep("a", refs(hint.Ref()), refs(amountKey.Ref()), func(_ context.Context, s State) error {
+				amountKey.Set(s, calls.add("a")*10)
+				return nil
+			})
+			_, state, run, err := buildRun(t, PipelineSpec{
+				Steps: []Step{WithAmendable(WithCache(a, nil), hint.Ref()), describeAmount(calls, "b")},
+				Transitions: []Transition{
+					{From: "b", When: amountIs(10), To: "a", Amend: amend, Accept: tt.accept},
+					{From: "b", When: func(State, error) bool {
+						if calls.of("b") == 2 {
+							panic("route broke")
+						}
+						return false
+					}, To: End},
+					{From: "b", OnError: true, To: "a", Amend: amend},
+				},
+				MaxVisits: map[string]int{"a": 3},
+				Defaults:  []Default{DefaultValue(hint, "")},
+			}, Prediction{})
+
+			require.NoError(t, err)
+			require.Equal(t, tt.wantA, outcomesOf(run, "a"), "a's third visit reads what its second read")
+			require.Equal(t, tt.wantAmount, state.values["amount"])
+			require.Equal(t, fmt.Sprintf("amount %d", tt.wantAmount), state.values["decision"])
+		})
+	}
+}
+
+// A visit of a top-level WithCache step whose writes cannot be merged into the state fails, so
+// its result is not cached and the next visit runs the step.
+func TestWithCacheDoesNotCacheAVisitWhoseMergeFails(t *testing.T) {
+	n := Key[int]{Name: "n"}
+	calls := &stepCalls{}
+	p := NewStep("p", nil, refs(n.Ref()), func(_ context.Context, s State) error {
+		n.Set(s, calls.add("p"))
+		return nil
+	})
+	a := NewStep("a", nil, refs(n.Ref()), func(_ context.Context, s State) error {
+		n.Set(s, calls.add("a")*100)
+		return nil
+	})
+	_, state, run, err := buildRun(t, PipelineSpec{
+		Steps: []Step{p, WithCache(a, nil)},
+		Merges: []MergeRule{MergeWith(n, func(prev, next int) (int, error) {
+			if prev == 1 {
+				return 0, errors.New("cannot merge onto 1")
+			}
+			return prev + next, nil
+		})},
+		Transitions: []Transition{{From: "a", OnError: true, To: "p"}},
+		MaxVisits:   map[string]int{"p": 2},
+	}, Prediction{})
+
+	require.NoError(t, err)
+	require.Equal(t, 2, calls.of("a"), "the second visit runs a")
+	require.Equal(t, []string{
+		"p#1",
+		"a#1",
+		`a#2 err: merge state key "n": cannot merge onto 1`,
+		"p#2",
+		"a#3",
+	}, outcomeSummary(run))
+	require.Equal(t, 202, state.values["n"], "p's second write merged with a's second")
 }
 
 func TestTransitionFailGivesAStepErrorNamingFrom(t *testing.T) {

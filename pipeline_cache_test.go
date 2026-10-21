@@ -214,6 +214,43 @@ func TestWithCacheDoesNotCacheFailures(t *testing.T) {
 	require.Equal(t, []string{"flaky#1 err: rate limited", "flaky#2"}, outcomeSummary(run))
 }
 
+// The cache journal of a rewind takes back the entries stored while it runs when the rewind is
+// rejected, putting back the first entry each one replaced, keeps them when it is not, and
+// records nothing once it has ended.
+func TestWithCacheJournalTakesBackWhatARejectedRewindStored(t *testing.T) {
+	cachedAmount := func(run *pipelineRun, key string) any {
+		result, ok := run.cached("a", key)
+		if !ok {
+			return nil
+		}
+		return result.writes["amount"]
+	}
+	for _, keep := range []bool{false, true} {
+		t.Run(fmt.Sprintf("keep %t", keep), func(t *testing.T) {
+			run := newPipelineRun(nil)
+			store := func(key string, amount int) {
+				run.storeCached("a", key, stepResult{writes: map[string]any{"amount": amount}})
+			}
+			store("before", 1)
+			run.startCacheJournal()
+			store("before", 2)
+			store("before", 3)
+			store("during", 4)
+			run.endCacheJournal(keep)
+			store("after", 5)
+			run.endCacheJournal(false)
+
+			want := map[string]any{"before": 1, "during": nil, "after": 5}
+			if keep {
+				want = map[string]any{"before": 3, "during": 4, "after": 5}
+			}
+			for key, amount := range want {
+				require.Equal(t, amount, cachedAmount(run, key), key)
+			}
+		})
+	}
+}
+
 func TestWithCacheBuildErrors(t *testing.T) {
 	_, err := PipelineSpec{Steps: []Step{writeAmount("parse", 1), WithCache(nil, nil)}}.Build()
 	require.EqualError(t, err, "pipeline step 1 is nil")

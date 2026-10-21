@@ -14,11 +14,15 @@ type pipelineRunKey struct{}
 // pipelineRun is what the steps of one Pipeline run share: the step cache, the outcome of every
 // step execution and the run's tool session, which records every tool call. It is safe for
 // concurrent use, and a nil run, outside a pipeline, records and caches nothing.
+//
+// replaced, while a rewind's range runs again, maps each cache entry stored since the rewind
+// began to the entry it replaced, nil for none, so a rejected rewind can take them back.
 type pipelineRun struct {
 	optional map[string]map[string]bool
 	tools    *ToolSession
 	mu       sync.Mutex
 	cache    map[stepCacheKey]stepResult
+	replaced map[stepCacheKey]*stepResult
 	attempts map[string]int
 	outcomes []stepOutcome
 }
@@ -110,7 +114,47 @@ func (r *pipelineRun) storeCached(step, key string, result stepResult) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.cache[stepCacheKey{step: step, key: key}] = result
+	entry := stepCacheKey{step: step, key: key}
+	if _, recorded := r.replaced[entry]; r.replaced != nil && !recorded {
+		var prev *stepResult
+		if old, ok := r.cache[entry]; ok {
+			prev = &old
+		}
+		r.replaced[entry] = prev
+	}
+	r.cache[entry] = result
+}
+
+// startCacheJournal records the cache entries stored from now on, until endCacheJournal.
+func (r *pipelineRun) startCacheJournal() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.replaced = map[stepCacheKey]*stepResult{}
+}
+
+// endCacheJournal stops recording the cache entries stored and, unless keep is set, takes back
+// those recorded, putting back the entries they replaced.
+func (r *pipelineRun) endCacheJournal(keep bool) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	replaced := r.replaced
+	r.replaced = nil
+	if keep {
+		return
+	}
+	for entry, prev := range replaced {
+		if prev == nil {
+			delete(r.cache, entry)
+		} else {
+			r.cache[entry] = *prev
+		}
+	}
 }
 
 // stepResult is what a successful step leaves to commit: its pending writes, already copies
@@ -317,8 +361,8 @@ func runChild(ctx context.Context, candidate Candidate, parent string, child *st
 // commit, when set, checks the result before the execution ends, so an error it returns fails
 // the execution and drops what it staged. A wrapper has no execution of its own, so the last
 // execution inside it that succeeds is held until commit has checked the result: it fails with
-// an error commit marks with failsExecution, and otherwise ends as it did and the failure is
-// recorded as an execution that commits nothing.
+// an error commit marks with failsExecution, and otherwise ends as it did, without what waits
+// for its result to commit, and the failure is recorded as an execution that commits nothing.
 func runNode(
 	ctx context.Context,
 	candidate Candidate,
@@ -388,7 +432,9 @@ func runNode(
 			err = own.err
 		}
 		if hold != nil && !(failsOwn && hold.release(err)) {
-			hold.release(nil)
+			// the held execution succeeded, but its result does not commit, so WithCache does not
+			// store it.
+			hold.releaseUncommitted()
 			beginStandIn(ctx, commitFailed, node, values)(stepResult{}, err)
 		}
 		return stepResult{}, err
@@ -411,8 +457,8 @@ type finishHoldKey struct{}
 // finishHold holds the report of the latest successful execution directly inside a top-level
 // wrapper, so the execution ends with the pipeline's check of the wrapper's result and a failed
 // transition fails it instead of adding an execution. succeeded holds what waits for the held
-// execution to end as a success, such as WithCache storing its result. It is safe for concurrent
-// use.
+// execution to end as a success whose result commits, such as WithCache storing its result. It
+// is safe for concurrent use.
 type finishHold struct {
 	mu        sync.Mutex
 	report    func(stepOutcome, stepResult)
@@ -444,6 +490,18 @@ func (h *finishHold) finish(outcome stepOutcome, result stepResult, report func(
 // one was held. What waits for the execution to succeed runs when it ends as a success and is
 // dropped otherwise.
 func (h *finishHold) release(err error) bool {
+	return h.end(err, err == nil)
+}
+
+// releaseUncommitted reports the held execution as the success it was, but drops what waits for
+// it to succeed, since the pipeline could not commit its result.
+func (h *finishHold) releaseUncommitted() {
+	h.end(nil, false)
+}
+
+// end reports the held execution, failed with err when err is not nil, runs what waits for it to
+// succeed when commits is set and drops it otherwise, and returns whether one was held.
+func (h *finishHold) end(err error, commits bool) bool {
 	h.mu.Lock()
 	report, outcome, result, succeeded := h.report, h.held, h.result, h.succeeded
 	h.report, h.succeeded = nil, nil
@@ -455,7 +513,7 @@ func (h *finishHold) release(err error) bool {
 		outcome.Err, result = err, stepResult{}
 	}
 	report(outcome, result)
-	if err == nil {
+	if commits {
 		for _, do := range succeeded {
 			do()
 		}
@@ -463,8 +521,9 @@ func (h *finishHold) release(err error) bool {
 	return true
 }
 
-// whenSucceeded runs do once the execution that h holds ends as a success, or at once when h is
-// nil, as outside a top-level wrapper, where an execution that succeeded has ended.
+// whenSucceeded runs do once the execution that h holds ends as a success whose result commits,
+// or at once when h is nil, as outside a top-level wrapper, where an execution that succeeded
+// has ended.
 func (h *finishHold) whenSucceeded(do func()) {
 	if h == nil {
 		do()

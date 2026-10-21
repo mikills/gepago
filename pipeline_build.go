@@ -249,14 +249,9 @@ type skippableStep struct {
 // the steps checked so far; maybeAbsent maps a key to the step that may skip writing it when
 // nothing guarantees the key exists afterwards.
 //
-// The rest is what the pass over steps derives from what the pass over transitions left (see
-// checkTransitions): skipped and covered are the running sums of its difference arrays at the
-// current step, the number of rules that skip over it and of rewind ranges that hold it, and
-// current the rewind range that holds it; rewinds counts the rewind targets so far; unwritten
-// maps a key to an earlier step that may not write it, for keys without a default; writers
-// records, for each key a step has written, what the merge rule check needs; used marks the
-// defaults a step reads or writes; labels maps the label key of each Branch checked so far to
-// the Branch.
+// flow holds what the two passes derive to check transitions and the keys each step may read
+// (see transitionFacts); used marks the defaults a step reads or writes; labels maps the label
+// key of each Branch checked so far to the Branch.
 type pipelineBuilder struct {
 	inputs      map[string]reflect.Type
 	merges      map[string]func(prev, next any) (any, error)
@@ -271,15 +266,9 @@ type pipelineBuilder struct {
 	// optional holds the optional outputs of each programme step, by step name.
 	optional map[string]map[string]bool
 
-	flow      *transitionFacts
-	skipped   int
-	covered   int
-	current   *rewindRange
-	rewinds   int
-	unwritten map[string]unwrittenKey
-	writers   map[string]writerFacts
-	used      map[string]bool
-	labels    map[string]string
+	flow   *transitionFacts
+	used   map[string]bool
+	labels map[string]string
 }
 
 // unwrittenKey names a top-level step that may not write a key, and its index.
@@ -316,8 +305,6 @@ func newPipelineBuilder(
 		names:       map[string]bool{},
 		maybeAbsent: map[string]string{},
 		optional:    map[string]map[string]bool{},
-		unwritten:   map[string]unwrittenKey{},
-		writers:     map[string]writerFacts{},
 		used:        map[string]bool{},
 		labels:      map[string]string{},
 	}
@@ -527,7 +514,7 @@ func (b *pipelineBuilder) checkReads(node *stepNode) error {
 				source.describe(key.Name),
 			)
 		}
-		if unwritten, ok := b.unwritten[key.Name]; ok {
+		if unwritten, ok := b.flow.unwritten[key.Name]; ok {
 			return fmt.Errorf(
 				"pipeline step %q reads %q (%s), which step %q may not write because %s; "+
 					"declare a Default for %q",
@@ -646,8 +633,8 @@ func (b *pipelineBuilder) checkLabel(node *stepNode, key KeyRef) error {
 // the current step, re-running the current step without them. register records every earlier
 // writer, and a key with none has the zero writerFacts, which counts as both committing.
 func (b *pipelineBuilder) bothCommit(key string) bool {
-	earlier := b.writers[key]
-	return earlier.reach <= b.index || b.rewinds > earlier.rewinds
+	earlier := b.flow.writtenBy[key]
+	return earlier.reach <= b.index || b.flow.rewinds > earlier.rewinds
 }
 
 // register makes a checked top-level step's writes available to the steps after it. A key
@@ -665,7 +652,7 @@ func (b *pipelineBuilder) register(node *stepNode) {
 			}
 		}
 	}
-	reach, unwritten := b.flow.reach(b.index), b.mayNotWrite()
+	reach, unwritten := b.flow.reach(b.index), b.flow.mayNotWrite(b.index)
 	b.leave(node)
 	for _, key := range node.writes {
 		source, existed := b.sources[key.Name]
@@ -676,16 +663,9 @@ func (b *pipelineBuilder) register(node *stepNode) {
 			delete(b.maybeAbsent, key.Name)
 		}
 		if _, ok := b.defaults[key.Name]; !ok && unwritten {
-			if _, ok := b.unwritten[key.Name]; !ok {
-				b.unwritten[key.Name] = unwrittenKey{step: node.name, index: b.index}
-			}
+			b.flow.markUnwritten(key.Name, node.name, b.index)
 		}
-		if facts, ok := b.writers[key.Name]; ok {
-			facts.reach = min(facts.reach, reach)
-			b.writers[key.Name] = facts
-		} else {
-			b.writers[key.Name] = writerFacts{reach: reach, rewinds: b.rewinds}
-		}
+		b.flow.addWriter(key.Name, reach)
 		if !existed || source.writers == 0 {
 			b.sources[key.Name] = keySource{typ: key.Type, step: node.name, def: existed, writers: 1}
 			continue

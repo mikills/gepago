@@ -336,10 +336,11 @@ evaluate:
 }
 
 // rejectRewind ends the running rewind, whose From is step i, without the range's new visit:
-// it restores the snapshot, drops what the range staged for tools and, when Accept returned
-// false rather than failed, reports RewindRejected. It returns the values of the step's reads
-// that visit's view held before the restore, which changes the state the view may share, for
-// the step's StepError.
+// it restores the snapshot, drops what the range staged for tools and the step cache entries
+// its visits stored, so WithCache does not serve them later in the run, and, when Accept
+// returned false rather than failed, reports RewindRejected. It returns the values of the
+// step's reads that visit's view held before the restore, which changes the state the view may
+// share, for the step's StepError.
 func (f *flowRun) rejectRewind(i int, visit stepVisit) map[string]any {
 	reads := keyValues(visit.view, f.p.steps[i].readTypes)
 	r := f.rewind
@@ -366,24 +367,26 @@ func (f *flowRun) commit(visit stepVisit) {
 }
 
 // startRewind takes rule, a rewind: it snapshots the values of its range, resets them to what
-// they were before the target's latest visit, and stages the range's tool writes until the
-// rewind ends.
+// they were before the target's latest visit, and stages the range's tool writes and records
+// the step cache entries its visits store until the rewind ends.
 func (f *flowRun) startRewind(rule *transitionRule, amended map[string]any) {
 	prev := f.snapshot(rule.keys)
 	restoreValues(f.state.values, f.defaulted, f.before[rule.to], rule.keys)
 	evaluationCaptureFrom(f.ctx).offer(amended)
 	ctx, stage := beginStepStage(f.ctx)
+	pipelineRunFrom(f.ctx).startCacheJournal()
 	f.rewind = &pendingRewind{rule: rule, prev: prev, amended: amended, ctx: ctx, stage: stage}
 }
 
 // endRewind ends the running rewind, if any, committing what its range staged for tools when
-// keep is set and dropping it otherwise.
+// keep is set and dropping it otherwise, with the step cache entries the range's visits stored.
 func (f *flowRun) endRewind(keep bool) {
 	r := f.rewind
 	if r == nil {
 		return
 	}
 	f.rewind = nil
+	pipelineRunFrom(f.ctx).endCacheJournal(keep)
 	if keep {
 		commitStaged(f.ctx, r.stage.snapshot())
 	}
