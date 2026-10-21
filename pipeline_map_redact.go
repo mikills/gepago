@@ -93,6 +93,9 @@ func (m *mapStep) elementShape() elementShape {
 // under such a key outside the map's executions may be hidden too. A key that is already being
 // checked further up is not checked again, so names that refer to each other end. A value is
 // checked against only the maps whose item key or body's key is its key, in the order of maps.
+// Maps of one elementShape count once, but maps that share that key and differ in another name
+// each check the value, so pipelines built on each run that name their items or results anew
+// each time cost time quadratic in the runs.
 func hideMapElements(redactors []Redactor, maps []*mapStep) Redactor {
 	byKey := map[string][]*mapStep{}
 	for _, m := range maps {
