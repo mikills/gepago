@@ -45,8 +45,7 @@ type MapResult[Out any] struct {
 // every other key body reads as it checks the reads of the Map's own position: each must be
 // guaranteed there (see Transition). The Map reads items and the other keys body reads, writes
 // results, and can be the From or To of a transition like any top-level step. body cannot, since
-// it is not a top-level step, and its policy may not skip on error. A rewind that runs the Map
-// again runs every element again.
+// it is not a top-level step. A rewind that runs the Map again runs every element again.
 //
 // Elements run at most opts.MaxConcurrency at a time, and must be safe to run concurrently with
 // each other. At zero or one they run one at a time in input order; above one they start, and
@@ -216,7 +215,6 @@ func (m *mapStep) Name() string             { return m.name }
 func (m *mapStep) Reads() []KeyRef          { return slices.Clone(m.reads) }
 func (m *mapStep) Writes() []KeyRef         { return []KeyRef{m.results} }
 func (m *mapStep) wrapper() bool            { return false }
-func (m *mapStep) skipsOnError() bool       { return false }
 func (m *mapStep) children() []childStep    { return []childStep{{label: "body", node: m.body}} }
 func (m *mapStep) seedCandidate() Candidate { return seedChildren(m.body) }
 

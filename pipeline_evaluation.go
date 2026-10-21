@@ -41,7 +41,7 @@ type evaluationCapture struct {
 
 // newEvaluationCapture returns a capture holding the Redactors and key types of every Pipeline
 // program holds, as far as its structure shows them: the programme itself and the pipelines
-// its steps run through NewProgramStep, composite steps and policy fallbacks included. A
+// its steps run through NewProgramStep, composite steps included. A
 // pipeline reached only through another kind of Program joins when it runs.
 func newEvaluationCapture(program Program) *evaluationCapture {
 	capture := &evaluationCapture{

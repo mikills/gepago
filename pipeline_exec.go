@@ -34,8 +34,8 @@ type stepCacheKey struct {
 	key  string
 }
 
-// stepOutcome records one execution of a step, top-level or nested: each retry attempt, each
-// cache hit and each skip on error is an execution of its own. Attempt counts the step's
+// stepOutcome records one execution of a step, top-level or nested: each retry attempt and
+// each cache hit is an execution of its own. Attempt counts the step's
 // executions in the run from one. Usage is what the execution's model calls recorded, nested
 // steps included, and Unbudgeted what RecordUnbudgetedUsage recorded. Err is the step's own
 // error, before any enclosing step wraps it. ToolCalls holds the tool calls the execution made
@@ -48,7 +48,6 @@ type stepOutcome struct {
 	Usage      Usage
 	Unbudgeted Usage
 	Cached     bool
-	Skipped    bool
 	Err        error
 	ToolCalls  []ToolCallRecord
 	Attributes map[string]int
@@ -158,24 +157,16 @@ func (r *pipelineRun) endCacheJournal(keep bool) {
 }
 
 // stepResult is what a successful step leaves to commit: its pending writes, already copies
-// of their declared types, the declared writes it left unwritten because it was skipped, and
-// the tool memory writes and cached tool results it staged.
+// of their declared types, and the tool memory writes and cached tool results it staged.
 type stepResult struct {
-	writes  map[string]any
-	skipped map[string]bool
-	staged  stagedTools
+	writes map[string]any
+	staged stagedTools
 }
 
 func (r stepResult) clone() stepResult {
 	out := stepResult{writes: make(map[string]any, len(r.writes)), staged: r.staged.clone()}
 	for key, value := range r.writes {
 		out.writes[key] = deepCopy(value)
-	}
-	for key := range r.skipped {
-		if out.skipped == nil {
-			out.skipped = map[string]bool{}
-		}
-		out.skipped[key] = true
 	}
 	return out
 }
@@ -185,9 +176,6 @@ func (r stepResult) clone() stepResult {
 func (r stepResult) commitTo(s State, child *stepNode) {
 	for key, value := range r.writes {
 		s.store(key, child.writeTypes[key], value, true)
-	}
-	for key := range r.skipped {
-		s.skip(key)
 	}
 	if s.scope != nil && s.scope.stage != nil {
 		s.scope.stage.add(r.staged)
@@ -246,8 +234,8 @@ func (t stagedTools) clone() stagedTools {
 }
 
 // stepStage holds what one step execution stages for tools until the step commits, so the
-// memory writes and cached results of a step that fails, times out or is skipped never reach
-// the run, and a retry, a fallback or a later step calls the tool again. As the step's
+// memory writes and cached results of a step that fails or times out never reach the run, and
+// a retry or a later step calls the tool again. As the step's
 // ToolMemory it reads through to the memory the step runs with; a pipeline session's call
 // first looks in the stages of the step and of the steps it runs inside for a cached result.
 // It is safe for concurrent use.
@@ -418,11 +406,11 @@ func runNode(
 		return stepResult{}, scope.err
 	}
 	for _, key := range node.writeNames {
-		if _, ok := scope.pending[key]; !ok && !scope.skipped[key] {
+		if _, ok := scope.pending[key]; !ok {
 			return stepResult{}, fmt.Errorf("step did not write declared state key %q", key)
 		}
 	}
-	result = stepResult{writes: scope.pending, skipped: scope.skipped, staged: scope.stage.snapshot()}
+	result = stepResult{writes: scope.pending, staged: scope.stage.snapshot()}
 	if commit == nil {
 		return result, nil
 	}
@@ -587,8 +575,6 @@ type standIn int
 const (
 	// cacheHit commits a WithCache step's cached writes.
 	cacheHit standIn = iota
-	// skippedOnError leaves the writes of a step that skips on error unwritten.
-	skippedOnError
 	// commitFailed fails a top-level WithPolicy or WithCache step whose writes cannot be merged
 	// into the state.
 	commitFailed
@@ -611,7 +597,6 @@ func beginStandIn(ctx context.Context, kind standIn, node *stepNode, values map[
 			Attempt:  attempt,
 			Duration: time.Since(start),
 			Cached:   kind == cacheHit,
-			Skipped:  kind == skippedOnError,
 			Err:      err,
 		}
 		hold.finish(outcome, result, func(outcome stepOutcome, result stepResult) {

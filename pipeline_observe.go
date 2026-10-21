@@ -17,10 +17,9 @@ import (
 // step has a span whose parent is the span of the run or of the execution around it. Every span
 // of a run has the TraceID of the run's RunContext, which the runs nested in it share (see
 // RunContext), and every event carries the run's RunContext, with its attributes redacted (see
-// Redactor). An execution is one run of a step: each retry attempt, each fallback step, each
-// cache hit and each skip on error is an execution of its own, numbered by Attempt. WithPolicy
-// and WithCache are not executions of their own; their attempts, fallbacks, cache hits and skips
-// are. A top-level step's writes are merged into the state as part of its execution, so a
+// Redactor). An execution is one run of a step: each retry attempt and each cache hit is an
+// execution of its own, numbered by Attempt. WithPolicy and WithCache are not executions of
+// their own; their attempts and cache hits are. A top-level step's writes are merged into the state as part of its execution, so a
 // MergeRule that fails fails that execution; for a top-level WithPolicy or WithCache step it
 // adds a failed execution after the one that wrote. The same holds for the step's transitions
 // on success, evaluated before its execution ends: a When, Amend or Accept that fails or panics
@@ -33,11 +32,10 @@ import (
 //   - Every execution emits StepStarted and later StepFinished with the same span.
 //   - A top-level step finishes before the next one starts, and a top-level step a transition
 //     skips over emits nothing (see Transition). An execution nested in a composite step (a
-//     Parallel, an element of a Map, or the fallback step of an OnErrorFallback policy nested in
-//     one) starts after the composite starts and finishes before it finishes.
+//     Parallel or an element of a Map) starts after the composite starts and finishes before it
+//     finishes.
 //   - The attempts of a step follow each other in order, except for the steps of a Map's body
-//     above a MaxConcurrency of one (see below). A skip, or the fallback step of an
-//     OnErrorFallback policy, follows the step's last failed attempt.
+//     above a MaxConcurrency of one (see below).
 //   - With a MaxConcurrency of zero or one, the elements of a Map run in input order, each
 //     finishing before the next starts, so the attempts of its body follow each other in order.
 //     Above one, its elements start in any order, and the attempts of its body and of the steps
@@ -164,13 +162,13 @@ type StepStartedEvent struct {
 	// RunContext is the RunContext of the run the step belongs to, as RunStarted reported it.
 	RunContext RunContext
 	Step       string
-	// Attempt counts the step's executions in the run from one, cache hits and skips included.
+	// Attempt counts the step's executions in the run from one, cache hits included.
 	Attempt int
 	// Reads holds the values of the step's declared reads after redaction.
 	Reads map[string]any
 	// Lane names the step of a Parallel the execution belongs to when the execution is that step
-	// or one its step policy runs, such as a retry or an OnErrorFallback step; it is empty
-	// otherwise, for the executions nested in them too. The executions of different lanes of a
+	// or one its step policy runs, such as a retry; it is empty otherwise, for the executions
+	// nested in them too. The executions of different lanes of a
 	// Parallel run side by side, so they may start in any order.
 	Lane string
 	// Attributes describe where the execution runs. "visit" numbers, from one, the visits of the
@@ -208,9 +206,6 @@ type StepFinishedEvent struct {
 	Writes map[string]any
 	// Cached reports a WithCache hit: the step did not run and its cached writes were committed.
 	Cached bool
-	// Skipped reports a step that skipped on error under OnErrorSkip: the step did not run
-	// again and wrote nothing.
-	Skipped bool
 	// Attributes are those StepStarted reported, and for a Map or MapCollect also "failed", the
 	// number of its elements that failed.
 	Attributes map[string]int
@@ -598,7 +593,6 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 			Details:    run.redactDetails(details),
 			Reads:      lane.reads,
 			Cached:     outcome.Cached,
-			Skipped:    outcome.Skipped,
 			Attributes: attributes,
 		}
 		event.ToolCalls = run.scrubToolCalls(toolCalls)

@@ -16,10 +16,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The tests below port the internal tests that use the v0.8.0 Branch and Fallback composites,
-// now legacyBranch and legacyFallback, to the Branch and Fallback flows, with the same scenarios
-// and expected values. A "v0.9.0" comment marks each expectation that changed because the arms
-// or the fallback's steps are now top-level steps, which a Parallel or a policy cannot hold.
+// The tests below port v0.8.0's internal tests of the Branch and Fallback composites and of a
+// step policy's fallback and skip on error to the Branch and Fallback flows and OnError transitions, with
+// the same scenarios and expected values. A "v0.9.0" comment marks each expectation that changed
+// because the arms, the fallback's steps or a policy's fallback are now top-level steps, which a
+// Parallel or a policy cannot hold.
 
 func TestFlowStepsScopeTheirCandidates(t *testing.T) {
 	seen := &sync.Map{}
@@ -27,10 +28,15 @@ func TestFlowStepsScopeTheirCandidates(t *testing.T) {
 	spec := PipelineSpec{
 		Inputs: refs(docKey.Ref()),
 		Steps: []Step{
-			WithPolicy(WithCache(scopedStep(seen, "extract", "fact", errBadRequest), nil), StepPolicy{
-				OnError: OnErrorFallback(scopedStep(seen, "estimate", "fact", nil)),
-			}),
+			WithPolicy(WithCache(scopedStep(seen, "extract", "fact", errBadRequest), nil), StepPolicy{}),
+			// v0.9.0: the step that stood in for extract as its policy's fallback is a top-level step
+			// an OnError transition goes to.
+			scopedStep(seen, "estimate", "fact", nil),
 			Parallel("fan", scopedStep(seen, "left", "left", nil), writeNotes("plain", "no components")),
+		},
+		Transitions: []Transition{
+			{From: "extract", OnError: true, To: "estimate"},
+			{From: "extract", To: "fan"},
 		},
 	}
 	// v0.9.0: the Branch follows the Parallel instead of being in it.
@@ -90,17 +96,13 @@ func TestCandidateKeysReachTheLeavesOfFlows(t *testing.T) {
 		return NewProgramStep(name, program, refs(docKey.Ref()), refs(Key[string]{Name: out}.Ref()))
 	}
 	always := func(State) (string, error) { return "x", nil }
-	innerSpec := PipelineSpec{
-		Inputs: refs(docKey.Ref()),
-		Steps: []Step{
-			WithCache(
-				WithPolicy(leaf("i1", "k1", true), StepPolicy{OnError: OnErrorFallback(leaf("i2", "k1", false))}),
-				nil,
-			),
-			Parallel("ip", WithPolicy(leaf("i3", "k3", false), StepPolicy{})),
-		},
-	}
-	// v0.9.0: the Branch follows the Parallel instead of being in it.
+	innerSpec := PipelineSpec{Inputs: refs(docKey.Ref())}
+	// v0.9.0: a Fallback stands in for the policy's fallback step, and the Branch follows the
+	// Parallel instead of being in it.
+	innerSpec.Add(
+		Fallback("if", WithCache(WithPolicy(leaf("i1", "k1", true), StepPolicy{}), nil), leaf("i2", "k1", false)),
+	)
+	innerSpec.Steps = append(innerSpec.Steps, Parallel("ip", WithPolicy(leaf("i3", "k3", false), StepPolicy{})))
 	innerSpec.Add(Branch("ib", always, map[string]Step{"x": WithCache(leaf("i4", "k4", false), nil)}))
 	inner, err := innerSpec.Build()
 	require.NoError(t, err)
@@ -110,26 +112,22 @@ func TestCandidateKeysReachTheLeavesOfFlows(t *testing.T) {
 		refs(docKey.Ref()),
 		refs(Key[string]{Name: "k1"}.Ref(), Key[string]{Name: "k3"}.Ref(), Key[string]{Name: "k4"}.Ref()),
 	)
-	spec := PipelineSpec{
-		Inputs: refs(docKey.Ref()),
-		Steps: []Step{
-			leaf("plain", "p", false),
-			WithPolicy(leaf("pol", "q", true), StepPolicy{OnError: OnErrorFallback(
-				Parallel("fbp", WithPolicy(leaf("fb1", "q", false), StepPolicy{})),
-			)}),
-			WithPolicy(Parallel("wp", WithCache(leaf("w1", "r", false), nil)), StepPolicy{}),
-		},
-	}
-	// v0.9.0: the Fallback follows the Parallel under a policy instead of being in it.
-	spec.Add(Fallback("wf", leaf("w2", "s", true), WithPolicy(leaf("w3", "s", true), StepPolicy{
-		OnError: OnErrorFallback(leaf("w4", "s", false)),
-	})))
+	spec := PipelineSpec{Inputs: refs(docKey.Ref()), Steps: []Step{leaf("plain", "p", false)}}
+	// v0.9.0: Fallbacks stand in for the policies' fallback steps, and the Fallback follows the
+	// Parallel under a policy instead of being in it; a step's fallback has none of its own.
+	spec.Add(Fallback(
+		"polf",
+		WithPolicy(leaf("pol", "q", true), StepPolicy{}),
+		Parallel("fbp", WithPolicy(leaf("fb1", "q", false), StepPolicy{})),
+	))
+	spec.Steps = append(spec.Steps, WithPolicy(Parallel("wp", WithCache(leaf("w1", "r", false), nil)), StepPolicy{}))
+	spec.Add(Fallback("wf", leaf("w2", "s", true), WithPolicy(leaf("w3", "s", false), StepPolicy{})))
 	spec.Steps = append(spec.Steps, WithCache(nested, nil))
 	pipeline, err := spec.Build()
 	require.NoError(t, err)
 
 	seed := pipeline.SeedCandidate()
-	require.Len(t, seed, 11)
+	require.Len(t, seed, 10)
 	trained := Candidate{}
 	for key := range seed {
 		trained[key] = "T:" + key
@@ -297,13 +295,12 @@ func TestPipelineObserverFlowSequence(t *testing.T) {
 		),
 		Fallback("fb", failAmount("primary", TransientError(errors.New("down"))), writeAmount("secondary", 7)),
 	)
-	spec.Steps = append(
-		spec.Steps,
-		WithPolicy(guess, StepPolicy{OnError: OnErrorSkip}),
-		WithPolicy(
-			verdict("estimate", "x", errBadRequest),
-			StepPolicy{OnError: OnErrorFallback(verdict("spare", "ok", nil))},
-		),
+	// v0.9.0: OnError transitions stand in for guess's skip on error and estimate's fallback step.
+	spec.Steps = append(spec.Steps, guess, verdict("estimate", "x", errBadRequest), verdict("spare", "ok", nil))
+	spec.Transitions = append(spec.Transitions,
+		Transition{From: "guess", OnError: true, To: "estimate"},
+		Transition{From: "estimate", OnError: true, To: "spare"},
+		Transition{From: "estimate", To: End},
 	)
 	pipeline, err := spec.Build()
 	require.NoError(t, err)
@@ -335,20 +332,20 @@ func TestPipelineObserverFlowSequence(t *testing.T) {
 		"finish fb#1",
 		"start guess#1 in run",
 		"finish guess#1 err: no notes",
-		"start guess#2 in run",
-		"finish guess#2 skipped",
+		"transition 5 guess -> estimate",
 		"start estimate#1 in run",
 		"finish estimate#1 err: bad request",
+		"transition 6 estimate -> spare",
 		"start spare#1 in run",
 		"finish spare#1",
 		"finish run",
 	}, log.Lines())
 	require.Equal(t, map[string]any{"decision": "brief"}, log.finishedStep(t, "brief", 1).Writes)
 	require.Equal(t, map[string]any{"amount": 7}, log.finishedStep(t, "secondary", 1).Writes)
-	skipped := log.finishedStep(t, "guess", 2)
-	require.True(t, skipped.Skipped)
-	require.NoError(t, skipped.Err)
-	require.Empty(t, skipped.Writes)
+	// v0.9.0: the failed step's writes are dropped and the default stays, as a skip on error left it.
+	failed := log.finishedStep(t, "guess", 1)
+	require.EqualError(t, failed.Err, "no notes")
+	require.Empty(t, failed.Writes)
 }
 
 // TestPipelineObserverStressWithFallbackFlows runs many runs of Fallback flows of retried,
@@ -586,20 +583,20 @@ func TestPipelineFingerprintCoversFlowsAndTransitions(t *testing.T) {
 	})
 
 	t.Run("a v0.8.0 artefact loads into a pipeline without transitions", func(t *testing.T) {
-		// fpGolden is the fingerprint v0.8.0 gave both pipelines; the second has Defaults.
-		for _, options := range []fpOptions{{instruction: "seed"}, {instruction: "seed", skip: true}} {
-			spec := fpSpec(t, options)
+		// fpV08Golden is the fingerprint v0.8.0 gave both pipelines; the second has Defaults.
+		for _, def := range []bool{false, true} {
+			spec := fpV08Spec(t, def)
 			pipeline := fpBuild(t, spec)
 			candidate, err := json.Marshal(pipeline.SeedCandidate())
 			require.NoError(t, err)
 			saved := fmt.Sprintf(`{"format_version": 1, "name": "fp", "fingerprint": %q, "candidate": %s,
-				"created_at": "2026-01-02T03:04:05Z"}`, fpGolden, candidate)
+				"created_at": "2026-01-02T03:04:05Z"}`, fpV08Golden, candidate)
 			path := filepath.Join(t.TempDir(), "fp.json")
 			require.NoError(t, os.WriteFile(path, []byte(saved), 0o600))
 
 			_, artifact, err := LoadCompiledProgram(path, pipeline)
 			require.NoError(t, err, "defaults %v", spec.Defaults)
-			require.Equal(t, fpGolden, artifact.Fingerprint)
+			require.Equal(t, fpV08Golden, artifact.Fingerprint)
 
 			spec.Transitions = []Transition{{From: "nested", To: End}}
 			_, _, err = LoadCompiledProgram(path, fpBuild(t, spec))

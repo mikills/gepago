@@ -175,7 +175,6 @@ var runReportTemplate = template.Must(template.New("gepa-run-report").Funcs(temp
 <span class="muted">attempt {{.Attempt}}{{with index .Attributes "visit"}} · visit {{.}}{{end}}
 {{- element .Attributes}}{{with index .Attributes "failed"}} · {{.}} failed{{end}}</span>
 {{if .Cached}}<span class="badge">cached</span>{{end}}
-{{if .Skipped}}<span class="badge">skipped</span>{{end}}
 {{if .RewindRejected}}<span class="badge">rewind rejected</span>{{end}}
 {{if or .Failed .Err}}<span class="badge error-badge">failed{{with .ErrKind}} · {{.}}{{end}}</span>{{end}}
 <span class="muted">

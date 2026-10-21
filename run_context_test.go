@@ -219,9 +219,8 @@ func TestPipelineRunKeepsTheCallerRunContext(t *testing.T) {
 }
 
 // nestedRunContextPipeline returns a pipeline whose steps run pipelines directly, two levels
-// deep, inside a Parallel and inside the chosen arm of a Branch, every one of them probed. With
-// flows set the Branch is the Branch flow, and otherwise the v0.8.0 composite.
-func nestedRunContextPipeline(t *testing.T, probe *runContextProbe, spec PipelineSpec, flows bool) Pipeline {
+// deep, inside a Parallel and as the chosen arm of a Branch, every one of them probed.
+func nestedRunContextPipeline(t *testing.T, probe *runContextProbe, spec PipelineSpec) Pipeline {
 	t.Helper()
 	grandchild := buildPipeline(t, PipelineSpec{Steps: []Step{probe.step("grandchild", intKey("g"))}})
 	child := buildPipeline(t, PipelineSpec{Steps: []Step{
@@ -246,48 +245,40 @@ func nestedRunContextPipeline(t *testing.T, probe *runContextProbe, spec Pipelin
 		"chosen": NewProgramStep("run chosen", chosen, nil, refs(intKey("arm").Ref())),
 		"other":  NewProgramStep("run other", other, nil, refs(intKey("arm").Ref())),
 	}
-	if flows {
-		spec.Add(Branch("route", route, arms))
-	} else {
-		spec.Steps = append(spec.Steps, legacyBranch("route", route, arms))
-	}
+	spec.Add(Branch("route", route, arms))
 	spec.Steps = append(spec.Steps, probe.step("outer again", intKey("o2")))
 	return buildPipeline(t, spec)
 }
 
 func TestNestedPipelinesPropagateTheRunContext(t *testing.T) {
-	for _, flows := range []bool{false, true} {
-		t.Run(fmt.Sprint("flows ", flows), func(t *testing.T) {
-			probe := &runContextProbe{}
-			pipeline := nestedRunContextPipeline(t, probe, PipelineSpec{}, flows)
+	probe := &runContextProbe{}
+	pipeline := nestedRunContextPipeline(t, probe, PipelineSpec{})
 
-			_, err := pipeline.Run(WithRunContext(context.Background(), callerContext()), NewState(nil))
-			require.NoError(t, err)
+	_, err := pipeline.Run(WithRunContext(context.Background(), callerContext()), NewState(nil))
+	require.NoError(t, err)
 
-			outer := probe.only(t, "outer")
-			require.Equal(t, "caller", outer.ParentRunID)
-			require.Equal(t, outer, probe.only(t, "outer again"))
-			child := probe.only(t, "child")
-			parents := map[string]string{
-				"child":      outer.RunID,
-				"grandchild": child.RunID,
-				"left":       outer.RunID,
-				"right":      outer.RunID,
-				"chosen arm": outer.RunID,
-			}
-			runIDs := map[string]bool{outer.RunID: true}
-			for step, parent := range parents {
-				rc := probe.only(t, step)
-				require.Equal(t, parent, rc.ParentRunID, step)
-				require.Equal(t, "trace-1", rc.TraceID, step)
-				require.Equal(t, map[string]string{"request": "req-7"}, rc.Attributes, step)
-				require.NotEmpty(t, rc.RunID, step)
-				require.False(t, runIDs[rc.RunID], "%s has a run id of its own", step)
-				runIDs[rc.RunID] = true
-			}
-			require.Empty(t, probe.all("other arm"))
-		})
+	outer := probe.only(t, "outer")
+	require.Equal(t, "caller", outer.ParentRunID)
+	require.Equal(t, outer, probe.only(t, "outer again"))
+	child := probe.only(t, "child")
+	parents := map[string]string{
+		"child":      outer.RunID,
+		"grandchild": child.RunID,
+		"left":       outer.RunID,
+		"right":      outer.RunID,
+		"chosen arm": outer.RunID,
 	}
+	runIDs := map[string]bool{outer.RunID: true}
+	for step, parent := range parents {
+		rc := probe.only(t, step)
+		require.Equal(t, parent, rc.ParentRunID, step)
+		require.Equal(t, "trace-1", rc.TraceID, step)
+		require.Equal(t, map[string]string{"request": "req-7"}, rc.Attributes, step)
+		require.NotEmpty(t, rc.RunID, step)
+		require.False(t, runIDs[rc.RunID], "%s has a run id of its own", step)
+		runIDs[rc.RunID] = true
+	}
+	require.Empty(t, probe.all("other arm"))
 }
 
 func TestStepThatReplacesTheRunContextParentsTheRunsItStarts(t *testing.T) {
@@ -313,16 +304,10 @@ func TestStepThatReplacesTheRunContextParentsTheRunsItStarts(t *testing.T) {
 // TestConcurrentRunsGetDistinctRunIDs runs a pipeline with nested and parallel runs from many
 // goroutines; run it with -race.
 func TestConcurrentRunsGetDistinctRunIDs(t *testing.T) {
-	for _, flows := range []bool{false, true} {
-		t.Run(fmt.Sprint("flows ", flows), func(t *testing.T) { concurrentRunsGetDistinctRunIDs(t, flows) })
-	}
-}
-
-func concurrentRunsGetDistinctRunIDs(t *testing.T, flows bool) {
 	const runs = 16
 	probe := &runContextProbe{}
 	recorder := &RecordingObserver{}
-	pipeline := nestedRunContextPipeline(t, probe, PipelineSpec{Observers: []PipelineObserver{recorder}}, flows)
+	pipeline := nestedRunContextPipeline(t, probe, PipelineSpec{Observers: []PipelineObserver{recorder}})
 	ctx := WithRunContext(context.Background(), callerContext())
 
 	var wg sync.WaitGroup

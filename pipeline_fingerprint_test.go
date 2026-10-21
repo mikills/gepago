@@ -55,7 +55,6 @@ type fpOptions struct {
 	reverse     bool
 	timeout     time.Duration
 	retries     int
-	skip        bool
 	scoreDef    *int
 	cache       bool
 	budget      RunBudget
@@ -63,7 +62,7 @@ type fpOptions struct {
 }
 
 // fpSpec uses every kind of step: a programme step under a policy and a cache, a Branch, a
-// Parallel, a Fallback, a policy fallback and a nested pipeline.
+// Parallel, a Fallback, a transition and a nested pipeline.
 func fpSpec(t *testing.T, o fpOptions) PipelineSpec {
 	t.Helper()
 	order := func(keys ...KeyRef) []KeyRef {
@@ -86,15 +85,8 @@ func fpSpec(t *testing.T, o fpOptions) PipelineSpec {
 	if o.reverse {
 		slices.Reverse(annotate)
 	}
-	score := WithPolicy(
-		fpStep("score", refs(amountKey.Ref()), refs(fpScore.Ref())),
-		StepPolicy{OnError: OnErrorFallback(fpStep("default_score", refs(docKey.Ref()), refs(fpScore.Ref())))},
-	)
-	var defaults []Default
-	if o.skip {
-		score = WithPolicy(score, StepPolicy{OnError: OnErrorSkip})
-		defaults = append(defaults, DefaultValue(fpScore, 0))
-	}
+	// the arms may not write the decision, so the steps that read it need its default.
+	defaults := []Default{DefaultValue(decisionKey, "")}
 	if o.scoreDef != nil {
 		defaults = append(defaults, DefaultValue(fpScore, *o.scoreDef))
 	}
@@ -102,35 +94,76 @@ func fpSpec(t *testing.T, o fpOptions) PipelineSpec {
 		Inputs: refs(amountKey.Ref()),
 		Steps:  []Step{fpStep("inner", refs(amountKey.Ref()), refs(fpReport.Ref()))},
 	})
-	return PipelineSpec{
+	spec := PipelineSpec{
 		Inputs: refs(docKey.Ref()),
 		Steps: []Step{
 			parse,
 			fpStep("route", order(docKey.Ref(), amountKey.Ref()), refs(routeKey.Ref())),
-			legacyBranch("decide", routeBy, map[string]Step{
-				"approve": fpStep("approve", refs(amountKey.Ref()), refs(decisionKey.Ref())),
-				"review":  fpStep("review", refs(amountKey.Ref()), refs(decisionKey.Ref())),
-				"refuse":  fpStep("refuse", refs(amountKey.Ref()), refs(decisionKey.Ref())),
-			}, routeKey.Ref()),
-			Parallel("annotate", annotate...),
-			legacyFallback(
-				"summarise",
-				fpStep("draft", order(decisionKey.Ref(), notesKey.Ref()), refs(fpSummary.Ref())),
-				fpStep("template", refs(decisionKey.Ref()), refs(fpSummary.Ref())),
-			),
-			score,
-			NewProgramStep("nested", inner, refs(amountKey.Ref()), refs(fpReport.Ref())),
 		},
 		Defaults:         defaults,
 		Budget:           o.budget,
 		AllowExtraInputs: o.allowExtra,
 	}
+	spec.Add(Branch("decide", routeBy, map[string]Step{
+		"approve": fpStep("approve", refs(amountKey.Ref()), refs(decisionKey.Ref())),
+		"review":  fpStep("review", refs(amountKey.Ref()), refs(decisionKey.Ref())),
+		"refuse":  fpStep("refuse", refs(amountKey.Ref()), refs(decisionKey.Ref())),
+	}, routeKey.Ref()))
+	spec.Steps = append(spec.Steps, Parallel("annotate", annotate...))
+	spec.Add(Fallback(
+		"summarise",
+		fpStep("draft", order(decisionKey.Ref(), notesKey.Ref()), refs(fpSummary.Ref())),
+		fpStep("template", refs(decisionKey.Ref()), refs(fpSummary.Ref())),
+	))
+	spec.Steps = append(
+		spec.Steps,
+		WithPolicy(fpStep("score", refs(amountKey.Ref()), refs(fpScore.Ref())), StepPolicy{}),
+		NewProgramStep("nested", inner, refs(amountKey.Ref()), refs(fpReport.Ref())),
+	)
+	spec.Transitions = append(spec.Transitions, Transition{From: "score", OnError: true, To: End})
+	return spec
 }
 
 // fpGolden is the fingerprint of fpSpec. It must not change unless the fingerprint scheme
 // does, and then pipelineFingerprintVersion must change too, because every artefact saved
 // with the old scheme stops loading.
-const fpGolden = "015589b948084a23c8bc1ef7b75b66247e7595dabf5ffd9fda23d2481500dd36"
+const fpGolden = "bea9099f21bdd430bf71a1e411d12b86cdae53a2e322595820b9188e3d7a888d"
+
+// fpV08Spec is a pipeline v0.8.0 could build too: a programme step under a policy, a Parallel,
+// a step under a policy and a nested pipeline, with a Default for the score when def is set.
+// v0.8.0 gave it fpV08Golden, with and without the Default, which then served a score step that
+// skipped on error.
+func fpV08Spec(t *testing.T, def bool) PipelineSpec {
+	t.Helper()
+	inner := fpBuild(t, PipelineSpec{
+		Inputs: refs(amountKey.Ref()),
+		Steps:  []Step{fpStep("inner", refs(amountKey.Ref()), refs(fpReport.Ref()))},
+	})
+	spec := PipelineSpec{
+		Inputs: refs(docKey.Ref()),
+		Steps: []Step{
+			WithPolicy(
+				NewProgramStep("parse", fpPredict("seed", nil), refs(docKey.Ref()), refs(amountKey.Ref())),
+				StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}},
+			),
+			fpStep("decide", refs(amountKey.Ref()), refs(decisionKey.Ref())),
+			Parallel(
+				"annotate",
+				fpStep("note", refs(decisionKey.Ref()), refs(notesKey.Ref())),
+				fpStep("flag", refs(decisionKey.Ref()), refs(fpFlag.Ref())),
+			),
+			WithPolicy(fpStep("score", refs(amountKey.Ref()), refs(fpScore.Ref())), StepPolicy{}),
+			NewProgramStep("nested", inner, refs(amountKey.Ref()), refs(fpReport.Ref())),
+		},
+	}
+	if def {
+		spec.Defaults = []Default{DefaultValue(fpScore, 0)}
+	}
+	return spec
+}
+
+// fpV08Golden is the fingerprint v0.8.0 gave fpV08Spec.
+const fpV08Golden = "4f8b6ab78277355f763b06b07dc0471027dfb645d7a8bd6a1681697052c39bfc"
 
 func TestPipelineFingerprintIsStable(t *testing.T) {
 	for range 20 {
@@ -147,7 +180,6 @@ func TestPipelineFingerprintLeavesOutValuesOutsideTheShape(t *testing.T) {
 		"candidate demos":   {instruction: "seed", demos: []Demo{{Inputs: Prediction{"document": "x"}}}},
 		"declaration order": {instruction: "seed", reverse: true},
 		"policy values":     {instruction: "seed", timeout: time.Minute, retries: 3},
-		"skip on error":     {instruction: "seed", skip: true},
 		"default":           {instruction: "seed", scoreDef: &five},
 		"cache":             {instruction: "seed", cache: true},
 		"budget": {instruction: "seed", budget: RunBudget{
@@ -168,11 +200,7 @@ func TestPipelineFingerprintLeavesOutValuesOutsideTheShape(t *testing.T) {
 func TestPipelineFingerprintChangesWithTheShape(t *testing.T) {
 	total := Key[int]{Name: "total"}
 	amountFloat := Key[float64]{Name: "amount"}
-	decide := func(name string, arms map[string]Step) Step {
-		return legacyBranch(name, routeBy, arms, routeKey.Ref())
-	}
-	arm := func(name string) Step { return fpStep(name, refs(amountKey.Ref()), refs(decisionKey.Ref())) }
-	first := func(State) (string, error) { return "primary", nil }
+	decide := fpStep("decide", refs(amountKey.Ref()), refs(decisionKey.Ref()))
 	route := fpStep("route", refs(amountKey.Ref()), refs(routeKey.Ref()))
 	note := fpStep("note", refs(decisionKey.Ref()), refs(notesKey.Ref()))
 	flag := fpStep("flag", refs(decisionKey.Ref()), refs(fpFlag.Ref()))
@@ -215,32 +243,8 @@ func TestPipelineFingerprintChangesWithTheShape(t *testing.T) {
 			spec(fpStep("score", refs(amountKey.Ref()), refs(fpScore.Ref())), route),
 		},
 		"parallel made sequential": {
-			spec(route, decide("decide", map[string]Step{"a": arm("a")}), Parallel("annotate", note, flag)),
-			spec(route, decide("decide", map[string]Step{"a": arm("a")}), note, flag),
-		},
-		"branch arm relabelled": {
-			spec(route, decide("decide", map[string]Step{"approve": arm("a"), "review": arm("b")})),
-			spec(route, decide("decide", map[string]Step{"approve": arm("a"), "escalate": arm("b")})),
-		},
-		"branch arm renamed": {
-			spec(route, decide("decide", map[string]Step{"approve": arm("a"), "review": arm("b")})),
-			spec(route, decide("decide", map[string]Step{"approve": arm("a"), "review": arm("c")})),
-		},
-		"branch made fallback": {
-			spec(legacyBranch("decide", first, map[string]Step{"primary": arm("a"), "secondary": arm("b")})),
-			spec(legacyFallback("decide", arm("a"), arm("b"))),
-		},
-		"fallback roles swapped": {
-			spec(legacyFallback("decide", arm("a"), arm("b"))),
-			spec(legacyFallback("decide", arm("b"), arm("a"))),
-		},
-		"policy fallback added": {
-			spec(arm("a")),
-			spec(WithPolicy(arm("a"), StepPolicy{OnError: OnErrorFallback(arm("b"))})),
-		},
-		"policy fallback renamed": {
-			spec(WithPolicy(arm("a"), StepPolicy{OnError: OnErrorFallback(arm("b"))})),
-			spec(WithPolicy(arm("a"), StepPolicy{OnError: OnErrorFallback(arm("c"))})),
+			spec(route, decide, Parallel("annotate", note, flag)),
+			spec(route, decide, note, flag),
 		},
 		"nested pipeline changed": {
 			spec(nested("inner")),
@@ -276,7 +280,6 @@ func (c *fpComposite) children() []childStep {
 }
 func (c *fpComposite) checkChildren() error                                 { return nil }
 func (c *fpComposite) wrapper() bool                                        { return false }
-func (c *fpComposite) skipsOnError() bool                                   { return false }
 func (c *fpComposite) seedCandidate() Candidate                             { return Candidate{} }
 func (c *fpComposite) runCandidate(context.Context, Candidate, State) error { return nil }
 

@@ -37,8 +37,8 @@ func timedRun(start, end int, steps ...gepa.StepTrace) gepa.PipelineTrace {
 }
 
 // orderedTrace has sequential steps, a Parallel whose steps did not overlap and nest steps of
-// their own, one of them failing over to its policy's fallback, a Fallback, a retried step, two
-// nested runs that overlap and an unfinished step.
+// their own, one of them retried by its policy, a Map whose second element finished before its
+// first element's retry, a retried step, two nested runs that overlap and an unfinished step.
 func orderedTrace() gepa.PipelineTrace {
 	step := func(name string, attempt int) gepa.StepTrace { return gepa.StepTrace{Step: name, Attempt: attempt} }
 	inLane := func(lane string, step gepa.StepTrace) gepa.StepTrace {
@@ -54,9 +54,18 @@ func orderedTrace() gepa.PipelineTrace {
 	branchA.Steps = []gepa.StepTrace{timed(step("a1", 1), 22, 25), timed(step("a2", 1), 26, 29)}
 	branchB := inLane("b", failed(timed(step("b", 1), 31, 40)))
 	branchB.Steps = []gepa.StepTrace{timed(step("b1", 1), 32, 35)}
-	fan.Steps = []gepa.StepTrace{branchA, branchB, inLane("b", timed(step("spare", 1), 41, 45))}
-	fb := timed(step("fb", 1), 50, 60)
-	fb.Steps = []gepa.StepTrace{failed(timed(step("primary", 1), 51, 54)), timed(step("secondary", 1), 55, 59)}
+	fan.Steps = []gepa.StepTrace{branchA, branchB, inLane("b", timed(step("b", 2), 41, 45))}
+	element := func(index, attempt int) gepa.StepTrace {
+		step := step("body", attempt)
+		step.Attributes = map[string]int{"visit": 1, "index": index}
+		return step
+	}
+	m := timed(step("m", 1), 50, 60)
+	m.Steps = []gepa.StepTrace{
+		failed(timed(element(0, 1), 51, 53)),
+		timed(element(1, 2), 51, 52),
+		timed(element(0, 3), 54, 59),
+	}
 	custom := timed(step("custom", 1), 70, 90)
 	custom.Runs = []gepa.PipelineTrace{
 		timedRun(71, 80, timed(step("x", 1), 72, 79)),
@@ -66,7 +75,7 @@ func orderedTrace() gepa.PipelineTrace {
 		timed(step("first", 1), 0, 10),
 		timed(step("second", 1), 10, 20),
 		fan,
-		fb,
+		m,
 		failed(timed(step("flaky", 1), 60, 61)),
 		timed(step("flaky", 2), 62, 63),
 		custom,
@@ -86,10 +95,11 @@ func orderedSteps() []gepatest.ExpectedStep {
 		{Step: "fan.a.a2"},
 		{Step: "fan.b", Failed: true},
 		{Step: "fan.b.b1"},
-		{Step: "fan.spare"},
-		{Step: "fb"},
-		{Step: "fb.primary", Failed: true},
-		{Step: "fb.secondary"},
+		{Step: "fan.b", Attempt: 2},
+		{Step: "m"},
+		{Step: "m.body", Attributes: map[string]int{"index": 0}, Failed: true},
+		{Step: "m.body", Attributes: map[string]int{"index": 1}},
+		{Step: "m.body", Attempt: 2, Attributes: map[string]int{"index": 0}},
 		{Step: "flaky", Attempt: 1, Failed: true},
 		{Step: "flaky", Attempt: 2},
 		{Step: "custom"},
@@ -104,7 +114,12 @@ func orderedSteps() []gepatest.ExpectedStep {
 // before.
 func moved(t *testing.T, steps []gepatest.ExpectedStep, from, before string) []gepatest.ExpectedStep {
 	t.Helper()
-	labelOf := func(step gepatest.ExpectedStep) string { return fmt.Sprintf("%s #%d", step.Step, max(step.Attempt, 1)) }
+	labelOf := func(step gepatest.ExpectedStep) string {
+		if index, ok := step.Attributes["index"]; ok {
+			return fmt.Sprintf("%s[%d] #%d", step.Step, index, max(step.Attempt, 1))
+		}
+		return fmt.Sprintf("%s #%d", step.Step, max(step.Attempt, 1))
+	}
 	i := slices.IndexFunc(steps, func(step gepatest.ExpectedStep) bool { return labelOf(step) == from })
 	require.GreaterOrEqual(t, i, 0, from)
 	step := steps[i]
@@ -126,9 +141,13 @@ func TestAssertTraceChecksTheOrderExecutionsRanIn(t *testing.T) {
 		{"steps of a Parallel", "fan.b #1", "fan.a #1", true},
 		{"steps nested in different steps of a Parallel", "fan.b.b1 #1", "fan.a.a1 #1", true},
 		{"sequential steps in one step of a Parallel", "fan.a.a2 #1", "fan.a.a1 #1", false},
-		{"a policy's fallback before the step of a Parallel it stands in for", "fan.spare #1", "fan.b #1", false},
-		{"a step of a Parallel after another step's fallback", "fan.a #1", "fb #1", true},
-		{"a Fallback's second step before its first", "fb.secondary #1", "fb.primary #1", false},
+		{"a policy's retry before the attempt of a Parallel's step it retries", "fan.b #2", "fan.b #1", false},
+		{"a step of a Parallel after another step's retry", "fan.a #1", "m #1", true},
+		{"elements of a Map", "m.body[1] #1", "m.body[0] #1", true},
+		{"an element after another element's retry", "m.body[1] #1", "flaky #1", true},
+		{"an element after a later step", "m.body[1] #1", "last #1", false},
+		{"an element's retry before its first attempt", "m.body[0] #2", "m.body[0] #1", false},
+		{"a step after a Map before one of its elements", "flaky #1", "m.body[0] #2", false},
 		{"a retry before its first attempt", "flaky #2", "flaky #1", false},
 		{"steps of overlapping runs", "custom.y #1", "custom.x #1", true},
 		{"an unfinished step", "last #1", "open #1", true},
@@ -261,7 +280,11 @@ func TestAssertTraceChecksTheOrderOfARecordedRun(t *testing.T) {
 	// v0.9.0: Fallback's steps are top-level steps followed by the step named after it.
 	inOrder := []gepatest.ExpectedStep{
 		{Step: "first"},
-		{Step: "primary", Err: "primary down"},
+		{
+			Step:       "primary",
+			Err:        "primary down",
+			Transition: &gepa.TransitionTrace{From: "primary", To: "secondary", Rule: 1},
+		},
 		{Step: "secondary"},
 		{Step: "fb"},
 		{Step: "flaky", Attempt: 1, Err: "busy"},
@@ -294,10 +317,16 @@ func TestAssertTraceKeepsTheOrderWithinAStepOfAParallel(t *testing.T) {
 	noop := func(name string) gepa.Step {
 		return gepa.NewStep(name, nil, nil, func(context.Context, gepa.State) error { return nil })
 	}
-	down := gepa.NewStep("a", nil, nil, func(context.Context, gepa.State) error { return errors.New("a down") })
+	attempts := 0
+	down := gepa.NewStep("a", nil, nil, func(context.Context, gepa.State) error {
+		if attempts++; attempts%2 == 1 {
+			return gepa.TransientError(errors.New("a down"))
+		}
+		return nil
+	})
 	pipeline, err := gepa.PipelineSpec{
 		Steps: []gepa.Step{gepa.Parallel("fan",
-			gepa.WithPolicy(down, gepa.StepPolicy{OnError: gepa.OnErrorFallback(noop("backup"))}),
+			gepa.WithPolicy(down, gepa.StepPolicy{Retry: gepa.RetryPolicy{MaxAttempts: 2}}),
 			noop("c"),
 		)},
 		Observers: []gepa.PipelineObserver{recorder},
@@ -307,7 +336,11 @@ func TestAssertTraceKeepsTheOrderWithinAStepOfAParallel(t *testing.T) {
 		_, err := pipeline.Run(context.Background(), gepa.NewState(nil))
 		require.NoError(t, err)
 	}
-	withoutC := []gepatest.ExpectedStep{{Step: "fan"}, {Step: "fan.a", Err: "a down"}, {Step: "fan.backup"}}
+	withoutC := []gepatest.ExpectedStep{
+		{Step: "fan"},
+		{Step: "fan.a", Attempt: 1, Err: "a down"},
+		{Step: "fan.a", Attempt: 2},
+	}
 
 	for _, trace := range recorder.Traces() {
 		for i := range len(withoutC) + 1 {
@@ -320,12 +353,12 @@ func TestAssertTraceKeepsTheOrderWithinAStepOfAParallel(t *testing.T) {
 			Steps: moved(
 				t,
 				append(slices.Clone(withoutC), gepatest.ExpectedStep{Step: "fan.c"}),
-				"fan.backup #1",
+				"fan.a #2",
 				"fan.a #1",
 			),
-		}), "the fallback ran after the step it stands in for")
+		}), "the retry ran after the attempt it repeats")
 		require.Contains(t, recorder.errors[0],
-			"want lists fan.backup #1 before fan.a #1, but fan.a #1 finished before fan.backup #1 started")
+			"want lists fan.a #2 before fan.a #1, but fan.a #1 finished before fan.a #2 started")
 	}
 }
 

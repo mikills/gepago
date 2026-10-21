@@ -193,8 +193,8 @@ type ProgramEvaluator struct {
 // element's item included, and the attributes of their RunContexts, is removed from every
 // string in them (see Redactor). The Redactors and Maps are those of the Pipelines the
 // programme's structure shows, found before any example runs: the programme itself when it is a
-// Pipeline and the Pipelines its steps run through NewProgramStep, inside composite steps and
-// policy fallbacks too; a Pipeline reached only through another kind of Program adds its
+// Pipeline and the Pipelines its steps run through NewProgramStep, inside composite steps
+// too; a Pipeline reached only through another kind of Program adds its
 // Redactor and Maps for the examples on which it runs, from when it starts: the values runs
 // gave, wrote or attached to errors before then do not pass through its Redactor, so it removes
 // their text only where it changes one of the item's own values that holds them. Without any

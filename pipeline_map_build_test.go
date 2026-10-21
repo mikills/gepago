@@ -220,14 +220,6 @@ func TestMapBuildErrors(t *testing.T) {
 			wantErr: `pipeline step "measure" is duplicated`,
 		},
 		{
-			name: "a body that skips on error",
-			spec: PipelineSpec{
-				Steps: []Step{lengthsOf(WithPolicy(measure, StepPolicy{OnError: OnErrorSkip}), MapOptions{})},
-			},
-			wantErr: `pipeline step "lengths": body "measure" skips on error, but a map body must write; use ` +
-				`MapCollect to keep the elements that succeed`,
-		},
-		{
 			name: "an amendable body",
 			spec: PipelineSpec{
 				Steps: []Step{lengthsOf(WithAmendable(measure, word), MapOptions{})},

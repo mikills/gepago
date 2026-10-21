@@ -34,14 +34,12 @@ type State struct {
 }
 
 // stepScope restricts a State to one step's declared keys and buffers its writes until the
-// step succeeds. skipped holds the declared writes a skipped step may leave unwritten, and
-// rejected copies of the values the step tried to write but was refused, which the observer
-// events of a failed step redact.
+// step succeeds. rejected holds copies of the values the step tried to write but was refused,
+// which the observer events of a failed step redact.
 type stepScope struct {
 	reads    map[string]reflect.Type
 	writes   map[string]reflect.Type
 	pending  map[string]any
-	skipped  map[string]bool
 	rejected []stateWrite
 	err      error
 	// stage holds what the step stages for tools until it commits.
@@ -104,23 +102,6 @@ func (s *stepScope) attempted() []stateWrite {
 // readOnlyView returns a State over values that exposes only reads and refuses every write.
 func readOnlyView(values map[string]any, reads map[string]reflect.Type) State {
 	return State{values: values, scope: &stepScope{reads: reads, pending: map[string]any{}}}
-}
-
-// skip marks a declared write that a step skipped on error leaves unwritten. Outside a step
-// there is nothing to mark.
-func (s State) skip(key string) {
-	scope := s.scope
-	if scope == nil {
-		return
-	}
-	if _, ok := scope.writes[key]; !ok {
-		scope.fail(fmt.Errorf("state key %q is not a declared write", key))
-		return
-	}
-	if scope.skipped == nil {
-		scope.skipped = map[string]bool{}
-	}
-	scope.skipped[key] = true
 }
 
 // NewState creates a State holding a copy of values.

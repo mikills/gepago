@@ -218,31 +218,29 @@ This mirrors the GEPA paper's compound-system formulation `Φ = (M, C, X, Y)`: t
 reads, writes := []gepa.KeyRef{document.Ref()}, []gepa.KeyRef{amount.Ref()}
 extract := gepa.WithPolicy(
     gepa.NewProgramStep("extract", extractProgram, reads, writes),
-    gepa.StepPolicy{
-        Timeout: 20 * time.Second,
-        Retry:   gepa.RetryPolicy{MaxAttempts: 3},
-        OnError: gepa.OnErrorFallback(gepa.NewProgramStep("extract_small", smallProgram, reads, writes)),
-    },
+    gepa.StepPolicy{Timeout: 20 * time.Second, Retry: gepa.RetryPolicy{MaxAttempts: 3}},
 )
 
 spec := gepa.PipelineSpec{
     Inputs:   []gepa.KeyRef{document.Ref()},
-    Steps:    []gepa.Step{extract},
-    Defaults: []gepa.Default{gepa.DefaultValue(decision, "undecided")},
+    Defaults: []gepa.Default{gepa.DefaultValue(amount, 0), gepa.DefaultValue(decision, "undecided")},
     Budget:   gepa.RunBudget{MaxDuration: time.Minute, MaxModelCalls: 6, MaxTokens: 20000},
 }
-spec.Add(gepa.Branch("route", route, map[string]gepa.Step{"review": review, "approve": approve}, amount.Ref()))
+spec.Add(
+    gepa.Fallback("extracted", extract, gepa.NewProgramStep("extract_small", smallProgram, reads, writes)),
+    gepa.Branch("route", route, map[string]gepa.Step{"review": review, "approve": approve}, amount.Ref()),
+)
 pipeline, err := spec.Build()
 ```
 
 - `Transitions` move a run from a top-level step to a later one (skipping those between), back to an earlier one (a rewind, bounded by `MaxVisits`, with `Amend` and `Accept`), to `End` or to `Fail`. A step a transition skips over may not write, so a later reader of its keys needs a `Default`, which seeds the key before the first step.
 - `Branch` and `Fallback` build a `Flow` of ordinary steps and transitions that `PipelineSpec.Add` appends: `Branch` calls its condition once, writes the chosen label to a string key named after the branch and runs the arm with that label, all arms writing the same keys, and `Fallback` runs a secondary step when the primary fails with a non-permanent error. Budget their arms or steps by name; the steps a flow adds for routing and joining spend nothing.
-- `WithPolicy` gives a step a per-attempt `Timeout`, retries (of transient errors unless `RetryIf` says otherwise) and an action for when it still fails: `OnErrorFail`, `OnErrorSkip` or `OnErrorFallback(step)`.
+- `WithPolicy` gives a step a per-attempt `Timeout` and retries of transient errors; a step that still fails fails the run unless an `OnError` transition or a `Fallback` takes the run elsewhere.
 - `Parallel` runs steps with disjoint writes concurrently and commits them together, and `WithCache` reuses a step's result within a run when its key function returns a key it has seen.
 - `Map(name, items, item, body, results, opts)` runs `body` once per element of a list known only at run time, each element on its own view holding the element under `item`, at most `MaxConcurrency` at a time, and writes the outputs in input order; the first failure cancels the rest and commits nothing. `MapCollect` runs every element and writes a `MapResult` for each, with `Error` set for the ones that failed, so a later step can tell what is missing. Elements share the run's budget and tool scope, and their events carry `Attributes["index"]`.
 - `RunBudget` limits a run's duration, model calls, tokens and tokens per step; exceeding a limit fails with a `Budget` error naming it. A step reads what is left with `gepa.BudgetFrom(ctx).Remaining()`.
 
-`Build` checks all of this before the first run: transitions that name unknown steps or overlap as rewinds, an `Accept` on an `OnError` rewind, reads of keys a step may not write without a default, arms that disagree, overlapping parallel writes, a `Map` body that does not read its item, writes other than one key of the results' element type or reads a key that is not guaranteed, a skippable write with neither a default nor a later writer, and budgets that name unknown steps or a flow's routing and joining steps all fail it.
+`Build` checks all of this before the first run: transitions that name unknown steps or overlap as rewinds, an `Accept` on an `OnError` rewind, reads of keys a step may not write without a default, arms that disagree, overlapping parallel writes, a `Map` body that does not read its item, writes other than one key of the results' element type or reads a key that is not guaranteed, and budgets that name unknown steps or a flow's routing and joining steps all fail it.
 
 ## Tools
 

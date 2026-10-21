@@ -14,7 +14,7 @@ import (
 
 // TestNewEvaluationCaptureFindsThePipelinesOfAProgramme checks that the capture finds the
 // Redactors and key types of the pipelines a programme's structure shows, nested ones and
-// those inside composite steps and policy fallbacks included, each once, and not those of a
+// those inside composite steps and step policies included, each once, and not those of a
 // pipeline reached only through another kind of Program.
 func TestNewEvaluationCaptureFindsThePipelinesOfAProgramme(t *testing.T) {
 	scoreKey := Key[float64]{Name: "score"}
@@ -36,18 +36,17 @@ func TestNewEvaluationCaptureFindsThePipelinesOfAProgramme(t *testing.T) {
 	deepest := redacting("deepest", lengthStep())
 	parallel := redacting("parallel",
 		NewProgramStep("deepest", deepest, refs(docKey.Ref()), refs(amountKey.Ref())))
-	fallback := redacting("fallback", writing("write letter", letterKey.Ref()))
+	policy := redacting("policy", writing("write letter", letterKey.Ref()))
 	hidden := redacting("hidden", writing("write summary", summaryKey.Ref()))
 	listed := redacting("listed", writing("write score", scoreKey.Ref()))
 	outer, err := PipelineSpec{
 		Inputs: refs(docKey.Ref()),
 		Steps: []Step{
 			Parallel("fan", NewProgramStep("nested", parallel, refs(docKey.Ref()), refs(amountKey.Ref()))),
-			WithPolicy(writing("letter", letterKey.Ref()), StepPolicy{
-				OnError: OnErrorFallback(
-					NewProgramStep("letter fallback", fallback, refs(docKey.Ref()), refs(letterKey.Ref())),
-				),
-			}),
+			WithPolicy(
+				NewProgramStep("letter", policy, refs(docKey.Ref()), refs(letterKey.Ref())),
+				StepPolicy{Retry: RetryPolicy{MaxAttempts: 2}},
+			),
 			NewProgramStep("custom", programFunc(func(ctx context.Context, inputs Prediction) (Prediction, error) {
 				return hidden.RunCandidate(ctx, hidden.SeedCandidate(), inputs)
 			}), refs(docKey.Ref()), refs(summaryKey.Ref())),
@@ -72,7 +71,7 @@ func TestNewEvaluationCaptureFindsThePipelinesOfAProgramme(t *testing.T) {
 
 	capture := newEvaluationCapture(&program)
 	require.Len(t, capture.redactors, 5, "each pipeline's Redactor is found once")
-	for _, name := range []string{"outer", "parallel", "deepest", "fallback", "listed"} {
+	for _, name := range []string{"outer", "parallel", "deepest", "policy", "listed"} {
 		require.Equal(t, "["+name+"]", applyRedactors(capture.redactors, name, "secret"), name)
 	}
 	require.Equal(t, "secret", applyRedactors(capture.redactors, "hidden", "secret"),

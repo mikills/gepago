@@ -124,7 +124,6 @@ func (a *amendableStep) Name() string             { return a.child.name }
 func (a *amendableStep) Reads() []KeyRef          { return slices.Clone(a.child.reads) }
 func (a *amendableStep) Writes() []KeyRef         { return slices.Clone(a.child.writes) }
 func (a *amendableStep) wrapper() bool            { return true }
-func (a *amendableStep) skipsOnError() bool       { return false }
 func (a *amendableStep) children() []childStep    { return []childStep{{node: a.child}} }
 func (a *amendableStep) checkChildren() error     { return nil }
 func (a *amendableStep) seedCandidate() Candidate { return seedChildren(a.child) }

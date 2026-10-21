@@ -43,23 +43,20 @@ func newStepNode(step Step) *stepNode {
 }
 
 // compositeStep is implemented by this package's steps that hold others: WithPolicy, WithCache,
-// WithAmendable, Parallel and the v0.8.0 Branch and Fallback steps, which remain as
-// legacyBranch and legacyFallback. Build checks their children with the rules it applies to
-// top-level steps, and the pipeline runs each child on its own view of the state.
+// WithAmendable, Parallel, Map and MapCollect. Build checks their children with the rules it
+// applies to top-level steps, and the pipeline runs each child on its own view of the state.
 type compositeStep interface {
 	Step
 	// Validate checks the composite's own settings; Build checks its children separately.
 	Validate() error
 	// children returns the nested steps, each with the label Build uses for it in errors.
 	children() []childStep
-	// checkChildren applies the composite's own rules to its children, such as Branch arms
-	// writing the same keys.
+	// checkChildren applies the composite's own rules to its children, such as the steps of a
+	// Parallel writing different keys.
 	checkChildren() error
 	// wrapper reports whether the step wraps its first child under that child's name, writes
 	// and candidate components, as WithPolicy and WithCache do.
 	wrapper() bool
-	// skipsOnError reports whether the step commits defaults instead of failing.
-	skipsOnError() bool
 	seedCandidate() Candidate
 	runCandidate(ctx context.Context, candidate Candidate, s State) error
 }
@@ -238,31 +235,21 @@ func (p stepPosition) describe(problem string) string {
 	return fmt.Sprintf("pipeline step %q: %s %s", p.parent, p.label, problem)
 }
 
-// skippableStep is a step whose policy skips on error, with the top-level step containing it.
-type skippableStep struct {
-	index  int
-	name   string
-	writes []KeyRef
-}
-
 // pipelineBuilder checks a PipelineSpec step by step. sources holds the keys available after
-// the steps checked so far; maybeAbsent maps a key to the step that may skip writing it when
-// nothing guarantees the key exists afterwards.
+// the steps checked so far.
 //
 // flow holds what the two passes derive to check transitions and the keys each step may read
 // (see transitionFacts); used marks the defaults a step reads or writes; labels maps the label
 // key of each Branch checked so far to the Branch.
 type pipelineBuilder struct {
-	inputs      map[string]reflect.Type
-	merges      map[string]func(prev, next any) (any, error)
-	defaults    map[string]Default
-	tools       *ToolRegistry
-	toolPolicy  ToolPolicy
-	sources     map[string]keySource
-	names       map[string]bool
-	maybeAbsent map[string]string
-	skippable   []skippableStep
-	index       int
+	inputs     map[string]reflect.Type
+	merges     map[string]func(prev, next any) (any, error)
+	defaults   map[string]Default
+	tools      *ToolRegistry
+	toolPolicy ToolPolicy
+	sources    map[string]keySource
+	names      map[string]bool
+	index      int
 	// optional holds the optional outputs of each programme step, by step name.
 	optional map[string]map[string]bool
 
@@ -298,15 +285,14 @@ func newPipelineBuilder(
 		sources[name] = keySource{typ: def.Key.Type, def: true}
 	}
 	return &pipelineBuilder{
-		inputs:      inputs,
-		merges:      merges,
-		defaults:    defaults,
-		sources:     sources,
-		names:       map[string]bool{},
-		maybeAbsent: map[string]string{},
-		optional:    map[string]map[string]bool{},
-		used:        map[string]bool{},
-		labels:      map[string]string{},
+		inputs:   inputs,
+		merges:   merges,
+		defaults: defaults,
+		sources:  sources,
+		names:    map[string]bool{},
+		optional: map[string]map[string]bool{},
+		used:     map[string]bool{},
+		labels:   map[string]string{},
 	}
 }
 
@@ -375,9 +361,6 @@ func (b *pipelineBuilder) checkWrapper(node *stepNode, composite compositeStep, 
 	if err := composite.checkChildren(); err != nil {
 		return fmt.Errorf("pipeline step %q: %w", node.name, err)
 	}
-	if composite.skipsOnError() {
-		b.skippable = append(b.skippable, skippableStep{index: b.index, name: node.name, writes: node.writes})
-	}
 	if _, ok := unwrapComposite(node.step).(*amendableStep); ok && position.parent != "" {
 		return fmt.Errorf(
 			"pipeline step %q has amendable keys, but only a top-level step can be the target of a rewind",
@@ -406,20 +389,11 @@ func (b *pipelineBuilder) checkMap(node *stepNode, m *mapStep, position stepPosi
 	if err := b.checkElementKeys(node.name, m); err != nil {
 		return err
 	}
-	skippable := len(b.skippable)
 	b.sources[m.item.Name] = keySource{typ: m.item.Type, step: node.name}
 	err := b.checkStep(body, stepPosition{parent: node.name, label: "body"})
 	delete(b.sources, m.item.Name)
 	if err != nil {
 		return err
-	}
-	if len(b.skippable) > skippable {
-		return fmt.Errorf(
-			"pipeline step %q: body %q skips on error, but a map body must write; use MapCollect to keep "+
-				"the elements that succeed",
-			node.name,
-			body.name,
-		)
 	}
 	if node.readsErr != nil {
 		return fmt.Errorf("pipeline step %q reads: %w", node.name, node.readsErr)
@@ -526,15 +500,6 @@ func (b *pipelineBuilder) checkReads(node *stepNode) error {
 				key.Name,
 			)
 		}
-		if skipper, ok := b.maybeAbsent[key.Name]; ok {
-			return fmt.Errorf(
-				"pipeline step %q reads %q, which step %q may skip without writing; "+
-					"declare a default with DefaultValue or read it after its next writer",
-				node.name,
-				key.Name,
-				skipper,
-			)
-		}
 	}
 	return nil
 }
@@ -637,31 +602,12 @@ func (b *pipelineBuilder) bothCommit(key string) bool {
 	return earlier.reach <= b.index || b.flow.rewinds > earlier.rewinds
 }
 
-// register makes a checked top-level step's writes available to the steps after it. A key
-// that a step inside it may skip without a default stays possibly absent unless an earlier
-// step already guarantees it.
+// register makes a checked top-level step's writes available to the steps after it.
 func (b *pipelineBuilder) register(node *stepNode) {
-	skippers := map[string]string{}
-	for _, skippable := range b.skippable {
-		if skippable.index != b.index {
-			continue
-		}
-		for _, key := range skippable.writes {
-			if _, ok := b.defaults[key.Name]; !ok {
-				skippers[key.Name] = skippable.name
-			}
-		}
-	}
 	reach, unwritten := b.flow.reach(b.index), b.flow.mayNotWrite(b.index)
 	b.leave(node)
 	for _, key := range node.writes {
 		source, existed := b.sources[key.Name]
-		_, wasAbsent := b.maybeAbsent[key.Name]
-		if skipper, ok := skippers[key.Name]; ok && (!existed || wasAbsent) {
-			b.maybeAbsent[key.Name] = skipper
-		} else {
-			delete(b.maybeAbsent, key.Name)
-		}
 		if _, ok := b.defaults[key.Name]; !ok && unwritten {
 			b.flow.markUnwritten(key.Name, node.name, b.index)
 		}
@@ -673,30 +619,6 @@ func (b *pipelineBuilder) register(node *stepNode) {
 		source.writers++
 		b.sources[key.Name] = source
 	}
-}
-
-// checkSkips requires each write of a step that skips on error to have a default or a later
-// top-level writer, so the pipeline still produces every key when the step is skipped.
-func (b *pipelineBuilder) checkSkips(steps []*stepNode) error {
-	for _, skippable := range b.skippable {
-		for _, key := range skippable.writes {
-			if _, ok := b.defaults[key.Name]; ok {
-				continue
-			}
-			later := slices.ContainsFunc(steps[skippable.index+1:], func(node *stepNode) bool {
-				return node.writeTypes[key.Name] != nil
-			})
-			if !later {
-				return fmt.Errorf(
-					"pipeline step %q skips on error, but %q has no default and no later step writes it; "+
-						"declare a default with DefaultValue",
-					skippable.name,
-					key.Name,
-				)
-			}
-		}
-	}
-	return nil
 }
 
 // checkDefaults requires each default to be read or written by some step. The steps that read

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -37,14 +38,23 @@ func TestRecordingObserverRecordsFailuresAndParallelLanes(t *testing.T) {
 	silent := func(name string) gepa.Step {
 		return gepa.NewStep(name, nil, nil, func(context.Context, gepa.State) error { return errors.New("") })
 	}
+	var shakyAttempts atomic.Int32
+	shaky := gepa.NewStep("shaky", nil, nil, func(context.Context, gepa.State) error {
+		if shakyAttempts.Add(1) == 1 {
+			return gepa.TransientError(errors.New(""))
+		}
+		return nil
+	})
+	inner, err := gepa.PipelineSpec{Steps: []gepa.Step{noop("quiet"), noop("backup")}}.Build()
+	require.NoError(t, err)
 	recorder := &gepa.RecordingObserver{}
 	started := &startedSteps{lanes: map[string]string{}}
 	pipeline, err := gepa.PipelineSpec{
 		Steps: []gepa.Step{
 			gepa.Parallel("fan",
 				gepa.WithPolicy(noop("left"), gepa.StepPolicy{Retry: gepa.RetryPolicy{MaxAttempts: 2}}),
-				gepa.LegacyFallback("guard", silent("quiet"), noop("backup")),
-				gepa.WithPolicy(silent("shaky"), gepa.StepPolicy{OnError: gepa.OnErrorFallback(noop("spare"))}),
+				gepa.NewProgramStep("guard", inner, nil, nil),
+				gepa.WithPolicy(shaky, gepa.StepPolicy{Retry: gepa.RetryPolicy{MaxAttempts: 2}}),
 			),
 			silent("last"),
 		},
@@ -56,28 +66,38 @@ func TestRecordingObserverRecordsFailuresAndParallelLanes(t *testing.T) {
 
 	require.Error(t, err)
 	require.Equal(t, map[string]string{
-		"fan": "", "left": "left", "guard": "guard", "quiet": "", "backup": "", "shaky": "shaky", "spare": "shaky",
-		"last": "",
-	}, started.lanes, "a step of a Parallel and its policy's fallback share a lane, and the steps nested in them have none")
+		"fan": "", "left": "left", "guard": "guard", "quiet": "", "backup": "", "shaky": "shaky", "last": "",
+	}, started.lanes, "a step of a Parallel and its policy's retries share a lane, and the steps nested in them have none")
 	trace := onlyTrace(t, recorder)
 	require.True(t, trace.Failed)
 	fan, last := trace.Steps[0], trace.Steps[1]
 	require.False(t, fan.Failed)
 	require.Empty(t, fan.Lane)
-	byName := func(name string) gepa.StepTrace {
-		return fan.Steps[slices.IndexFunc(fan.Steps, func(step gepa.StepTrace) bool { return step.Step == name })]
+	byName := func(name string) []gepa.StepTrace {
+		var steps []gepa.StepTrace
+		for _, step := range fan.Steps {
+			if step.Step == name {
+				steps = append(steps, step)
+			}
+		}
+		return steps
 	}
-	guard := byName("guard")
+	guard := byName("guard")[0]
 	require.Equal(t, "guard", guard.Lane)
 	require.False(t, guard.Failed)
-	quiet := guard.Steps[0]
-	require.Equal(t, "quiet", quiet.Step)
-	require.True(t, quiet.Failed, "a step that fails with an empty message failed")
-	require.Empty(t, quiet.Err)
-	require.Empty(t, quiet.Lane)
-	require.Equal(t, "shaky", byName("shaky").Lane)
-	require.True(t, byName("shaky").Failed)
-	require.Equal(t, "shaky", byName("spare").Lane)
+	require.Len(t, guard.Runs, 1)
+	require.Equal(t, []string{"quiet", "backup"}, stepNames(guard.Runs[0].Steps))
+	for _, nested := range guard.Runs[0].Steps {
+		require.Empty(t, nested.Lane, nested.Step)
+	}
+	attempts := byName("shaky")
+	require.Len(t, attempts, 2)
+	slices.SortFunc(attempts, func(a, b gepa.StepTrace) int { return a.Attempt - b.Attempt })
+	require.Equal(t, "shaky", attempts[0].Lane)
+	require.True(t, attempts[0].Failed, "a step that fails with an empty message failed")
+	require.Empty(t, attempts[0].Err)
+	require.Equal(t, "shaky", attempts[1].Lane, "a retry keeps the lane of the step it retries")
+	require.False(t, attempts[1].Failed)
 	require.True(t, last.Failed)
 	require.Empty(t, last.Err)
 
@@ -93,10 +113,10 @@ func TestRecordingObserverRecordsFailuresAndParallelLanes(t *testing.T) {
 			{Step: "fan"},
 			{Step: "fan.left"},
 			{Step: "fan.guard"},
-			{Step: "fan.guard.quiet", Failed: true},
+			{Step: "fan.guard.quiet"},
 			{Step: "fan.guard.backup"},
-			{Step: "fan.shaky", Failed: true},
-			{Step: "fan.spare"},
+			{Step: "fan.shaky", Attempt: 1, Failed: true, ErrKind: gepa.Transient},
+			{Step: "fan.shaky", Attempt: 2},
 			{Step: "last", Failed: true},
 		},
 		Failed: true,

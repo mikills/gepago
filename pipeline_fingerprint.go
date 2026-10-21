@@ -25,11 +25,10 @@ const pipelineFingerprintVersion = 1
 //   - the pipeline inputs, by name and type;
 //   - the top-level steps, in order;
 //   - each step's name and its reads and writes, by name and type, for nested steps too;
-//   - the structure of composite steps: the steps of a Parallel and the fallback step of a
-//     WithPolicy, the labels of a Branch's arms and the roles of a Fallback's steps, which the
-//     steps Branch and Fallback add record, and the body of a Map or MapCollect, which of its
-//     reads holds the items, its item key by name and type, its results key, and its
-//     MapOptions;
+//   - the structure of composite steps: the steps of a Parallel, the labels of a Branch's arms
+//     and the roles of a Fallback's steps, which the steps Branch and Fallback add record, and
+//     the body of a Map or MapCollect, which of its reads holds the items, its item key by name
+//     and type, its results key, and its MapOptions;
 //   - for a NewProgramStep whose programme is a Fingerprinter, such as a nested Pipeline, that
 //     programme's fingerprint;
 //   - the transitions, in order, by From, To, OnError and whether When, Amend and Accept are
@@ -39,8 +38,7 @@ const pipelineFingerprintVersion = 1
 // pipeline: candidate components and their text (instructions, demos and other prompts), the
 // Go type and code of each step, the code of a transition's When, Amend and Accept, a programme
 // that is not a Fingerprinter, merge functions, Defaults, Budget, AllowExtraInputs, the
-// timeout, retries and error action of a WithPolicy apart from its fallback step, and
-// WithCache, which adds nothing to the step it wraps. Reads, writes and the steps of a Parallel
+// timeout and retries of a WithPolicy, and WithCache, which adds nothing to the step it wraps. Reads, writes and the steps of a Parallel
 // are taken in name order, so declaring them in another order keeps the fingerprint. A named
 // type is identified by its package path and name, not by its definition, so changing the
 // fields of a named struct type keeps the fingerprint; give the artefact and the loader a
@@ -107,9 +105,8 @@ type keyShape struct {
 }
 
 // stepShape is the shape of one step. Kind is "step" for a step that is not a composite;
-// Program is the fingerprint of a Fingerprinter programme behind NewProgramStep; Fallbacks
-// holds the fallback steps of the policies wrapping the step, innermost first; Amendable holds
-// the keys WithAmendable declares; Map holds what a Map or MapCollect adds to its body.
+// Program is the fingerprint of a Fingerprinter programme behind NewProgramStep; Amendable
+// holds the keys WithAmendable declares; Map holds what a Map or MapCollect adds to its body.
 type stepShape struct {
 	Kind      string       `json:"kind"`
 	Name      string       `json:"name"`
@@ -117,7 +114,6 @@ type stepShape struct {
 	Writes    []keyShape   `json:"writes"`
 	Program   string       `json:"program,omitempty"`
 	Children  []childShape `json:"children,omitempty"`
-	Fallbacks []stepShape  `json:"fallbacks,omitempty"`
 	Amendable []keyShape   `json:"amendable,omitempty"`
 	Map       *mapShape    `json:"map,omitempty"`
 }
@@ -146,9 +142,6 @@ func shapeOf(node *stepNode) stepShape {
 	switch s := step.(type) {
 	case *policyStep:
 		shape = shapeOf(s.child)
-		if s.fallback != nil {
-			shape.Fallbacks = append(shape.Fallbacks, shapeOf(s.fallback))
-		}
 	case *cacheStep:
 		shape = shapeOf(s.child)
 	case *amendableStep:
@@ -157,23 +150,12 @@ func shapeOf(node *stepNode) stepShape {
 		slices.SortFunc(shape.Amendable, func(a, b keyShape) int {
 			return cmp.Or(strings.Compare(a.Name, b.Name), strings.Compare(a.Type, b.Type))
 		})
-	case *branchStep:
-		shape.Kind = "branch"
-		for _, label := range s.labels {
-			shape.Children = append(shape.Children, childShape{Label: label, Step: shapeOf(s.arms[label])})
-		}
 	case *parallelStep:
 		shape.Kind = "parallel"
 		for _, child := range s.steps {
 			shape.Children = append(shape.Children, childShape{Step: shapeOf(child)})
 		}
 		slices.SortFunc(shape.Children, func(a, b childShape) int { return strings.Compare(a.Step.Name, b.Step.Name) })
-	case *fallbackStep:
-		shape.Kind = "fallback"
-		shape.Children = []childShape{
-			{Label: "primary", Step: shapeOf(s.primary)},
-			{Label: "secondary", Step: shapeOf(s.secondary)},
-		}
 	case *branchRoute:
 		// the arms are top-level steps with shapes of their own; the route keeps their labels.
 		shape.Kind = "branch route"

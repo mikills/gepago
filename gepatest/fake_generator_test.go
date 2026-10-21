@@ -267,7 +267,7 @@ func TestFakeGeneratorUnmatched(t *testing.T) {
 		unmatched[1].Request.Messages[0].Content = "changed"
 		require.Equal(t, "a stray chat", fake.Unmatched()[1].Request.Messages[0].Content, "Unmatched returns copies")
 	})
-	t.Run("catches a call a step policy hides", func(t *testing.T) {
+	t.Run("catches a call an OnError transition hides", func(t *testing.T) {
 		fake := gepatest.NewFakeGenerator().OnStep("other", gepatest.Text("x"))
 		draft := gepa.NewStep("draft", nil, nil, func(ctx context.Context, _ gepa.State) error {
 			_, err := fake.Generate(ctx, "draft a reply")
@@ -275,13 +275,14 @@ func TestFakeGeneratorUnmatched(t *testing.T) {
 		})
 		template := gepa.NewStep("template", nil, nil, func(context.Context, gepa.State) error { return nil })
 		pipeline, err := gepa.PipelineSpec{
-			Steps: []gepa.Step{gepa.WithPolicy(draft, gepa.StepPolicy{OnError: gepa.OnErrorFallback(template)})},
+			Steps:       []gepa.Step{draft, template},
+			Transitions: []gepa.Transition{{From: "draft", OnError: true, To: "template"}},
 		}.Build()
 		require.NoError(t, err)
 
 		_, err = pipeline.Run(context.Background(), gepa.NewState(nil))
 
-		require.NoError(t, err, "the fallback hides the missing script")
+		require.NoError(t, err, "the transition hides the missing script")
 		unmatched := fake.Unmatched()
 		require.Len(t, unmatched, 1)
 		require.Equal(t, "draft", unmatched[0].Step)

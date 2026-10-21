@@ -36,9 +36,9 @@ var (
 	large = gepa.Usage{PromptTokens: 10, CompletionTokens: 20, TotalTokens: 30, CachedInputTokens: 4}
 )
 
-// sampleTrace has a retried step, a Parallel whose second step started first, and a step that
-// ran a nested pipeline twice. It has no times, so AssertTrace fixes the order of none of its
-// executions.
+// sampleTrace has a retried step, a Parallel whose second step started first, a step that ran a
+// nested pipeline twice and a second visit with unbudgeted usage. It has no times, so
+// AssertTrace fixes the order of none of its executions.
 func sampleTrace() gepa.PipelineTrace {
 	return gepa.PipelineTrace{
 		Usage: large,
@@ -53,7 +53,7 @@ func sampleTrace() gepa.PipelineTrace {
 				{Steps: []gepa.StepTrace{{Step: "inner", Attempt: 1, Err: "first run"}}},
 				{Steps: []gepa.StepTrace{{Step: "inner", Attempt: 1}}},
 			}},
-			{Step: "optional", Attempt: 1, Skipped: true},
+			{Step: "optional", Attempt: 1, Unbudgeted: small, Attributes: map[string]int{"visit": 2}},
 		},
 	}
 }
@@ -62,7 +62,7 @@ func sampleExpectation() gepatest.ExpectedTrace {
 	return gepatest.ExpectedTrace{
 		Usage: large,
 		Steps: []gepatest.ExpectedStep{
-			{Step: "optional", Skipped: true},
+			{Step: "optional", Unbudgeted: small, Attributes: map[string]int{"visit": 2}},
 			{Step: "fan.right", Cached: true},
 			{Step: "fan.left", Usage: small, ToolCalls: []string{"a", "b"}},
 			{Step: "fan", Usage: small},
@@ -115,7 +115,17 @@ func TestAssertTraceReportsADiff(t *testing.T) {
 		Steps: []gepatest.ExpectedStep{
 			{Step: "extract", Usage: small},
 			{Step: "decide", Err: "kaboom"},
-			{Step: "missing", Attempt: 2, Failed: true, Cached: true, Skipped: true, ToolCalls: []string{"x"}},
+			{
+				Step:           "missing",
+				Attempt:        2,
+				Attributes:     map[string]int{"visit": 2},
+				Failed:         true,
+				Cached:         true,
+				Unbudgeted:     small,
+				ToolCalls:      []string{"x"},
+				RewindRejected: true,
+				Transition:     &gepa.TransitionTrace{From: "missing", To: gepa.End, Rule: 3},
+			},
 		},
 	}
 	recorder := &recordingT{}
@@ -127,7 +137,7 @@ step executions, in the order they ran:
     extract #1 ok usage{prompt=1 completion=2 total=3}
   - decide #1 failed, error containing "kaboom"
   + decide #1 failed: "boom" (permanent)
-  - missing #2 failed cached skipped tools[x]
+  - missing #2 failed visit=2 cached unbudgeted usage{prompt=1 completion=2 total=3} tools[x] rewind rejected transition 3 missing -> $end
   + extra #1 ok
 run:
   - run ok usage{prompt=10 completion=20 total=30 cached_input=4}
@@ -196,7 +206,84 @@ func TestAssertTraceComparesEveryField(t *testing.T) {
 			false,
 		},
 		{"cached", gepa.StepTrace{Step: "s", Attempt: 1, Cached: true}, gepatest.ExpectedStep{Step: "s"}, false},
-		{"skipped", gepa.StepTrace{Step: "s", Attempt: 1}, gepatest.ExpectedStep{Step: "s", Skipped: true}, false},
+		{
+			"unbudgeted usage",
+			gepa.StepTrace{Step: "s", Attempt: 1, Unbudgeted: small},
+			gepatest.ExpectedStep{Step: "s"},
+			false,
+		},
+		{
+			"same unbudgeted usage",
+			gepa.StepTrace{Step: "s", Attempt: 1, Unbudgeted: small},
+			gepatest.ExpectedStep{Step: "s", Unbudgeted: small},
+			true,
+		},
+		{
+			"an attribute",
+			gepa.StepTrace{Step: "s", Attempt: 1, Attributes: map[string]int{"visit": 2}},
+			gepatest.ExpectedStep{Step: "s", Attributes: map[string]int{"visit": 2}},
+			true,
+		},
+		{
+			"another value of an attribute",
+			gepa.StepTrace{Step: "s", Attempt: 1, Attributes: map[string]int{"visit": 1}},
+			gepatest.ExpectedStep{Step: "s", Attributes: map[string]int{"visit": 2}},
+			false,
+		},
+		{
+			"an absent attribute",
+			gepa.StepTrace{Step: "s", Attempt: 1, Attributes: map[string]int{"visit": 1}},
+			gepatest.ExpectedStep{Step: "s", Attributes: map[string]int{"failed": 0}},
+			false,
+		},
+		{
+			"attributes not listed",
+			gepa.StepTrace{Step: "s", Attempt: 1, Attributes: map[string]int{"visit": 3, "failed": 1}},
+			gepatest.ExpectedStep{Step: "s", Attributes: map[string]int{"failed": 1}},
+			true,
+		},
+		{
+			"a transition",
+			gepa.StepTrace{Step: "s", Attempt: 1, Transition: &gepa.TransitionTrace{From: "s", To: "t", Rule: 1}},
+			gepatest.ExpectedStep{Step: "s", Transition: &gepa.TransitionTrace{From: "s", To: "t", Rule: 1}},
+			true,
+		},
+		{
+			"an unexpected transition",
+			gepa.StepTrace{Step: "s", Attempt: 1, Transition: &gepa.TransitionTrace{From: "s", To: "t", Rule: 1}},
+			gepatest.ExpectedStep{Step: "s"},
+			false,
+		},
+		{
+			"a missing transition",
+			gepa.StepTrace{Step: "s", Attempt: 1},
+			gepatest.ExpectedStep{Step: "s", Transition: &gepa.TransitionTrace{From: "s", To: "t"}},
+			false,
+		},
+		{
+			"another rule",
+			gepa.StepTrace{Step: "s", Attempt: 1, Transition: &gepa.TransitionTrace{From: "s", To: "t", Rule: 1}},
+			gepatest.ExpectedStep{Step: "s", Transition: &gepa.TransitionTrace{From: "s", To: "t", Rule: 2}},
+			false,
+		},
+		{
+			"a rewind",
+			gepa.StepTrace{Step: "s", Attempt: 1, Transition: &gepa.TransitionTrace{From: "s", To: "r", Rewind: true}},
+			gepatest.ExpectedStep{Step: "s", Transition: &gepa.TransitionTrace{From: "s", To: "r"}},
+			false,
+		},
+		{
+			"a rejected rewind",
+			gepa.StepTrace{Step: "s", Attempt: 1, RewindRejected: true},
+			gepatest.ExpectedStep{Step: "s"},
+			false,
+		},
+		{
+			"an expected rejected rewind",
+			gepa.StepTrace{Step: "s", Attempt: 1, RewindRejected: true},
+			gepatest.ExpectedStep{Step: "s", RewindRejected: true},
+			true,
+		},
 		{"usage", gepa.StepTrace{Step: "s", Attempt: 1, Usage: small}, gepatest.ExpectedStep{Step: "s"}, false},
 		{
 			"one usage count",
@@ -256,6 +343,13 @@ func TestAssertTraceComparesTheRun(t *testing.T) {
 		{"other error", failed, gepatest.ExpectedTrace{Err: "cancelled", Usage: small}, false},
 		{"other kind", failed, gepatest.ExpectedTrace{Err: "spent", ErrKind: gepa.Transient, Usage: small}, false},
 		{"usage", failed, gepatest.ExpectedTrace{Err: "spent", Usage: large}, false},
+		{
+			"unbudgeted usage",
+			gepa.PipelineTrace{Unbudgeted: small},
+			gepatest.ExpectedTrace{Unbudgeted: small},
+			true,
+		},
+		{"unexpected unbudgeted usage", gepa.PipelineTrace{Unbudgeted: small}, gepatest.ExpectedTrace{}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

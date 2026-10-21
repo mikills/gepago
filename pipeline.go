@@ -334,7 +334,7 @@ type PipelineSpec struct {
 	// run goes through the run's one ToolSession. Its ToolMemory is the one the run's context
 	// carries (see WithToolMemory) or a new one; each step's memory writes reach it only when
 	// the step's state writes commit (see ToolMemory), and so do the results the step adds to
-	// the session's cache under ToolPolicy.Cache, so a retry, a fallback or a later step that
+	// the session's cache under ToolPolicy.Cache, so a retry or a later step, such as a Fallback's, that
 	// repeats a call of a failed step invokes the tool again. Within one step execution a
 	// repeated call is answered from the results that execution and the steps it runs inside
 	// staged.
@@ -415,9 +415,7 @@ func (s keySource) describe(key string) string {
 // Steps nested in WithPolicy, WithCache, WithAmendable, Parallel, Map and MapCollect are checked
 // by the same rules against the keys available before the top-level step that contains them,
 // a Map's body also seeing the Map's item (see Map), and every step name, nested ones included,
-// must be unique. Each write of a step whose policy skips on
-// error needs a default in Defaults or a later step that writes it, and no step may read such
-// a key between the skippable step and its next writer unless it has a default.
+// must be unique.
 //
 // Every tool and chat middleware that a ToolStep, or a Predict or TypedPredict run by
 // NewProgramStep, names must be registered on Tools, and every such tool allowed by
@@ -499,9 +497,6 @@ func (s PipelineSpec) build(work *int) (Pipeline, error) {
 	if err := checkCandidateKeys(steps); err != nil {
 		return Pipeline{}, err
 	}
-	if err := builder.checkSkips(steps); err != nil {
-		return Pipeline{}, err
-	}
 	if err := builder.checkDefaults(); err != nil {
 		return Pipeline{}, err
 	}
@@ -561,7 +556,7 @@ func isNil(value any) bool {
 // state accumulated by the steps before it. Details holds diagnostics the step attached with
 // WithStepDetails; a step that panicked has the stack under "stack".
 //
-// When a step nested in a composite step (a Parallel, a policy fallback or the body of a Map)
+// When a step nested in a composite step (a Parallel or the body of a Map)
 // fails, the composite's StepError wraps a StepError for the nested step, so the message
 // names each step from the top-level one down, with a Map's element index between the two, and
 // Details holds the innermost diagnostics.
@@ -629,9 +624,8 @@ func (p Pipeline) Validate() error {
 
 // SeedCandidate returns the components of every ComponentStep under step-scoped names. A
 // component of a nested step is scoped by each enclosing step, as "<outer>.<inner>.<component>".
-// WithPolicy, WithCache and WithAmendable add no scope of their own, and an OnErrorFallback step is scoped
-// beside the step it stands in for. Build rejects a pipeline in which two components would
-// share a key.
+// WithPolicy, WithCache and WithAmendable add no scope of their own. Build rejects a pipeline in
+// which two components would share a key.
 func (p Pipeline) SeedCandidate() Candidate {
 	return seedChildren(p.steps...)
 }

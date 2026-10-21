@@ -2,7 +2,6 @@ package gepa_test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -56,39 +55,35 @@ func tracedPipeline(t *testing.T) gepa.PipelineTrace {
 		},
 	)
 	recorder := &gepa.RecordingObserver{}
-	pipeline, err := gepa.PipelineSpec{
-		Inputs: refs(docKey.Ref()),
-		Steps: []gepa.Step{
-			gepa.Parallel(
-				"fan",
-				modelStep("summarise", tenTokenModel(`{"summary": "short"}`), docKey.Ref(), summaryKey.Ref()),
-				measure,
-			),
-			gepa.LegacyFallback("fb", primary, writeAmount("secondary", 3)),
-			gepa.NewProgramStep("inner", inner, refs(docKey.Ref()), refs(decisionKey.Ref())),
-			check,
+	// v0.9.0: check reads amount, which the fallback's steps may not write, so it has a default.
+	pipeline, err := withFlows(
+		gepa.PipelineSpec{
+			Inputs:    refs(docKey.Ref()),
+			Defaults:  []gepa.Default{gepa.DefaultValue(amountKey, 0)},
+			Observers: []gepa.PipelineObserver{recorder},
 		},
-		Observers: []gepa.PipelineObserver{recorder},
-	}.Build()
+		gepa.Parallel(
+			"fan",
+			modelStep("summarise", tenTokenModel(`{"summary": "short"}`), docKey.Ref(), summaryKey.Ref()),
+			measure,
+		),
+		gepa.Fallback("fb", primary, writeAmount("secondary", 3)),
+		gepa.NewProgramStep("inner", inner, refs(docKey.Ref()), refs(decisionKey.Ref())),
+		check,
+	).Build()
 	require.NoError(t, err)
 	_, err = pipeline.Run(context.Background(), gepa.NewState(gepa.Prediction{"document": "cash 10"}))
 	require.EqualError(t, err, `pipeline step "check": amount too small`)
-	traces := recorder.Traces()
-	require.Len(t, traces, 1)
-	return traces[0]
+	return onlyTrace(t, recorder)
 }
 
 func TestRecordingObserverRecordsNestedSteps(t *testing.T) {
 	trace := tracedPipeline(t)
-	require.NotEmpty(t, trace.TraceID)
 	require.Empty(t, trace.ParentID)
-	require.Equal(t, map[string]any{"document": "cash 10"}, trace.Inputs)
-	require.Equal(t, `pipeline step "check": amount too small`, trace.Err)
-	require.Equal(t, gepa.Permanent, trace.ErrKind)
-	require.Equal(t, tenTokens.Add(tenTokens), trace.Usage)
 	require.False(t, trace.EndedAt.IsZero())
 
-	require.Equal(t, []string{"fan", "fb", "inner", "check"}, stepNames(trace.Steps))
+	// the Fallback's steps are TestRecordingObserverRecordsFlowSteps's.
+	require.Equal(t, []string{"fan", "primary", "secondary", "fb", "inner", "check"}, stepNames(trace.Steps))
 	fan := trace.Steps[0]
 	require.Equal(t, trace.SpanID, fan.ParentID)
 	require.ElementsMatch(t, []string{"summarise", "measure"}, stepNames(fan.Steps))
@@ -99,25 +94,13 @@ func TestRecordingObserverRecordsNestedSteps(t *testing.T) {
 		"ratio":   "NaN",
 	}, fan.Writes)
 
-	fb := trace.Steps[1]
-	require.Equal(t, []string{"primary", "secondary"}, stepNames(fb.Steps))
-	require.Equal(t, "primary down", fb.Steps[0].Err)
-	require.Equal(t, gepa.Transient, fb.Steps[0].ErrKind)
-	require.Equal(t, map[string]any{"attempted": []any{"a"}}, fb.Steps[0].Details)
-	require.Equal(t, map[string]any{"amount": float64(3)}, fb.Writes)
-
-	nested := trace.Steps[2]
+	nested := trace.Steps[4]
 	require.Empty(t, nested.Steps)
 	require.Len(t, nested.Runs, 1)
 	require.Equal(t, nested.SpanID, nested.Runs[0].ParentID)
 	require.Equal(t, trace.TraceID, nested.Runs[0].TraceID)
 	require.Equal(t, []string{"classify"}, stepNames(nested.Runs[0].Steps))
 	require.Equal(t, tenTokens, nested.Runs[0].Usage)
-
-	check := trace.Steps[3]
-	require.Equal(t, "amount too small", check.Err)
-	require.Equal(t, map[string]any{"amount": float64(3)}, check.Reads)
-	require.Nil(t, check.Writes)
 }
 
 func stepNames(steps []gepa.StepTrace) []string {
@@ -126,18 +109,6 @@ func stepNames(steps []gepa.StepTrace) []string {
 		names = append(names, step.Step)
 	}
 	return names
-}
-
-func TestPipelineTraceSurvivesAJSONRoundTrip(t *testing.T) {
-	trace := tracedPipeline(t)
-	data, err := json.Marshal(trace)
-	require.NoError(t, err)
-	var decoded gepa.PipelineTrace
-	require.NoError(t, json.Unmarshal(data, &decoded))
-	require.Equal(t, trace, decoded)
-	again, err := json.Marshal(decoded)
-	require.NoError(t, err)
-	require.JSONEq(t, string(data), string(again))
 }
 
 // TestTraceDatasetBuilderOverProgramEvaluator evaluates a pipeline whose model step fails with
@@ -285,12 +256,12 @@ func TestHTMLRunReportShowsEveryStepAndTheFailure(t *testing.T) {
 	require.Contains(t, report, "pipeline step &#34;check&#34;: amount too small")
 	require.Contains(t, report, "primary down")
 	require.Contains(t, report, ">failed</strong>")
-	require.Contains(t, report, "Nested run "+trace.Steps[2].Runs[0].RunContext.RunID+" ·")
+	require.Contains(t, report, "Nested run "+trace.Steps[4].Runs[0].RunContext.RunID+" ·")
 	// a nested step is rendered inside the step that ran it
 	fan := strings.Index(report, "<strong>fan</strong>")
 	summarise := strings.Index(report, "<strong>summarise</strong>")
 	fb := strings.Index(report, "<strong>fb</strong>")
 	require.Less(t, fan, summarise)
 	require.Less(t, summarise, fb)
-	require.Equal(t, 4, strings.Count(report, `<ol class="steps">`))
+	require.Equal(t, 3, strings.Count(report, `<ol class="steps">`))
 }

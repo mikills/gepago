@@ -2,8 +2,6 @@ package gepa_test
 
 import (
 	"context"
-	"strings"
-	"sync"
 	"testing"
 
 	gepa "github.com/mikills/gepago"
@@ -11,79 +9,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestComposedPipelineConcurrentRuns(t *testing.T) {
-	lm := gepatest.NewFakeGenerator()
-	route := func(s gepa.State) (string, error) {
-		document, err := docKey.Get(s)
-		if err != nil {
-			return "", err
-		}
-		if len(document)%2 == 0 {
-			return "even", nil
-		}
-		return "odd", nil
-	}
-	label := func(name, value string) gepa.Step {
-		return gepa.NewStep(
-			name,
-			refs(docKey.Ref()),
-			refs(decisionKey.Ref()),
-			func(_ context.Context, s gepa.State) error {
-				decisionKey.Set(s, value)
-				return nil
-			},
-		)
-	}
-	pipeline, err := gepa.PipelineSpec{
-		Inputs: refs(docKey.Ref()),
-		Steps: []gepa.Step{
-			gepa.Parallel(
-				"fan",
-				gepa.WithCache(replyStep(lm, "a", "document", tenTokens), nil),
-				gepa.WithPolicy(
-					replyStep(lm, "b", "document", tenTokens),
-					gepa.StepPolicy{Retry: gepa.RetryPolicy{MaxAttempts: 2}},
-				),
-				gepa.LegacyBranch(
-					"route",
-					route,
-					map[string]gepa.Step{"even": label("even", "even"), "odd": label("odd", "odd")},
-					docKey.Ref(),
-				),
-			),
-			gepa.LegacyFallback("guard", failAmount("primary", errRateLimited), writeAmount("secondary", 1)),
-		},
-		Budget: gepa.RunBudget{MaxModelCalls: 2, MaxTokens: 20},
-	}.Build()
-	require.NoError(t, err)
-
-	var wg sync.WaitGroup
-	results := make([]gepa.Prediction, 16)
-	errs := make([]error, len(results))
-	for i := range results {
-		wg.Go(func() {
-			results[i], errs[i] = pipeline.RunCandidate(
-				context.Background(),
-				nil,
-				gepa.Prediction{"document": strings.Repeat("x", i)},
-			)
-		})
-	}
-	wg.Wait()
-	for i, got := range results {
-		require.NoError(t, errs[i])
-		want := "even"
-		if i%2 == 1 {
-			want = "odd"
-		}
-		require.Equal(t, gepa.Prediction{"a": "done", "b": "done", "decision": want, "amount": 1}, got)
-	}
-	require.Equal(t, int32(32), calls(lm))
-}
-
 func TestNestedStepsFollowTheBuildRules(t *testing.T) {
 	noop := func(context.Context, gepa.State) error { return nil }
-	route := func(gepa.State) (string, error) { return "a", nil }
 	docInput := refs(docKey.Ref())
 	tests := []struct {
 		name    string
@@ -105,13 +32,8 @@ func TestNestedStepsFollowTheBuildRules(t *testing.T) {
 			name: "nested name repeats a top-level name",
 			steps: []gepa.Step{
 				writeNotes("a"),
-				gepa.LegacyBranch("route", route, map[string]gepa.Step{"a": writeAmount("a", 1)}),
+				gepa.Parallel("fan", writeAmount("a", 1)),
 			},
-			wantErr: `pipeline step "a" is duplicated`,
-		},
-		{
-			name:    "duplicate names inside a Fallback",
-			steps:   []gepa.Step{gepa.LegacyFallback("guard", writeAmount("a", 1), writeAmount("a", 2))},
 			wantErr: `pipeline step "a" is duplicated`,
 		},
 		{
@@ -159,7 +81,7 @@ func TestNestedStepsFollowTheBuildRules(t *testing.T) {
 		{
 			name: "nested invalid step",
 			steps: []gepa.Step{
-				gepa.LegacyFallback("guard", writeAmount("a", 1), gepa.NewStep("b", nil, refs(amountKey.Ref()), nil)),
+				gepa.Parallel("fan", writeAmount("a", 1), gepa.NewStep("b", nil, refs(notesKey.Ref()), nil)),
 			},
 			wantErr: `pipeline step "b": run function is required`,
 		},

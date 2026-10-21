@@ -8,10 +8,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The tests of Branch and Fallback below port those of the v0.8.0 composites, now named
-// TestLegacyBranch* and TestLegacyFallback*, with the same scenarios and expected values. Where
-// an expectation changed because the arms or the fallback's steps are now top-level steps, a
-// "v0.9.0" comment says how.
+// The tests of Branch and Fallback below port those of the v0.8.0 composites, with the same
+// scenarios and expected values. Where an expectation changed because the arms or the fallback's
+// steps are now top-level steps, a "v0.9.0" comment says how.
 
 // flowSpec returns a spec of steps followed by flow.
 func flowSpec(inputs []KeyRef, flow Flow, steps ...Step) PipelineSpec {

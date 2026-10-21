@@ -60,10 +60,9 @@ type StepTrace struct {
 	Reads   map[string]any `json:"reads,omitempty"`
 	Writes  map[string]any `json:"writes,omitempty"`
 	Cached  bool           `json:"cached,omitempty"`
-	Skipped bool           `json:"skipped,omitempty"`
 	// Lane names the step of a Parallel the execution belongs to when the execution is that step
-	// or one its step policy ran, such as a retry or an OnErrorFallback step; it is empty
-	// otherwise, for the executions nested in them too. The executions of different lanes of a
+	// or one its step policy ran, such as a retry; it is empty otherwise, for the executions
+	// nested in them too. The executions of different lanes of a
 	// Parallel ran side by side, so they may have started in any order.
 	Lane string `json:"lane,omitempty"`
 	// Attributes are the execution's, as StepStartedEvent reported them, such as its "visit" and
@@ -190,7 +189,6 @@ func (r *RecordingObserver) StepFinished(_ context.Context, event StepFinishedEv
 	step.trace.Reads = traceValues(event.Reads)
 	step.trace.Writes = traceValues(event.Writes)
 	step.trace.Cached = event.Cached
-	step.trace.Skipped = event.Skipped
 	step.trace.Attributes = traceAttributes(event.Attributes)
 	step.trace.ToolCalls = traceToolCalls(event.ToolCalls)
 }
@@ -403,7 +401,7 @@ func isTraceDatasetBuilder(builder ReflectiveDatasetBuilder) bool {
 //
 // Each step record holds "trace_id", "step", the step's name, "attempt", "reads", "writes" and
 // "usage", and for a failed execution "error" and, when the step attached any, "details". A
-// cache hit adds "cached" and a skip "skipped".
+// cache hit adds "cached".
 func (TraceDatasetBuilder) BuildReflectiveDataset(
 	candidate Candidate,
 	eval EvaluationResult,
@@ -534,9 +532,6 @@ func stepRecord(traceID string, step StepTrace) ReflectiveRecord {
 	}
 	if step.Cached {
 		record["cached"] = true
-	}
-	if step.Skipped {
-		record["skipped"] = true
 	}
 	return record
 }

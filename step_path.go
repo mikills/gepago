@@ -30,3 +30,15 @@ func StepPathFrom(ctx context.Context) (string, bool) {
 	slices.Reverse(names)
 	return strings.Join(names, "."), true
 }
+
+// StepAttributesFrom returns the attributes of the pipeline step execution running with ctx, as
+// its StepStartedEvent reports them: "visit", which numbers from one the visits of the
+// top-level step it belongs to, and, for an execution of a Map element or one nested in it,
+// "index", the element's index in the list. A step of a pipeline that a step runs has the
+// attributes of its own run. It returns a new map each time, and false where StepPathFrom does.
+func StepAttributesFrom(ctx context.Context) (map[string]int, bool) {
+	if _, ok := StepPathFrom(ctx); !ok {
+		return nil, false
+	}
+	return executionAttributes(ctx, visitFrom(ctx)), true
+}

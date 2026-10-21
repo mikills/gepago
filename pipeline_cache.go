@@ -44,7 +44,6 @@ func (c *cacheStep) Reads() []KeyRef          { return slices.Clone(c.child.read
 func (c *cacheStep) Writes() []KeyRef         { return slices.Clone(c.child.writes) }
 func (c *cacheStep) Validate() error          { return nil }
 func (c *cacheStep) wrapper() bool            { return true }
-func (c *cacheStep) skipsOnError() bool       { return false }
 func (c *cacheStep) children() []childStep    { return []childStep{{node: c.child}} }
 func (c *cacheStep) checkChildren() error     { return nil }
 func (c *cacheStep) seedCandidate() Candidate { return seedChildren(c.child) }
