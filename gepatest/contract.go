@@ -113,9 +113,10 @@ func (c toolCheck) call(id, name, arguments string) gepa.ToolCall {
 //     undeclared property where additionalProperties is false. The property left out is the
 //     first required one whose schema does not admit null, since gepa.NewTool lists an
 //     omitempty or omitzero field in required, as nullable, and lets the arguments omit it;
-//     when there is none, the check leaves that object out. The wrong type is a boolean, or a
-//     number where the property admits booleans, since a string property may be a json.Number,
-//     which takes a number too. Each fails with an error that matches
+//     when there is none, the check leaves that object out. The wrong type is the first of a
+//     boolean, a number, a string, an array and an object that the property does not admit;
+//     a boolean comes first since a string property may be a json.Number, which takes a number
+//     too. Each fails with an error that matches
 //     gepa.ErrInvalidToolArguments and is Permanent (see gepa.IsPermanent), and reports no
 //     usage.
 //   - no panic: Invoke returns rather than panics for every call the check makes, among them
