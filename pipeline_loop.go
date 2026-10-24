@@ -300,6 +300,7 @@ func (l *loopStep) runCandidate(ctx context.Context, candidate Candidate, s Stat
 	// the iterations stage for tools in a stage of the loop's own, which commits only when until
 	// holds. So a failed loop drops what they staged, whoever runs it.
 	loopCtx, stage := beginStepStage(ctx)
+	evaluationCaptureFrom(loopCtx).offerIterationKey(l.iteration.Name)
 	for iteration := 1; ; iteration++ {
 		if err := stepCanStart(loopCtx); err != nil {
 			return err
@@ -308,7 +309,6 @@ func (l *loopStep) runCandidate(ctx context.Context, candidate Candidate, s Stat
 		view := maps.Clone(carry)
 		if l.iteration.Name != "" {
 			view[l.iteration.Name] = iteration
-			evaluationCaptureFrom(loopCtx).offer(map[string]any{l.iteration.Name: iteration})
 		}
 		iterationCtx := withIteration(loopCtx, l.iteration.Name, iteration)
 		result, err := runNode(iterationCtx, childCandidate(candidate, l.body), l.body, view, nil)
@@ -382,16 +382,22 @@ func (l *loopStep) callUntil(iteration int, values map[string]any) (done bool, e
 type loopIterationKey struct{}
 
 // loopIteration is the iteration of a Loop that executions belong to. It holds its number, from
-// one, and the Loop's iteration key, empty when the Loop has none.
+// one, and the Loop's iteration key, empty when the Loop has none. keys holds the iteration keys
+// of this Loop and of the Loops around it whose iterations the executions belong to.
 type loopIteration struct {
 	number int
 	key    string
+	keys   []string
 }
 
 // withIteration returns ctx for the executions of the iteration numbered number, from one, and of
 // the executions nested in them. key is the Loop's iteration key.
 func withIteration(ctx context.Context, key string, number int) context.Context {
-	return context.WithValue(ctx, loopIterationKey{}, loopIteration{number: number, key: key})
+	keys := iterationFrom(ctx).keys
+	if key != "" {
+		keys = append(slices.Clip(keys), key)
+	}
+	return context.WithValue(ctx, loopIterationKey{}, loopIteration{number: number, key: key, keys: keys})
 }
 
 // withoutIteration returns ctx for executions that belong to no iteration of a Loop, such as the
@@ -413,10 +419,44 @@ func iterationFrom(ctx context.Context) loopIteration {
 // keepsAttribute reports whether the run's events show value, an attribute that counts what the
 // state key key numbers. It is true when key is empty or the run's redactors leave value as it is
 // under key. It is false when they change it or panic, so that the events leave the attribute out.
-// The caller holds the trace lock.
+// The run does not remove value from error text (see redactNumber). The caller holds the trace
+// lock.
 func (r *runObservation) keepsAttribute(key string, value int) bool {
 	if key == "" || len(r.redactors) == 0 {
 		return true
 	}
-	return reflect.DeepEqual(r.redact(key, value), value)
+	return reflect.DeepEqual(r.redactNumber(key, value), value)
+}
+
+// redactNumber returns a copy of value, an iteration number under the iteration key key, as the
+// run's events carry it. Unlike redact, it records no text forms of value. A number such as 3
+// also occurs in other text, so the run must not remove it from error text. The caller holds
+// the trace lock.
+func (r *runObservation) redactNumber(key string, value any) any {
+	if len(r.redactors) == 0 {
+		return deepCopy(value)
+	}
+	return applyRedactors(r.redactors, key, deepCopy(value))
+}
+
+// redactReads returns copies of an execution's reads as its events carry them. A read under one
+// of iterationKeys, the iteration keys of the Loops around the execution, holds an iteration
+// number, so it passes through redactNumber. Every other read passes through redact. The caller
+// holds the trace lock.
+func (r *runObservation) redactReads(reads map[string]any, iterationKeys []string) map[string]any {
+	if len(iterationKeys) == 0 {
+		return r.redactValues(reads)
+	}
+	if len(reads) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(reads))
+	for key, value := range reads {
+		if slices.Contains(iterationKeys, key) {
+			out[key] = r.redactNumber(key, value)
+		} else {
+			out[key] = r.redact(key, value)
+		}
+	}
+	return out
 }

@@ -172,6 +172,37 @@ func TestRedactorHidesImageAndScrubsItsForms(t *testing.T) {
 	require.Equal(t, photo, seen[0], "the Redactor gets the Image under its key")
 }
 
+func TestNewToolRefusesImageArgumentsAndOutput(t *testing.T) {
+	type measureArgs struct {
+		Img gepa.Image `json:"img"`
+	}
+	type measureOut struct {
+		Bytes int `json:"bytes"`
+	}
+	type thumbnailOut struct {
+		Thumbnail *gepa.Image `json:"thumbnail"`
+	}
+	invoked := 0
+	measure := gepa.NewTool("measure_image", "Measure an image",
+		func(_ context.Context, args measureArgs) (measureOut, error) {
+			invoked++
+			return measureOut{Bytes: args.Img.Size()}, nil
+		})
+	thumbnail := gepa.NewTool("thumbnail", "Make a thumbnail",
+		func(context.Context, measureOut) (thumbnailOut, error) { return thumbnailOut{}, nil })
+
+	_, err := gepa.NewToolRegistry(measure)
+	require.EqualError(t, err, `register tool: tool "measure_image": arguments type gepa_test.measureArgs `+
+		`can hold an Image, but tool arguments travel as JSON without image data`)
+	_, err = gepa.NewToolRegistry(thumbnail)
+	require.EqualError(t, err, `register tool: tool "thumbnail": output type gepa_test.thumbnailOut `+
+		`can hold an Image, but tool output travels as JSON without image data`)
+
+	_, err = measure.Invoke(context.Background(), gepa.ToolCall{Name: "measure_image", Arguments: `{}`})
+	require.ErrorContains(t, err, `tool "measure_image": arguments type gepa_test.measureArgs can hold an Image`)
+	require.Zero(t, invoked, "the tool refuses every call")
+}
+
 func TestPipelineFingerprintIgnoresImageValues(t *testing.T) {
 	build := func(key gepa.KeyRef, defaults ...gepa.Default) gepa.Pipeline {
 		return fpBuild(t, gepa.PipelineSpec{

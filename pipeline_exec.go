@@ -361,20 +361,22 @@ func nameItself(name string, reads []KeyRef, s State, err error) error {
 	return failStep(&stepNode{name: name, reads: reads}, s.visibleValues(reads), err)
 }
 
-// runNode runs one step on a fresh view of values limited to its declared keys and returns its
-// writes when it succeeds, with the tool memory writes and cached tool results it staged;
-// those of a step that fails are dropped with its state writes. The candidate is the step's, as
-// childCandidate selects it. Each execution of a step other than a WithPolicy, WithCache or
-// WithAmendable wrapper gets its own usage frame, observer events and outcome record. A panic
-// becomes an error with the stack in its details. When the step's context ended because a budget
-// ran out or an attempt timed out, that cause replaces the step's result, unless the step's error
-// already carries it, so a step that finishes late still fails and its writes are dropped.
+// runNode runs one step on a fresh view of values. The view holds only the step's declared keys.
+// When the step succeeds, runNode returns its writes with the tool memory writes and cached tool
+// results it staged. When the step fails, runNode drops what it staged with its state writes. The
+// candidate is the step's, as childCandidate selects it. Each execution of a step other than a
+// WithPolicy, WithCache or WithAmendable wrapper gets its own usage frame, observer events and
+// outcome record. A panic becomes an error with the stack in its details. A budget that runs out
+// or an attempt that times out can end the step's context. That cause then replaces the step's
+// result, unless the step's error already carries it. So a step that finishes late still fails,
+// and runNode drops its writes.
 //
-// commit, when set, checks the result before the execution ends, so an error it returns fails
-// the execution and drops what it staged. A wrapper has no execution of its own, so the last
-// execution inside it that succeeds is held until commit has checked the result: it fails with
-// an error commit marks with failsExecution, and otherwise ends as it did, without what waits
-// for its result to commit, and the failure is recorded as an execution that commits nothing.
+// commit, when set, checks the result before the execution ends. An error that it returns fails
+// the execution and drops what the execution staged. A wrapper has no execution of its own. So
+// runNode holds the last execution inside the wrapper that succeeds until commit has checked the
+// result. That execution fails with an error that commit marks with failsExecution. With any
+// other error it ends as it did, but without the work that waits for its result to commit.
+// runNode then records the failure as an execution that commits nothing.
 func runNode(
 	ctx context.Context,
 	candidate Candidate,

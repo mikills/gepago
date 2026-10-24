@@ -172,12 +172,17 @@ func (p Provenance) Validate() error {
 // call a remote tool host serves.
 //
 // A schema that cannot be derived, an empty name or description, or a nil fn is reported by
-// the tool's Validate method, so ToolRegistry.Register rejects the tool.
+// the tool's Validate method, so ToolRegistry.Register rejects the tool. Validate also reports
+// Args or Out that can hold an Image. Tool arguments and output travel as JSON, and the JSON form
+// of an Image is only its summary.
 func NewTool[Args, Out any](name, description string, fn func(context.Context, Args) (Out, error)) ToolProvider {
 	tool := &typedTool[Args, Out]{fn: fn, schema: Tool{Name: name, Description: description}}
 	schema, err := JSONSchemaFor[Args]()
 	if err == nil && !structType(reflect.TypeFor[Args]()) {
 		err = fmt.Errorf("arguments type %s must be a struct, so its JSON form is an object", reflect.TypeFor[Args]())
+	}
+	if err == nil {
+		err = checkToolImages(reflect.TypeFor[Args](), reflect.TypeFor[Out]())
 	}
 	if err != nil {
 		tool.err = fmt.Errorf("tool %q: %w", name, err)
@@ -185,6 +190,21 @@ func NewTool[Args, Out any](name, description string, fn func(context.Context, A
 	}
 	tool.schema.Parameters = schema
 	return tool
+}
+
+// checkToolImages refuses an arguments or output type that can hold an Image. Tool arguments and
+// output travel as JSON, and the JSON form of an Image holds no image data.
+func checkToolImages(args, out reflect.Type) error {
+	if mayHoldImage(args, false) {
+		return fmt.Errorf(
+			"arguments type %s can hold an Image, but tool arguments travel as JSON without image data",
+			args,
+		)
+	}
+	if mayHoldImage(out, false) {
+		return fmt.Errorf("output type %s can hold an Image, but tool output travels as JSON without image data", out)
+	}
+	return nil
 }
 
 type typedTool[Args, Out any] struct {
@@ -200,8 +220,8 @@ func (t *typedTool[Args, Out]) Schema() Tool {
 	return schema
 }
 
-// Validate reports a schema that could not be derived, a missing name or description, or a
-// nil function.
+// Validate reports a schema that could not be derived, arguments or output that can hold an
+// Image, a missing name or description, or a nil function.
 func (t *typedTool[Args, Out]) Validate() error {
 	if t.err != nil {
 		return t.err

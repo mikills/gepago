@@ -97,8 +97,8 @@ func asComponentStep(step compositeStep, children ...*stepNode) Step {
 }
 
 // isWrapper reports whether step is a WithPolicy, WithCache or WithAmendable wrapper. A wrapper
-// shares the candidate namespace of the steps around it: its own SeedCandidate and RunCandidate use
-// keys already scoped by the names of the steps it wraps.
+// shares the candidate namespace of the steps around it. So its own SeedCandidate and RunCandidate
+// use keys that the names of the steps it wraps already scope.
 func isWrapper(step Step) bool {
 	composite, ok := step.(compositeStep)
 	return ok && composite.wrapper()

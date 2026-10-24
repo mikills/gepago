@@ -91,6 +91,17 @@ func TestToolRegistryRegister(t *testing.T) {
 			wantErr:  `register tool: tool "m": arguments type map[string]int must be a struct, so its JSON form is an object`,
 		},
 		{
+			name:     "typed tool whose output can hold an Image",
+			registry: registry,
+			provider: NewTool(
+				"img",
+				"image out",
+				func(context.Context, struct{}) (Image, error) { return Image{}, nil },
+			),
+			wantErr: `register tool: tool "img": output type gepa.Image can hold an Image, ` +
+				`but tool output travels as JSON without image data`,
+		},
+		{
 			name:     "panicking schema",
 			registry: registry,
 			provider: panickingSchema{},

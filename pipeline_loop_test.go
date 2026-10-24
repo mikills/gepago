@@ -1271,10 +1271,10 @@ func TestHTMLRunReportShowsIterations(t *testing.T) {
 	})
 }
 
-func TestLoopReflectionHidesTheIterationARedactorHides(t *testing.T) {
+func TestLoopReflectionKeepsIterationNumbersInErrorText(t *testing.T) {
 	body := addPages(func(_ context.Context, count, page int) (int, error) {
 		if page == 3 {
-			return 0, fmt.Errorf("%w: stuck after page %d", ErrInvalidOutput, page-1)
+			return 0, fmt.Errorf("%w: order 1234 failed with HTTP 512 after page %d", ErrInvalidOutput, page-1)
 		}
 		return count + page, nil
 	})
@@ -1286,22 +1286,25 @@ func TestLoopReflectionHidesTheIterationARedactorHides(t *testing.T) {
 		Redactor:  hiding("page"),
 	}.Build()
 	require.NoError(t, err)
-	evaluator := ProgramEvaluator{Program: pipeline, Metric: ExactMatchMetric{Fields: []string{"count"}}}
+	evaluator := ProgramEvaluator{
+		Program:      pipeline,
+		Metric:       ExactMatchMetric{Fields: []string{"count"}},
+		RecordTraces: true,
+	}
 	examples := []Example{NewIOExample("1", Prediction{}, Prediction{"count": 6})}
 
-	result, err := evaluator.Evaluate(context.Background(), nil, examples, false)
+	result, err := evaluator.Evaluate(context.Background(), nil, examples, true)
 
 	require.NoError(t, err)
 	sideInfo := result.Items[0].SideInfo
 	require.Equal(t, map[string]any{"count": 3, "page": RedactedText}, sideInfo["reads"])
-	require.Contains(t, sideInfo["feedback"], "stuck after page")
-	require.NotContains(
-		t,
-		sideInfo["feedback"],
-		"page 2",
-		"an earlier iteration's number is removed, as events remove it",
-	)
-	require.NotContains(t, log.finishedStep(t, "count_up", 3).Err.Error(), "page 2")
+	want := `iteration 3: pipeline step "count_up": invalid programme output: ` +
+		"order 1234 failed with HTTP 512 after page 2"
+	require.Contains(t, sideInfo["feedback"], want, "the run removes no iteration number from error text")
+	trace, ok := result.Items[0].Trace.(PipelineTrace)
+	require.True(t, ok)
+	require.Contains(t, trace.Err, want)
+	require.Contains(t, log.finishedStep(t, "count_up", 3).Err.Error(), "order 1234 failed with HTTP 512 after page 2")
 }
 
 // pageMemoryBody is addPages with each iteration also setting "page <n>" in its tool memory.
@@ -1652,6 +1655,63 @@ func TestMapRunByAnotherStepReportsNothingOnIt(t *testing.T) {
 	require.Equal(t, "flaky", results[1].Error)
 	require.Equal(t, map[string]int{"visit": 1}, log.finishedStep(t, "outer", 1).Attributes,
 		"only the map's own execution reports its failed elements")
+}
+
+func TestLoopRedactorThatHidesTheIterationKeepsNumbersInErrorText(t *testing.T) {
+	ticketKey := Key[string]{Name: "ticket"}
+	body := NewStep(
+		"count_up",
+		refs(loopCountKey.Ref(), loopPageKey.Ref(), ticketKey.Ref()),
+		refs(loopCountKey.Ref()),
+		func(_ context.Context, s State) error {
+			count, _ := loopCountKey.Get(s)
+			page, _ := loopPageKey.Get(s)
+			ticket, _ := ticketKey.Get(s)
+			if page == 3 {
+				return fmt.Errorf("ticket %s: order 1234 failed with HTTP 512 at step v2", ticket)
+			}
+			loopCountKey.Set(s, count+1)
+			return nil
+		},
+	)
+	allowCount := func(key string, value any) any {
+		if key == "count" {
+			return value
+		}
+		return RedactedText
+	}
+	log := &eventLog{}
+	traces := &RecordingObserver{}
+	pipeline, err := PipelineSpec{
+		Inputs:    refs(ticketKey.Ref()),
+		Steps:     []Step{pagedLoop(body, 100, 5)},
+		Defaults:  []Default{DefaultValue(loopCountKey, 0)},
+		Observers: []PipelineObserver{log, traces},
+		Redactor:  allowCount,
+	}.Build()
+	require.NoError(t, err)
+
+	_, err = pipeline.RunCandidate(context.Background(), nil, Prediction{"ticket": "T-77"})
+
+	require.EqualError(t, err, `pipeline step "loop": iteration 3: pipeline step "count_up": `+
+		"ticket T-77: order 1234 failed with HTTP 512 at step v2")
+	const kept = "ticket [redacted]: order 1234 failed with HTTP 512 at step v2"
+	require.Equal(t, kept, log.finishedStep(t, "count_up", 3).Err.Error(),
+		"the run removes the hidden ticket but no iteration number")
+	trace := onlyRecordedTrace(t, traces)
+	require.Equal(t, `pipeline step "loop": iteration 3: pipeline step "count_up": `+kept, trace.Err)
+	require.Equal(t, kept, trace.Steps[0].Steps[2].Err)
+	require.Equal(t, map[string]any{"count": float64(2), "page": RedactedText, "ticket": RedactedText},
+		trace.Steps[0].Steps[2].Reads)
+	for _, event := range log.finishedOf("count_up") {
+		require.Equal(t, map[string]int{"visit": 1}, event.Attributes, "the hidden iteration stays out")
+	}
+	require.Equal(t, map[string]int{"visit": 1}, log.finishedStep(t, "loop", 1).Attributes)
+	report, err := HTMLRunReport(trace, HTMLReportOptions{})
+	require.NoError(t, err)
+	require.Contains(t, report, "order 1234 failed with HTTP 512 at step v2")
+	require.NotContains(t, report, "T-77")
+	require.NotContains(t, report, "iteration 3</span>")
 }
 
 func TestLoopRedactorHidesTheIterationAttributes(t *testing.T) {

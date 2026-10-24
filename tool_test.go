@@ -241,6 +241,18 @@ func TestNewToolValidate(t *testing.T) {
 			wantErr: `tool "t": json schema for struct { C chan int }: field "C": chan int cannot be decoded from JSON`,
 		},
 		{
+			name: "arguments that can hold an Image",
+			tool: NewTool("t", "d", func(context.Context, struct{ Img []*Image }) (string, error) { return "", nil }),
+			wantErr: `tool "t": arguments type struct { Img []*gepa.Image } can hold an Image, ` +
+				`but tool arguments travel as JSON without image data`,
+		},
+		{
+			name: "output that can hold an Image",
+			tool: NewTool("t", "d", func(context.Context, lookupArgs) (map[string]Image, error) { return nil, nil }),
+			wantErr: `tool "t": output type map[string]gepa.Image can hold an Image, ` +
+				`but tool output travels as JSON without image data`,
+		},
+		{
 			name:    "nil function",
 			tool:    NewTool[lookupArgs, string]("t", "d", nil),
 			wantErr: `tool "t": function is required`,

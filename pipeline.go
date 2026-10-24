@@ -360,9 +360,9 @@ type PipelineSpec struct {
 	// that names a tool the policy does not allow, and a Predict or TypedPredict step that sets
 	// a ToolPolicy of its own.
 	ToolPolicy ToolPolicy
-	// ToolMiddleware names tool middleware from Tools, outermost first, that wraps every tool of
-	// a run. It wraps each call that the run's ToolSteps and Predict steps make through the run's
-	// session. It also wraps the calls of a Predict in a nested pipeline run that has a
+	// ToolMiddleware names tool middleware from Tools, outermost first. It wraps every tool call
+	// that the run's own session makes. Those are the calls of the run's ToolSteps and Predict
+	// steps. It also wraps the calls of a Predict in a nested pipeline run that has a
 	// ToolPolicy but no Tools. A session that starts inside the run uses only its own tool
 	// middleware (see ToolMiddleware). An agent's session and that of a nested pipeline with
 	// Tools are such sessions. Build fails on a name that is not registered, a repeated name and
@@ -402,10 +402,10 @@ type Pipeline struct {
 	optional map[string]map[string]bool
 }
 
-// keySource records the type of an available key and where it comes from: a step, the first
-// that writes it, or else a pipeline input, or a Default when def is set. view, when set, says that
-// step holds the key only in the views of the steps nested in it. It is viewItem for a Map's item
-// and viewIteration for a Loop's iteration key.
+// keySource records the type of an available key and where the key comes from. step names the
+// first step that writes the key. Without such a step, the key is a pipeline input, or a Default
+// when def is set. view, when set, says that step holds the key only in the views of the steps
+// nested in it. It is viewItem for a Map's item and viewIteration for a Loop's iteration key.
 type keySource struct {
 	typ     reflect.Type
 	step    string
@@ -481,16 +481,8 @@ func (s PipelineSpec) build(work *int) (Pipeline, error) {
 	if err := s.Budget.validate(); err != nil {
 		return Pipeline{}, err
 	}
-	if err := s.ToolPolicy.check(registered(s.Tools)); err != nil {
-		return Pipeline{}, fmt.Errorf("pipeline %w", err)
-	}
-	if err := s.checkToolMiddleware(); err != nil {
+	if err := s.checkToolsAndObservers(); err != nil {
 		return Pipeline{}, err
-	}
-	for i, observer := range s.Observers {
-		if isNil(observer) {
-			return Pipeline{}, fmt.Errorf("pipeline observer %d is nil", i)
-		}
 	}
 	steps := make([]*stepNode, len(s.Steps))
 	index := make(map[string]int, len(s.Steps))
@@ -565,6 +557,22 @@ func (s PipelineSpec) build(work *int) (Pipeline, error) {
 		observers:        slices.Clone(s.Observers),
 		redactor:         s.Redactor,
 	}, nil
+}
+
+// checkToolsAndObservers checks ToolPolicy and ToolMiddleware against Tools and refuses a nil observer.
+func (s PipelineSpec) checkToolsAndObservers() error {
+	if err := s.ToolPolicy.check(registered(s.Tools)); err != nil {
+		return fmt.Errorf("pipeline %w", err)
+	}
+	if err := s.checkToolMiddleware(); err != nil {
+		return err
+	}
+	for i, observer := range s.Observers {
+		if isNil(observer) {
+			return fmt.Errorf("pipeline observer %d is nil", i)
+		}
+	}
+	return nil
 }
 
 // checkToolMiddleware checks the names in ToolMiddleware against Tools.

@@ -66,8 +66,9 @@ import (
 // Under a Loop with an iteration key, the "iteration" attribute of each iteration's executions
 // passes through the Redactor under that key as an int. So does the Loop's "iterations" attribute,
 // once for each execution that carries it. Attributes hold integers, so when the Redactor changes
-// one or panics, the events leave it out. The run then removes its text from error messages as it
-// removes any other redacted value.
+// one or panics, the events leave it out. A step that reads the iteration key reads the same
+// number, and its events carry the read as the Redactor returns it. The run removes no iteration
+// number from error messages, since a short number such as 3 also occurs in other text.
 //
 // The Attributes of the RunContext that every event carries pass through the Redactor when a
 // run starts, before RunStarted, each under the key "attribute:<name>", where <name> is the
@@ -224,14 +225,16 @@ func (r *runObservation) scrubValues(values map[string]any) map[string]any {
 // are those of the pipelines the programme holds or ran, types the types of the keys those
 // pipelines declare, mapSteps their Maps, values the values the example's runs were given,
 // wrote or tried to write, the items of their Maps' elements included, details the details
-// their steps attached to errors, and toolCalls the tool calls their steps made.
+// their steps attached to errors, toolCalls the tool calls their steps made and iterationKeys
+// the iteration keys of their Loops.
 type evaluationRedaction struct {
-	redactors []Redactor
-	types     map[string]reflect.Type
-	mapSteps  []*mapStep
-	values    []stateWrite
-	details   []stateWrite
-	toolCalls []ToolCallRecord
+	redactors     []Redactor
+	types         map[string]reflect.Type
+	mapSteps      []*mapStep
+	values        []stateWrite
+	details       []stateWrite
+	toolCalls     []ToolCallRecord
+	iterationKeys []string
 }
 
 // apply returns item with the values reflection reads passed through the redactors, followed,
@@ -243,8 +246,9 @@ type evaluationRedaction struct {
 // writes, details and run context attributes of any PipelineTrace in its Trace as an event's,
 // with the tool calls of its steps redacted as an event's are. Then the text of every value the
 // redactors change, among those and the values, details and tool calls of the runs, is removed
-// from every string in them, errors and attributes included. Without redactors it returns item
-// unchanged.
+// from every string in them, errors and attributes included. SideInfo's "reads" passes through
+// redactReads with iterationKeys, as an execution's reads do in events. Without redactors it
+// returns item unchanged.
 func (e evaluationRedaction) apply(item EvaluationItem) EvaluationItem {
 	if len(e.redactors) == 0 {
 		return item
@@ -272,6 +276,8 @@ func (e evaluationRedaction) apply(item EvaluationItem) EvaluationItem {
 			switch {
 			case isMap && name == "details":
 				sideInfo[name] = run.redactEntries(details)
+			case isMap && name == "reads":
+				sideInfo[name] = run.redactReads(details, e.iterationKeys)
 			case isPrediction && (name == "inputs" || name == "expected"):
 				sideInfo[name] = run.redactTyped(example, e.types)
 			default:

@@ -540,10 +540,10 @@ func observeStep(ctx context.Context, node *stepNode, attempt, visit int, values
 			lanes[i-1].recording = lane
 		}
 		lane.ctx = ctx
-		lane.reads = lane.run.redactValues(reads)
+		iteration := iterationFrom(ctx)
+		lane.reads = lane.run.redactReads(reads, iteration.keys)
 		lane.attributes = executionAttributes(ctx, visit)
-		if iteration := iterationFrom(ctx); iteration.number > 0 &&
-			!lane.run.keepsAttribute(iteration.key, iteration.number) {
+		if iteration.number > 0 && !lane.run.keepsAttribute(iteration.key, iteration.number) {
 			delete(lane.attributes, "iteration")
 		}
 		event := StepStartedEvent{
