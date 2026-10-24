@@ -47,6 +47,80 @@ type stepScope struct {
 	// attributes holds what the step reports about its execution, which its StepFinished adds
 	// to the Attributes StepStarted reported, such as the elements of a Map that failed.
 	attributes map[string]int
+	// step is the step whose execution the scope belongs to, or nil for a scope of no execution.
+	// name is that step's name as the pipeline knows it.
+	step Step
+	name string
+	// loopKey is the iteration key of the Loop whose "iterations" attribute the scope reports,
+	// under which the run's Redactors see it.
+	loopKey string
+}
+
+// runs reports whether the scope belongs to an execution of step. It reports false for a step that
+// runs step itself with its own State. step must have a comparable type, such as a pointer.
+func (s *stepScope) runs(step Step) bool {
+	return s != nil && s.step != nil && unwrapComposite(s.step) == step
+}
+
+// named reports whether the scope belongs to an execution of a step named name. That execution
+// names the error of a step with the same name that it runs, so the step must not name it again.
+// runChild does not name such a child either.
+func (s *stepScope) named(name string) bool {
+	return s != nil && s.step != nil && s.name == name
+}
+
+// visible returns the value a step reading key through s gets, without a copy, and whether s
+// exposes one. Inside a step that is a value the step has set or a declared read that the state
+// holds. Outside a step it is any value the state holds.
+func (s State) visible(key string) (any, bool) {
+	if s.scope != nil {
+		if value, ok := s.scope.pending[key]; ok {
+			return value, true
+		}
+		if _, ok := s.scope.reads[key]; !ok {
+			return nil, false
+		}
+	}
+	value, ok := s.values[key]
+	return value, ok
+}
+
+// visibleValues returns the values of keys that s exposes (see visible).
+func (s State) visibleValues(keys []KeyRef) map[string]any {
+	values := make(map[string]any, len(keys))
+	for _, key := range keys {
+		if value, ok := s.visible(key.Name); ok {
+			values[key.Name] = value
+		}
+	}
+	return values
+}
+
+// exposed returns the values of every key that s exposes (see visible), without copies. It is the
+// view a step that runs another step on s gives it. Outside a step it returns the values s holds.
+func (s State) exposed() map[string]any {
+	if s.scope == nil {
+		return s.values
+	}
+	values := make(map[string]any, len(s.scope.reads)+len(s.scope.pending))
+	for key := range s.scope.reads {
+		if value, ok := s.values[key]; ok {
+			values[key] = value
+		}
+	}
+	maps.Copy(values, s.scope.pending)
+	return values
+}
+
+// childView returns the values that c, a composite step that runs on s, gives the steps it runs.
+// Under c's own execution they are the values s holds, the view that whatever runs c built for
+// it. Otherwise, as when a step runs c with its own State, they are the values of the keys s
+// exposes (see exposed).
+func (s State) childView(c Step) map[string]any {
+	if s.scope.runs(c) {
+		return s.values
+	}
+	return s.exposed()
 }
 
 // report sets an attribute of the step's execution. Outside a step there is nothing to report
@@ -59,6 +133,25 @@ func (s *stepScope) report(name string, value int) {
 		s.attributes = map[string]int{}
 	}
 	s.attributes[name] = value
+}
+
+// reportIterations sets the "iterations" attribute of the step's execution to count, the iterations
+// of a Loop. The run's Redactors see the attribute under key, the Loop's iteration key.
+func (s *stepScope) reportIterations(key string, count int) {
+	if s == nil {
+		return
+	}
+	s.loopKey = key
+	s.report("iterations", count)
+}
+
+// iterationKey returns the iteration key under which the run's Redactors see the "iterations"
+// attribute the step reported, or "" when there is none.
+func (s *stepScope) iterationKey() string {
+	if s == nil {
+		return ""
+	}
+	return s.loopKey
 }
 
 // reported returns a copy of the attributes the step reported, or nil when there are none.

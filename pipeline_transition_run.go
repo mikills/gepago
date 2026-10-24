@@ -12,9 +12,10 @@ import (
 type visitKey struct{}
 
 // withVisit returns ctx for the executions of one visit of a top-level step, numbered from one.
-// They belong to no element of a Map, even when their pipeline runs inside one.
+// They belong to no element of a Map and no iteration of a Loop, even when their pipeline runs
+// inside one.
 func withVisit(ctx context.Context, visit int) context.Context {
-	return context.WithValue(withoutElement(ctx), visitKey{}, visit)
+	return context.WithValue(withoutIteration(withoutElement(ctx)), visitKey{}, visit)
 }
 
 // visitFrom returns the visit the executions running with ctx belong to, or zero outside a
@@ -24,13 +25,17 @@ func visitFrom(ctx context.Context) int {
 	return visit
 }
 
-// executionAttributes returns the attributes of an execution of the given visit running with
-// ctx: its visit and, inside an element of a Map, the element's index. Only a pipeline run
-// observes executions, and it numbers every visit.
+// executionAttributes returns the attributes of an execution of the given visit running with ctx.
+// They hold its visit, the element's index inside an element of a Map, and the iteration's number
+// inside an iteration of a Loop. Only a pipeline run observes executions, and it numbers every
+// visit.
 func executionAttributes(ctx context.Context, visit int) map[string]int {
 	attributes := map[string]int{"visit": visit}
 	if element := elementFrom(ctx); element != nil {
 		attributes["index"] = element.index
+	}
+	if iteration := iterationFrom(ctx); iteration.number > 0 {
+		attributes["iteration"] = iteration.number
 	}
 	return attributes
 }

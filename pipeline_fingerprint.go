@@ -22,28 +22,37 @@ const pipelineFingerprintVersion = 1
 // LoadCompiledProgram refuses an artefact saved for another shape.
 //
 // The shape is:
-//   - the pipeline inputs, by name and type;
-//   - the top-level steps, in order;
-//   - each step's name and its reads and writes, by name and type, for nested steps too;
-//   - the structure of composite steps: the steps of a Parallel, the labels of a Branch's arms
-//     and the roles of a Fallback's steps, which the steps Branch and Fallback add record, and
-//     the body of a Map or MapCollect, which of its reads holds the items, its item key by name
-//     and type, its results key, and its MapOptions;
+//   - the pipeline inputs, by name and type
+//   - the top-level steps, in order
+//   - each step's name and its reads and writes, by name and type, for nested steps too
+//   - the steps of a Parallel
+//   - the labels of a Branch's arms and the roles of a Fallback's steps, which the steps that
+//     Branch and Fallback add record
+//   - the body of a Map or MapCollect, the read that holds its items, its item key by name and
+//     type, its results key and MapOptions
+//   - the body of a Loop, its MaxIterations and its iteration key by name and type
 //   - for a NewProgramStep whose programme is a Fingerprinter, such as a nested Pipeline, that
-//     programme's fingerprint;
-//   - the transitions, in order, by From, To, OnError and whether When, Amend and Accept are
-//     set; MaxVisits; and the amendable keys of each step (see WithAmendable).
+//     programme's fingerprint
+//   - the transitions, in order, by From, To, OnError and whether When, Amend and Accept are set
+//   - MaxVisits
+//   - the amendable keys of each step (see WithAmendable)
 //
-// Everything else is left out because it does not change which trained candidate fits the
-// pipeline: candidate components and their text (instructions, demos and other prompts), the
-// Go type and code of each step, the code of a transition's When, Amend and Accept, a programme
-// that is not a Fingerprinter, merge functions, Defaults, Budget, AllowExtraInputs, the
-// timeout and retries of a WithPolicy, and WithCache, which adds nothing to the step it wraps. Reads, writes and the steps of a Parallel
-// are taken in name order, so declaring them in another order keeps the fingerprint. A named
-// type is identified by its package path and name, not by its definition, so changing the
-// fields of a named struct type keeps the fingerprint; give the artefact and the loader a
-// ProgramVersion when such a change matters. A pipeline without transitions, MaxVisits or
-// amendable keys has the fingerprint v0.8.0 gave it, so its artefacts still load.
+// The fingerprint leaves out everything else, because it does not change which trained candidate
+// fits the pipeline:
+//   - candidate components and their text (instructions, demos and other prompts)
+//   - the Go type and code of each step
+//   - the code of a transition's When, Amend and Accept, and of a Loop's until
+//   - a programme that is not a Fingerprinter
+//   - merge functions, Defaults, Budget and AllowExtraInputs
+//   - the timeout and retries of a WithPolicy
+//   - WithCache, which adds nothing to the step it wraps
+//
+// Reads, writes and the steps of a Parallel are taken in name order, so declaring them in another
+// order keeps the fingerprint. The fingerprint identifies a named type by its package path and
+// name, not by its definition. So changing the fields of a named struct type keeps the
+// fingerprint. Give the artefact and the loader a ProgramVersion when such a change matters. A
+// pipeline without transitions, MaxVisits or amendable keys has the fingerprint v0.8.0 gave it,
+// so its artefacts still load.
 func (p Pipeline) Fingerprint() string {
 	if p.Validate() != nil {
 		return ""
@@ -104,9 +113,10 @@ type keyShape struct {
 	Type string `json:"type"`
 }
 
-// stepShape is the shape of one step. Kind is "step" for a step that is not a composite;
-// Program is the fingerprint of a Fingerprinter programme behind NewProgramStep; Amendable
-// holds the keys WithAmendable declares; Map holds what a Map or MapCollect adds to its body.
+// stepShape is the shape of one step. Kind is "step" for a step that is not a composite. Program
+// is the fingerprint of a Fingerprinter programme behind NewProgramStep. Amendable holds the keys
+// WithAmendable declares. Map holds what a Map or MapCollect adds to its body, and Loop what a
+// Loop adds to its body.
 type stepShape struct {
 	Kind      string       `json:"kind"`
 	Name      string       `json:"name"`
@@ -116,6 +126,7 @@ type stepShape struct {
 	Children  []childShape `json:"children,omitempty"`
 	Amendable []keyShape   `json:"amendable,omitempty"`
 	Map       *mapShape    `json:"map,omitempty"`
+	Loop      *loopShape   `json:"loop,omitempty"`
 }
 
 // mapShape is the shape a Map or MapCollect adds to its body: the read that holds the items,
@@ -126,6 +137,13 @@ type mapShape struct {
 	Results        string   `json:"results"`
 	MaxConcurrency int      `json:"max_concurrency,omitempty"`
 	MaxItems       int      `json:"max_items,omitempty"`
+}
+
+// loopShape is the shape a Loop adds to its body: its cap and its iteration key. The key is the
+// zero keyShape when the Loop has none.
+type loopShape struct {
+	MaxIterations int      `json:"max_iterations"`
+	Iteration     keyShape `json:"iteration,omitzero"`
 }
 
 type childShape struct {
@@ -180,6 +198,13 @@ func shapeOf(node *stepNode) stepShape {
 			Results:        s.results.Name,
 			MaxConcurrency: s.opts.MaxConcurrency,
 			MaxItems:       s.opts.MaxItems,
+		}
+		shape.Children = []childShape{{Label: "body", Step: shapeOf(s.body)}}
+	case *loopStep:
+		shape.Kind = "loop"
+		shape.Loop = &loopShape{MaxIterations: s.opts.MaxIterations}
+		if s.iteration.Name != "" {
+			shape.Loop.Iteration = keyShape{Name: s.iteration.Name, Type: typeIdentity(s.iteration.Type)}
 		}
 		shape.Children = []childShape{{Label: "body", Step: shapeOf(s.body)}}
 	case programStep:

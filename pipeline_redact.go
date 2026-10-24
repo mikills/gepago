@@ -63,6 +63,12 @@ import (
 // hides a Map's items hides every element's item, and one that hides its results every element's
 // output, in MapResult.Error too, and in what ProgramEvaluator gives reflection.
 //
+// Under a Loop with an iteration key, the "iteration" attribute of each iteration's executions
+// passes through the Redactor under that key as an int. So does the Loop's "iterations" attribute,
+// once for each execution that carries it. Attributes hold integers, so when the Redactor changes
+// one or panics, the events leave it out. The run then removes its text from error messages as it
+// removes any other redacted value.
+//
 // The Attributes of the RunContext that every event carries pass through the Redactor when a
 // run starts, before RunStarted, each under the key "attribute:<name>", where <name> is the
 // attribute's, with its value as a string; its events then carry the result. A result that is

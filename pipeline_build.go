@@ -43,7 +43,7 @@ func newStepNode(step Step) *stepNode {
 }
 
 // compositeStep is implemented by this package's steps that hold others: WithPolicy, WithCache,
-// WithAmendable, Parallel, Map and MapCollect. Build checks their children with the rules it
+// WithAmendable, Parallel, Map, MapCollect and Loop. Build checks their children with the rules it
 // applies to top-level steps, and the pipeline runs each child on its own view of the state.
 type compositeStep interface {
 	Step
@@ -55,7 +55,7 @@ type compositeStep interface {
 	// Parallel writing different keys.
 	checkChildren() error
 	// wrapper reports whether the step wraps its first child under that child's name, writes
-	// and candidate components, as WithPolicy and WithCache do.
+	// and candidate components, as WithPolicy, WithCache and WithAmendable do.
 	wrapper() bool
 	seedCandidate() Candidate
 	runCandidate(ctx context.Context, candidate Candidate, s State) error
@@ -96,9 +96,9 @@ func asComponentStep(step compositeStep, children ...*stepNode) Step {
 	return step
 }
 
-// isWrapper reports whether step is a WithPolicy or WithCache wrapper. A wrapper shares the
-// candidate namespace of the steps around it: its own SeedCandidate and RunCandidate use keys
-// already scoped by the names of the steps it wraps.
+// isWrapper reports whether step is a WithPolicy, WithCache or WithAmendable wrapper. A wrapper
+// shares the candidate namespace of the steps around it: its own SeedCandidate and RunCandidate use
+// keys already scoped by the names of the steps it wraps.
 func isWrapper(step Step) bool {
 	composite, ok := step.(compositeStep)
 	return ok && composite.wrapper()
@@ -306,8 +306,11 @@ func (b *pipelineBuilder) checkStep(node *stepNode, position stepPosition) error
 	if composite != nil && composite.wrapper() {
 		return b.checkWrapper(node, composite, position)
 	}
-	if m, ok := unwrapComposite(node.step).(*mapStep); ok {
-		return b.checkMap(node, m, position)
+	switch step := unwrapComposite(node.step).(type) {
+	case *mapStep:
+		return b.checkMap(node, step, position)
+	case *loopStep:
+		return b.checkLoop(node, step, position)
 	}
 	if err := validateStepName(node.name, position, b.names); err != nil {
 		return err
@@ -343,8 +346,8 @@ func (b *pipelineBuilder) checkStep(node *stepNode, position stepPosition) error
 	return b.checkWrites(node)
 }
 
-// checkWrapper checks a WithPolicy or WithCache step. The wrapped step stands in its place, so
-// it takes the wrapper's position and name.
+// checkWrapper checks a WithPolicy, WithCache or WithAmendable step. The wrapped step stands in its
+// place, so it takes the wrapper's position and name.
 func (b *pipelineBuilder) checkWrapper(node *stepNode, composite compositeStep, position stepPosition) error {
 	children := composite.children()
 	if err := b.checkStep(children[0].node, position); err != nil {
@@ -389,7 +392,7 @@ func (b *pipelineBuilder) checkMap(node *stepNode, m *mapStep, position stepPosi
 	if err := b.checkElementKeys(node.name, m); err != nil {
 		return err
 	}
-	b.sources[m.item.Name] = keySource{typ: m.item.Type, step: node.name}
+	b.sources[m.item.Name] = keySource{typ: m.item.Type, step: node.name, view: viewItem}
 	err := b.checkStep(body, stepPosition{parent: node.name, label: "body"})
 	delete(b.sources, m.item.Name)
 	if err != nil {
@@ -408,30 +411,95 @@ func (b *pipelineBuilder) checkMap(node *stepNode, m *mapStep, position stepPosi
 // the map runs: a pipeline input, a key with a Default or one an earlier step writes. Neither
 // reaches the state, so each needs a key of its own.
 func (b *pipelineBuilder) checkElementKeys(mapName string, m *mapStep) error {
-	keys := []string{m.item.Name}
-	for _, key := range m.body.writes {
-		keys = append(keys, key.Name)
+	if err := b.checkViewKey(mapName, "item key", m.item.Name); err != nil {
+		return err
 	}
-	for i, key := range keys {
-		source, ok := b.sources[key]
-		if !ok {
+	for _, key := range m.body.writes {
+		if err := b.checkViewKey(mapName, fmt.Sprintf("body %q writes", m.body.name), key.Name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkViewKey refuses key, which only the views of the step named step hold, when it is already in
+// state where the step runs. Such a key is a pipeline input, a key with a Default or one an earlier
+// step writes. role names what the key is to the step.
+func (b *pipelineBuilder) checkViewKey(step, role, key string) error {
+	source, ok := b.sources[key]
+	if !ok {
+		return nil
+	}
+	origin := source.describe(key)
+	if source.def && source.step == "" {
+		origin = fmt.Sprintf("%q has a Default", key)
+	}
+	return fmt.Errorf(
+		"pipeline step %q: %s %q, which is already in state (%s); it never reaches the state, so "+
+			"give it a key of its own",
+		step,
+		role,
+		key,
+		origin,
+	)
+}
+
+// checkLoop checks a Loop. It checks its own settings and its body against it (see
+// loopStep.Validate), and the keys the body carries from one iteration to the next. It checks the
+// body as a nested step that may also read the iteration key, and the loop's reads and writes as
+// any step's. The iteration key is available only while checkLoop checks the body, since only the
+// iterations' views hold it.
+func (b *pipelineBuilder) checkLoop(node *stepNode, l *loopStep, position stepPosition) error {
+	if err := validateStepName(node.name, position, b.names); err != nil {
+		return err
+	}
+	if err := validateStep(node); err != nil {
+		return err
+	}
+	body := l.body
+	if body.readsErr == nil && body.writesErr == nil {
+		if err := b.checkSeeds(node.name, body); err != nil {
+			return err
+		}
+	}
+	iteration := l.iteration.Name
+	if iteration != "" {
+		if err := b.checkViewKey(node.name, "iteration key", iteration); err != nil {
+			return err
+		}
+		b.sources[iteration] = keySource{typ: l.iteration.Type, step: node.name, view: viewIteration}
+	}
+	err := b.checkStep(body, stepPosition{parent: node.name, label: "body"})
+	if iteration != "" {
+		delete(b.sources, iteration)
+	}
+	if err != nil {
+		return err
+	}
+	if err := b.checkReads(node); err != nil {
+		return err
+	}
+	return b.checkWrites(node)
+}
+
+// checkSeeds refuses a key that the body of the loop named loop reads and writes when nothing
+// gives the first iteration a value of it.
+func (b *pipelineBuilder) checkSeeds(loop string, body *stepNode) error {
+	for _, key := range body.reads {
+		if _, carried := body.writeTypes[key.Name]; !carried {
 			continue
 		}
-		origin := source.describe(key)
-		if source.def && source.step == "" {
-			origin = fmt.Sprintf("%q has a Default", key)
-		}
-		role := "item key"
-		if i > 0 {
-			role = fmt.Sprintf("body %q writes", m.body.name)
+		if _, ok := b.sources[key.Name]; ok {
+			continue
 		}
 		return fmt.Errorf(
-			"pipeline step %q: %s %q, which is already in state (%s); it never reaches the state, so "+
-				"give it a key of its own",
-			mapName,
-			role,
-			key,
-			origin,
+			"pipeline step %q: body %q reads %q, which it also writes, but nothing gives it a value for the "+
+				"first iteration, so declare a Default for %q, the usual seed, or write it in an earlier step with a "+
+				"MergeRule that keeps the Loop's value, since that value already holds the seed",
+			loop,
+			body.name,
+			key.Name,
+			key.Name,
 		)
 	}
 	return nil

@@ -383,17 +383,31 @@ type Pipeline struct {
 }
 
 // keySource records the type of an available key and where it comes from: a step, the first
-// that writes it, or else a pipeline input, or a Default when def is set.
+// that writes it, or else a pipeline input, or a Default when def is set. view, when set, says that
+// step holds the key only in the views of the steps nested in it. It is viewItem for a Map's item
+// and viewIteration for a Loop's iteration key.
 type keySource struct {
 	typ     reflect.Type
 	step    string
 	def     bool
 	writers int
+	view    string
 }
+
+const (
+	viewItem      = "item"
+	viewIteration = "iteration"
+)
 
 // describe names where a key from a step or a pipeline input comes from; Build words a
 // mismatch with a Default itself.
 func (s keySource) describe(key string) string {
+	switch s.view {
+	case viewItem:
+		return fmt.Sprintf("Map %q holds each element under it as %s", s.step, s.typ)
+	case viewIteration:
+		return fmt.Sprintf("Loop %q numbers its iterations with it as %s", s.step, s.typ)
+	}
 	if s.step != "" {
 		return fmt.Sprintf("step %q writes it as %s", s.step, s.typ)
 	}
@@ -412,10 +426,11 @@ func (s keySource) describe(key string) string {
 // that always writes, and every read must be guaranteed. Build makes one pass over the
 // transitions and then one over the steps; it never enumerates paths.
 //
-// Steps nested in WithPolicy, WithCache, WithAmendable, Parallel, Map and MapCollect are checked
-// by the same rules against the keys available before the top-level step that contains them,
-// a Map's body also seeing the Map's item (see Map), and every step name, nested ones included,
-// must be unique.
+// Build checks the steps nested in WithPolicy, WithCache, WithAmendable, Parallel, Map, MapCollect
+// and Loop by the same rules. It checks them against the keys available before the top-level step
+// that contains them. A Map's body also sees the Map's item (see Map), and a Loop's body its
+// iteration key (see Loop). Every step name, nested ones included, must be unique. A Loop needs a
+// cap.
 //
 // Every tool and chat middleware that a ToolStep, or a Predict or TypedPredict run by
 // NewProgramStep, names must be registered on Tools, and every such tool allowed by
@@ -556,10 +571,10 @@ func isNil(value any) bool {
 // state accumulated by the steps before it. Details holds diagnostics the step attached with
 // WithStepDetails; a step that panicked has the stack under "stack".
 //
-// When a step nested in a composite step (a Parallel or the body of a Map)
-// fails, the composite's StepError wraps a StepError for the nested step, so the message
-// names each step from the top-level one down, with a Map's element index between the two, and
-// Details holds the innermost diagnostics.
+// A step can fail inside a Parallel or in the body of a Map or a Loop. Then the composite's
+// StepError wraps a StepError for that step. So the message names each step from the top-level one
+// down. A Map's element index or a Loop's iteration comes between the two. Details holds the
+// innermost diagnostics.
 //
 // Reads holds copies of the values of the step's declared reads that were in state when it
 // ran, for diagnosis and reflection; Error does not print them. A PipelineTrace and its run

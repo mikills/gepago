@@ -372,3 +372,33 @@ func TestWithPolicyBuildErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestWrapperRunNamesTheStepItWrapsOutsideAPipeline(t *testing.T) {
+	failing := NewStep("fails", refs(amountKey.Ref()), refs(notesKey.Ref()), func(context.Context, State) error {
+		return errFlaky
+	})
+	wrappers := map[string]Step{
+		"WithPolicy":    WithPolicy(failing, StepPolicy{}),
+		"WithCache":     WithCache(failing, nil),
+		"WithAmendable": WithAmendable(failing, amountKey.Ref()),
+	}
+	for name, wrapped := range wrappers {
+		t.Run(name, func(t *testing.T) {
+			err := wrapped.Run(context.Background(), NewState(Prediction{"amount": 3}))
+
+			require.EqualError(t, err, `pipeline step "fails": flaky`)
+			require.ErrorIs(t, err, errFlaky)
+			var stepErr *StepError
+			require.ErrorAs(t, err, &stepErr)
+			require.Equal(t, map[string]any{"amount": 3}, stepErr.Reads)
+
+			pipeline, buildErr := PipelineSpec{
+				Inputs: refs(amountKey.Ref()),
+				Steps:  []Step{WithPolicy(failing, StepPolicy{})},
+			}.Build()
+			require.NoError(t, buildErr)
+			_, err = pipeline.RunCandidate(context.Background(), nil, Prediction{"amount": 3})
+			require.EqualError(t, err, `pipeline step "fails": flaky`, "a pipeline names the step once")
+		})
+	}
+}

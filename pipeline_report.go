@@ -39,13 +39,15 @@ func WriteHTMLRunReport(path string, trace PipelineTrace, options HTMLReportOpti
 	return os.WriteFile(path, []byte(content), 0o644)
 }
 
-// HTMLRunReport renders a self-contained HTML report of one pipeline run, such as a trace from
-// a RecordingObserver: a summary of the run with its run context (run id, parent run id, trace
-// id and attributes, as redacted when the run's events carried them), then every step
-// execution in the order it started with its visit, the index of the Map element it ran for,
-// the number of a Map's elements that failed, duration, usage, unbudgeted usage when it has
-// any, reads, writes, tool calls, error, a rejected rewind and the transition taken after it,
-// executions nested in a composite step or a nested pipeline shown inside the execution that ran
+// HTMLRunReport renders a self-contained HTML report of one pipeline run, such as a trace from a
+// RecordingObserver. The report starts with a summary of the run and its run context. The context
+// shows the run id, parent run id, trace id and attributes, as redacted when the run's events
+// carried them. Then the report shows every step execution in the order it started. Each execution
+// shows its visit, the index of the Map element it ran for and the number of a Map's elements that
+// failed. It shows the number of the Loop iteration it ran for and the number of a Loop's
+// iterations that ran. It shows its duration, usage, unbudgeted usage when it has any, reads,
+// writes, tool calls and error. It shows a rejected rewind and the transition taken after it.
+// Executions nested in a composite step or a nested pipeline show inside the execution that ran
 // them. Every value and error is escaped. Values are shown as JSON, indented when it nests no
 // deeper than 32 levels and is no larger than 64 KiB, and compact otherwise, so the report grows
 // linearly with the trace.
@@ -121,6 +123,23 @@ func reportElement(attributes map[string]int) string {
 	return fmt.Sprintf(" · element %d", index)
 }
 
+// reportLoop names, from the attributes of an execution, the iteration of a Loop it ran for. For a
+// Loop's own execution it names how many iterations ran. It returns "" for an execution of neither.
+func reportLoop(attributes map[string]int) string {
+	var out strings.Builder
+	if iteration, ok := attributes["iteration"]; ok {
+		fmt.Fprintf(&out, " · iteration %d", iteration)
+	}
+	if count, ok := attributes["iterations"]; ok {
+		noun := "iterations"
+		if count == 1 {
+			noun = "iteration"
+		}
+		fmt.Fprintf(&out, " · %d %s", count, noun)
+	}
+	return out.String()
+}
+
 // reportValues renders values as JSON, without escaping HTML, which the template escapes,
 // indented as reportJSON indents it.
 func reportValues(values map[string]any) string {
@@ -166,6 +185,7 @@ var runReportTemplate = template.Must(template.New("gepa-run-report").Funcs(temp
 	"runID":   traceRunID,
 	"tokens":  usageTokens,
 	"element": reportElement,
+	"loop":    reportLoop,
 }).Parse(`{{define "steps"}}
 <ol class="steps">
 {{range .}}
@@ -173,7 +193,7 @@ var runReportTemplate = template.Must(template.New("gepa-run-report").Funcs(temp
 <div class="step-head">
 <strong>{{.Step}}</strong>
 <span class="muted">attempt {{.Attempt}}{{with index .Attributes "visit"}} · visit {{.}}{{end}}
-{{- element .Attributes}}{{with index .Attributes "failed"}} · {{.}} failed{{end}}</span>
+{{- element .Attributes}}{{loop .Attributes}}{{with index .Attributes "failed"}} · {{.}} failed{{end}}</span>
 {{if .Cached}}<span class="badge">cached</span>{{end}}
 {{if .RewindRejected}}<span class="badge">rewind rejected</span>{{end}}
 {{if or .Failed .Err}}<span class="badge error-badge">failed{{with .ErrKind}} · {{.}}{{end}}</span>{{end}}

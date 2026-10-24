@@ -132,9 +132,9 @@ type Call struct {
 	// Request is a copy of a Chat call's request, and nil for the other methods.
 	Request *gepa.ChatRequest
 	// Attributes are those of the pipeline step execution that made the call, as
-	// gepa.StepAttributesFrom reports them: its "visit" and, for an execution of a Map element,
-	// its "index", which a step of a pipeline that the element runs does not have. It is nil
-	// outside a step.
+	// gepa.StepAttributesFrom reports them. They hold its "visit", its "index" when it runs in a
+	// Map element and its "iteration" when it runs in a Loop iteration. A step of a pipeline that
+	// the element or the iteration runs has neither. It is nil outside a step.
 	Attributes map[string]int
 	// RunContext is the gepa.RunContext the call's context carried, and the zero value when it
 	// carried none.

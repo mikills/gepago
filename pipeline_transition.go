@@ -106,7 +106,15 @@ var ErrMaxVisits = errors.New("max visits exceeded")
 //
 // The returned step has step's name, reads and writes and, in a pipeline, its candidate keys;
 // it is a ComponentStep when step is one. Build requires it to be a top-level step that some
-// rewind with an Amend targets, and at least one key.
+// rewind with an Amend targets, and at least one key. When a caller runs the returned step with Run
+// or RunCandidate, step sees only the keys that the caller's State exposes (see Loop). An error of
+// step is then a StepError that names step. A step with step's name that runs the returned step in
+// its own execution gets the error as it is, and its execution names step. A step that is not a
+// wrapper has its own execution when a pipeline, a Parallel, a Map, a Loop or a wrapper runs it.
+// WithPolicy, WithCache and WithAmendable return wrappers. A decorator you write is never a
+// wrapper, even when it embeds one. So a decorator that embeds the returned step and keeps its name
+// gets the error as it is. That is so when a pipeline, a Parallel, a Map, a Loop or a wrapper runs
+// the decorator. A caller that runs the returned step outside such an execution gets the StepError.
 func WithAmendable(step Step, keys ...KeyRef) Step {
 	a := &amendableStep{child: newStepNode(step), keys: slices.Clone(keys)}
 	a.types, a.keysErr = stateKeyTypes(a.keys)
@@ -152,9 +160,9 @@ func (a *amendableStep) Run(ctx context.Context, s State) error {
 }
 
 func (a *amendableStep) runCandidate(ctx context.Context, candidate Candidate, s State) error {
-	result, err := runChild(ctx, candidate, a.child.name, a.child, s.values)
+	result, err := runChild(ctx, candidate, a.child.name, a.child, s.childView(a))
 	if err != nil {
-		return err
+		return nameWrapped(s, a.child, err)
 	}
 	result.commitTo(s, a.child)
 	return nil

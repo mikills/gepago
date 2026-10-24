@@ -65,9 +65,9 @@ type StepTrace struct {
 	// nested in them too. The executions of different lanes of a
 	// Parallel ran side by side, so they may have started in any order.
 	Lane string `json:"lane,omitempty"`
-	// Attributes are the execution's, as StepStartedEvent reported them, such as its "visit" and
-	// a Map element's "index", and once it has finished as StepFinishedEvent did, with a Map's
-	// "failed".
+	// Attributes are the execution's, as StepStartedEvent reported them, such as its "visit", a Map
+	// element's "index" and a Loop iteration's "iteration". Once it has finished they are as
+	// StepFinishedEvent reported them, with a Map's "failed" and a Loop's "iterations".
 	Attributes map[string]int `json:"attributes,omitempty"`
 	// Transition is the transition the run took after this execution, the last of a top-level
 	// step's visit, as TransitionTakenEvent reported it.
@@ -79,10 +79,12 @@ type StepTrace struct {
 	// with each Output compacted as encoding/json writes it, or stored as a JSON string when it
 	// is not JSON.
 	ToolCalls []ToolCallRecord `json:"tool_calls,omitempty"`
-	// Steps holds the executions nested in this one, such as the attempts of a WithPolicy, the
-	// steps of a Parallel or the elements of a Map, in the order they started. A Map's elements
-	// start in input order only at a MaxConcurrency of zero or one, and in any order above it, so
-	// each carries its index in the list under Attributes["index"] (see PipelineObserver).
+	// Steps holds the executions nested in this one, in the order they started. They are such as
+	// the attempts of a WithPolicy, the steps of a Parallel, the elements of a Map or the
+	// iterations of a Loop. A Map's elements start in input order only at a MaxConcurrency of zero
+	// or one, and in any order above it, so each carries its index in the list under
+	// Attributes["index"] (see PipelineObserver). A Loop's iterations start in order, and each
+	// carries its number under Attributes["iteration"].
 	Steps []StepTrace `json:"steps,omitempty"`
 	// Runs holds the pipeline runs this execution started, such as the run of a pipeline
 	// adapted with NewProgramStep.

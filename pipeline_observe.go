@@ -18,12 +18,14 @@ import (
 // of a run has the TraceID of the run's RunContext, which the runs nested in it share (see
 // RunContext), and every event carries the run's RunContext, with its attributes redacted (see
 // Redactor). An execution is one run of a step: each retry attempt and each cache hit is an
-// execution of its own, numbered by Attempt. WithPolicy and WithCache are not executions of
-// their own; their attempts and cache hits are. A top-level step's writes are merged into the state as part of its execution, so a
-// MergeRule that fails fails that execution; for a top-level WithPolicy or WithCache step it
-// adds a failed execution after the one that wrote. The same holds for the step's transitions
-// on success, evaluated before its execution ends: a When, Amend or Accept that fails or panics
-// fails that execution. Each execution reports the visit of its top-level step in Attributes.
+// execution of its own, numbered by Attempt. WithPolicy, WithCache and WithAmendable are not
+// executions of their own. The executions of the steps they wrap are, and so are the cache hits of
+// WithCache. A top-level step's writes merge into the state as part of its execution, so a
+// MergeRule that fails fails that execution. For a top-level WithPolicy, WithCache or WithAmendable
+// step, that failure adds a failed execution after the one that wrote. The same holds for the
+// step's transitions on success, evaluated before its execution ends: a When, Amend or Accept that
+// fails or panics fails that execution. Each execution reports the visit of its top-level step in
+// Attributes.
 //
 // The events of a run are ordered:
 //   - RunStarted comes before every other event of the run and RunFinished after them. A run
@@ -31,9 +33,9 @@ import (
 //     invalid, emits no events.
 //   - Every execution emits StepStarted and later StepFinished with the same span.
 //   - A top-level step finishes before the next one starts, and a top-level step a transition
-//     skips over emits nothing (see Transition). An execution nested in a composite step (a
-//     Parallel or an element of a Map) starts after the composite starts and finishes before it
-//     finishes.
+//     skips over emits nothing (see Transition). An execution nested in a composite step starts
+//     after the composite starts and finishes before it finishes. Such an execution is a step of
+//     a Parallel, an element of a Map or an iteration of a Loop.
 //   - The attempts of a step follow each other in order, except for the steps of a Map's body
 //     above a MaxConcurrency of one (see below).
 //   - With a MaxConcurrency of zero or one, the elements of a Map run in input order, each
@@ -42,6 +44,9 @@ import (
 //     nested in it interleave in any order, those of one element still following each other in
 //     order. The events of an element, and of the executions nested in it, carry its index in
 //     the list under Attributes["index"].
+//   - The iterations of a Loop run in order, each finishing before the next starts. The events
+//     of an iteration, and of the executions nested in it, carry its number, from one, under
+//     Attributes["iteration"].
 //   - A pipeline run by a step, through NewProgramStep or a step that runs it with its
 //     context, joins the observation of the run: its RunStarted and RunFinished come between
 //     that step's StepStarted and StepFinished, and its run span's parent is the step's span.
@@ -175,6 +180,9 @@ type StepStartedEvent struct {
 	// top-level step it belongs to: a rewind visits a step again (see Transition). "index" is set
 	// for the executions of an element of a Map, those nested in them included, to the element's
 	// index in the list, from zero; above a MaxConcurrency of one, elements start in any order.
+	// "iteration" gives the executions of an iteration of a Loop, those nested in them included,
+	// the number of the iteration, from one. Where Loops nest, the nearest Loop gives it. The
+	// event leaves it out when the run's Redactors change it under the Loop's iteration key.
 	Attributes map[string]int
 }
 
@@ -206,8 +214,12 @@ type StepFinishedEvent struct {
 	Writes map[string]any
 	// Cached reports a WithCache hit: the step did not run and its cached writes were committed.
 	Cached bool
-	// Attributes are those StepStarted reported, and for a Map or MapCollect also "failed", the
-	// number of its elements that failed.
+	// Attributes are those StepStarted reported. A Map or MapCollect adds "failed", the number of
+	// its elements that failed. A Loop adds "iterations", the number of its iterations that ran,
+	// the failed one included. Only the nearest execution with the Map's or Loop's name carries the
+	// count. That is its own execution, or else that of a step with its name that runs it. A
+	// decorator that embeds the Map or Loop and keeps its name is such a step. The event leaves
+	// "iterations" out when the run's Redactors change it under the Loop's iteration key.
 	Attributes map[string]int
 	// ToolCalls holds the tool calls the execution made, through the run's ToolSession or any
 	// other, such as an agent's, in the order they finished, after redaction (see Redactor). The
@@ -482,8 +494,10 @@ type stepObservation struct {
 // observeStep emits StepStarted for an execution of node over values, the state its view
 // reads, when the run in ctx is observed. visit is the visit of the top-level step the execution
 // belongs to. The events of a Map's executions, and of those nested in them, hide its elements'
-// items and outputs (see hideElements). It returns ctx carrying the execution's span, and nil
-// when nothing observes the run.
+// items and outputs (see hideElements). The "iteration" attribute of an execution in a Loop's
+// iteration passes through the redactors under the Loop's iteration key. So does the "iterations"
+// attribute of a Loop. The events leave out one that the redactors change. It returns ctx carrying
+// the execution's span, and nil when nothing observes the run.
 func observeStep(ctx context.Context, node *stepNode, attempt, visit int, values map[string]any) (
 	context.Context,
 	*stepObservation,
@@ -527,6 +541,10 @@ func observeStep(ctx context.Context, node *stepNode, attempt, visit int, values
 		lane.ctx = ctx
 		lane.reads = lane.run.redactValues(reads)
 		lane.attributes = executionAttributes(ctx, visit)
+		if iteration := iterationFrom(ctx); iteration.number > 0 &&
+			!lane.run.keepsAttribute(iteration.key, iteration.number) {
+			delete(lane.attributes, "iteration")
+		}
 		event := StepStartedEvent{
 			Span:       lane.span,
 			RunContext: lane.run.runContext,
@@ -581,6 +599,9 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 		if len(outcome.Attributes) > 0 {
 			attributes = maps.Clone(attributes)
 			maps.Copy(attributes, outcome.Attributes)
+			if count, ok := outcome.Attributes["iterations"]; ok && !run.keepsAttribute(outcome.loopKey, count) {
+				delete(attributes, "iterations")
+			}
 		}
 		event := StepFinishedEvent{
 			RunContext: run.runContext,

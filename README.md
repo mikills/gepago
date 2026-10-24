@@ -14,7 +14,7 @@ Original paper:
 
 - Call any model through the provider-neutral `Generator` interface, with usage, the resolved model and a finish reason on every call.
 - Ask for structured output: typed signature fields, strict JSON schemas, native structured output where the provider has it, and validation before a reply is returned.
-- Build typed `Pipeline`s with retries, timeouts, forward skips, bounded rewinds, branches, fallbacks, parallel steps, run-time fan-out with `Map`, step caching and run budgets.
+- Build typed `Pipeline`s with retries, timeouts, forward skips, bounded rewinds, branches, fallbacks and parallel steps. Add run-time fan-out with `Map`, bounded repeats with `Loop`, step caching and run budgets.
 - Give model steps tools from a registry, under a per-run policy with call limits and caching, with the caller's scope, such as a tenant, on every call.
 - Observe every run with events, recorded traces, HTML run reports, a run context and redaction.
 - Run optional agent loops from the composable `agents` package, with full trace events for runs, turns, LLM calls, tool calls, errors, and run completion.
@@ -307,6 +307,31 @@ The body reads the element under `page` and writes exactly one key; each element
 
 [`examples/map_reduce`](examples/map_reduce) puts skips, `MapCollect`, a rewind with `Amend` and `Accept`, and a scoped tool into one runnable pipeline.
 
+`Loop` runs a body step, and runs it again until a typed condition on the state holds, at most `MaxIterations` times in all:
+
+```go
+pages := gepa.Key[[]string]{Name: "pages"}
+page := gepa.Key[int]{Name: "page"}
+total := gepa.Key[string]{Name: "total"}
+
+readPage := gepa.NewProgramStep("read_page", pageProgram, []gepa.KeyRef{pages.Ref(), page.Ref()}, []gepa.KeyRef{total.Ref()})
+done := func(s gepa.State) (bool, error) {
+    found, err := total.Get(s)
+    if err != nil {
+        return false, err
+    }
+    n, err := page.Get(s)
+    if err != nil {
+        return false, err
+    }
+    list, err := pages.Get(s)
+    return found != "" || n == len(list), err
+}
+scan := gepa.Loop("scan", readPage, done, gepa.LoopOptions{MaxIterations: 50, Iteration: page})
+```
+
+Each iteration runs the body on its own view of the keys it reads. `Iteration` holds the number of the iteration, from one, and never reaches the state. A key that the body reads and writes carries from one iteration to the next, and starts from its `Default` or an earlier write. A `Default` is the usual seed. An earlier write also needs a `MergeRule`. The Loop's value already holds the seed, so a rule that adds or appends counts the seed twice. After each iteration the condition (`done` here) reads the body's keys. When it holds, the Loop commits the writes of that iteration. `Build` refuses a Loop without `MaxIterations`. A Loop that reaches its cap fails with a Permanent error that wraps `ErrMaxIterations` and commits nothing, and an `OnError` transition can catch it. So write the condition to hold when the work ends, found or not, and keep the cap as a guard. A failed iteration fails the Loop with the kind of its error and commits nothing. Cancellation or a spent budget stops the Loop before the next iteration. Each iteration sees the tool memory and cached tool results of the iterations before it, and its events carry `Attributes["iteration"]`. A `Redactor` that hides the iteration key also hides that attribute and the Loop's `"iterations"`. Events, traces and the run report then leave them out. A Loop can be the body of a `Map` or `MapCollect`. There the keys it writes cannot have a seed. To carry a key in each element, run the Loop in a nested pipeline whose `Defaults` seed it. Then make `NewProgramStep` of that pipeline the Map's body. To retry a step, use a rewind with `MaxVisits` instead.
+
 ## Tools
 
 Register tools once and refer to them by name:
@@ -360,7 +385,7 @@ A tool reports usage it did not record itself in `ToolResult.Usage`, which count
 
 ## Observability and redaction
 
-`PipelineSpec.Observers` receive `RunStarted`, `StepStarted`, `StepFinished` (duration, usage and unbudgeted usage, error, reads, writes, tool calls, attempt, attributes such as the visit and a Map element's index, and whether the result was cached) and `RunFinished` events, and a `TransitionObserver` also `TransitionTaken` and `RewindRejected`; an observer that panics does not fail the run. `RecordingObserver` turns the events into serialisable `PipelineTrace`s, which `WriteHTMLRunReport` renders step by step and `TraceDatasetBuilder` turns into reflection records during `Compile`.
+`PipelineSpec.Observers` receive `RunStarted`, `StepStarted`, `StepFinished` and `RunFinished` events. A `TransitionObserver` also receives `TransitionTaken` and `RewindRejected`. `StepFinished` carries the duration, usage and unbudgeted usage, error, reads, writes, tool calls and attempt. It also carries attributes, such as the visit, a Map element's index and a Loop iteration's number, and whether a cache gave the result. An observer that panics does not fail the run. `RecordingObserver` turns the events into serialisable `PipelineTrace`s, which `WriteHTMLRunReport` renders step by step and `TraceDatasetBuilder` turns into reflection records during `Compile`.
 
 ```go
 recorder := &gepa.RecordingObserver{}
@@ -401,7 +426,7 @@ artifact := compiled.Artifact("internal-program")
 err := gepa.SaveProgramArtifact("internal-program.program.json", artifact)
 ```
 
-`compiled.Artifact` records the programme's fingerprint. `Pipeline.Fingerprint()` is derived from the step names, keys and types, the transitions, `MaxVisits`, amendable keys and each `Map`'s keys and `MapOptions` (so changing `MaxConcurrency` changes it), and every loader refuses an artefact whose fingerprint differs from the programme's with a `*FingerprintMismatchError` that shows both, so a renamed key or step never silently picks up a stale prompt. Artefacts saved before v0.8.0 have no fingerprint and still load. To load an artefact across a shape change you know is compatible, record the same `ProgramVersion` on the artefact and pass it to `LoadCompiledProgramVersion` or `LoadCompiledVersion`.
+`compiled.Artifact` records the programme's fingerprint. `Pipeline.Fingerprint()` covers the step names, keys and types, the transitions, `MaxVisits` and amendable keys. It also covers each `Map`'s keys and `MapOptions` (so changing `MaxConcurrency` changes it) and each `Loop`'s `MaxIterations` and iteration key. Every loader refuses an artefact whose fingerprint differs from the programme's with a `*FingerprintMismatchError` that shows both. So a renamed key or step never silently picks up a stale prompt. Artefacts saved before v0.8.0 have no fingerprint and still load. To load an artefact across a shape change you know is compatible, record the same `ProgramVersion` on the artefact and pass it to `LoadCompiledProgramVersion` or `LoadCompiledVersion`.
 
 At runtime, register factories that inject app dependencies such as models, tools, stores, or retrievers:
 
@@ -440,7 +465,7 @@ Lower-level optimiser APIs remain available when you need full control.
 
 ## Test kit
 
-Package `gepatest` provides `FakeGenerator`, a model with scripted replies, usage, finish reasons and errors per call, and `AssertTrace`, which compares a recorded run's steps, the order they ran in, their errors, usage, attributes and transitions; the steps of a pipeline that a Map element runs take that element's index.
+Package `gepatest` provides `FakeGenerator`, a model with scripted replies, usage, finish reasons and errors per call. It also provides `AssertTrace`, which compares a recorded run's steps, the order they ran in, their errors, usage, attributes and transitions. The steps of a pipeline that a Map element runs take that element's index. `AssertTrace` numbers the iterations of a Loop in the order they ran.
 
 A call takes the next reply of the script for its Map element (`OnElement`), else its visit (`OnVisit`), else its step (`OnStep`), each tried by step path, as `gepa.StepPathFrom` reports it, and then by step name; else the first prompt substring it contains, else the default. `OnElement` does not match the calls of a pipeline that an element runs; script those by step path. A script repeats its last reply once used up. `Chat` refuses the requests `ErrInvalidChatRequest` lists, which no provider accepts, with that error; a message without a role passes, though all three providers refuse it. `Calls` returns every call the fake received, `Unmatched` the calls no script answered (an `OnError` transition can hide their error), and `Plain` hides its structured and chat methods to test the prompt-only path.
 

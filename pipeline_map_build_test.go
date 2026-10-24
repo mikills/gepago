@@ -244,6 +244,31 @@ func TestMapBuildErrors(t *testing.T) {
 			wantErr: `transition 0 from "first": To "measure" is not a top-level step of this pipeline, End or Fail`,
 		},
 		{
+			name: "an item key an enclosing map holds",
+			spec: PipelineSpec{
+				Inputs: refs(mapWordsKey.Ref(), Key[[]string]{Name: "inner_words"}.Ref()),
+				Steps: []Step{MapCollect("outer", mapWordsKey, mapWordKey, Parallel(
+					"both",
+					Map("inner", Key[[]string]{Name: "inner_words"}, mapWordKey, measure, mapLengthsKey, MapOptions{}),
+					NewStep("note", refs(word), nil, noop),
+				), Key[[]MapResult[[]int]]{Name: "outer_lengths"}, MapOptions{})},
+			},
+			wantErr: `pipeline step "inner": item key "word", which is already in state (Map "outer" holds each ` +
+				`element under it as string); it never reaches the state, so give it a key of its own`,
+		},
+		{
+			name: "a step nested in the body reading the item as another type",
+			spec: PipelineSpec{
+				Steps: []Step{lengthsOf(Parallel(
+					"both",
+					measure,
+					NewStep("note", refs(Key[int]{Name: "word"}.Ref()), nil, noop),
+				), MapOptions{})},
+			},
+			wantErr: `pipeline step "note" reads "word" as int, but Map "lengths" holds each element under it as ` +
+				`string`,
+		},
+		{
 			name: "a later step reading the body's write",
 			spec: PipelineSpec{
 				Steps: []Step{lengthsOf(measure, MapOptions{}), NewStep("after", refs(length), nil, noop)},

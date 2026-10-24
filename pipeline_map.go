@@ -63,8 +63,10 @@ type MapResult[Out any] struct {
 // limit counts all its elements together. Each element is an execution of body nested in the
 // Map's execution, whose StepStarted and StepFinished events carry the element's index, from
 // zero, under Attributes["index"] beside "visit", as do the executions nested in it, and whose
-// StepPathFrom is "<map>.<body>". The Map's StepFinished carries under Attributes["failed"] how
-// many elements failed.
+// StepPathFrom is "<map>.<body>". The nearest execution with the Map's name reports once how many
+// elements failed, under Attributes["failed"] of its StepFinished. That is the Map's own execution,
+// or else that of a step with the Map's name that runs it. A decorator that embeds the Map and
+// keeps its name is such a step.
 //
 // An element's events carry its element under the item key and its output under the key body
 // writes. A Redactor that hides the list under items hides every element's item, and one that
@@ -75,7 +77,17 @@ type MapResult[Out any] struct {
 //
 // body is a nested step: its name must be unique in the pipeline and its components are scoped
 // as "<map>.<body>.<component>", one set that every element shares. The Map is a ComponentStep
-// when body is one.
+// when body is one. Before any element runs, the Map checks that body reads item, also when a
+// caller runs it without Build. Only Build checks that body reads it as In, since a run converts
+// the element to the type body reads it as. When a caller runs the Map with Run or RunCandidate,
+// the Map and its elements read only the keys the caller's State exposes (see Loop). The Map's
+// error is then a StepError that names the Map, as in a pipeline. A step with the Map's name that
+// runs it in its own execution gets the error as it is, and its execution names the Map. A step
+// that is not a wrapper has its own execution when a pipeline, a Parallel, a Map, a Loop or a
+// wrapper runs it. WithPolicy, WithCache and WithAmendable return wrappers. A decorator you write
+// is never a wrapper, even when it embeds one. So a decorator that embeds the Map and keeps its
+// name gets the error as it is. That is so when a pipeline, a Parallel, a Map, a Loop or a wrapper
+// runs the decorator. A caller that runs the Map outside such an execution gets the StepError.
 func Map[In, Out any](
 	name string,
 	items Key[[]In],
@@ -242,18 +254,15 @@ func (m *mapStep) Validate() error {
 	return nil
 }
 
-// checkBody requires the body to read the item as the list's element type and to write exactly
-// one key, of the results' element type, that is none of the map's own keys. The body's keys
-// must be valid.
+// checkBody requires the body to read the item as the list's element type (see checkItem). The body
+// must also write exactly one key, of the results' element type, that is none of the map's own
+// keys. The body's keys must be valid.
 func (m *mapStep) checkBody() error {
+	if err := m.checkItem(); err != nil {
+		return err
+	}
 	body := m.body
-	typ, reads := body.readTypes[m.item.Name]
-	switch {
-	case !reads:
-		return fmt.Errorf("body %q must read the item key %q", body.name, m.item.Name)
-	case typ != m.item.Type:
-		return fmt.Errorf("body %q reads item %q as %s, but the items are %s", body.name, m.item.Name, typ, m.item.Type)
-	case len(body.writes) != 1:
+	if len(body.writes) != 1 {
 		return fmt.Errorf("body %q writes %q, but a map body writes exactly one key", body.name, body.writeNames)
 	}
 	write := body.writes[0]
@@ -270,14 +279,62 @@ func (m *mapStep) checkBody() error {
 	return nil
 }
 
+// checkItem requires the body to read the item as the list's element type (see readsItem). The
+// body's reads must be valid.
+func (m *mapStep) checkItem() error {
+	if err := m.readsItem(); err != nil {
+		return err
+	}
+	if typ := m.body.readTypes[m.item.Name]; typ != m.item.Type {
+		return fmt.Errorf(
+			"body %q reads item %q as %s, but the items are %s",
+			m.body.name,
+			m.item.Name,
+			typ,
+			m.item.Type,
+		)
+	}
+	return nil
+}
+
+// readsItem requires the body to read the item key, as any type. The body's reads must be valid.
+func (m *mapStep) readsItem() error {
+	body := m.body
+	if _, reads := body.readTypes[m.item.Name]; reads {
+		return nil
+	}
+	if loop := nestedLoop(body); loop != nil && loop.iteration.Name == m.item.Name {
+		return fmt.Errorf(
+			"body %q is a Loop whose iteration key is the item key %q, but a Loop in a Map needs an iteration key "+
+				"of its own",
+			body.name,
+			m.item.Name,
+		)
+	}
+	return fmt.Errorf("body %q must read the item key %q", body.name, m.item.Name)
+}
+
 func (m *mapStep) Run(ctx context.Context, s State) error {
 	return m.runCandidate(ctx, nil, s)
 }
 
-func (m *mapStep) runCandidate(ctx context.Context, candidate Candidate, s State) error {
+func (m *mapStep) runCandidate(ctx context.Context, candidate Candidate, s State) (err error) {
+	defer func() { err = nameItself(m.name, m.reads, s, err) }()
 	failed := 0
-	defer func() { s.scope.report("failed", failed) }()
-	raw, ok := s.values[m.items.Name]
+	// the execution of the map, or of a step with its name that runs it, reports its failed
+	// elements.
+	if s.scope.named(m.name) {
+		defer func() { s.scope.report("failed", failed) }()
+	}
+	// Build has made this check when a pipeline runs the map, but a caller may run it unbuilt. Only
+	// Build checks the type the body reads the item as, since the element converts to it as any
+	// state value does.
+	if m.body.step != nil && m.body.readsErr == nil {
+		if err := m.readsItem(); err != nil {
+			return err
+		}
+	}
+	raw, ok := s.visible(m.items.Name)
 	if !ok {
 		return fmt.Errorf("state key %q is missing", m.items.Name)
 	}
@@ -294,7 +351,8 @@ func (m *mapStep) runCandidate(ctx context.Context, candidate Candidate, s State
 			m.opts.MaxItems,
 		))
 	}
-	outcomes, err := m.runElements(ctx, candidate, elements, s.values)
+	// the elements see only the keys s exposes, as the body would through s.
+	outcomes, err := m.runElements(ctx, candidate, elements, s.visibleValues(m.body.reads))
 	for _, outcome := range outcomes {
 		if outcome.err != nil {
 			failed++
