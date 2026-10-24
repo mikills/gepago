@@ -292,7 +292,7 @@ func decodeToolArguments[T any](arguments string) (T, error) {
 	if err != nil {
 		return zero, err
 	}
-	return decodeTypedValue[T](value)
+	return decodeTypedValue[T](value, fromText)
 }
 
 // parseToolArguments parses a call's JSON arguments, keeping numbers as json.Number; empty

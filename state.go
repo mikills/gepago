@@ -339,6 +339,17 @@ func decodeStateValue[T any](key string, raw any) (T, error) {
 // convertStateValue returns a copy of value as typ, converting values of other types through
 // their JSON form, and checks the result with its Validate method if it has one.
 func convertStateValue(key string, typ reflect.Type, value any) (any, error) {
+	return convertValue(key, typ, value, fromState)
+}
+
+// convertTextValue is convertStateValue for a value that a model or a tool wrote, such as a field
+// of a tool's output. Its image errors name nothing of the value (see valueSource).
+func convertTextValue(key string, typ reflect.Type, value any) (any, error) {
+	return convertValue(key, typ, value, fromText)
+}
+
+// convertValue is convertStateValue for a value from source.
+func convertValue(key string, typ reflect.Type, value any, source valueSource) (any, error) {
 	var out any
 	switch {
 	case value == nil:
@@ -350,7 +361,7 @@ func convertStateValue(key string, typ reflect.Type, value any) (any, error) {
 		typ.Kind() == reflect.Interface && reflect.TypeOf(value).Implements(typ):
 		out = deepCopy(value)
 	default:
-		decoded, err := decodeJSONValue(typ, value)
+		decoded, err := decodeValue(typ, value, source)
 		if err != nil {
 			return nil, fmt.Errorf("state key %q: decode as %s: %w", key, typ, err)
 		}
@@ -642,12 +653,29 @@ func tagOptionError(typ reflect.Type) (reflect.Type, error) {
 	return nil, nil
 }
 
-// decodeJSONValue converts value to typ through its JSON form. Some types can hold an Image, or an
-// empty interface that value may fill with one. When typ is such a type and value holds images,
-// each Image of value decodes at its place as itself (see imagePlaces.decodeOptions). This is
-// necessary because the JSON form of an Image, a summary, holds no data. For any other type it
-// never walks value for images.
+// valueSource says where a value to decode comes from. A model or a tool can write any text, so
+// an image error about a value from text names nothing of the value.
+type valueSource int
+
+const (
+	// fromState is a value of the state, of a run's inputs or of a Default.
+	fromState valueSource = iota
+	// fromText is a value that a model or a tool wrote, such as a reply or tool arguments.
+	fromText
+)
+
+// decodeJSONValue converts value, a value from state, to typ through its JSON form (see
+// decodeValue).
 func decodeJSONValue(typ reflect.Type, value any) (any, error) {
+	return decodeValue(typ, value, fromState)
+}
+
+// decodeValue converts value, from source, to typ through its JSON form. Some types can hold an
+// Image, or an empty interface that value may fill with one. When typ is such a type and value
+// holds images, each Image of value decodes at its place as itself (see imagePlaces.decodeOptions).
+// This is necessary because the JSON form of an Image, a summary, holds no data. For any other
+// type it never walks value for images. The type check is only a fast path before that walk.
+func decodeValue(typ reflect.Type, value any, source valueSource) (any, error) {
 	var (
 		data   []byte
 		places imagePlaces
@@ -663,7 +691,7 @@ func decodeJSONValue(typ reflect.Type, value any) (any, error) {
 	}
 	options := decodeOptions
 	if places != nil || mayHoldImage(typ, false) {
-		options = places.decodeOptions()
+		options = places.decodeOptions(source)
 	}
 	var generic any
 	decoder := json.NewDecoder(bytes.NewReader(data))

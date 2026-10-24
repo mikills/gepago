@@ -249,10 +249,12 @@ func nextPointer(dec *jsontext.Decoder) jsontext.Pointer {
 
 // decodeOptions returns decodeOptions with an Image decoded as the image of p at its place. An
 // empty interface at the place of an image of p decodes as that image too. An Image anywhere else
-// fails with ErrInvalidImage, naming at most the digest of the summary it holds. Null leaves the
-// Image as it is, as Image.UnmarshalJSON does.
-func (p imagePlaces) decodeOptions() jsonv2.Options {
-	unmarshalers := []*jsonv2.Unmarshalers{jsonv2.UnmarshalFromFunc(p.decodeImage)}
+// fails with ErrInvalidImage. For a value from state, the error names the digest of the summary it
+// holds, when that is a digest. For a value from text it names nothing of the value. Null leaves
+// the Image as it is, as Image.UnmarshalJSON does.
+func (p imagePlaces) decodeOptions(source valueSource) jsonv2.Options {
+	decodeImage := func(dec *jsontext.Decoder, image *Image) error { return p.decodeImage(dec, image, source) }
+	unmarshalers := []*jsonv2.Unmarshalers{jsonv2.UnmarshalFromFunc(decodeImage)}
 	if len(p) > 0 {
 		unmarshalers = append(unmarshalers, jsonv2.UnmarshalFromFunc(p.decodeInterface))
 	}
@@ -262,8 +264,9 @@ func (p imagePlaces) decodeOptions() jsonv2.Options {
 	)
 }
 
-// decodeImage decodes an Image at the place of an image of p.
-func (p imagePlaces) decodeImage(dec *jsontext.Decoder, image *Image) error {
+// decodeImage decodes an Image at the place of an image of p. Its error names the digest of a
+// summary only for a value from state, and only when the digest is 64 lower-case hex digits.
+func (p imagePlaces) decodeImage(dec *jsontext.Decoder, image *Image, source valueSource) error {
 	at := nextPointer(dec)
 	value, err := dec.ReadValue()
 	if err != nil {
@@ -277,7 +280,8 @@ func (p imagePlaces) decodeImage(dec *jsontext.Decoder, image *Image) error {
 		return nil
 	}
 	var summary imageSummary
-	if jsonv2.Unmarshal(value, &summary, jsonv2.RejectUnknownMembers(true)) != nil || !hexDigest(summary.SHA256) {
+	if source == fromText || jsonv2.Unmarshal(value, &summary, jsonv2.RejectUnknownMembers(true)) != nil ||
+		!hexDigest(summary.SHA256) {
 		return fmt.Errorf("%w: JSON holds no image data (build the image with NewImage)", ErrInvalidImage)
 	}
 	return fmt.Errorf(

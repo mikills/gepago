@@ -641,37 +641,39 @@ func TestTypedPredictRejectsImageInputWithoutChatClient(t *testing.T) {
 	type pagesIn struct {
 		Pages []gepa.Image `json:"pages"`
 	}
-	lm := gepatest.NewFakeGenerator()
+	lm := gepatest.NewFakeGenerator().Default(reply(`{"caption": "x"}`))
+	program := gepa.TypedPredict[pagesIn, captionOut]{LM: lm.Plain()}
 
-	err := gepa.TypedPredict[pagesIn, captionOut]{LM: lm.Plain()}.Validate()
-
+	require.NoError(t, program.Validate(), "only an input with the Type \"image\" needs a chat client to build")
+	_, err := program.Run(context.Background(), pagesIn{})
+	require.NoError(t, err, "a run without images does not chat")
+	_, err = program.Run(context.Background(), pagesIn{Pages: []gepa.Image{gepatest.PNG("page")}})
 	require.ErrorIs(t, err, gepa.ErrImagesUnsupported)
 	require.True(t, gepa.IsPermanent(err))
-	require.EqualError(t, err, "model cannot take images: typed predict input gepa_test.pagesIn holds an Image, "+
+	require.EqualError(t, err, `model cannot take images: input "pages" holds an image, `+
 		"which needs a language model that implements ChatClient, and gepatest.plainGenerator does not")
-	_, err = gepa.TypedPredict[pagesIn, captionOut]{LM: lm.Plain()}.Run(
-		context.Background(),
-		pagesIn{Pages: []gepa.Image{gepatest.PNG("page")}},
-	)
-	require.ErrorIs(t, err, gepa.ErrImagesUnsupported)
+	require.Len(t, lm.Calls(), 1, "the run with an image makes no call")
 	err = gepa.TypedPredict[albumIn, captionOut]{LM: lm.Plain()}.Validate()
 	require.ErrorIs(t, err, gepa.ErrImagesUnsupported)
 	require.ErrorContains(t, err, `input field "photo" has the type "image"`)
 	require.NoError(t, gepa.TypedPredict[pagesIn, captionOut]{LM: lm}.Validate())
-	require.Empty(t, lm.Calls())
 }
 
-func TestTypedPredictRejectsImageOutput(t *testing.T) {
+func TestTypedPredictRejectsAnImageOutputField(t *testing.T) {
 	type figureOut struct {
+		Figure gepa.Image `json:"figure,omitzero"`
+	}
+	type optionalFigureOut struct {
 		Figure *gepa.Image `json:"figure"`
 	}
 
 	err := gepa.TypedPredict[captionOut, figureOut]{LM: gepatest.NewFakeGenerator()}.Validate()
 
-	require.EqualError(
+	require.EqualError(t, err, `output field "figure": type "image" applies to inputs only`)
+	require.NoError(
 		t,
-		err,
-		"typed predict outputs: gepa_test.figureOut can hold an Image, but a model reply cannot carry one",
+		gepa.TypedPredict[captionOut, optionalFigureOut]{LM: gepatest.NewFakeGenerator()}.Validate(),
+		"a reply decodes null into a *Image, and refuses any other value",
 	)
 }
 

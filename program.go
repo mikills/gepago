@@ -436,7 +436,7 @@ func (s Signature) checkOutputs(prediction Prediction) error {
 		case value == nil && ok && !field.Optional:
 			problems = append(problems, fmt.Sprintf("output %q is null", field.Name))
 		case value != nil && fieldTypes[field.Type] != nil:
-			if _, err := decodeJSONValue(fieldTypes[field.Type], value); err != nil {
+			if _, err := decodeValue(fieldTypes[field.Type], value, fromText); err != nil {
 				problems = append(problems, fmt.Sprintf("output %q is not a valid %s: %v", field.Name, field.Type, err))
 			}
 		}

@@ -329,7 +329,7 @@ func TestDecodeTimeDurationNumberAndBytes(t *testing.T) {
 		require.Equal(t, want, got)
 	})
 	t.Run("typed predict output", func(t *testing.T) {
-		got, err := decodeTypedValue[decodedKinds](reply("blob", nil))
+		got, err := decodeTypedValue[decodedKinds](reply("blob", nil), fromText)
 		require.NoError(t, err)
 		require.Equal(t, time.Duration(1500*time.Millisecond), got.Wait)
 		require.Nil(t, got.Blob)

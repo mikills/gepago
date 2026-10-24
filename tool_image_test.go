@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	gepa "github.com/mikills/gepago"
@@ -84,12 +85,14 @@ func TestNewToolRefusesAnImageInItsArguments(t *testing.T) {
 	photo := gepatest.PNG("photo")
 	summary, err := json.Marshal(photo)
 	require.NoError(t, err)
+	secret := strings.Repeat("SECRET-sha", 20)
 
 	for name, call := range map[string]struct {
 		tool      gepa.ToolProvider
 		arguments string
 	}{
 		"an image's summary": {tool: measure, arguments: `{"img":` + string(summary) + `}`},
+		"a long sha256":      {tool: measure, arguments: `{"img":{"media_type":"image/png","size":5,"sha256":"` + secret + `"}}`},
 		"base64 data":        {tool: measure, arguments: `{"img":"aGVsbG8="}`},
 		"an image part":      {tool: history, arguments: `{"history":[{"role":"user","parts":[{"image":"aGVsbG8="}]}]}`},
 	} {
@@ -99,7 +102,10 @@ func TestNewToolRefusesAnImageInItsArguments(t *testing.T) {
 			require.ErrorIs(t, err, gepa.ErrInvalidToolArguments)
 			require.ErrorIs(t, err, gepa.ErrInvalidImage)
 			require.True(t, gepa.IsPermanent(err))
-			require.NotContains(t, err.Error(), "aGVsbG8=")
+			require.ErrorContains(t, err, "JSON holds no image data (build the image with NewImage)")
+			for _, sent := range []string{"aGVsbG8=", photo.SHA256(), secret} {
+				require.NotContains(t, err.Error(), sent, "the error names nothing of the arguments")
+			}
 			require.Zero(t, invoked, "the tool does not run")
 		})
 	}
@@ -244,4 +250,103 @@ func TestToolMiddlewareSeesTheImageOutputError(t *testing.T) {
 	require.EqualError(t, seen[0], message)
 	require.True(t, gepa.IsPermanent(seen[0]))
 	require.False(t, errors.Is(err, gepa.ErrInvalidOutput), "the tool fails before the ToolStep reads its output")
+}
+
+// anyArguments is a tool that takes any arguments and returns them as its output.
+func anyArguments(name string, calls *[]string) gepa.ToolProvider {
+	return gepa.NewToolFunc(
+		gepa.Tool{Name: name, Description: "Echo the arguments", Parameters: json.RawMessage(`{"type":"object"}`)},
+		func(_ context.Context, call gepa.ToolCall) (gepa.ToolResult, error) {
+			*calls = append(*calls, call.Arguments)
+			return gepa.ToolResult{Output: json.RawMessage(`{"count":1}`)}, nil
+		},
+	)
+}
+
+func TestToolStepRefusesAnImageArgumentKeyAtBuild(t *testing.T) {
+	var calls []string
+	registry, err := gepa.NewToolRegistry(anyArguments("measure_image", &calls))
+	require.NoError(t, err)
+	count := gepa.Key[int]{Name: "count"}
+	for _, key := range []gepa.KeyRef{
+		gepa.Key[gepa.Image]{Name: "photo"}.Ref(),
+		gepa.Key[*gepa.Image]{Name: "photo"}.Ref(),
+		gepa.Key[[]gepa.Image]{Name: "photo"}.Ref(),
+		gepa.Key[[2]gepa.Image]{Name: "photo"}.Ref(),
+		gepa.Key[map[string][]*gepa.Image]{Name: "photo"}.Ref(),
+	} {
+		t.Run(key.Type.String(), func(t *testing.T) {
+			_, err := gepa.PipelineSpec{
+				Inputs: refs(key),
+				Steps:  []gepa.Step{gepa.ToolStep("measure", "measure_image", refs(key), refs(count.Ref()))},
+				Tools:  registry,
+			}.Build()
+
+			require.EqualError(t, err, `pipeline step "measure": reads "photo" as `+key.Type.String()+
+				`, which holds an Image, but the arguments of tool "measure_image" travel as JSON without image data`)
+		})
+	}
+}
+
+func TestToolStepRefusesAnImageInItsArgumentsAtRunTime(t *testing.T) {
+	type framed struct {
+		Caption string     `json:"caption"`
+		Photo   gepa.Image `json:"photo"`
+	}
+	var calls []string
+	registry, err := gepa.NewToolRegistry(anyArguments("frame", &calls))
+	require.NoError(t, err)
+	frameKey := gepa.Key[framed]{Name: "framed"}
+	count := gepa.Key[int]{Name: "count"}
+	pipeline := fpBuild(t, gepa.PipelineSpec{
+		Inputs: refs(frameKey.Ref()),
+		Steps:  []gepa.Step{gepa.ToolStep("frame", "frame", refs(frameKey.Ref()), refs(count.Ref()))},
+		Tools:  registry,
+	})
+	photo := gepatest.PNG("photo")
+
+	_, err = pipeline.RunCandidate(context.Background(), nil, gepa.Prediction{
+		"framed": framed{Caption: "secret caption", Photo: photo},
+	})
+
+	require.EqualError(t, err, `pipeline step "frame": encode arguments of tool "frame": state key "framed": `+
+		"gepa_test.framed holds an Image, but tool arguments travel as JSON without image data")
+	require.True(t, gepa.IsPermanent(err))
+	require.NotContains(t, err.Error(), photo.SHA256())
+	require.Empty(t, calls, "the tool does not run")
+
+	_, err = pipeline.RunCandidate(context.Background(), nil, gepa.Prediction{"framed": framed{Caption: "none"}})
+	require.NoError(t, err)
+	require.Equal(t, []string{`{"framed":{"caption":"none","photo":null}}`}, calls, "a zero Image encodes as null")
+}
+
+func TestToolStepPassesTextOnlyMessagesFromState(t *testing.T) {
+	var got []gepa.Message
+	tool := gepa.NewTool("history", "Read a history", func(_ context.Context, args historyArgs) (struct {
+		Count int `json:"count"`
+	}, error,
+	) {
+		got = args.History
+		return struct {
+			Count int `json:"count"`
+		}{Count: len(args.History)}, nil
+	})
+	registry, err := gepa.NewToolRegistry(tool)
+	require.NoError(t, err)
+	count := gepa.Key[int]{Name: "count"}
+	pipeline := fpBuild(t, gepa.PipelineSpec{
+		Inputs: refs(historyKey.Ref()),
+		Steps:  []gepa.Step{gepa.ToolStep("read", "history", refs(historyKey.Ref()), refs(count.Ref()))},
+		Tools:  registry,
+	})
+	history := []gepa.Message{
+		{Role: gepa.RoleUser, Content: "hi"},
+		{Role: gepa.RoleAssistant, Parts: []gepa.Part{{Text: "hello"}}},
+	}
+
+	outputs, err := pipeline.RunCandidate(context.Background(), nil, gepa.Prediction{"history": history})
+
+	require.NoError(t, err)
+	require.Equal(t, gepa.Prediction{"count": 2}, outputs)
+	require.Equal(t, history, got)
 }

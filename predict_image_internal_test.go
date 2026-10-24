@@ -87,7 +87,7 @@ func TestImageDecodeOptionsPrecedeImageMethods(t *testing.T) {
 
 	var got target
 	got.Null = &img
-	require.NoError(t, jsonv2.Unmarshal(data, &got, places.decodeOptions()))
+	require.NoError(t, jsonv2.Unmarshal(data, &got, places.decodeOptions(fromState)))
 	require.Equal(t, target{
 		Direct:  img,
 		Pointer: &img,
@@ -105,7 +105,7 @@ func TestImagePlacesDecodeErrors(t *testing.T) {
 
 	t.Run("an Image from a cut stream", func(t *testing.T) {
 		var decoded Image
-		require.Error(t, places.decodeImage(jsontext.NewDecoder(strings.NewReader("{")), &decoded))
+		require.Error(t, places.decodeImage(jsontext.NewDecoder(strings.NewReader("{")), &decoded, fromState))
 	})
 	t.Run("an any from a cut stream", func(t *testing.T) {
 		dec := jsontext.NewDecoder(strings.NewReader(`{"photo": {`))
@@ -133,17 +133,21 @@ func TestImagePlacesDecodeErrors(t *testing.T) {
 	})
 	t.Run("a summary at no image's place", func(t *testing.T) {
 		var decoded Image
-		err := places.decodeImage(jsontext.NewDecoder(strings.NewReader(string(summaryJSON(t, img)))), &decoded)
+		summary := string(summaryJSON(t, img))
+		err := places.decodeImage(jsontext.NewDecoder(strings.NewReader(summary)), &decoded, fromState)
 		require.ErrorIs(t, err, ErrInvalidImage)
 		require.EqualError(
 			t,
 			err,
 			"invalid image: the summary with the sha256 "+img.SHA256()+" is not an image (build the image with NewImage)",
 		)
+		err = places.decodeImage(jsontext.NewDecoder(strings.NewReader(summary)), &decoded, fromText)
+		require.EqualError(t, err, "invalid image: JSON holds no image data (build the image with NewImage)",
+			"text from a model or a tool names nothing of the value")
 	})
 	t.Run("a summary whose sha256 is not a digest", func(t *testing.T) {
 		var decoded Image
-		err := places.decodeImage(jsontext.NewDecoder(strings.NewReader(`{"sha256": "SECRET"}`)), &decoded)
+		err := places.decodeImage(jsontext.NewDecoder(strings.NewReader(`{"sha256": "SECRET"}`)), &decoded, fromState)
 		require.EqualError(t, err, "invalid image: JSON holds no image data (build the image with NewImage)")
 	})
 	t.Run("an encoding that fails", func(t *testing.T) {

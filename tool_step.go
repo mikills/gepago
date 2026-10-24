@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"reflect"
@@ -25,6 +27,12 @@ import (
 // and every required property must be read. For a tool made by NewTool, each read must also
 // have the Go type of the argument field it fills and each write the Go type of the output
 // field it takes, when the output is a struct.
+//
+// Tool arguments travel as JSON, and the JSON form of an Image holds no image data. So Build
+// refuses a read whose type is Image, or reaches Image only through pointers, slices, arrays and
+// map values, such as []*Image. A read of another type can hold an Image in a struct field. When
+// its value holds an Image from NewImage, the step fails with a Permanent error. The error names
+// the key and the Go type of its value. A zero Image encodes as null.
 func ToolStep(name, tool string, reads, writes []KeyRef) Step {
 	return &toolStep{
 		name:   strings.TrimSpace(name),
@@ -45,12 +53,42 @@ func (s *toolStep) Name() string     { return s.name }
 func (s *toolStep) Reads() []KeyRef  { return slices.Clone(s.reads) }
 func (s *toolStep) Writes() []KeyRef { return slices.Clone(s.writes) }
 
-// Validate requires a tool name.
+// Validate requires a tool name. It also refuses a read whose type is an Image, or a chain of
+// pointers, slices, arrays and map values that ends at one.
 func (s *toolStep) Validate() error {
 	if strings.TrimSpace(s.tool) == "" {
 		return errors.New("tool step tool name is required")
 	}
+	for _, key := range s.reads {
+		if key.Type != nil && imageChain(key.Type) {
+			return fmt.Errorf(
+				"reads %q as %s, which holds an Image, but the arguments of tool %q travel as JSON without image data",
+				key.Name,
+				key.Type,
+				s.tool,
+			)
+		}
+	}
 	return nil
+}
+
+// imageChain reports whether typ is Image, or reaches Image through pointers, slices, arrays and
+// map values alone.
+func imageChain(typ reflect.Type) bool {
+	seen := map[reflect.Type]bool{}
+	for !seen[typ] {
+		if typ == imageType {
+			return true
+		}
+		seen[typ] = true
+		switch typ.Kind() {
+		case reflect.Pointer, reflect.Slice, reflect.Array, reflect.Map:
+			typ = typ.Elem()
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 // namedTools returns the tool the step calls.
@@ -165,7 +203,7 @@ func (s *toolStep) Run(ctx context.Context, state State) error {
 		}
 		args[key.Name] = value
 	}
-	arguments, err := json.Marshal(args)
+	arguments, err := encodeToolArguments(args)
 	if err != nil {
 		return fmt.Errorf("encode arguments of tool %q: %w", s.tool, err)
 	}
@@ -181,7 +219,7 @@ func (s *toolStep) Run(ctx context.Context, state State) error {
 		value, ok := outputs[key.Name]
 		if !ok {
 			err = fmt.Errorf("%w: tool %q output has no field %q", ErrInvalidOutput, s.tool, key.Name)
-		} else if value, err = convertStateValue(key.Name, key.Type, value); err != nil {
+		} else if value, err = convertTextValue(key.Name, key.Type, value); err != nil {
 			err = fmt.Errorf("%w: tool %q output: %w", ErrInvalidOutput, s.tool, err)
 		}
 		if err != nil {
@@ -190,6 +228,39 @@ func (s *toolStep) Run(ctx context.Context, state State) error {
 		state.store(key.Name, key.Type, value, true)
 	}
 	return nil
+}
+
+// encodeToolArguments encodes args, the value of each read under its key, as json.Marshal does.
+// The JSON form of an Image holds no image data. So an Image from NewImage in a value fails the
+// encode with a Permanent error. The error names the key and the Go type of the value. A zero
+// Image encodes as null.
+func encodeToolArguments(args map[string]any) ([]byte, error) {
+	var at jsontext.Pointer
+	holdsImage := false
+	refuse := jsonv2.MarshalToFunc(func(enc *jsontext.Encoder, image Image) error {
+		if image.Validate() != nil {
+			return errors.ErrUnsupported
+		}
+		if !holdsImage {
+			holdsImage, at = true, enc.StackPointer()
+		}
+		return ErrInvalidImage
+	})
+	arguments, err := jsonv2.Marshal(args, json.DefaultOptionsV1(), jsonv2.WithMarshalers(refuse))
+	if !holdsImage {
+		return arguments, err
+	}
+	// args is an object, so the first token of the image's place is the key that holds it.
+	key := ""
+	for token := range at.Tokens() {
+		key = token
+		break
+	}
+	return nil, PermanentError(fmt.Errorf(
+		"state key %q: %T holds an Image, but tool arguments travel as JSON without image data",
+		key,
+		args[key],
+	))
 }
 
 // toolOutputObject decodes a tool's output as a JSON object, keeping numbers as json.Number.

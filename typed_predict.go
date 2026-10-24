@@ -42,11 +42,20 @@ import (
 // an empty interface, or a map whose values are Image or an empty interface, such as Prediction.
 // Pointers to these work too, as do map values behind pointers, such as *map[string]Image or
 // map[string]*any. The Images reach the model as Go values. RunCandidate takes each Image of In
-// from its inputs at its place, so a step can read an Image key. Sometimes the static type of a
-// field of In holds an Image, such as Image, *Image or []Image. Then LM must be able to chat, or
-// Validate fails with a Permanent error that matches ErrImagesUnsupported for the model.
-// MaxToolTurns must not be negative either. TypedPredict finds an Image in a field of type any only
-// at run time, as Predict does. Out cannot hold an Image, since a model reply cannot carry one.
+// from its inputs at its place, so a step can read an Image key.
+//
+// An input of the Type "image" needs an LM that can chat, or Validate fails with a Permanent error
+// that matches ErrImagesUnsupported (see Predict.Validate). A run checks every other input against
+// its value, as Predict does. So a field of a type such as *Image, []Image or []Message passes
+// Validate with any LM. When a value of the inputs holds an Image, the run needs an LM that can
+// chat and a MaxToolTurns that is not negative. Otherwise it fails with a Permanent error before
+// it calls the model.
+//
+// A model reply cannot carry an image. So an Out field of type Image fails Validate, since the
+// Type "image" applies to inputs only. Out can hold an Image in other places, such as in the Parts
+// of a Message. A reply that gives such an Image a value other than null fails to decode with an
+// error that matches ErrInvalidImage. It goes through the repair loop like any other invalid
+// reply. The error names nothing of the reply.
 //
 // TypedPredict implements Program and SignatureProgram, so Compile can optimise it and
 // NewProgramStep can run it as a pipeline step that reads In's fields and writes Out's.
@@ -108,7 +117,7 @@ func (p TypedPredict[In, Out]) RunCandidate(
 	candidate Candidate,
 	inputs Prediction,
 ) (Prediction, error) {
-	in, err := decodeTypedValue[In](map[string]any(inputs))
+	in, err := decodeTypedValue[In](map[string]any(inputs), fromState)
 	if err != nil {
 		return nil, fmt.Errorf("typed predict inputs: %w", err)
 	}
@@ -169,7 +178,7 @@ func typedOutputs(out any, reply Prediction) Prediction {
 		case fieldValue.CanInterface():
 			outputs[name] = fieldValue.Interface()
 		default:
-			decoded, err := convertStateValue(name, field.typ, reply[name])
+			decoded, err := convertTextValue(name, field.typ, reply[name])
 			if err != nil {
 				decoded = reflect.Zero(field.typ).Interface()
 			}
@@ -205,7 +214,7 @@ func (p TypedPredict[In, Out]) run(
 		return out, nil, err
 	}
 	reply, err := predict.run(ctx, candidate, inputs, func(reply Prediction) error {
-		decoded, err := decodeTypedValue[Out](map[string]any(reply))
+		decoded, err := decodeTypedValue[Out](map[string]any(reply), fromText)
 		if err != nil {
 			return fmt.Errorf("%w: %s%w", ErrInvalidOutput, signaturePrefix(predict.Signature.Name), err)
 		}
@@ -234,24 +243,7 @@ func (p TypedPredict[In, Out]) predict() (Predict, error) {
 		ToolRegistry:    p.ToolRegistry,
 		ToolPolicy:      p.ToolPolicy,
 	}
-	if err := predict.Validate(); err != nil {
-		return predict, err
-	}
-	in := reflect.TypeFor[In]()
-	switch {
-	case !mayHoldImage(in, false):
-	case !canChat(p.LM):
-		return predict, PermanentError(fmt.Errorf(
-			"%w: typed predict input %s holds an Image, which needs a language model that implements ChatClient, and %T %s",
-			ErrImagesUnsupported,
-			in,
-			p.LM,
-			chatReason(p.LM),
-		))
-	case p.MaxToolTurns < 0:
-		return predict, predict.negativeToolTurns()
-	}
-	return predict, nil
+	return predict, predict.Validate()
 }
 
 // namedTools returns the tools the programme offers its model.
@@ -274,12 +266,6 @@ func typedSignature(base Signature, in, out reflect.Type) (Signature, error) {
 		return Signature{}, fmt.Errorf("typed predict derives its outputs from %s; leave Signature.Outputs empty", out)
 	}
 	signature := base
-	if mayHoldImage(out, false) {
-		return Signature{}, fmt.Errorf(
-			"typed predict outputs: %s can hold an Image, but a model reply cannot carry one",
-			out,
-		)
-	}
 	outputs, err := structFields(out, true)
 	if err != nil {
 		return Signature{}, fmt.Errorf("typed predict outputs: %w", err)
@@ -389,7 +375,8 @@ func optionalImageInputs(inputs []Field, in reflect.Type) []Field {
 
 // structFields lists the JSON fields of a struct type as signature fields. An input of type
 // Image has the Type "image" in place of a schema, unless its tag has omitempty or omitzero,
-// which makes it optional.
+// which makes it optional. An output of type Image has the Type "image" too, so
+// Signature.Validate refuses it.
 func structFields(typ reflect.Type, outputs bool) ([]Field, error) {
 	if !structType(typ) {
 		return nil, fmt.Errorf("%s must be a struct without its own UnmarshalJSON or UnmarshalText", typ)
@@ -401,7 +388,7 @@ func structFields(typ reflect.Type, outputs bool) ([]Field, error) {
 	result := make([]Field, 0, len(names))
 	for _, name := range names {
 		field := fields[name]
-		if !outputs && field.typ == imageType && !field.optional {
+		if field.typ == imageType && (outputs || !field.optional) {
 			result = append(result, Field{Name: name, Description: field.description, Type: imageFieldType})
 			continue
 		}
@@ -429,12 +416,12 @@ func structFields(typ reflect.Type, outputs bool) ([]Field, error) {
 	return result, nil
 }
 
-// decodeTypedValue converts a JSON value to T with Key.Get's strict rules and T's Validate
-// method.
-func decodeTypedValue[T any](value any) (T, error) {
+// decodeTypedValue converts a JSON value from source to T with Key.Get's strict rules and T's
+// Validate method.
+func decodeTypedValue[T any](value any, source valueSource) (T, error) {
 	var zero T
 	typ := reflect.TypeFor[T]()
-	decoded, err := decodeJSONValue(typ, value)
+	decoded, err := decodeValue(typ, value, source)
 	if err != nil {
 		return zero, fmt.Errorf("decode as %s: %w", typ, err)
 	}
