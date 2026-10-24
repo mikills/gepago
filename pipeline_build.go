@@ -247,6 +247,8 @@ type pipelineBuilder struct {
 	defaults   map[string]Default
 	tools      *ToolRegistry
 	toolPolicy ToolPolicy
+	// namedTools holds the tools the steps name, which Build wraps in the tool middleware.
+	namedTools map[string]bool
 	sources    map[string]keySource
 	names      map[string]bool
 	index      int
@@ -285,14 +287,15 @@ func newPipelineBuilder(
 		sources[name] = keySource{typ: def.Key.Type, def: true}
 	}
 	return &pipelineBuilder{
-		inputs:   inputs,
-		merges:   merges,
-		defaults: defaults,
-		sources:  sources,
-		names:    map[string]bool{},
-		optional: map[string]map[string]bool{},
-		used:     map[string]bool{},
-		labels:   map[string]string{},
+		inputs:     inputs,
+		merges:     merges,
+		defaults:   defaults,
+		sources:    sources,
+		names:      map[string]bool{},
+		namedTools: map[string]bool{},
+		optional:   map[string]map[string]bool{},
+		used:       map[string]bool{},
+		labels:     map[string]string{},
 	}
 }
 
@@ -514,6 +517,11 @@ func (b *pipelineBuilder) bindTools(node *stepNode) error {
 	}
 	if err := binder.bindTools(b.tools, b.toolPolicy); err != nil {
 		return fmt.Errorf("pipeline step %q: %w", node.name, err)
+	}
+	if namer, ok := node.step.(toolNamer); ok {
+		for _, name := range namer.namedTools() {
+			b.namedTools[name] = true
+		}
 	}
 	return nil
 }

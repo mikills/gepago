@@ -254,6 +254,11 @@ func (p TypedPredict[In, Out]) predict() (Predict, error) {
 	return predict, nil
 }
 
+// namedTools returns the tools the programme offers its model.
+func (p TypedPredict[In, Out]) namedTools() []string {
+	return p.Tools
+}
+
 // bindTools checks the programme's tools and middleware against a pipeline's registry and
 // policy, as Predict's are.
 func (p TypedPredict[In, Out]) bindTools(registry *ToolRegistry, policy ToolPolicy) error {

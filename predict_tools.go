@@ -32,6 +32,17 @@ type toolBinder interface {
 	bindTools(registry *ToolRegistry, policy ToolPolicy) error
 }
 
+// toolNamer is a step or programme that names the tools it calls, so Build can apply the
+// pipeline's tool middleware to them.
+type toolNamer interface {
+	namedTools() []string
+}
+
+// namedTools returns the tools the Predict offers its model.
+func (p Predict) namedTools() []string {
+	return p.Tools
+}
+
 // chats reports whether the Predict runs as a chat rather than one Generate call.
 func (p Predict) chats() bool {
 	return len(p.Tools) > 0 || len(p.Middleware) > 0

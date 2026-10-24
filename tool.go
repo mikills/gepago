@@ -33,6 +33,57 @@ type ToolProvider interface {
 	Invoke(ctx context.Context, call ToolCall) (ToolResult, error)
 }
 
+// ToolMiddleware wraps a ToolProvider, for example to limit, log, audit or fall back around
+// tool calls. Register it on a ToolRegistry by name. Attach it by name to a pipeline or an
+// agent. The first name listed is the outermost wrapper. It sees each call first and each
+// result last. The middleware must keep the schema of the tool it wraps. It must be safe for
+// concurrent use.
+//
+// The middleware runs only for the calls a ToolSession invokes. It never sees a refused call or
+// a call the cache answers. Only the session that makes a call wraps it. An agent's session,
+// or that of a nested pipeline with its own Tools, uses only its own tool middleware. So the
+// middleware of an enclosing pipeline does not see those calls. The enclosing ToolPolicy still
+// governs them.
+//
+// Each call to next is an attempt, and each attempt runs the tool once. An attempt belongs to
+// the call whose context it carries, so pass ctx, or a context derived from it, to next. The
+// first attempt of a call is the first attempt that carries its context. An attempt whose
+// context carries no call of the tool fails, and the tool does not run. An attempt that starts
+// after its call has returned also fails. When the middleware returns, the call cancels the
+// context of the attempts that still run. The call returns only when every attempt has
+// returned. So a timeout in middleware cannot bound a tool that ignores its context.
+//
+// Each attempt records the usage of its result with RecordUsage and RecordUnbudgetedUsage as
+// soon as it returns. A ToolSession records a call without middleware in the same way. The
+// session's record of the call shows the usage of all the attempts. The middleware sees the
+// result of each attempt as the tool returned it. It may return the result of one of its own
+// call's attempts as it is. Any other result it returns must carry no usage, or the call fails.
+// So a middleware that reuses a result across calls, such as a cache or a singleflight, must
+// return that result without usage. The error of such a call keeps the kind of the error that
+// the middleware returned. It is Permanent when the middleware returned no error or an
+// unclassified error. Middleware that spends tokens itself records them with RecordUsage or
+// RecordUnbudgetedUsage, as any code does.
+//
+// The first attempt always runs. A later attempt fails, and the tool does not run, when its
+// context has ended. It fails with the context's cause. The run's budget can also refuse a
+// later attempt, as it refuses a model call. The attempt then fails with the budget error. The
+// budget refuses it when the tokens of the run or of the step exceed a limit. It also refuses
+// it when the run has reached MaxDuration or has already failed with a budget error. A spent
+// MaxModelCalls does not refuse an attempt.
+//
+// An attempt turns a panic of the tool into the error a ToolSession gives a panicking tool. The
+// error keeps the stack in its step details. The attempt also checks the result as the session
+// does. Output that is not valid JSON and a Provenance entry that fails Validate fail the
+// attempt with the session's error. So the middleware sees these failures and can replace the
+// result. The session checks the result that the middleware returns too.
+//
+// The function runs for each tool that the steps of a pipeline name when Build runs. It runs
+// for each tool of an agent when Agent.Validate runs. It runs again for each tool on the first
+// call of the tool in each run. If it fails then, only the calls to that tool fail. So the
+// function must have no side effects. All runs share the state in the function. State in the
+// provider it returns lasts one tool for one run.
+type ToolMiddleware func(next ToolProvider) ToolProvider
+
 // ToolResult is what a tool call returns.
 //
 // Output is the structured result, a JSON value; a ToolStep converts its fields into state.
@@ -184,6 +235,12 @@ func (t *typedTool[Args, Out]) Invoke(ctx context.Context, call ToolCall) (ToolR
 		result.Text = value.String()
 	}
 	return result, nil
+}
+
+// typedProvider is a tool that knows the Go types of its arguments and output, as one made by
+// NewTool does. Build checks the keys of a ToolStep against these types.
+type typedProvider interface {
+	toolTypes() (reflect.Type, reflect.Type)
 }
 
 // toolTypes returns the Go types of the tool's arguments and output, so Build can check the

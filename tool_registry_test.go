@@ -224,6 +224,11 @@ func TestToolRegistryMiddlewareErrors(t *testing.T) {
 
 func TestToolRegistryAndToolAreSafeForConcurrentUse(t *testing.T) {
 	calls := &atomic.Int32{}
+	passed := &atomic.Int32{}
+	passThrough := aroundTool(func(ctx context.Context, call ToolCall, next ToolProvider) (ToolResult, error) {
+		passed.Add(1)
+		return next.Invoke(ctx, call)
+	})
 	registry, err := NewToolRegistry(lookupTool(calls))
 	require.NoError(t, err)
 	var wg sync.WaitGroup
@@ -232,9 +237,15 @@ func TestToolRegistryAndToolAreSafeForConcurrentUse(t *testing.T) {
 			assert.NoError(t, registry.Register(echoTool(fmt.Sprintf("echo-%d", i))))
 			_ = registry.RegisterMiddleware(fmt.Sprintf("mw-%d", i), func(next ChatClient) ChatClient { return next })
 			_, _ = registry.LookupMiddleware("mw-0")
+			assert.NoError(t, registry.RegisterToolMiddleware(fmt.Sprintf("tmw-%d", i), passThrough))
+			_, _ = registry.LookupToolMiddleware("tmw-0")
 			_ = registry.Schemas()
 			provider, ok := registry.Lookup("lookup_order")
 			if !assert.True(t, ok) {
+				return
+			}
+			wrapped, err := registry.WrapTool(provider, fmt.Sprintf("tmw-%d", i))
+			if !assert.NoError(t, err) {
 				return
 			}
 			session, err := NewToolSession(registry.providers(), ToolPolicy{Cache: true}, nil)
@@ -251,13 +262,16 @@ func TestToolRegistryAndToolAreSafeForConcurrentUse(t *testing.T) {
 			}
 			_, err = provider.Invoke(context.Background(), ToolCall{Arguments: `{"order_id":"direct"}`})
 			assert.NoError(t, err)
+			_, err = wrapped.Invoke(context.Background(), ToolCall{Arguments: `{"order_id":"wrapped"}`})
+			assert.NoError(t, err)
 		})
 	}
 	wg.Wait()
 
 	require.Len(t, registry.Schemas(), 17)
-	require.LessOrEqual(t, calls.Load(), int32(16*2+16), "each session caches its repeated calls")
-	require.GreaterOrEqual(t, calls.Load(), int32(16+16))
+	require.EqualValues(t, 16, passed.Load(), "each wrapped call passes through its middleware once")
+	require.LessOrEqual(t, calls.Load(), int32(16*2+16+16), "each session caches its repeated calls")
+	require.GreaterOrEqual(t, calls.Load(), int32(16+16+16))
 }
 
 func TestToolRegistryRegisterIsRaceFreeForOneName(t *testing.T) {
@@ -275,4 +289,258 @@ func TestToolRegistryRegisterIsRaceFreeForOneName(t *testing.T) {
 	}
 	wg.Wait()
 	require.EqualValues(t, 1, wins.Load(), "exactly one registration of a name succeeds")
+}
+
+// aroundTool returns tool middleware whose provider keeps the schema of next and runs invoke
+// for each call.
+func aroundTool(invoke func(ctx context.Context, call ToolCall, next ToolProvider) (ToolResult, error)) ToolMiddleware {
+	return func(next ToolProvider) ToolProvider {
+		return NewToolFunc(next.Schema(), func(ctx context.Context, call ToolCall) (ToolResult, error) {
+			return invoke(ctx, call, next)
+		})
+	}
+}
+
+// tracingToolMiddleware appends "<name>>" before and "<<name" after each call it wraps.
+func tracingToolMiddleware(name string, trace *[]string, mu *sync.Mutex) ToolMiddleware {
+	return aroundTool(func(ctx context.Context, call ToolCall, next ToolProvider) (ToolResult, error) {
+		mu.Lock()
+		*trace = append(*trace, name+">")
+		mu.Unlock()
+		result, err := next.Invoke(ctx, call)
+		mu.Lock()
+		*trace = append(*trace, "<"+name)
+		mu.Unlock()
+		return result, err
+	})
+}
+
+func TestWrapToolOrdersMiddlewareOutermostFirst(t *testing.T) {
+	var trace []string
+	var mu sync.Mutex
+	registry := &ToolRegistry{}
+	require.NoError(t, registry.RegisterToolMiddleware("outer", tracingToolMiddleware("outer", &trace, &mu)))
+	require.NoError(t, registry.RegisterToolMiddleware("inner", tracingToolMiddleware("inner", &trace, &mu)))
+	base := NewToolFunc(Tool{Name: "base", Description: "base"}, func(context.Context, ToolCall) (ToolResult, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		trace = append(trace, "tool")
+		return ToolResult{Text: "done"}, nil
+	})
+
+	tool, err := registry.WrapTool(base, "outer", "inner")
+	require.NoError(t, err)
+	result, err := tool.Invoke(context.Background(), ToolCall{Name: "base"})
+
+	require.NoError(t, err)
+	require.Equal(t, "done", result.Text)
+	require.Equal(t, []string{"outer>", "inner>", "tool", "<inner", "<outer"}, trace)
+	_, ok := registry.LookupToolMiddleware("outer")
+	require.True(t, ok)
+	_, ok = registry.LookupToolMiddleware("missing")
+	require.False(t, ok)
+}
+
+func TestToolMiddlewareRegistryErrors(t *testing.T) {
+	registry := &ToolRegistry{}
+	identity := func(next ToolProvider) ToolProvider { return next }
+	reschema := func(change func(*Tool)) ToolMiddleware {
+		return func(next ToolProvider) ToolProvider {
+			schema := next.Schema()
+			change(&schema)
+			return plainProvider{schema: schema}
+		}
+	}
+	for name, middleware := range map[string]ToolMiddleware{
+		"ok":            identity,
+		"nil-provider":  func(ToolProvider) ToolProvider { return nil },
+		"typed-nil":     func(ToolProvider) ToolProvider { return (*funcTool)(nil) },
+		"panics":        func(ToolProvider) ToolProvider { panic("boom") },
+		"schema-panics": func(ToolProvider) ToolProvider { return panickingSchema{} },
+		"renames":       reschema(func(tool *Tool) { tool.Name = "other" }),
+		"redescribes":   reschema(func(tool *Tool) { tool.Description = "other" }),
+		"reparameters": reschema(func(tool *Tool) {
+			tool.Parameters = json.RawMessage(`{"type":"object","properties":{}}`)
+		}),
+	} {
+		require.NoError(t, registry.RegisterToolMiddleware(name, middleware))
+	}
+	base := echoTool("base")
+
+	var nilRegistry *ToolRegistry
+	require.EqualError(t, nilRegistry.RegisterToolMiddleware("x", identity), "tool registry is nil")
+	_, ok := nilRegistry.LookupToolMiddleware("x")
+	require.False(t, ok)
+	require.EqualError(t, registry.RegisterToolMiddleware("bad name", identity),
+		`register tool middleware "bad name": name must be 1 to 64 letters, digits, '_' or '-'`)
+	require.EqualError(t, registry.RegisterToolMiddleware("x", nil), `register tool middleware "x": middleware is nil`)
+	require.EqualError(t, registry.RegisterToolMiddleware("ok", identity),
+		`register tool middleware "ok": middleware with this name is already registered`)
+
+	for _, tt := range []struct {
+		name     string
+		registry *ToolRegistry
+		provider ToolProvider
+		names    []string
+		wantErr  string
+	}{
+		{name: "nil provider", registry: registry, names: []string{"ok"}, wantErr: "wrap tool: provider is nil"},
+		{name: "nil provider without names", registry: registry, wantErr: "wrap tool: provider is nil"},
+		{name: "typed nil provider", registry: registry, provider: (*funcTool)(nil), names: []string{"ok"},
+			wantErr: "wrap tool: provider is nil"},
+		{name: "unknown name", registry: registry, provider: base, names: []string{"missing"},
+			wantErr: `tool middleware "missing" is not registered`},
+		{name: "repeated name", registry: registry, provider: base, names: []string{"ok", "ok"},
+			wantErr: `tool middleware "ok" is listed twice`},
+		{name: "no registry", provider: base, names: []string{"ok"},
+			wantErr: `tool middleware "ok": no tool registry holds middleware`},
+		{name: "middleware returns nil", registry: registry, provider: base, names: []string{"nil-provider"},
+			wantErr: `tool middleware "nil-provider" returned a nil provider for tool "base"`},
+		{name: "middleware returns a typed nil", registry: registry, provider: base, names: []string{"typed-nil"},
+			wantErr: `tool middleware "typed-nil" returned a nil provider for tool "base"`},
+		{name: "middleware panics", registry: registry, provider: base, names: []string{"panics"},
+			wantErr: `tool middleware "panics" panicked on tool "base": boom`},
+		{name: "an inner middleware panics", registry: registry, provider: base, names: []string{"ok", "panics"},
+			wantErr: `tool middleware "panics" panicked on tool "base": boom`},
+		{name: "middleware changes the name", registry: registry, provider: base, names: []string{"renames"},
+			wantErr: `tool middleware "renames" must keep the schema of tool "base" but changed its name`},
+		{name: "middleware changes the description", registry: registry, provider: base,
+			names:   []string{"redescribes"},
+			wantErr: `tool middleware "redescribes" must keep the schema of tool "base" but changed its description`},
+		{name: "middleware changes the parameters", registry: registry, provider: base,
+			names:   []string{"reparameters"},
+			wantErr: `tool middleware "reparameters" must keep the schema of tool "base" but changed its parameters`},
+		{name: "the schema of the middleware's provider panics", registry: registry, provider: base,
+			names: []string{"schema-panics"}, wantErr: `tool middleware "schema-panics": schema of tool "base" panicked: no schema`},
+		{name: "the schema of the wrapped provider panics", registry: registry, provider: panickingSchema{},
+			names: []string{"ok"}, wantErr: "wrap tool: tool schema panicked: no schema"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			wrapped, err := tt.registry.WrapTool(tt.provider, tt.names...)
+			require.EqualError(t, err, tt.wantErr)
+			require.Nil(t, wrapped)
+		})
+	}
+}
+
+func TestToolMiddlewareNamesAreSeparate(t *testing.T) {
+	registry, err := NewToolRegistry(echoTool("audit"))
+	require.NoError(t, err)
+	identity := func(next ToolProvider) ToolProvider { return next }
+	require.NoError(t, registry.RegisterMiddleware("audit", func(next ChatClient) ChatClient { return next }))
+	require.NoError(t, registry.RegisterToolMiddleware("audit", identity))
+	require.NoError(t, registry.RegisterMiddleware("chat-only", func(next ChatClient) ChatClient { return next }))
+	require.NoError(t, registry.RegisterToolMiddleware("tool-only", identity))
+	base := ChatClientFunc(func(context.Context, ChatRequest) (ChatResponse, error) { return ChatResponse{}, nil })
+
+	_, ok := registry.LookupMiddleware("tool-only")
+	require.False(t, ok)
+	_, ok = registry.Lookup("tool-only")
+	require.False(t, ok)
+	_, ok = registry.LookupToolMiddleware("chat-only")
+	require.False(t, ok)
+	_, err = registry.WrapChat(base, "tool-only")
+	require.EqualError(t, err, `chat middleware "tool-only" is not registered`)
+	_, err = registry.WrapTool(echoTool("echo"), "chat-only")
+	require.EqualError(t, err, `tool middleware "chat-only" is not registered`)
+	_, err = registry.WrapTool(echoTool("echo"), "audit", "tool-only")
+	require.NoError(t, err)
+	_, err = registry.WrapChat(base, "audit", "chat-only")
+	require.NoError(t, err)
+}
+
+func TestWrapToolWithoutNamesReturnsTheProvider(t *testing.T) {
+	provider := echoTool("echo")
+	registry := &ToolRegistry{}
+	require.NoError(t, registry.RegisterToolMiddleware("audit", func(next ToolProvider) ToolProvider { return next }))
+
+	wrapped, err := registry.WrapTool(provider)
+	require.NoError(t, err)
+	require.True(t, wrapped == provider, "WrapTool without names returns the provider itself")
+
+	var nilRegistry *ToolRegistry
+	wrapped, err = nilRegistry.WrapTool(provider)
+	require.NoError(t, err)
+	require.True(t, wrapped == provider, "a nil registry wraps nothing without names")
+
+	wrapped, err = registry.WrapTool(provider, "audit")
+	require.NoError(t, err)
+	require.False(t, wrapped == provider, "middleware that returns next still gives a wrapped provider")
+	require.Equal(t, provider.Schema(), wrapped.Schema())
+}
+
+func TestWrapToolKeepsSchemaValidateAndTypes(t *testing.T) {
+	calls := &atomic.Int32{}
+	audited := &atomic.Int32{}
+	registry := &ToolRegistry{}
+	require.NoError(t, registry.RegisterToolMiddleware("audit", aroundTool(
+		func(ctx context.Context, call ToolCall, next ToolProvider) (ToolResult, error) {
+			audited.Add(1)
+			return next.Invoke(ctx, call)
+		},
+	)))
+	typed := lookupTool(calls)
+
+	wrapped, err := registry.WrapTool(typed, "audit")
+
+	require.NoError(t, err)
+	require.Equal(t, typed.Schema(), wrapped.Schema())
+	schema := wrapped.Schema()
+	schema.Parameters[0] = '['
+	require.Equal(t, byte('{'), wrapped.Schema().Parameters[0], "Schema returns copies")
+	require.NoError(t, wrapped.(interface{ Validate() error }).Validate())
+
+	t.Run("a registry takes it and a ToolStep is checked against the tool's types", func(t *testing.T) {
+		other, err := NewToolRegistry(wrapped)
+		require.NoError(t, err)
+		orderIDNumber := Key[int]{Name: "order_id"}
+		_, err = PipelineSpec{
+			Inputs: refs(orderIDNumber.Ref()),
+			Steps:  []Step{ToolStep("s", "lookup_order", refs(orderIDNumber.Ref()), nil)},
+			Tools:  other,
+		}.Build()
+		require.EqualError(
+			t,
+			err,
+			`pipeline step "s": reads "order_id" as int, but tool "lookup_order" takes it as string`,
+		)
+
+		pipeline, err := toolPipeline(other, ToolPolicy{},
+			ToolStep("lookup", "lookup_order", refs(orderIDKey.Ref()), refs(statusKey.Ref())))
+		require.NoError(t, err)
+		state, err := pipeline.Run(context.Background(), NewState(Prediction{"order_id": "A-1"}))
+		require.NoError(t, err)
+		status, err := statusKey.Get(state)
+		require.NoError(t, err)
+		require.Equal(t, "shipped", status)
+		require.EqualValues(t, 1, audited.Load())
+		require.EqualValues(t, 1, calls.Load())
+	})
+
+	t.Run("Validate is the wrapped provider's", func(t *testing.T) {
+		invalid := NewTool("m", "map args", func(context.Context, map[string]int) (int, error) { return 0, nil })
+		wrapped, err := registry.WrapTool(invalid, "audit")
+		require.NoError(t, err)
+		wantErr := `tool "m": arguments type map[string]int must be a struct, so its JSON form is an object`
+		require.EqualError(t, wrapped.(interface{ Validate() error }).Validate(), wantErr)
+		require.EqualError(t, (&ToolRegistry{}).Register(wrapped), "register tool: "+wantErr)
+
+		plain, err := registry.WrapTool(plainProvider{schema: Tool{Name: "plain", Description: "plain"}}, "audit")
+		require.NoError(t, err)
+		require.NoError(t, plain.(interface{ Validate() error }).Validate(), "a provider without Validate passes")
+	})
+
+	t.Run("a tool without Go types stays without them", func(t *testing.T) {
+		raw, err := registry.WrapTool(echoTool("echo"), "audit")
+		require.NoError(t, err)
+		other, err := NewToolRegistry(raw)
+		require.NoError(t, err)
+		orderIDNumber := Key[int]{Name: "order_id"}
+		_, err = PipelineSpec{
+			Inputs: refs(orderIDNumber.Ref()),
+			Steps:  []Step{ToolStep("s", "echo", refs(orderIDNumber.Ref()), nil)},
+			Tools:  other,
+		}.Build()
+		require.NoError(t, err, "only the schema constrains the reads of a tool without Go types")
+	})
 }

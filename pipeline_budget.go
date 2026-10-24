@@ -413,6 +413,32 @@ func (f *usageFrame) admit() error {
 	return nil
 }
 
+// admitAttempt returns the budget error that refuses another attempt of a tool call under f
+// now, or nil. It refuses the attempt as admit refuses a model call. A spent MaxModelCalls does
+// not refuse it. It reserves nothing.
+func (f *usageFrame) admitAttempt() error {
+	if f == nil {
+		return nil
+	}
+	f.budget.mu.Lock()
+	defer f.budget.mu.Unlock()
+	if err := f.checkLocked(); err != nil {
+		return err
+	}
+	for frame := f; frame != nil; frame = frame.parent {
+		if frame.step != "" {
+			if err := frame.checkStepTokens(frame.spent()); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := frame.budget.checkTokens(frame.spent()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // refusalLocked returns the budget error that refuses a model call under f now, failing the
 // limit it exceeds: a token limit that the spent tokens, pending ones included, exceed, or a
 // spent MaxModelCalls, besides any error that already stops work under f. The caller holds mu.

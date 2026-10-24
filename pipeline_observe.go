@@ -270,9 +270,10 @@ func (r *runObservation) observerContext(ctx context.Context) context.Context {
 }
 
 // observerCtx takes its deadline and cancellation from a run's life and its values from a
-// run's context, hiding those that tie it to a pipeline run: its trace, step frame, run
-// context, budget, usage collection, step cache, evaluation capture, tool session, tool memory
-// and staged tool results.
+// run's context. It hides the values that tie it to a pipeline run. These are the trace, the
+// step frame, the run context, the budget, usage collection and the step cache. They are also
+// evaluation capture, the tool session, tool memory, staged tool results, and the tool call
+// and usage tally of a wrapped tool.
 type observerCtx struct {
 	context.Context
 	values context.Context
@@ -281,7 +282,7 @@ type observerCtx struct {
 func (c observerCtx) Value(key any) any {
 	switch key.(type) {
 	case observeKey, evaluationKey, pipelineRunKey, runContextKey, usageFrameKey, usageCollectorKey, retryAdmissionKey,
-		budgetClockKey, toolEnvKey, toolMemoryKey, stepStageKey:
+		budgetClockKey, toolEnvKey, toolMemoryKey, stepStageKey, toolAttemptsKey, recordedUsageKey:
 		return nil
 	}
 	return c.values.Value(key)

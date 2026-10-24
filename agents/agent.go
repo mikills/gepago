@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	gepa "github.com/mikills/gepago"
@@ -41,7 +42,8 @@ type Agent struct {
 	ResponseFormat *JSONSchemaResponseFormat
 	Logger         *slog.Logger
 	Observers      []Observer
-	// ToolRegistry holds the tools ToolNames names and the middleware Middleware names.
+	// ToolRegistry holds the tools ToolNames names, the chat middleware Middleware names and the
+	// tool middleware ToolMiddleware names.
 	ToolRegistry *gepa.ToolRegistry
 	// ToolNames names registry tools the agent offers the model besides Tools. Validate fails
 	// on a name that is not registered.
@@ -52,12 +54,26 @@ type Agent struct {
 	// Middleware names chat middleware from ToolRegistry, outermost first, that wraps Client
 	// for every chat call of a run.
 	Middleware []string
+	// ToolMiddleware names tool middleware from ToolRegistry, outermost first, that wraps every
+	// tool of a run (see gepa.ToolMiddleware). It wraps the bindings in Tools and the registry
+	// tools that ToolNames names alike. Validate applies it to each tool. A run applies it to
+	// each tool on the tool's first call, so a tool it cannot wrap then fails only its own calls.
+	// In a pipeline step the agent's own session invokes its tools, so the pipeline run's tool
+	// middleware does not wrap them.
+	ToolMiddleware []string
 }
 
-// Validate checks that the agent has the required model and client settings, that its tools
-// have unique names and valid schemas, that every name in ToolNames and Middleware is
-// registered on ToolRegistry, and that ToolPolicy names only the agent's tools.
+// Validate checks that the agent has the required model and client settings, and that its tools
+// have unique names and valid schemas. It checks that ToolRegistry holds every name in
+// ToolNames, Middleware and ToolMiddleware, and that ToolMiddleware applies to each tool. It
+// also checks that ToolPolicy names only the agent's tools.
 func (a *Agent) Validate() error {
+	return a.validate(true)
+}
+
+// validate is Validate. It applies ToolMiddleware to each tool only when wrap is true. A run
+// leaves that to the first call of each tool.
+func (a *Agent) validate(wrap bool) error {
 	if strings.TrimSpace(a.Name) == "" {
 		return errors.New("agent name is required")
 	}
@@ -88,14 +104,25 @@ func (a *Agent) Validate() error {
 			return fmt.Errorf("response format: %w", err)
 		}
 	}
-	_, err := gepa.NewToolSession(a.toolProviders(), a.ToolPolicy, nil)
+	providers := a.toolProviders()
+	if wrap && len(a.ToolMiddleware) > 0 {
+		for _, provider := range providers {
+			if _, err := a.ToolRegistry.WrapTool(provider, a.ToolMiddleware...); err != nil {
+				return err
+			}
+		}
+	}
+	_, err := gepa.NewToolSession(providers, a.ToolPolicy, nil)
 	return err
 }
 
-// validateRegistryTools checks ToolNames and Middleware against ToolRegistry.
+// validateRegistryTools checks ToolNames, Middleware and ToolMiddleware against ToolRegistry.
 func (a *Agent) validateRegistryTools(seen map[string]struct{}) error {
 	if a.ToolRegistry == nil && len(a.ToolNames)+len(a.Middleware) > 0 {
 		return fmt.Errorf("agent tool names %q and middleware %q need a ToolRegistry", a.ToolNames, a.Middleware)
+	}
+	if a.ToolRegistry == nil && len(a.ToolMiddleware) > 0 {
+		return fmt.Errorf("agent tool middleware %q needs a ToolRegistry", a.ToolMiddleware)
 	}
 	for _, name := range a.ToolNames {
 		if _, ok := a.ToolRegistry.Lookup(name); !ok {
@@ -106,11 +133,31 @@ func (a *Agent) validateRegistryTools(seen map[string]struct{}) error {
 		}
 		seen[name] = struct{}{}
 	}
+	if err := a.checkToolMiddleware(); err != nil {
+		return err
+	}
 	if len(a.Middleware) == 0 {
 		return nil
 	}
 	_, err := a.ToolRegistry.WrapChat(a.Client, a.Middleware...)
 	return err
+}
+
+// checkToolMiddleware checks that ToolRegistry holds tool middleware under every name in
+// ToolMiddleware, and that no name repeats, as gepa.ToolRegistry.WrapTool does. So the check
+// also holds for an agent without tools.
+func (a *Agent) checkToolMiddleware() error {
+	seen := make(map[string]bool, len(a.ToolMiddleware))
+	for _, name := range a.ToolMiddleware {
+		if seen[name] {
+			return fmt.Errorf("tool middleware %q is listed twice", name)
+		}
+		seen[name] = true
+		if _, ok := a.ToolRegistry.LookupToolMiddleware(name); !ok {
+			return fmt.Errorf("tool middleware %q is not registered", name)
+		}
+	}
+	return nil
 }
 
 // toolProviders returns the agent's tools in offer order: its bindings, then its registry
@@ -126,6 +173,44 @@ func (a *Agent) toolProviders() []gepa.ToolProvider {
 		}
 	}
 	return providers
+}
+
+// runTools returns the agent's tools for one run. With ToolMiddleware, the run wraps each tool
+// on its first call.
+func (a *Agent) runTools() []gepa.ToolProvider {
+	providers := a.toolProviders()
+	if len(a.ToolMiddleware) == 0 {
+		return providers
+	}
+	for i, provider := range providers {
+		providers[i] = &lazyTool{registry: a.ToolRegistry, names: a.ToolMiddleware, provider: provider}
+	}
+	return providers
+}
+
+// lazyTool is a tool of one run. The run wraps it in the agent's tool middleware on its first
+// call. A failure to wrap it fails every call to it and no other tool.
+type lazyTool struct {
+	registry *gepa.ToolRegistry
+	names    []string
+	provider gepa.ToolProvider
+	once     sync.Once
+	wrapped  gepa.ToolProvider
+	err      error
+}
+
+// Schema returns the schema of the provider.
+func (t *lazyTool) Schema() Tool {
+	return t.provider.Schema()
+}
+
+// Invoke wraps the provider on the first call and runs the call through the middleware.
+func (t *lazyTool) Invoke(ctx context.Context, call ToolCall) (gepa.ToolResult, error) {
+	t.once.Do(func() { t.wrapped, t.err = t.registry.WrapTool(t.provider, t.names...) })
+	if t.err != nil {
+		return gepa.ToolResult{}, t.err
+	}
+	return t.wrapped.Invoke(ctx, call)
 }
 
 // toolNames returns the names of the agent's tools that its policy allows, in offer order.
@@ -259,7 +344,7 @@ type agentRun struct {
 }
 
 func (a *Agent) newRun(ctx context.Context, req RunRequest) (*agentRun, error) {
-	if err := a.Validate(); err != nil {
+	if err := a.validate(false); err != nil {
 		return nil, err
 	}
 	if err := req.Validate(); err != nil {
@@ -278,7 +363,7 @@ func (a *Agent) newRun(ctx context.Context, req RunRequest) (*agentRun, error) {
 	if err != nil {
 		return nil, err
 	}
-	session, err := gepa.NewToolSession(a.toolProviders(), a.ToolPolicy, req.Memory)
+	session, err := gepa.NewToolSession(a.runTools(), a.ToolPolicy, req.Memory)
 	if err != nil {
 		return nil, err
 	}

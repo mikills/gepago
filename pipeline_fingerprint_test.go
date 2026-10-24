@@ -59,6 +59,8 @@ type fpOptions struct {
 	cache       bool
 	budget      RunBudget
 	allowExtra  bool
+	// toolMiddleware gives the pipeline Tools and tool middleware.
+	toolMiddleware bool
 }
 
 // fpSpec uses every kind of step: a programme step under a policy and a cache, a Branch, a
@@ -121,6 +123,15 @@ func fpSpec(t *testing.T, o fpOptions) PipelineSpec {
 		NewProgramStep("nested", inner, refs(amountKey.Ref()), refs(fpReport.Ref())),
 	)
 	spec.Transitions = append(spec.Transitions, Transition{From: "score", OnError: true, To: End})
+	if o.toolMiddleware {
+		registry, err := NewToolRegistry(echoTool("echo"))
+		require.NoError(t, err)
+		require.NoError(
+			t,
+			registry.RegisterToolMiddleware("audit", func(next ToolProvider) ToolProvider { return next }),
+		)
+		spec.Tools, spec.ToolMiddleware = registry, []string{"audit"}
+	}
 	return spec
 }
 
@@ -186,7 +197,8 @@ func TestPipelineFingerprintLeavesOutValuesOutsideTheShape(t *testing.T) {
 			MaxModelCalls: 3,
 			PerStepTokens: map[string]int{"parse": 10, "review": 5},
 		}},
-		"extra inputs": {instruction: "seed", allowExtra: true},
+		"extra inputs":    {instruction: "seed", allowExtra: true},
+		"tool middleware": {instruction: "seed", toolMiddleware: true},
 	}
 	for name, options := range variants {
 		t.Run(name, func(t *testing.T) {

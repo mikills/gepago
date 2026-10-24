@@ -17,7 +17,9 @@ import (
 	gepa "github.com/mikills/gepago"
 )
 
-// checkWait bounds how long the Check functions wait for a call made with an ended context.
+// checkWait bounds how long the Check functions wait for a call made with an ended context. It
+// also bounds how long CheckToolMiddleware waits for a run to return after it cancels the run.
+// CheckToolMiddleware adds it to the deadline to bound each Build.
 var checkWait = 5 * time.Second
 
 // checkConcurrency is how many calls the Check functions make at once.

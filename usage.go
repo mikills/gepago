@@ -42,11 +42,12 @@ func WithUsageCollector(ctx context.Context) (context.Context, *UsageCollector) 
 
 // RecordUsage adds usage to the collector carried by ctx, if there is one, and counts it
 // against the RunBudget of the pipeline run in ctx. Predict, LLMJudgeMetric and other model
-// consumers call it once for every model call, failed calls included, and a ToolSession once
-// for every call that invokes its tool, with ToolResult.Usage; a custom Program or Metric that
-// calls a Generator directly should do the same so its usage reaches
-// CompiledProgram.RunWithUsage, ProgramEvaluator and the run budget. Usage that must not count
-// against the budget is recorded with RecordUnbudgetedUsage instead.
+// consumers call it once for every model call, failed calls included. A ToolSession calls it
+// once for every call that invokes its tool, with ToolResult.Usage. A custom Program or Metric
+// that calls a Generator directly should do the same. Then its usage reaches
+// CompiledProgram.RunWithUsage, ProgramEvaluator and the run budget. Record usage that must not
+// count against the budget with RecordUnbudgetedUsage instead. For a tool wrapped in tool
+// middleware, each attempt calls it with the usage of its result instead (see ToolMiddleware).
 func RecordUsage(ctx context.Context, usage Usage) {
 	collector, _ := ctx.Value(usageCollectorKey{}).(*UsageCollector)
 	collector.Add(usage)
@@ -55,11 +56,13 @@ func RecordUsage(ctx context.Context, usage Usage) {
 
 // RecordUnbudgetedUsage records usage the run must see but must not count against its budget,
 // such as a call billed elsewhere. It adds usage to the collector carried by ctx, if there is
-// one, so CompiledProgram.RunWithUsage and ProgramEvaluator report it with the budgeted usage,
-// and to the Unbudgeted usage of the pipeline step and run in ctx and every step and run around
-// them, which their events and traces report apart from Usage. It counts against no RunBudget
-// limit. A ToolSession calls it once for every call that invokes its tool, failed calls
-// included, with ToolResult.UnbudgetedUsage.
+// one, so CompiledProgram.RunWithUsage and ProgramEvaluator report it with the budgeted usage.
+// It also adds usage to the Unbudgeted usage of the pipeline step and run in ctx, and of every
+// step and run around them. Their events and traces report it apart from Usage. It counts
+// against no RunBudget limit. A ToolSession calls it once for every call that invokes its tool,
+// failed calls included, with ToolResult.UnbudgetedUsage. For a tool wrapped in tool
+// middleware, each attempt calls it with the unbudgeted usage of its result instead (see
+// ToolMiddleware).
 func RecordUnbudgetedUsage(ctx context.Context, usage Usage) {
 	collector, _ := ctx.Value(usageCollectorKey{}).(*UsageCollector)
 	collector.Add(usage)

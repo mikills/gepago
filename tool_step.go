@@ -53,6 +53,11 @@ func (s *toolStep) Validate() error {
 	return nil
 }
 
+// namedTools returns the tool the step calls.
+func (s *toolStep) namedTools() []string {
+	return []string{s.tool}
+}
+
 // bindTools checks that the tool is registered and allowed and that the step's keys fit it.
 func (s *toolStep) bindTools(registry *ToolRegistry, policy ToolPolicy) error {
 	if registry == nil {
@@ -66,9 +71,7 @@ func (s *toolStep) bindTools(registry *ToolRegistry, policy ToolPolicy) error {
 	if err := s.checkArgumentSchema(schema.Parameters); err != nil {
 		return err
 	}
-	typed, ok := provider.(interface {
-		toolTypes() (reflect.Type, reflect.Type)
-	})
+	typed, ok := provider.(typedProvider)
 	if !ok {
 		return nil
 	}

@@ -163,6 +163,12 @@ func ToolMemoryFrom(ctx context.Context) ToolMemory {
 // is also governed by the session of every enclosing pipeline run: each call must be allowed
 // by their policies too, counts against their limits and is recorded in them as well. Only
 // the session that makes the call answers it from its cache.
+//
+// A run's tool middleware wraps the providers the run gives NewToolSession (see
+// ToolMiddleware). So the middleware runs only for calls the session invokes. Only the
+// middleware of the session that makes a call wraps it. The session checks, caches and applies
+// the result the outermost middleware returns. A wrapped tool records the usage of each attempt
+// itself. The session does not record that usage again, but the call's record reports it.
 type ToolSession struct {
 	// id numbers sessions in the order they were created. It gives the locks of all sessions
 	// one global order, in which reserve takes them, so two calls never wait on each other.
@@ -342,11 +348,15 @@ func (s *ToolSession) Call(ctx context.Context, call ToolCall) (ToolResult, Tool
 		memory = stage
 	}
 	call.Scope = ToolScopeFrom(ctx)
+	// a wrapped tool records the usage of its attempts itself and reports it here.
+	recorded := &recordedUsage{}
 	start := time.Now()
-	result, err := s.invoke(WithToolMemory(ctx, memory), call)
+	result, err := s.invoke(withRecordedUsage(WithToolMemory(ctx, memory), recorded), call)
 	record.Duration = time.Since(start)
 	RecordUsage(ctx, result.Usage)
 	RecordUnbudgetedUsage(ctx, result.UnbudgetedUsage)
+	usage, unbudgeted := recorded.totals()
+	result.Usage, result.UnbudgetedUsage = result.Usage.Add(usage), result.UnbudgetedUsage.Add(unbudgeted)
 	record = withResult(record, result)
 	if err == nil && ctx.Err() != nil {
 		err = context.Cause(ctx)
@@ -392,10 +402,7 @@ func applyMemoryWrites(memory ToolMemory, writes map[string]any) {
 func (s *ToolSession) invoke(ctx context.Context, call ToolCall) (result ToolResult, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			result, err = ToolResult{}, WithStepDetails(
-				fmt.Errorf("tool panicked: %v", recovered),
-				map[string]any{"stack": string(debug.Stack())},
-			)
+			result, err = ToolResult{}, toolPanicError(recovered)
 		}
 	}()
 	result, err = s.tools[call.Name].Invoke(ctx, call)
@@ -403,15 +410,27 @@ func (s *ToolSession) invoke(ctx context.Context, call ToolCall) (result ToolRes
 	if err != nil {
 		return result, err
 	}
+	return result, checkToolResult(result)
+}
+
+// checkToolResult reports output that is not valid JSON and a Provenance entry that fails
+// Provenance.Validate.
+func checkToolResult(result ToolResult) error {
 	if len(result.Output) > 0 && !json.Valid(result.Output) {
-		return result, errors.New("tool output is not valid JSON")
+		return errors.New("tool output is not valid JSON")
 	}
 	for i, provenance := range result.Provenance {
 		if err := provenance.Validate(); err != nil {
-			return result, fmt.Errorf("invalid provenance %d: %w", i, err)
+			return fmt.Errorf("invalid provenance %d: %w", i, err)
 		}
 	}
-	return result, nil
+	return nil
+}
+
+// toolPanicError is the error of a tool call whose tool panics with recovered. It names the
+// value, and it holds the stack in its step details.
+func toolPanicError(recovered any) error {
+	return WithStepDetails(fmt.Errorf("tool panicked: %v", recovered), map[string]any{"stack": string(debug.Stack())})
 }
 
 // cacheKey returns the cache key of call, when the policy caches and its arguments parse.
