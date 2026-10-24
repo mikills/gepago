@@ -16,6 +16,7 @@ Original paper:
 - Ask for structured output: typed signature fields, strict JSON schemas, native structured output where the provider has it, and validation before a reply is returned.
 - Build typed `Pipeline`s with retries, timeouts, forward skips, bounded rewinds, branches, fallbacks and parallel steps. Add run-time fan-out with `Map`, bounded repeats with `Loop`, step caching and run budgets.
 - Give model steps tools from a registry, under a per-run policy with call limits and caching, with the caller's scope, such as a tenant, on every call.
+- Send PNG, JPEG and WebP images in user chat messages to the OpenAI, Claude and Google chat clients, and as `Predict` and `TypedPredict` inputs.
 - Observe every run with events, recorded traces, HTML run reports, a run context and redaction.
 - Run optional agent loops from the composable `agents` package, with full trace events for runs, turns, LLM calls, tool calls, errors, and run completion.
 - Track usage with spans and ledgers instead of relying only on turn counts.
@@ -154,6 +155,27 @@ extract := gepa.TypedPredict[Document, Extraction]{
 }
 result, err := extract.Run(ctx, Document{Document: "Bond obligation for 125,000."})
 ```
+
+### Image inputs
+
+A `Predict` or `TypedPredict` input can hold a `gepa.Image`, at any depth. Give a top-level image input the `Type` `"image"`, so `Validate` and `Build` check it. A `TypedPredict` derives that `Type` for an `In` field of type `gepa.Image`. Tag the field `omitempty` or `omitzero` to make the image optional: a zero `gepa.Image` there sends no image. Such an optional field takes a `*gepa.Image` key in a pipeline, nil for no image, since `State` refuses the zero `Image`. A required field takes a `Key[gepa.Image]`:
+
+```go
+type Figure struct {
+    Chart gepa.Image `json:"chart" description:"the chart to read"`
+    Title string     `json:"title"`
+}
+
+read := gepa.TypedPredict[Figure, Extraction]{
+    Signature: gepa.Signature{Name: "read_chart"},
+    LM:        chatModel, // a gepa.ChatClient
+}
+result, err := read.Run(ctx, Figure{Chart: chart, Title: "Q3 revenue"})
+```
+
+A call with images chats, also without tools. Its one user message has an empty `Content`. Its `Parts` hold, for each distinct image, the text `[image N]` and then the image. The last part is the prompt. A `ChatClient` or `ChatMiddleware` that reads only `Content` sees no prompt in such a call, so read the text parts too. In the prompt's input JSON each image is its label, such as `"chart": "[image 1]"`, and `BuildPrompt` returns that text. The repairs continue the same chat, so the images stay in its first message. The model must be a `ChatClient`. With another model, such as `providers/pi`, an input of `Type` `"image"` fails `Validate`. An image in any other input fails the run before any call. Both fail with a Permanent `ErrImagesUnsupported`. Demos cannot hold images, and `TypedPredict`'s `Out` cannot either. Inputs without images send the same request as before.
+
+In a pipeline, read an image input from a `Key[gepa.Image]`. `Key.Get` converts between `gepa.Image` and `*gepa.Image`, and into structs, slices, maps and `any` values that hold images. It puts each image back where the stored value held it. An image reaches the model, and comes back from `Key.Get`, only where `encoding/json` meets it as a `gepa.Image`. Behind a type's own `MarshalJSON` it is that method's JSON, the summary. So no image is sent for it, and `Key.Get` into an `any` gives the summary as a map. Traces, reports, `WithCache` keys, optimiser fingerprints and reflection records hold the image's summary, never its data. A `Redactor` gets the `gepa.Image` under its key, and when it changes it, the image's summary text and JSON are removed from error messages.
 
 ## Pipelines
 
@@ -348,7 +370,7 @@ lookup := gepa.NewTool("lookup_customer", "Look up a customer's plan.",
 tools, err := gepa.NewToolRegistry(lookup)
 ```
 
-`NewTool` derives the argument schema from `Args` and encodes `Out` as the result; `NewToolFunc` takes a hand-written schema. In a pipeline, set `PipelineSpec.Tools` and either call a tool deterministically with `gepa.ToolStep("lookup", "lookup_customer", reads, writes)` or give a `Predict` step a bounded tool loop with `Predict.Tools` (its `LM` must be a `ChatClient`, which the OpenAI, Claude and Google providers are). `PipelineSpec.ToolPolicy` sets the run's allow-list, total and per-tool call limits and result cache, and a tool's memory writes commit only with its step's writes. `Build` fails on a tool that is not registered or not allowed. Chat middleware registered with `RegisterMiddleware` wraps a step's or an agent's chat client by name, outermost first.
+`NewTool` derives the argument schema from `Args` and encodes `Out` as the result. `NewToolFunc` takes a hand-written schema. In a pipeline, set `PipelineSpec.Tools`. Then call a tool deterministically with `gepa.ToolStep("lookup", "lookup_customer", reads, writes)`, or give a `Predict` step a bounded tool loop with `Predict.Tools`. Its `LM` must be a `ChatClient`, which the OpenAI, Claude and Google providers are. `PipelineSpec.ToolPolicy` sets the run's allow-list, total and per-tool call limits and result cache, and a tool's memory writes commit only with its step's writes. `Build` fails on a tool that is not registered or not allowed. Chat middleware registered with `RegisterMiddleware` wraps a step's or an agent's chat client by name, outermost first. A middleware or a chat client that reads the text of a request must read each message's `Parts` as well as its `Content`. A `Predict` with image inputs sends its prompt as the last text part of a message with an empty `Content`.
 
 Tools often act for someone: a tenant, a user, an account. Set that scope on the run's context and every tool call of the run carries it as `ToolCall.Scope`, from a `ToolStep`, a `Predict` tool loop, a `Map` element or an agent. The model never sees it, and gepago never inspects it.
 
@@ -467,9 +489,11 @@ Lower-level optimiser APIs remain available when you need full control.
 
 Package `gepatest` provides `FakeGenerator`, a model with scripted replies, usage, finish reasons and errors per call. It also provides `AssertTrace`, which compares a recorded run's steps, the order they ran in, their errors, usage, attributes and transitions. The steps of a pipeline that a Map element runs take that element's index. `AssertTrace` numbers the iterations of a Loop in the order they ran.
 
-A call takes the next reply of the script for its Map element (`OnElement`), else its visit (`OnVisit`), else its step (`OnStep`), each tried by step path, as `gepa.StepPathFrom` reports it, and then by step name; else the first prompt substring it contains, else the default. `OnElement` does not match the calls of a pipeline that an element runs; script those by step path. A script repeats its last reply once used up. `Chat` refuses the requests `ErrInvalidChatRequest` lists, which no provider accepts, with that error; a message without a role passes, though all three providers refuse it. `Calls` returns every call the fake received, `Unmatched` the calls no script answered (an `OnError` transition can hide their error), and `Plain` hides its structured and chat methods to test the prompt-only path.
+A call takes the next reply of the script for its Map element (`OnElement`), else its visit (`OnVisit`), else its step (`OnStep`). Each is tried by step path, as `gepa.StepPathFrom` reports it, and then by step name. Else it takes the reply for the first prompt substring it contains, else the default. `OnElement` does not match the calls of a pipeline that an element runs. Script those by step path. A script repeats its last reply once used up. `Chat` refuses the requests `ErrInvalidChatRequest` lists, which no provider accepts, with that error. A message without a role passes, unless it carries parts, though all three providers refuse it. `Calls` returns every call the fake received. `Unmatched` returns the calls no script answered, as an `OnError` transition can hide their error. `Plain` hides its structured and chat methods to test the prompt-only path.
 
-`CheckToolProvider(t, provider, options...)` and `CheckChatClient(t, client)` are contract tests for your own tools and chat clients, and report each requirement one breaks. `CheckToolProvider` checks that a `ToolRegistry` registers the tool's schema, that it refuses invalid arguments with a Permanent `ErrInvalidToolArguments`, never panics and reports usage a run can count, that on an ended context it returns promptly and fails, if at all, with the context's error, that valid calls succeed through a `ToolSession`, that a caching session answers the same arguments laid out differently from its cache, and that concurrent calls succeed. `CheckChatClient` checks that the client refuses requests no provider accepts with a Permanent error and no usage, never panics and reports usage a run can count, that it fails promptly with the context's error on an ended context, that a valid request succeeds, that the same request sent again, which a provider may answer from its prompt cache, reports the same `PromptTokens`, or zero usage when the client answers it from its own cache without calling the provider, and that concurrent requests succeed. Equal counts catch only counting that differs between a cache miss and a hit, not cached tokens left out of `PromptTokens` on both. Pass `ToolArguments(...)` to a tool that refuses the arguments the check derives from its schema, and `ToolScope(...)` to one that needs a scope.
+`CheckToolProvider(t, provider, options...)` and `CheckChatClient(t, client, options...)` are contract tests for your own tools and chat clients, and report each requirement one breaks. `CheckToolProvider` checks that a `ToolRegistry` registers the tool's schema, and that the tool refuses invalid arguments with a Permanent `ErrInvalidToolArguments`. The tool must never panic and must report usage a run can count. On an ended context it must return promptly and fail, if at all, with the context's error. Valid calls must succeed through a `ToolSession`. A caching session must answer the same arguments laid out differently from its cache. Concurrent calls must succeed. `CheckChatClient` checks that the client refuses requests no provider accepts with a Permanent error and no usage. The client must never panic and must report usage a run can count. On an ended context it must fail promptly with the context's error. A valid request must succeed. The same request sent again, which a provider may answer from its prompt cache, must report the same `PromptTokens`. When the client answers it from its own cache without calling the provider, it may report zero usage instead. Concurrent requests must succeed. Equal counts catch only counting that differs between a cache miss and a hit, not cached tokens left out of `PromptTokens` on both. Pass `ToolArguments(...)` to a tool that refuses the arguments the check derives from its schema, and `ToolScope(...)` to one that needs a scope. Pass `ChatImages()` to `CheckChatClient` for a client that sends image parts. The check then also requires it to refuse invalid parts, and parts on a message that is not a user message. It must refuse them with a Permanent error and no usage, and answer a request with a PNG.
+
+`PNG(label)` returns a small, valid PNG `gepa.Image` for tests. The same label gives the same image, and different labels give different digests. Its pixels are stored uncompressed, so its bytes and digest do not change with the Go toolchain. A `Call` of `Chat` records the images of its message parts in `Images`, and its `Prompt` holds the text parts too.
 
 ## Key extension points
 
@@ -598,6 +622,23 @@ chatClient, err := gepagoogle.NewChatClient(gepagoogle.Config{
     Model:  "gemini-1.5-flash",
 })
 ```
+
+### Images in chat messages
+
+A user `gepa.Message` can carry `Parts`. Each `gepa.Part` holds a text or a `gepa.Image`. The model reads the message's `Content`, when it is not blank, and then each part in order:
+
+```go
+figure, err := gepa.NewImage(pngBytes) // PNG, JPEG or WebP, at most gepa.MaxImageBytes
+resp, err := chatClient.Chat(ctx, gepa.ChatRequest{Messages: []gepa.Message{{
+    Role:    gepa.RoleUser,
+    Content: "What does the chart show?",
+    Parts:   []gepa.Part{{Image: figure}},
+}}})
+```
+
+`NewImage` reads the media type from the first bytes of the data and checks the start of the structure that follows them. It copies the data and hashes it once. An `Image` is immutable. Its `String`, every `fmt` verb and its JSON form give a summary, such as `{"media_type":"image/png","size":48213,"sha256":"..."}`, and never the data. So traces, logs and errors hold the summary. Where `fmt` cannot call its methods, such as for `%p` or in an unexported struct field, a print shows an address. Each provider also limits the size of a whole request, such as about 20 MB of inline data for Gemini. So several large images in one request can fail at the provider. JSON cannot decode into an `Image`. Build it with `NewImage`.
+
+The OpenAI, Claude and Google chat clients send each image as base64 data. OpenAI gets an `image_url` part with a data URL, Claude a base64 `image` block and Google an `inlineData` part. Only a user message can carry parts. A request with parts on a message that is not a user message fails with a Permanent error before it is sent. So does a request with a part that fails `Part.Validate`. When a provider's error quotes the request, the clients replace the base64 data of the images in the error text. A message without parts is sent as the same bytes as before. Claude's OpenTelemetry content mode exports images as base64 data in its spans.
 
 ## Examples
 

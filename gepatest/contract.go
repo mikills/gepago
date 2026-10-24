@@ -36,6 +36,7 @@ const (
 	requireCacheHit        = "cache hit"
 	requireValidRequest    = "valid request"
 	requireConcurrentCalls = "concurrent calls"
+	requireImages          = "images"
 )
 
 // problems collects the requirements an implementation breaks, one message each.
@@ -593,7 +594,15 @@ func checkToolConcurrency(
 //   - concurrent calls: the valid request sent several times at once succeeds every time, as
 //     gepa.ChatClient requires of a client shared between goroutines; run the test with -race
 //     to catch the data races too.
-func CheckChatClient(t TestingT, client gepa.ChatClient) bool {
+//   - images, checked only with ChatImages: Chat refuses a request with parts that no provider
+//     sends, before it sends it. Such a part is an image part on a system, an assistant or a
+//     tool message. It is also a part that sets both Text and Image, an empty part or a part of
+//     blank text. Each fails with a Permanent error and reports no usage. A request whose user
+//     message carries a text part and a valid PNG (see PNG) succeeds as the valid request does.
+//     Chat returns rather than panics for each of these requests.
+//
+// It ignores a nil option.
+func CheckChatClient(t TestingT, client gepa.ChatClient, options ...ChatCheckOption) bool {
 	if helper, ok := t.(interface{ Helper() }); ok {
 		helper.Helper()
 	}
@@ -602,13 +611,84 @@ func CheckChatClient(t TestingT, client gepa.ChatClient) bool {
 		found.add(requireValidRequest, "the client is nil")
 		return found.report(t, "chat client")
 	}
+	var check chatCheck
+	for _, option := range options {
+		if option != nil {
+			option(&check)
+		}
+	}
 	checkChatInvalidRequests(client, &found)
 	checkChatOddRequests(client, &found)
 	checkChatEndedContext(client, &found)
 	if checkChatValidRequests(client, &found) {
 		checkChatConcurrency(client, &found)
 	}
+	if check.images {
+		checkChatImages(client, &found)
+	}
 	return found.report(t, fmt.Sprintf("chat client %T", client))
+}
+
+// ChatCheckOption configures CheckChatClient. ChatImages returns one.
+type ChatCheckOption func(*chatCheck)
+
+// chatCheck is what the options of CheckChatClient set: whether it checks image parts.
+type chatCheck struct {
+	images bool
+}
+
+// ChatImages makes CheckChatClient check the images requirement too. Use it for a client that sends
+// image parts (see gepa.Part), such as the chat clients of providers/openai, providers/claude and
+// providers/google. Without it the check sends no parts, so a client that takes no images still
+// passes.
+func ChatImages() ChatCheckOption {
+	return func(check *chatCheck) { check.images = true }
+}
+
+// checkChatImages checks the images requirement.
+func checkChatImages(client gepa.ChatClient, found *problems) {
+	imagePart := gepa.Part{Image: PNG("gepatest contract check")}
+	withMessage := func(message gepa.Message) gepa.ChatRequest {
+		req := validChatRequest()
+		req.Messages = append(req.Messages, message)
+		return req
+	}
+	withPart := func(part gepa.Part) gepa.ChatRequest {
+		return withMessage(gepa.Message{Role: gepa.RoleUser, Parts: []gepa.Part{part}})
+	}
+	for _, invalid := range []struct {
+		what string
+		req  gepa.ChatRequest
+	}{
+		{"an image part on a system message", withMessage(gepa.Message{Role: gepa.RoleSystem, Parts: []gepa.Part{imagePart}})},
+		{"an image part on an assistant message", withMessage(
+			gepa.Message{Role: gepa.RoleAssistant, Content: "A chart.", Parts: []gepa.Part{imagePart}},
+		)},
+		{"an image part on a tool message", withMessage(
+			gepa.Message{Role: gepa.RoleTool, ToolCallID: "call-1", Content: "a chart", Parts: []gepa.Part{imagePart}},
+		)},
+		{"a part that sets both Text and Image", withPart(gepa.Part{Text: "A chart.", Image: imagePart.Image})},
+		{"an empty part", withPart(gepa.Part{})},
+		{"a part whose text is blank", withPart(gepa.Part{Text: " \n"})},
+	} {
+		outcome := chat(context.Background(), client, invalid.req)
+		if !outcome.checked("a request with "+invalid.what, found) {
+			continue
+		}
+		switch {
+		case outcome.err == nil:
+			found.add(requireImages, "Chat accepted a request with %s", invalid.what)
+		case !gepa.IsPermanent(outcome.err):
+			found.add(requireImages, "Chat's error for a request with %s is not Permanent: %v",
+				invalid.what, outcome.err)
+		case outcome.resp.Usage != (gepa.Usage{}):
+			found.add(requireImages, "Chat refused a request with %s but reported usage %+v",
+				invalid.what, outcome.resp.Usage)
+		}
+	}
+	valid := validChatRequest()
+	valid.Messages[1].Parts = []gepa.Part{{Text: "The image is attached."}, imagePart}
+	chat(context.Background(), client, valid).validResponse(requireImages, "on a request with a PNG image", found)
 }
 
 // chatOutcome is what one Chat returned, or the value it panicked with.

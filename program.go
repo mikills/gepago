@@ -120,6 +120,16 @@ func refusalText(text string) string {
 //
 // A Predict with Tools or Middleware chats instead: LM must also be a ChatClient, and the call
 // is a bounded tool loop described on Tools.
+//
+// A Predict whose inputs hold an Image, at any depth, chats too, even without Tools or Middleware.
+// LM must be a ChatClient that can chat. A RetryingLanguageModel can chat only when its model can.
+// Otherwise the run fails with a Permanent error that matches ErrImagesUnsupported, and makes no
+// call. The chat's one user message has an empty Content. Its Parts hold, for each distinct image
+// by digest, the text "[image N]" and then the image. The last part is the prompt that BuildPrompt
+// gives, in which each image is that label. The repairs continue the same chat, so the images stay
+// in its first message, and RepairLM is not used. An input whose Field.Type is "image" must hold an
+// Image from NewImage. A ChatClient that has no Tools or Middleware is called directly, so it needs
+// no ToolRegistry. Inputs without images send the same request as before images existed.
 type Predict struct {
 	Signature       Signature
 	LM              Generator
@@ -161,15 +171,21 @@ type Predict struct {
 }
 
 // Validate checks that the programme has a valid signature and language model, and that a
-// ToolPolicy comes with a ToolRegistry. With Tools or Middleware, LM must also be a
-// ChatClient, the names must be unique, MaxToolTurns must not be negative, and when
-// ToolRegistry is set every name must be registered and every tool allowed by ToolPolicy.
+// ToolPolicy comes with a ToolRegistry. With Tools or Middleware, LM must also be a ChatClient, the
+// names must be unique, and MaxToolTurns must not be negative. When ToolRegistry is set, every name
+// must be registered and ToolPolicy must allow every tool. An input with the Type "image" needs an
+// LM that can chat. Otherwise Validate fails with a Permanent error that matches
+// ErrImagesUnsupported. MaxToolTurns must not be negative either. A demo that holds an Image fails
+// too.
 func (p Predict) Validate() error {
 	if err := p.Signature.Validate(); err != nil {
 		return err
 	}
 	if p.LM == nil {
 		return errors.New("predict language model is required")
+	}
+	if err := p.validateImages(); err != nil {
+		return err
 	}
 	return p.validateChat()
 }
@@ -209,7 +225,10 @@ func (p Predict) run(
 	if err := p.Validate(); err != nil {
 		return nil, err
 	}
-	prompt, err := p.BuildPrompt(candidate, inputs)
+	if err := p.checkImageInputs(inputs); err != nil {
+		return nil, err
+	}
+	prompt, images, err := p.buildPrompt(candidate, inputs)
 	if err != nil {
 		return nil, err
 	}
@@ -217,8 +236,15 @@ func (p Predict) run(
 	if err != nil {
 		return nil, err
 	}
-	if p.chats() {
-		return p.runChat(ctx, prompt, format, check)
+	switch {
+	case len(images) > 0 && !canChat(p.LM):
+		return nil, p.imagesUnsupported(inputs)
+	case len(images) > 0 && p.MaxToolTurns < 0:
+		return nil, p.negativeToolTurns()
+	case len(images) > 0:
+		return p.runChat(ctx, imageMessage(prompt, images), format, check)
+	case p.chats():
+		return p.runChat(ctx, Message{Role: RoleUser, Content: prompt}, format, check)
 	}
 	raw, err := p.generate(ctx, p.LM, prompt, format)
 	if err != nil {
@@ -246,10 +272,34 @@ func (p Predict) generate(ctx context.Context, lm Generator, prompt string, form
 // BuildPrompt renders the signature, candidate text, demos, and inputs into a model prompt.
 // When an output sets Type, Schema or Optional, the prompt also carries the signature's JSON
 // schema, so a model without structured output still learns the reply's shape.
+//
+// When the inputs hold an Image, at any depth, the input JSON holds the string "[image N]" in place
+// of each image. The numbers start at 1, in the order the JSON encoding meets the images. A line
+// after the JSON tells the model that each label names the image attached with it. An image that
+// comes again, by digest, keeps its number. Predict sends the images with the prompt (see Predict).
+// Inputs without images give the same prompt as before images existed.
 func (p Predict) BuildPrompt(candidate Candidate, inputs Prediction) (string, error) {
-	inputJSON, err := json.MarshalIndent(inputs, "", "  ")
+	prompt, _, err := p.buildPrompt(candidate, inputs)
+	return prompt, err
+}
+
+// buildPrompt is BuildPrompt, and also returns the images of the inputs in label order.
+func (p Predict) buildPrompt(candidate Candidate, inputs Prediction) (string, []Image, error) {
+	var (
+		inputJSON []byte
+		images    []Image
+		err       error
+	)
+	if holdsImage(inputs) {
+		inputJSON, images, err = encodeImageInputs(inputs)
+	}
+	// a JSON encoding that meets no image, such as one behind a type's own MarshalJSON, is the
+	// text-only prompt.
+	if err == nil && len(images) == 0 {
+		inputJSON, err = json.MarshalIndent(inputs, "", "  ")
+	}
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	var b strings.Builder
 	b.WriteString(p.Signature.Render())
@@ -261,18 +311,22 @@ func (p Predict) BuildPrompt(candidate Candidate, inputs Prediction) (string, er
 	}
 	b.WriteString("\n\nInput JSON:\n```json\n")
 	b.Write(inputJSON)
-	b.WriteString("\n```\n\nReturn only a JSON object with these output fields: ")
+	b.WriteString("\n```\n")
+	if len(images) > 0 {
+		b.WriteString(imageReferenceNote + "\n")
+	}
+	b.WriteString("\nReturn only a JSON object with these output fields: ")
 	b.WriteString(strings.Join(p.Signature.OutputNames(), ", "))
 	b.WriteString(".")
 	if p.Signature.typed() {
 		schema, err := p.Signature.JSONSchema()
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
 		b.WriteString("\n\n")
 		b.WriteString(schemaInstruction(schema))
 	}
-	return b.String(), nil
+	return b.String(), images, nil
 }
 
 // schemaInstruction renders a JSON schema for a prompt.

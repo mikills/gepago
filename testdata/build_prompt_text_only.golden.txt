@@ -1,0 +1,157 @@
+Task: invoice_extract
+Description: Extract the totals of an invoice.
+Inputs:
+- document: the invoice text
+- context
+- items: line items
+Outputs:
+- total: the grand total
+- currency
+- notes
+
+Instruction:
+Read the invoice and return its totals.
+Use the stated currency.
+
+Examples:
+[
+  {
+    "inputs": {
+      "context": null,
+      "document": "Total: 5 EUR",
+      "items": []
+    },
+    "outputs": {
+      "currency": "EUR",
+      "total": 5
+    },
+    "rationale": "The total line says 5 EUR."
+  },
+  {
+    "inputs": {
+      "context": {
+        "z": 1
+      },
+      "document": "Sum \u003cb\u003e7\u003c/b\u003e \u0026 tax"
+    },
+    "outputs": {
+      "currency": "GBP",
+      "notes": "tax \"included\"",
+      "total": 7.5
+    }
+  }
+]
+
+Input JSON:
+```json
+{
+  "context": {
+    "apple": null,
+    "emoji": "price 💶",
+    "nested": {
+      "deep": [
+        {
+          "a": [],
+          "b": "2"
+        },
+        [
+          [
+            "x"
+          ]
+        ]
+      ],
+      "raw": {
+        "keep": [
+          1,
+          2
+        ]
+      }
+    },
+    "numbers": [
+      1e3,
+      2.5,
+      -7,
+      255,
+      1e+21,
+      1e-7
+    ],
+    "zebra": true
+  },
+  "document": "Invoice #42\n\"Quoted\" total: 1,234.50 EUR\tdue 2026-10-24 \u003cscript\u003e",
+  "items": [
+    {
+      "sku": "A-1\u003c2\u003e\u00263",
+      "quantity": 3,
+      "price": 0.30000000000000004,
+      "tags": [
+        "x",
+        "\u2028line",
+        "tab\there"
+      ],
+      "meta": {
+        "Mid": "case",
+        "alpha": "first",
+        "zeta": "last"
+      },
+      "supplier": {
+        "name": "Größe \u0026 Söhne",
+        "country": "DE"
+      }
+    },
+    {
+      "sku": "A-1\u003c2\u003e\u00263",
+      "quantity": 3,
+      "price": 0.30000000000000004,
+      "tags": [
+        "x",
+        "\u2028line",
+        "tab\there"
+      ],
+      "meta": {
+        "Mid": "case",
+        "alpha": "first",
+        "zeta": "last"
+      },
+      "supplier": {
+        "name": "Größe \u0026 Söhne",
+        "country": "DE"
+      }
+    },
+    null
+  ]
+}
+```
+
+Return only a JSON object with these output fields: total, currency, notes.
+
+The JSON object must match this JSON schema:
+```json
+{
+  "type": "object",
+  "properties": {
+    "total": {
+      "type": "number",
+      "description": "the grand total"
+    },
+    "currency": {
+      "type": "string"
+    },
+    "notes": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "total",
+    "currency",
+    "notes"
+  ],
+  "additionalProperties": false
+}
+```

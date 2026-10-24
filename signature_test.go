@@ -388,6 +388,7 @@ func TestFieldGoType(t *testing.T) {
 		{field: Field{Name: "a", Type: "string"}, want: reflect.TypeFor[string]()},
 		{field: Field{Name: "a", Type: "slice"}, want: reflect.TypeFor[[]any]()},
 		{field: Field{Name: "a", Type: "map"}, want: reflect.TypeFor[map[string]any]()},
+		{field: Field{Name: "a", Type: "image"}, want: reflect.TypeFor[Image]()},
 		{field: Field{Name: "a"}},
 		{field: Field{Name: "a", Schema: json.RawMessage(`{"type":"string"}`)}},
 		{field: Field{Name: "a", Type: "complex128"}},
@@ -397,7 +398,30 @@ func TestFieldGoType(t *testing.T) {
 	}
 	for name := range fieldTypes {
 		field := Field{Name: "a", Type: name}
-		require.NoError(t, Signature{Inputs: []Field{{Name: "in"}}, Outputs: []Field{field}}.Validate())
+		require.NoError(t, Signature{Inputs: []Field{field}, Outputs: []Field{{Name: "out"}}}.Validate())
+		if name != "image" {
+			require.NoError(t, Signature{Inputs: []Field{{Name: "in"}}, Outputs: []Field{field}}.Validate())
+		}
 		require.Equal(t, fieldTypes[name], field.GoType())
 	}
+}
+
+func TestSignatureImageFieldTypeIsForInputsOnly(t *testing.T) {
+	signature := Signature{
+		Inputs:  []Field{{Name: "figure", Type: "image"}, {Name: "question", Type: "string"}},
+		Outputs: []Field{{Name: "answer", Type: "string"}},
+	}
+	require.NoError(t, signature.Validate())
+
+	signature.Outputs = []Field{{Name: "picture", Type: "image"}}
+	require.EqualError(t, signature.Validate(), `output field "picture": type "image" applies to inputs only`)
+	_, err := signature.JSONSchema()
+	require.EqualError(t, err, signature.Validate().Error(), "JSONSchema gives the error Validate gives")
+	_, err = signature.ResponseFormat()
+	require.EqualError(t, err, `output field "picture": type "image" applies to inputs only`)
+
+	signature.Outputs = []Field{{Name: "answer"}}
+	signature.Inputs[1].Type = "text"
+	require.ErrorContains(t, signature.Validate(), `input field "question": type "text" is not supported; `+
+		`use one of bool, float32, float64, image, int,`)
 }

@@ -806,11 +806,12 @@ func (e *redactedError) Is(target error) bool {
 	return slices.Contains(e.matches, target)
 }
 
-// textForms returns the ways value may appear in an error message: each string it holds, as
-// it is, quoted and JSON-encoded, and for a value that is not a string its %v, %+v and JSON
+// textForms returns the ways value may appear in an error message. They are each string it holds,
+// as it is, quoted and JSON-encoded. They are also the String text and JSON summary of each Image
+// it holds at any depth. For a value that is not a string, they are also its %v, %+v and JSON
 // forms. A panic in a value's String or MarshalJSON method only drops that form.
 func textForms(value any) []string {
-	forms := stringForms(value)
+	forms := append(stringForms(value), imageForms(value)...)
 	if value == nil || reflect.TypeOf(value).Kind() == reflect.String {
 		return forms
 	}
@@ -837,7 +838,8 @@ func stringForms(value any) []string {
 	return forms
 }
 
-// walkStrings calls visit with every string v holds, unexported fields included.
+// walkStrings calls visit with every string v holds, unexported fields included. It skips a
+// slice or an array of numbers or booleans, such as an Image's data, without a walk.
 func walkStrings(v reflect.Value, seen map[uintptr]bool, visit func(string)) {
 	switch v.Kind() {
 	case reflect.String:
@@ -859,14 +861,28 @@ func walkStrings(v reflect.Value, seen map[uintptr]bool, visit func(string)) {
 	case reflect.Interface:
 		walkStrings(v.Elem(), seen, visit)
 	case reflect.Slice, reflect.Array:
-		for i := range v.Len() {
-			walkStrings(v.Index(i), seen, visit)
+		if !holdsNoStrings(v.Type().Elem().Kind()) {
+			for i := range v.Len() {
+				walkStrings(v.Index(i), seen, visit)
+			}
 		}
 	case reflect.Struct:
 		for i := range v.NumField() {
 			walkStrings(v.Field(i), seen, visit)
 		}
 	}
+}
+
+// holdsNoStrings reports whether a value of kind is a number or a boolean, which holds no
+// string.
+func holdsNoStrings(kind reflect.Kind) bool {
+	switch kind {
+	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128:
+		return true
+	}
+	return false
 }
 
 // replaceStrings returns a copy of value with replace applied to every string it holds that

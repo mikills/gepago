@@ -287,6 +287,11 @@ func (s State) store(key string, typ reflect.Type, value any, fresh bool) {
 // `json:"-,"`, or with a ",string" field that is not a boolean, number or string or whose type
 // has its own unmarshal method (json.Number aside), is refused for every object.
 //
+// An Image's JSON form is a summary without its data. So an Image converts only from a value that
+// holds the same Image. Get converts between Image and *Image, and into a struct, slice, map or any
+// that holds Images. It takes each Image from the stored value by its digest. A summary of an image
+// that the stored value does not hold fails with an error that matches ErrInvalidImage.
+//
 // If T or *T has a Validate() error method, Get calls it on every value it returns (except a
 // nil pointer) and returns its error, so a value that decodes but breaks T's invariants is
 // still refused.
@@ -370,12 +375,16 @@ var decodeOptions = jsonv2.JoinOptions(
 	json.FormatDurationAsNano(true),
 	json.FormatByteArrayAsArray(true),
 	json.FormatBytesWithLegacySemantics(true),
-	jsonv2.WithUnmarshalers(jsonv2.JoinUnmarshalers(
-		jsonv2.UnmarshalFromFunc(decodeMethodMapKey[json.Unmarshaler]),
-		jsonv2.UnmarshalFromFunc(decodeMethodMapKey[jsonv2.UnmarshalerFrom]),
-		jsonv2.UnmarshalFromFunc(decodeMethodMapKey[encoding.TextUnmarshaler]),
-		jsonv2.UnmarshalFromFunc(decodeQuotedNumber),
-	)),
+	jsonv2.WithUnmarshalers(decodeUnmarshalers),
+)
+
+// decodeUnmarshalers are the unmarshalers of decodeOptions. A later WithUnmarshalers option
+// replaces them, so options that add unmarshalers join these (see imagePlaces.decodeOptions).
+var decodeUnmarshalers = jsonv2.JoinUnmarshalers(
+	jsonv2.UnmarshalFromFunc(decodeMethodMapKey[json.Unmarshaler]),
+	jsonv2.UnmarshalFromFunc(decodeMethodMapKey[jsonv2.UnmarshalerFrom]),
+	jsonv2.UnmarshalFromFunc(decodeMethodMapKey[encoding.TextUnmarshaler]),
+	jsonv2.UnmarshalFromFunc(decodeQuotedNumber),
 )
 
 // decodeQuotedNumber is called by encoding/json/v2 before it decodes a json.Number. In a
@@ -633,10 +642,28 @@ func tagOptionError(typ reflect.Type) (reflect.Type, error) {
 	return nil, nil
 }
 
+// decodeJSONValue converts value to typ through its JSON form. Some types can hold an Image, or an
+// empty interface that value may fill with one. When typ is such a type and value holds images,
+// each Image of value decodes at its place as itself (see imagePlaces.decodeOptions). This is
+// necessary because the JSON form of an Image, a summary, holds no data. For any other type it
+// never walks value for images.
 func decodeJSONValue(typ reflect.Type, value any) (any, error) {
-	data, err := json.Marshal(value)
+	var (
+		data   []byte
+		places imagePlaces
+		err    error
+	)
+	if mayHoldImage(typ, true) && holdsImage(value) {
+		data, places, err = encodeImages(value)
+	} else {
+		data, err = json.Marshal(value)
+	}
 	if err != nil {
 		return nil, err
+	}
+	options := decodeOptions
+	if places != nil || mayHoldImage(typ, false) {
+		options = places.decodeOptions()
 	}
 	var generic any
 	decoder := json.NewDecoder(bytes.NewReader(data))
@@ -645,7 +672,7 @@ func decodeJSONValue(typ reflect.Type, value any) (any, error) {
 		return nil, err
 	}
 	out := reflect.New(typ)
-	err = jsonv2.Unmarshal(data, out.Interface(), decodeOptions)
+	err = jsonv2.Unmarshal(data, out.Interface(), options)
 	// an unknown member, such as a renamed field, explains a missing field, so it comes first,
 	// unless it is inside an object for a struct whose definition is refused, which explains it.
 	if errors.Is(err, jsonv2.ErrUnknownName) {

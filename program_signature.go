@@ -27,17 +27,20 @@ type ProgramSignature struct {
 }
 
 // ProgramSignature implements SignatureProgram. Predict's outputs are JSON values, so the
-// result has no Go types.
+// result has no output types. Each input with the Type "image" has the input type Image, so a
+// step must read it from a Key[Image].
 func (p Predict) ProgramSignature() (ProgramSignature, error) {
-	return ProgramSignature{Signature: p.Signature}, p.Signature.Validate()
+	return ProgramSignature{Signature: p.Signature, InputTypes: imageInputTypes(p.Signature)}, p.Signature.Validate()
 }
 
 // ProgramSignature implements SignatureProgram: the signature with its reasoning field, which a
-// step may leave out of its writes.
+// step may leave out of its writes. Each input with the Type "image" has the input type Image,
+// as for Predict.
 func (c ChainOfThought) ProgramSignature() (ProgramSignature, error) {
 	predict := c.ToPredict()
 	return ProgramSignature{
 		Signature:        predict.Signature,
+		InputTypes:       imageInputTypes(predict.Signature),
 		OmittableOutputs: []string{c.reasoningFieldName()},
 	}, predict.Signature.Validate()
 }

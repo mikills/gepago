@@ -37,8 +37,9 @@ type Config struct {
 	// the TracerProvider and propagator registered with the OpenTelemetry API, and a traceparent
 	// header on the request, subject to the SDK's ANTHROPIC_OPEN_TELEMETRY* environment
 	// variables. With ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE=content the spans carry the
-	// prompts and replies, which bypasses a pipeline's Redactor. False, the default, sends no
-	// spans and no trace headers, whatever the environment says.
+	// prompts and replies, which bypasses a pipeline's Redactor. In that mode the spans also carry
+	// the images of a chat request as base64 data. False, the default, sends no spans and no trace
+	// headers, whatever the environment says.
 	OpenTelemetry bool
 }
 
@@ -226,18 +227,25 @@ func classifyErrorAs(ctx context.Context, operation string, err error) error {
 // (output_config.format); Claude has no non-strict schema mode, so any other format is not
 // sent.
 //
+// A user message with Parts becomes its Content, when it is not blank, and then a block for each
+// part. The block of a part is a text block or a base64 image block. A message of another role with
+// parts, or a part that fails gepa.Part.Validate, fails with a Permanent error before the request
+// is sent. When an error's text echoes the base64 data of a sent image, that data is replaced in
+// the error.
+//
 // Failures are classified as Generate's are. A refusal is not an error: its stop reason gives
 // FinishContentFilter. A reply with no text and no tool call is an error unless it stopped at
 // the token limit or under a content policy. A reply that fails after the API reported usage
 // returns that usage with the error.
 func (m *LanguageModel) Chat(ctx context.Context, req gepa.ChatRequest) (gepa.ChatResponse, error) {
-	params, err := m.chatParams(req)
+	params, images, err := m.chatParams(req)
 	if err != nil {
 		return gepa.ChatResponse{}, gepa.PermanentError(fmt.Errorf("claude chat: %w", err))
 	}
 	call := providerlog.Call{Provider: "claude", Operation: "chat", Model: string(params.Model)}
 	return providerlog.Chat(ctx, m.logger, call, func() (gepa.ChatResponse, error) {
-		return m.chat(ctx, params)
+		resp, err := m.chat(ctx, params)
+		return resp, providererr.ScrubImages(err, images...)
 	})
 }
 
@@ -274,7 +282,9 @@ func (m *LanguageModel) chat(ctx context.Context, params anthropic.MessageNewPar
 	return resp, nil
 }
 
-func (m *LanguageModel) chatParams(req gepa.ChatRequest) (anthropic.MessageNewParams, error) {
+// chatParams converts req to the request Chat sends, and returns the base64 data of the images
+// it carries.
+func (m *LanguageModel) chatParams(req gepa.ChatRequest) (anthropic.MessageNewParams, []string, error) {
 	model := m.model
 	if strings.TrimSpace(req.Model) != "" {
 		model = req.Model
@@ -286,11 +296,14 @@ func (m *LanguageModel) chatParams(req gepa.ChatRequest) (anthropic.MessageNewPa
 	params := anthropic.MessageNewParams{Model: anthropic.Model(model), MaxTokens: int64(maxTokens)}
 	if t := req.Temperature; t != nil {
 		if math.IsNaN(*t) || math.IsInf(*t, 0) {
-			return params, fmt.Errorf("temperature %v is not a finite number", *t)
+			return params, nil, fmt.Errorf("temperature %v is not a finite number", *t)
 		}
 		params.Temperature = anthropic.Float(*t)
 	}
-	var system []string
+	if err := providererr.CheckParts(req.Messages); err != nil {
+		return params, nil, err
+	}
+	var system, images []string
 	for _, message := range req.Messages {
 		if message.Role == gepa.RoleSystem {
 			if strings.TrimSpace(message.Content) != "" {
@@ -298,9 +311,9 @@ func (m *LanguageModel) chatParams(req gepa.ChatRequest) (anthropic.MessageNewPa
 			}
 			continue
 		}
-		converted, err := claudeMessage(message)
+		converted, err := claudeMessage(message, &images)
 		if err != nil {
-			return params, err
+			return params, nil, err
 		}
 		if last := len(params.Messages) - 1; last >= 0 && params.Messages[last].Role == converted.Role {
 			params.Messages[last].Content = append(params.Messages[last].Content, converted.Content...)
@@ -315,7 +328,7 @@ func (m *LanguageModel) chatParams(req gepa.ChatRequest) (anthropic.MessageNewPa
 		schema := tool.InputSchema()
 		inputSchema, err := claudeInputSchema(schema)
 		if err != nil {
-			return params, fmt.Errorf("tool %q parameters: %w", tool.Name, err)
+			return params, nil, fmt.Errorf("tool %q parameters: %w", tool.Name, err)
 		}
 		toolParam := anthropic.ToolParam{Name: tool.Name, InputSchema: inputSchema}
 		if tool.Description != "" {
@@ -329,18 +342,22 @@ func (m *LanguageModel) chatParams(req gepa.ChatRequest) (anthropic.MessageNewPa
 	if format := req.ResponseFormat; format != nil && format.Strict {
 		schema, err := claudeSchema(format.Schema)
 		if err != nil {
-			return params, fmt.Errorf("response format schema: %w", err)
+			return params, nil, fmt.Errorf("response format schema: %w", err)
 		}
 		params.OutputConfig = anthropic.OutputConfigParam{Format: anthropic.JSONOutputFormatParam{Schema: schema}}
 	}
-	return params, nil
+	return params, images, nil
 }
 
-// claudeMessage converts one non-system transcript message to a Messages API turn.
-func claudeMessage(message gepa.Message) (anthropic.MessageParam, error) {
+// claudeMessage converts one non-system transcript message to a Messages API turn, and adds
+// the base64 data of each image it sends to images.
+func claudeMessage(message gepa.Message, images *[]string) (anthropic.MessageParam, error) {
 	switch message.Role {
 	case gepa.RoleUser:
-		return anthropic.NewUserMessage(anthropic.NewTextBlock(message.Content)), nil
+		if len(message.Parts) == 0 {
+			return anthropic.NewUserMessage(anthropic.NewTextBlock(message.Content)), nil
+		}
+		return anthropic.NewUserMessage(claudeUserBlocks(message, images)...), nil
 	case gepa.RoleTool:
 		if message.Content == "" {
 			// Claude rejects an empty text block, so an empty result has no content.
@@ -359,6 +376,26 @@ func claudeMessage(message gepa.Message) (anthropic.MessageParam, error) {
 		return anthropic.NewAssistantMessage(blocks...), nil
 	}
 	return anthropic.MessageParam{}, fmt.Errorf("message role %q is not supported", message.Role)
+}
+
+// claudeUserBlocks returns the blocks of a user message with parts. They are its Content, when it
+// is not blank, and then a text or base64 image block for each part. It adds the base64 data of
+// each image to images.
+func claudeUserBlocks(message gepa.Message, images *[]string) []anthropic.ContentBlockParamUnion {
+	blocks := make([]anthropic.ContentBlockParamUnion, 0, len(message.Parts)+1)
+	if strings.TrimSpace(message.Content) != "" {
+		blocks = append(blocks, anthropic.NewTextBlock(message.Content))
+	}
+	for _, part := range message.Parts {
+		if part.Text != "" {
+			blocks = append(blocks, anthropic.NewTextBlock(part.Text))
+			continue
+		}
+		data := providererr.EncodeImage(part.Image)
+		*images = append(*images, data)
+		blocks = append(blocks, anthropic.NewImageBlockBase64(part.Image.MediaType(), data))
+	}
+	return blocks
 }
 
 // claudeToolInput returns a call's arguments as raw JSON when they are a JSON object, and

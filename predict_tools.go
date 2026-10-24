@@ -15,6 +15,16 @@ const defaultMaxToolTurns = 8
 // Budget error (see IsBudget).
 var ErrToolTurnLimit = errors.New("tool turn limit reached")
 
+// errNegativeToolTurns is the error of a Predict that can chat and sets a negative MaxToolTurns.
+var errNegativeToolTurns = errors.New("predict MaxToolTurns must not be negative")
+
+// negativeToolTurns is the error of a Predict that chats for images and sets a negative
+// MaxToolTurns. It is a Permanent error that names the signature, since no retry or fallback can
+// fix its configuration.
+func (p Predict) negativeToolTurns() error {
+	return PermanentError(fmt.Errorf("%s%w", signaturePrefix(p.Signature.Name), errNegativeToolTurns))
+}
+
 // toolBinder is a step or programme that calls tools or chat middleware by name. Build binds
 // the names against the pipeline's registry and policy, so an unknown or disallowed name fails
 // Build rather than a run.
@@ -35,6 +45,10 @@ func (p Predict) validateChat() error {
 		)
 	}
 	if !p.chats() {
+		// an input with the Type "image" makes the Predict chat.
+		if imageInputTypes(p.Signature) != nil && p.MaxToolTurns < 0 {
+			return p.negativeToolTurns()
+		}
 		return nil
 	}
 	if !canChat(p.LM) {
@@ -49,7 +63,7 @@ func (p Predict) validateChat() error {
 		)
 	}
 	if p.MaxToolTurns < 0 {
-		return errors.New("predict MaxToolTurns must not be negative")
+		return errNegativeToolTurns
 	}
 	if err := uniqueNames("tool", p.Tools); err != nil {
 		return err
@@ -136,33 +150,33 @@ func uniqueNames(kind string, names []string) error {
 	return nil
 }
 
-// runChat answers the prompt through a chat with tools, then checks the reply, repairing it by
-// continuing the chat.
+// runChat answers the first message, which holds the prompt, through a chat. It uses the tools and
+// middleware when the Predict has any. Then it checks the reply and repairs it by continuing the
+// chat. Without tools or middleware it calls LM directly, so it needs no tool registry.
 func (p Predict) runChat(
 	ctx context.Context,
-	prompt string,
+	first Message,
 	format ResponseFormat,
 	check func(Prediction) error,
 ) (Prediction, error) {
-	env, err := p.chatEnv(ctx)
-	if err != nil {
-		return nil, err
-	}
-	client, err := env.registry.WrapChat(p.LM.(ChatClient), p.Middleware...)
-	if err != nil {
-		return nil, err
-	}
-	tools, err := env.session.Schemas(p.Tools)
-	if err != nil {
-		return nil, err
-	}
 	chat := &predictChat{
 		subject:    fmt.Sprintf("signature %q", p.Signature.Name),
-		client:     client,
-		tools:      tools,
-		session:    env.session,
-		transcript: []Message{{Role: RoleUser, Content: prompt}},
+		client:     p.LM.(ChatClient),
+		transcript: []Message{first},
 		maxTurns:   p.MaxToolTurns,
+	}
+	if p.chats() {
+		env, err := p.chatEnv(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if chat.client, err = env.registry.WrapChat(chat.client, p.Middleware...); err != nil {
+			return nil, err
+		}
+		if chat.tools, err = env.session.Schemas(p.Tools); err != nil {
+			return nil, err
+		}
+		chat.session = env.session
 	}
 	if chat.maxTurns == 0 {
 		chat.maxTurns = defaultMaxToolTurns
@@ -315,6 +329,7 @@ func toolNames(tools []Tool) []string {
 }
 
 func cloneMessage(message Message) Message {
+	message.Parts = slices.Clone(message.Parts)
 	message.ToolCalls = slices.Clone(message.ToolCalls)
 	return message
 }

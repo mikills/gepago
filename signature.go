@@ -27,7 +27,10 @@ import (
 // as required, so Signature.JSONSchema lists an optional output as required but nullable.
 // Optional applies to outputs only.
 //
-// On an input, Type and Schema describe the value but Predict does not check them.
+// On an input, Type and Schema describe the value but Predict does not check them. An input may
+// also have the Type "image", for a value that is an Image. Predict checks that such an input
+// holds an Image from NewImage, and that its model can take images. An output cannot have that
+// Type.
 type Field struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
@@ -54,7 +57,11 @@ var fieldTypes = map[string]reflect.Type{
 	"string":  reflect.TypeFor[string](),
 	"slice":   reflect.TypeFor[[]any](),
 	"map":     reflect.TypeFor[map[string]any](),
+	"image":   reflect.TypeFor[Image](),
 }
+
+// imageFieldType is the Field.Type of an Image input. An output cannot have it.
+const imageFieldType = "image"
 
 // Signature describes the input/output contract a Predict programme must satisfy.
 type Signature struct {
@@ -206,8 +213,11 @@ func (f Field) propertySchema() (any, error) {
 	node := schemaNode{}
 	if f.Type != "" {
 		typ := fieldTypes[f.Type]
+		if f.Type == imageFieldType {
+			return nil, imageOutputError()
+		}
 		if typ == nil {
-			return nil, unknownFieldType(f.Type)
+			return nil, unknownFieldType(f.Type, "output")
 		}
 		var err error
 		if node, _, err = newSchemaBuilder().typeSchema(typ, ""); err != nil {
@@ -223,17 +233,26 @@ func (f Field) propertySchema() (any, error) {
 	return node, nil
 }
 
-// GoType returns the Go type f's Type names, the type Predict checks an output's value against
-// and so the type a pipeline key for the field holds, or nil when Type is empty or not one
-// Signature.Validate accepts.
+// GoType returns the Go type that f's Type names, or nil when Type is empty or not one that
+// Signature.Validate accepts. Predict checks an output's value against this type, so a pipeline key
+// for the field holds it. The input Type "image" names Image.
 func (f Field) GoType() reflect.Type {
 	return fieldTypes[f.Type]
 }
 
-func unknownFieldType(name string) error {
+// imageOutputError reports an output with the Type "image", which applies to inputs only.
+func imageOutputError() error {
+	return fmt.Errorf("type %q applies to inputs only", imageFieldType)
+}
+
+// unknownFieldType reports a Type that a field of kind, "input" or "output", cannot have, and
+// lists those it can.
+func unknownFieldType(name, kind string) error {
 	names := make([]string, 0, len(fieldTypes))
 	for typeName := range fieldTypes {
-		names = append(names, typeName)
+		if kind != "output" || typeName != imageFieldType {
+			names = append(names, typeName)
+		}
 	}
 	slices.Sort(names)
 	return fmt.Errorf("type %q is not supported; use one of %s", name, strings.Join(names, ", "))
@@ -249,8 +268,11 @@ func validateField(field Field, kind string) error {
 	if field.Type != "" && len(field.Schema) > 0 {
 		return fmt.Errorf("%s field %q sets both Type and Schema; set one", kind, field.Name)
 	}
+	if kind == "output" && field.Type == imageFieldType {
+		return fmt.Errorf("output field %q: %w", field.Name, imageOutputError())
+	}
 	if field.Type != "" && fieldTypes[field.Type] == nil {
-		return fmt.Errorf("%s field %q: %w", kind, field.Name, unknownFieldType(field.Type))
+		return fmt.Errorf("%s field %q: %w", kind, field.Name, unknownFieldType(field.Type, kind))
 	}
 	if len(field.Schema) > 0 {
 		if err := checkSchemaJSON(field.Schema); err != nil {

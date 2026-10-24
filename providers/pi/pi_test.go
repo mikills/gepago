@@ -9,6 +9,7 @@ import (
 	"time"
 
 	gepa "github.com/mikills/gepago"
+	"github.com/mikills/gepago/gepatest"
 	"github.com/stretchr/testify/require"
 )
 
@@ -144,4 +145,39 @@ func TestLanguageModelClassifiesErrors(t *testing.T) {
 		_, err := lm.Generate(context.Background(), "prompt")
 		require.EqualError(t, err, "pi language model is nil")
 	})
+}
+
+func TestPredictWithImageRefusesPi(t *testing.T) {
+	ran := filepath.Join(t.TempDir(), "ran")
+	lm, err := NewLanguageModel(Config{Command: fakePi(t, "touch "+ran+"; printf '{\"a\": \"x\"}'")})
+	require.NoError(t, err)
+	photo := gepatest.PNG("photo")
+
+	_, err = gepa.Predict{
+		Signature: gepa.Signature{
+			Name:    "look",
+			Inputs:  []gepa.Field{{Name: "page"}},
+			Outputs: []gepa.Field{{Name: "a"}},
+		},
+		LM: lm,
+	}.Run(context.Background(), gepa.Prediction{"page": map[string]any{"scan": photo}})
+
+	require.ErrorIs(t, err, gepa.ErrImagesUnsupported)
+	require.True(t, gepa.IsPermanent(err))
+	require.EqualError(
+		t,
+		err,
+		`model cannot take images: signature "look": input "page" holds an image, which needs a `+
+			"language model that implements ChatClient, and *pi.LanguageModel does not",
+	)
+	require.NoFileExists(t, ran, "pi never runs")
+
+	err = gepa.Predict{
+		Signature: gepa.Signature{
+			Inputs:  []gepa.Field{{Name: "page", Type: "image"}},
+			Outputs: []gepa.Field{{Name: "a"}},
+		},
+		LM: lm,
+	}.Validate()
+	require.ErrorIs(t, err, gepa.ErrImagesUnsupported)
 }
