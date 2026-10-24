@@ -403,9 +403,9 @@ type Pipeline struct {
 }
 
 // keySource records the type of an available key and where the key comes from. step names the
-// first step that writes the key. Without such a step, the key is a pipeline input, or a Default
-// when def is set. view, when set, says that step holds the key only in the views of the steps
-// nested in it. It is viewItem for a Map's item and viewIteration for a Loop's iteration key.
+// first step that writes the key. Without such a step, a pipeline input gives the key, or a
+// Default when def is true. view, when not empty, says that step holds the key only in the views
+// of the steps nested in it. It is viewItem for a Map's item and viewIteration for a Loop's iteration key.
 type keySource struct {
 	typ     reflect.Type
 	step    string

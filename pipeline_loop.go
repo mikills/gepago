@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"runtime/debug"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -300,7 +301,6 @@ func (l *loopStep) runCandidate(ctx context.Context, candidate Candidate, s Stat
 	// the iterations stage for tools in a stage of the loop's own, which commits only when until
 	// holds. So a failed loop drops what they staged, whoever runs it.
 	loopCtx, stage := beginStepStage(ctx)
-	evaluationCaptureFrom(loopCtx).offerIterationKey(l.iteration.Name)
 	for iteration := 1; ; iteration++ {
 		if err := stepCanStart(loopCtx); err != nil {
 			return err
@@ -309,6 +309,7 @@ func (l *loopStep) runCandidate(ctx context.Context, candidate Candidate, s Stat
 		view := maps.Clone(carry)
 		if l.iteration.Name != "" {
 			view[l.iteration.Name] = iteration
+			evaluationCaptureFrom(loopCtx).offerIteration(l.iteration.Name, iteration)
 		}
 		iterationCtx := withIteration(loopCtx, l.iteration.Name, iteration)
 		result, err := runNode(iterationCtx, childCandidate(candidate, l.body), l.body, view, nil)
@@ -382,31 +383,86 @@ func (l *loopStep) callUntil(iteration int, values map[string]any) (done bool, e
 type loopIterationKey struct{}
 
 // loopIteration is the iteration of a Loop that executions belong to. It holds its number, from
-// one, and the Loop's iteration key, empty when the Loop has none. keys holds the iteration keys
-// of this Loop and of the Loops around it whose iterations the executions belong to.
+// one, and the Loop's iteration key, empty when the Loop has none. numbers holds the iteration
+// numbers of this Loop and of the Loops around it. The pipelines that an iteration runs keep
+// numbers, but their steps belong to no iteration, so number is zero for them.
 type loopIteration struct {
-	number int
-	key    string
-	keys   []string
+	number  int
+	key     string
+	numbers iterationNumbers
+}
+
+// iterationNumbers holds, for each iteration key, the highest iteration number that a Loop gave
+// under it.
+type iterationNumbers map[string]int
+
+// with returns a copy of n that also holds number under key. An empty key leaves n as it is.
+func (n iterationNumbers) with(key string, number int) iterationNumbers {
+	if key == "" || n[key] >= number {
+		return n
+	}
+	out := maps.Clone(n)
+	if out == nil {
+		out = iterationNumbers{}
+	}
+	out[key] = number
+	return out
+}
+
+// holds reports whether value, under key, is an iteration number. That is so when value is a
+// number or a string whose text is a whole number from one to the highest number under key.
+func (n iterationNumbers) holds(key string, value any) bool {
+	last := n[key]
+	if last == 0 || value == nil {
+		return false
+	}
+	switch reflect.TypeOf(value).Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64, reflect.String:
+	default:
+		return false
+	}
+	text := fmt.Sprint(value)
+	number, err := strconv.Atoi(text)
+	return err == nil && number >= 1 && number <= last && strconv.Itoa(number) == text
+}
+
+// without returns values without the iteration numbers it holds, or values itself when it holds
+// none.
+func (n iterationNumbers) without(values map[string]any) map[string]any {
+	var out map[string]any
+	for key, value := range values {
+		if !n.holds(key, value) {
+			continue
+		}
+		if out == nil {
+			out = maps.Clone(values)
+		}
+		delete(out, key)
+	}
+	if out == nil {
+		return values
+	}
+	return out
 }
 
 // withIteration returns ctx for the executions of the iteration numbered number, from one, and of
 // the executions nested in them. key is the Loop's iteration key.
 func withIteration(ctx context.Context, key string, number int) context.Context {
-	keys := iterationFrom(ctx).keys
-	if key != "" {
-		keys = append(slices.Clip(keys), key)
-	}
-	return context.WithValue(ctx, loopIterationKey{}, loopIteration{number: number, key: key, keys: keys})
+	numbers := iterationFrom(ctx).numbers.with(key, number)
+	return context.WithValue(ctx, loopIterationKey{}, loopIteration{number: number, key: key, numbers: numbers})
 }
 
 // withoutIteration returns ctx for executions that belong to no iteration of a Loop, such as the
-// steps of a pipeline an iteration runs.
+// steps of a pipeline an iteration runs. They keep the iteration numbers of the Loops around
+// them, since the pipeline can take such a number as an input.
 func withoutIteration(ctx context.Context) context.Context {
-	if iterationFrom(ctx).number == 0 {
+	iteration := iterationFrom(ctx)
+	if iteration.number == 0 {
 		return ctx
 	}
-	return context.WithValue(ctx, loopIterationKey{}, loopIteration{})
+	return context.WithValue(ctx, loopIterationKey{}, loopIteration{numbers: iteration.numbers})
 }
 
 // iterationFrom returns the iteration of a Loop the executions running with ctx belong to, or
@@ -439,20 +495,20 @@ func (r *runObservation) redactNumber(key string, value any) any {
 	return applyRedactors(r.redactors, key, deepCopy(value))
 }
 
-// redactReads returns copies of an execution's reads as its events carry them. A read under one
-// of iterationKeys, the iteration keys of the Loops around the execution, holds an iteration
-// number, so it passes through redactNumber. Every other read passes through redact. The caller
-// holds the trace lock.
-func (r *runObservation) redactReads(reads map[string]any, iterationKeys []string) map[string]any {
-	if len(iterationKeys) == 0 {
-		return r.redactValues(reads)
+// redactStateValues returns copies of state values, such as an execution's reads or a run's
+// inputs, as the run's events carry them. A value that numbers holds is an iteration number, so
+// it passes through redactNumber. Every other value passes through redact. The caller holds the
+// trace lock.
+func (r *runObservation) redactStateValues(values map[string]any, numbers iterationNumbers) map[string]any {
+	if len(numbers) == 0 {
+		return r.redactValues(values)
 	}
-	if len(reads) == 0 {
+	if len(values) == 0 {
 		return nil
 	}
-	out := make(map[string]any, len(reads))
-	for key, value := range reads {
-		if slices.Contains(iterationKeys, key) {
+	out := make(map[string]any, len(values))
+	for key, value := range values {
+		if numbers.holds(key, value) {
 			out[key] = r.redactNumber(key, value)
 		} else {
 			out[key] = r.redact(key, value)

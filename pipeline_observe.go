@@ -355,7 +355,8 @@ func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any,
 	parent := observeScopeFrom(ctx)
 	capture := evaluationCaptureFrom(ctx)
 	recorder := capture.join(p, parent == nil)
-	capture.offer(inputs)
+	numbers := iterationFrom(ctx).numbers
+	capture.offer(numbers.without(inputs))
 	capture.offer(attributeValues(rc))
 	if parent == nil {
 		parent = &observeScope{}
@@ -394,7 +395,11 @@ func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any,
 	defer run.trace.mu.Unlock()
 	for lane := run; lane != nil; lane = lane.recording {
 		lane.runContext = lane.redactRunContext(rc)
-		event := RunStartedEvent{Span: lane.span, RunContext: lane.runContext, Inputs: lane.redactValues(inputs)}
+		event := RunStartedEvent{
+			Span:       lane.span,
+			RunContext: lane.runContext,
+			Inputs:     lane.redactStateValues(inputs, numbers),
+		}
 		observerCtx := lane.observerContext(ctx)
 		lane.deliver(func(observer PipelineObserver) {
 			event := event
@@ -541,7 +546,7 @@ func observeStep(ctx context.Context, node *stepNode, attempt, visit int, values
 		}
 		lane.ctx = ctx
 		iteration := iterationFrom(ctx)
-		lane.reads = lane.run.redactReads(reads, iteration.keys)
+		lane.reads = lane.run.redactStateValues(reads, iteration.numbers)
 		lane.attributes = executionAttributes(ctx, visit)
 		if iteration.number > 0 && !lane.run.keepsAttribute(iteration.key, iteration.number) {
 			delete(lane.attributes, "iteration")

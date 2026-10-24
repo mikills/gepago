@@ -2,6 +2,7 @@ package gepa
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -1712,6 +1713,25 @@ func TestLoopRedactorThatHidesTheIterationKeepsNumbersInErrorText(t *testing.T) 
 	require.Contains(t, report, "order 1234 failed with HTTP 512 at step v2")
 	require.NotContains(t, report, "T-77")
 	require.NotContains(t, report, "iteration 3</span>")
+}
+
+func TestIterationNumbersHoldOnlyTheNumbersOfTheirKeys(t *testing.T) {
+	numbers := iterationNumbers{}.with("page", 3).with("round", 1).with("page", 2).with("", 9)
+
+	require.Equal(t, iterationNumbers{"page": 3, "round": 1}, numbers)
+	for _, value := range []any{1, 3, int64(2), uint8(1), 2.0, json.Number("3"), "2"} {
+		require.True(t, numbers.holds("page", value), "%T %v", value, value)
+	}
+	for _, value := range []any{0, 4, -1, 2.5, "03", " 2", "T-77", true, []int{1}, nil} {
+		require.False(t, numbers.holds("page", value), "%T %v", value, value)
+	}
+	require.False(t, numbers.holds("count", 1), "a key that no Loop numbers")
+
+	values := map[string]any{"page": 2, "round": "secret", "count": 1}
+	require.Equal(t, map[string]any{"round": "secret", "count": 1}, numbers.without(values))
+	require.Equal(t, map[string]any{"page": 2, "round": "secret", "count": 1}, values, "without copies")
+	unchanged := map[string]any{"count": 1}
+	require.Equal(t, unchanged, iterationNumbers(nil).without(unchanged))
 }
 
 func TestLoopRedactorHidesTheIterationAttributes(t *testing.T) {

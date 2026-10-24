@@ -2,7 +2,9 @@ package gepa_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	gepa "github.com/mikills/gepago"
@@ -148,4 +150,94 @@ func TestLoopInvalidOutputReachesReflection(t *testing.T) {
 	require.Equal(t, map[string]any{"page": 2}, sideInfo["reads"])
 	require.Contains(t, sideInfo["feedback"], `pipeline step "pages": iteration 2: pipeline step "read": `+
 		`invalid programme output`)
+}
+
+// errorObserver records the error of every StepFinished event and the run's trace.
+type errorObserver struct {
+	gepa.RecordingObserver
+	mu   sync.Mutex
+	errs []string
+}
+
+func (o *errorObserver) StepFinished(ctx context.Context, event gepa.StepFinishedEvent) {
+	if event.Err != nil {
+		o.mu.Lock()
+		o.errs = append(o.errs, event.Step+": "+event.Err.Error())
+		o.mu.Unlock()
+	}
+	o.RecordingObserver.StepFinished(ctx, event)
+}
+
+func TestLoopIterationNumberInNestedPipelinesStaysInErrorText(t *testing.T) {
+	note := gepa.Key[string]{Name: "note"}
+	check := gepa.NewStep("check", refs(pageKey.Ref()), refs(note.Ref()), func(_ context.Context, s gepa.State) error {
+		page, err := pageKey.Get(s)
+		if err != nil {
+			return err
+		}
+		if page == 3 {
+			return errors.New("order 1234 failed with HTTP 512")
+		}
+		note.Set(s, "ok")
+		return nil
+	})
+	// nest returns a pipeline that takes the page as an input and runs step.
+	nest := func(step gepa.Step) gepa.Pipeline {
+		return fpBuild(t, gepa.PipelineSpec{Inputs: refs(pageKey.Ref()), Steps: []gepa.Step{step}})
+	}
+	oneLevel := nest(check)
+	twoLevels := nest(gepa.NewProgramStep("deeper", oneLevel, refs(pageKey.Ref()), refs(note.Ref())))
+	hidePage := func(key string, value any) any {
+		if key == "page" {
+			return gepa.RedactedText
+		}
+		return value
+	}
+
+	for name, tt := range map[string]struct {
+		nested gepa.Pipeline
+		path   string
+		depth  int
+	}{
+		"one level":  {nested: oneLevel, path: `pipeline step "check": `, depth: 1},
+		"two levels": {nested: twoLevels, path: `pipeline step "deeper": pipeline step "check": `, depth: 2},
+	} {
+		t.Run(name, func(t *testing.T) {
+			observer := &errorObserver{}
+			body := gepa.NewProgramStep("count_up", tt.nested, refs(pageKey.Ref()), refs(note.Ref()))
+			pipeline := fpBuild(t, gepa.PipelineSpec{
+				Steps: []gepa.Step{gepa.Loop("scan", body, func(gepa.State) (bool, error) { return false, nil },
+					gepa.LoopOptions{MaxIterations: 5, Iteration: pageKey})},
+				Redactor:  hidePage,
+				Observers: []gepa.PipelineObserver{observer},
+			})
+
+			_, err := pipeline.RunCandidate(context.Background(), nil, gepa.Prediction{})
+
+			want := `pipeline step "scan": iteration 3: pipeline step "count_up": ` + tt.path +
+				"order 1234 failed with HTTP 512"
+			require.EqualError(t, err, want)
+			trace := observer.Traces()[0]
+			require.Equal(t, want, trace.Err, "the run removes no iteration number from error text")
+			observer.mu.Lock()
+			require.Len(t, observer.errs, 2+tt.depth)
+			for _, text := range observer.errs {
+				require.Contains(t, text, "order 1234 failed with HTTP 512")
+				require.NotContains(t, text, gepa.RedactedText)
+			}
+			observer.mu.Unlock()
+			step := trace.Steps[0].Steps[2]
+			require.Equal(t, map[string]int{"visit": 1}, step.Attributes, "the hidden iteration stays out")
+			require.Equal(t, map[string]any{"page": gepa.RedactedText}, step.Reads)
+			for range tt.depth {
+				run := step.Runs[0]
+				require.Equal(t, map[string]any{"page": gepa.RedactedText}, run.Inputs,
+					"the nested run's input still shows as hidden")
+				step = run.Steps[0]
+				require.Equal(t, map[string]any{"page": gepa.RedactedText}, step.Reads)
+				require.Equal(t, map[string]int{"visit": 1}, step.Attributes)
+			}
+			require.Equal(t, "order 1234 failed with HTTP 512", step.Err)
+		})
+	}
 }

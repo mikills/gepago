@@ -16,28 +16,29 @@ type evaluationKey struct{}
 // maxProgramDepth bounds how deep newEvaluationCapture looks into nested programmes.
 const maxProgramDepth = 32
 
-// evaluationCapture collects what ProgramEvaluator needs to redact one evaluated example: the
-// Redactors, key types and Maps of the pipelines the programme holds or runs, the values those
-// runs were given, wrote, tried to write or attached to their errors while the capture had a
-// Redactor, the items their Maps gave their elements among them, the tool calls their steps
-// made, and, when recorder is set, the traces of the top-level runs. Without a Redactor it keeps
-// no values, so an evaluation without one holds no more than it would without the capture; a
-// Redactor that joins when its pipeline runs applies only to values offered after it joined.
-// known holds the pipelines already accounted for, by their first step, and mapSteps one Map of
-// each shape in shapes, so a programme that builds a pipeline on each run does not add a Map
-// per run. iterationKeys holds the iteration keys of the Loops that ran.
+// evaluationCapture collects what ProgramEvaluator needs to redact one evaluated example. It holds
+// the Redactors, key types and Maps of the pipelines that the programme holds or runs. It keeps
+// the values that those runs took as inputs, wrote, tried to write or attached to their errors
+// while the capture had a Redactor. Among them are the items that their Maps gave their elements.
+// It also keeps the tool calls that their steps made. When recorder is not nil, it keeps the
+// traces of the top-level runs. Without a Redactor it keeps no values. So an evaluation without
+// one holds no more than it would without the capture. A Redactor that joins when its pipeline
+// runs applies only to values offered after it joined. known holds the pipelines that the capture
+// has accounted for, by their first step. mapSteps holds one Map of each shape in shapes. So a
+// programme that builds a pipeline on each run does not add a Map per run. iterations holds the
+// iteration numbers that the Loops gave.
 type evaluationCapture struct {
-	recorder      *RecordingObserver
-	mu            sync.Mutex
-	redactors     []Redactor
-	types         map[string]reflect.Type
-	mapSteps      []*mapStep
-	shapes        map[elementShape]bool
-	known         map[*stepNode]bool
-	values        []stateWrite
-	details       []stateWrite
-	toolCalls     []ToolCallRecord
-	iterationKeys []string
+	recorder   *RecordingObserver
+	mu         sync.Mutex
+	redactors  []Redactor
+	types      map[string]reflect.Type
+	mapSteps   []*mapStep
+	shapes     map[elementShape]bool
+	known      map[*stepNode]bool
+	values     []stateWrite
+	details    []stateWrite
+	toolCalls  []ToolCallRecord
+	iterations iterationNumbers
 }
 
 // newEvaluationCapture returns a capture holding the Redactors and key types of every Pipeline
@@ -207,18 +208,16 @@ func (c *evaluationCapture) offerStep(writes []stateWrite, err error) {
 	}
 }
 
-// offerIterationKey keeps key, the iteration key of a Loop that runs, unless it is empty. A step
-// that reads key reads an iteration number, so reflection records no text forms of it (see
-// runObservation.redactReads).
-func (c *evaluationCapture) offerIterationKey(key string) {
-	if c == nil || key == "" {
+// offerIteration keeps number, the number of an iteration of a Loop with the iteration key key.
+// Reflection then records no text forms of the iteration numbers that steps read (see
+// runObservation.redactStateValues).
+func (c *evaluationCapture) offerIteration(key string, number int) {
+	if c == nil {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !slices.Contains(c.iterationKeys, key) {
-		c.iterationKeys = append(c.iterationKeys, key)
-	}
+	c.iterations = c.iterations.with(key, number)
 }
 
 // offerToolCalls keeps the tool calls an execution made, when the capture has a Redactor.
@@ -242,13 +241,13 @@ func (c *evaluationCapture) apply(item EvaluationItem) EvaluationItem {
 	}
 	c.mu.Lock()
 	redaction := evaluationRedaction{
-		redactors:     slices.Clone(c.redactors),
-		types:         maps.Clone(c.types),
-		mapSteps:      slices.Clone(c.mapSteps),
-		values:        slices.Clone(c.values),
-		details:       slices.Clone(c.details),
-		toolCalls:     cloneRecords(c.toolCalls),
-		iterationKeys: slices.Clone(c.iterationKeys),
+		redactors:  slices.Clone(c.redactors),
+		types:      maps.Clone(c.types),
+		mapSteps:   slices.Clone(c.mapSteps),
+		values:     slices.Clone(c.values),
+		details:    slices.Clone(c.details),
+		toolCalls:  cloneRecords(c.toolCalls),
+		iterations: maps.Clone(c.iterations),
 	}
 	c.mu.Unlock()
 	return redaction.apply(item)
