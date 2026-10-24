@@ -45,7 +45,7 @@ func TestPNGIsValidAndDistinct(t *testing.T) {
 	}()
 }
 
-// TestPNGBytesDoNotDependOnTheToolchain pins PNG's digest. Its data is stored uncompressed, so
+// TestPNGBytesDoNotDependOnTheToolchain pins PNG's digest. PNG stores its data uncompressed, so
 // no change to compress/flate can change it.
 func TestPNGBytesDoNotDependOnTheToolchain(t *testing.T) {
 	img := gepatest.PNG("chart")

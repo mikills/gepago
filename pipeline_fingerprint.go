@@ -33,7 +33,7 @@ const pipelineFingerprintVersion = 1
 //   - the body of a Loop, its MaxIterations and its iteration key by name and type
 //   - for a NewProgramStep whose programme is a Fingerprinter, such as a nested Pipeline, that
 //     programme's fingerprint
-//   - the transitions, in order, by From, To, OnError and whether When, Amend and Accept are set
+//   - the transitions, in order, by From, To, OnError and which of When, Amend and Accept they set
 //   - MaxVisits
 //   - the amendable keys of each step (see WithAmendable)
 //

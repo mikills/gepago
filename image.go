@@ -24,8 +24,8 @@ const MaxImageBytes = 3_932_160
 // hold. Part.Validate does not return it.
 var ErrInvalidImage = errors.New("invalid image")
 
-// ErrImagesUnsupported marks a call that carries images to a model that cannot take them. It is
-// returned as a Permanent error (see IsPermanent).
+// ErrImagesUnsupported marks a call that carries images to a model that cannot take them. An error
+// that matches it is Permanent (see IsPermanent).
 var ErrImagesUnsupported = errors.New("model cannot take images")
 
 // imageFormat is the encoding of an Image's data.
@@ -58,8 +58,9 @@ var imageMediaTypes = [...]string{
 //
 // Predict, TypedPredict and Key.Get find an Image only where encoding/json meets it as an
 // Image. An Image behind a type's own MarshalJSON is that method's JSON, its summary. So Predict
-// sends no image for it, and Key.Get into an any gives the summary as a map. An Image in an
-// unexported field is left out entirely, with no summary, as encoding/json leaves the field out.
+// sends no image for it, and Key.Get into an any gives the summary as a map. Predict, TypedPredict
+// and Key.Get leave out an Image in an unexported field entirely, with no summary, as
+// encoding/json leaves the field out.
 type Image struct {
 	_    [0]func()
 	body *imageBody

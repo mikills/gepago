@@ -229,9 +229,9 @@ func classifyErrorAs(ctx context.Context, operation string, err error) error {
 //
 // A user message with Parts becomes its Content, when it is not blank, and then a block for each
 // part. The block of a part is a text block or a base64 image block. A message of another role with
-// parts, or a part that fails gepa.Part.Validate, fails with a Permanent error before the request
-// is sent. When an error's text echoes the base64 data of a sent image, that data is replaced in
-// the error.
+// parts, or a part that fails gepa.Part.Validate, fails with a Permanent error before Chat sends
+// the request. When an error's text echoes the base64 data of a sent image, Chat replaces that data
+// in the error.
 //
 // Failures are classified as Generate's are. A refusal is not an error: its stop reason gives
 // FinishContentFilter. A reply with no text and no tool call is an error unless it stopped at

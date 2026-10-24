@@ -42,7 +42,7 @@ func newStepNode(step Step) *stepNode {
 	return node
 }
 
-// compositeStep is implemented by this package's steps that hold others: WithPolicy, WithCache,
+// compositeStep is the interface of this package's steps that hold others: WithPolicy, WithCache,
 // WithAmendable, Parallel, Map, MapCollect and Loop. Build checks their children with the rules it
 // applies to top-level steps, and the pipeline runs each child on its own view of the state.
 type compositeStep interface {

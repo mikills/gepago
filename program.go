@@ -127,9 +127,10 @@ func refusalText(text string) string {
 // call. The chat's one user message has an empty Content. Its Parts hold, for each distinct image
 // by digest, the text "[image N]" and then the image. The last part is the prompt that BuildPrompt
 // gives, in which each image is that label. The repairs continue the same chat, so the images stay
-// in its first message, and RepairLM is not used. An input whose Field.Type is "image" must hold an
-// Image from NewImage. A ChatClient that has no Tools or Middleware is called directly, so it needs
-// no ToolRegistry. Inputs without images send the same request as before images existed.
+// in its first message, and Predict does not use RepairLM. An input whose Field.Type is "image"
+// must hold an Image from NewImage. Without Tools or Middleware, Predict calls the ChatClient
+// directly and needs no ToolRegistry. Inputs without images send the same request as before images
+// existed.
 type Predict struct {
 	Signature       Signature
 	LM              Generator
@@ -172,9 +173,9 @@ type Predict struct {
 
 // Validate checks that the programme has a valid signature and language model, and that a
 // ToolPolicy comes with a ToolRegistry. With Tools or Middleware, LM must also be a ChatClient, the
-// names must be unique, and MaxToolTurns must not be negative. When ToolRegistry is set, every name
-// must be registered and ToolPolicy must allow every tool. An input with the Type "image" needs an
-// LM that can chat. Otherwise Validate fails with a Permanent error that matches
+// names must be unique, and MaxToolTurns must not be negative. With a ToolRegistry, the registry
+// must hold every name, and ToolPolicy must allow every tool. An input with the Type "image" needs
+// an LM that can chat. Otherwise Validate fails with a Permanent error that matches
 // ErrImagesUnsupported. MaxToolTurns must not be negative either. A demo that holds an Image fails
 // too.
 func (p Predict) Validate() error {

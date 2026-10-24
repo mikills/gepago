@@ -26,11 +26,11 @@ const (
 // A user message may also carry Parts, such as images: the model reads Content, when it is not
 // blank, and then each part in order. Each part must pass Part.Validate. Only a user message may
 // carry parts. The chat clients of the providers refuse any other message with parts. They return a
-// Permanent error before they send the request. A message without parts encodes to the same JSON,
-// and is sent as the same request, as before parts existed. A message may have an empty Content and
-// its text in Parts. For example, a Predict whose inputs hold images sends its whole prompt as the
-// last text part (see Predict). Code that reads a message's text, such as a ChatClient or a
-// ChatMiddleware, must read the text parts too.
+// Permanent error before they send the request. A message without parts encodes to the same JSON
+// as before parts existed, and the chat clients send the same request. A message may have an empty
+// Content and its text in Parts. For example, a Predict whose inputs hold images sends its whole
+// prompt as the last text part (see Predict). Code that reads a message's text, such as a
+// ChatClient or a ChatMiddleware, must read the text parts too.
 type Message struct {
 	Role       Role       `json:"role"`
 	Content    string     `json:"content,omitempty"`

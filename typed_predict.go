@@ -35,8 +35,8 @@ import (
 // optional. A zero Image there sends no image. The prompt's input JSON leaves it out (omitzero) or
 // writes it as null (omitempty), as encoding/json does. The input type of an optional Image field
 // is *Image. So in a pipeline a step reads it from a *Image key, nil for no image, since State
-// refuses the zero Image. A required Image field is read from an Image key. A given input of the
-// Type "image" on such an optional field is optional in the same way. A given input of the Type
+// refuses the zero Image. A step reads a required Image field from an Image key. A given input of
+// the Type "image" on such an optional field is optional in the same way. A given input of the Type
 // "image" must name an Image field when In is a struct or a pointer to one. When In is not a struct
 // or a pointer to one, a decode must be able to put an Image in the input's place. Then In must be
 // an empty interface, or a map whose values are Image or an empty interface, such as Prediction.
@@ -45,8 +45,8 @@ import (
 // from its inputs at its place, so a step can read an Image key. Sometimes the static type of a
 // field of In holds an Image, such as Image, *Image or []Image. Then LM must be able to chat, or
 // Validate fails with a Permanent error that matches ErrImagesUnsupported for the model.
-// MaxToolTurns must not be negative either. An Image in a field of type any is found only at run
-// time, as on Predict. Out cannot hold an Image, since a model reply cannot carry one.
+// MaxToolTurns must not be negative either. TypedPredict finds an Image in a field of type any only
+// at run time, as Predict does. Out cannot hold an Image, since a model reply cannot carry one.
 //
 // TypedPredict implements Program and SignatureProgram, so Compile can optimise it and
 // NewProgramStep can run it as a pipeline step that reads In's fields and writes Out's.
@@ -142,7 +142,7 @@ func (p TypedPredict[In, Out]) ProgramSignature() (ProgramSignature, error) {
 	}
 	if in := reflect.TypeFor[In](); structType(in) {
 		signature.InputTypes = fieldTypesOf(in)
-		// an optional image is read from a *Image key, since State refuses the zero Image.
+		// a step reads an optional image from a *Image key, since State refuses the zero Image.
 		for name, field := range jsonFields(in) {
 			if field.typ == imageType && field.optional {
 				signature.InputTypes[name] = reflect.TypeFor[*Image]()
@@ -388,7 +388,7 @@ func optionalImageInputs(inputs []Field, in reflect.Type) []Field {
 }
 
 // structFields lists the JSON fields of a struct type as signature fields. An input of type
-// Image has the Type "image" in place of a schema, unless it is tagged omitempty or omitzero,
+// Image has the Type "image" in place of a schema, unless its tag has omitempty or omitzero,
 // which makes it optional.
 func structFields(typ reflect.Type, outputs bool) ([]Field, error) {
 	if !structType(typ) {

@@ -35,8 +35,8 @@ type busyLineItem struct {
 }
 
 // busyPredict is a Predict whose prompt has every section. Its signature has a name, a description,
-// and inputs and outputs with descriptions. Its outputs are typed and optional, so the schema is
-// added. It has an instruction with spaces around it, and demos.
+// and inputs and outputs with descriptions. Its outputs have types and one is optional, so the
+// prompt holds the schema. It has an instruction with spaces around it, and demos.
 func busyPredict(lm gepa.Generator) gepa.Predict {
 	return gepa.Predict{
 		Signature: gepa.Signature{
@@ -69,7 +69,7 @@ func busyPredict(lm gepa.Generator) gepa.Predict {
 	}
 }
 
-// busyInputs are nested JSON inputs: maps with unsorted keys, numbers of each kind, HTML
+// busyInputs returns nested JSON inputs: maps with unsorted keys, numbers of each kind, HTML
 // characters, escapes, Unicode, nulls, raw JSON and a struct.
 func busyInputs() gepa.Prediction {
 	tenth, fifth := 0.1, 0.2

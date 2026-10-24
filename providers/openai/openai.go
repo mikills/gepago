@@ -256,11 +256,11 @@ func classifyErrorAs(ctx context.Context, operation string, err error) error {
 // format's Strict flag. Assistant messages carry their tool calls and tool messages their
 // call's id, so a transcript round-trips.
 //
-// A user message with Parts is sent as content parts. The first is its Content, when it is not
+// Chat sends a user message with Parts as content parts. The first is its Content, when it is not
 // blank. Then each part becomes a text part or an image_url part with a base64 data URL. A message
 // of another role with parts, or a part that fails gepa.Part.Validate, fails with a Permanent error
-// before the request is sent. When an error's text echoes the base64 data of a sent image, that
-// data is replaced in the error.
+// before Chat sends the request. When an error's text echoes the base64 data of a sent image, Chat
+// replaces that data in the error.
 //
 // Failures are classified as Generate's are, and a refusal is not an error: it becomes the
 // reply text with FinishContentFilter. A reply with no text and no tool call is an error unless

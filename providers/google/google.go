@@ -141,10 +141,10 @@ func (m *LanguageModel) Chat(ctx context.Context, req gepa.ChatRequest) (gepa.Ch
 // produces it. Gemini models before Gemini 3 reject a JSON response type together with
 // function declarations, so a request with tools is sent without its response format; a
 // gepa.Predict still checks the final reply against its signature. A function call's id, when
-// Gemini gives one, becomes the ToolCall's ID and is sent back with its result. Otherwise the ID is
-// the function's name. A user message with Parts becomes its Content, when it is not blank, and
-// then one Gemini part for each of its parts. That part is a text part or an inlineData part with
-// base64 data.
+// Gemini gives one, becomes the ToolCall's ID, and the client sends it back with its result.
+// Otherwise the ID is the function's name. A user message with Parts becomes its Content, when it
+// is not blank, and then one Gemini part for each of its parts. That part is a text part or an
+// inlineData part with base64 data.
 type ChatClient struct {
 	apiKey  string
 	baseURL string
@@ -180,16 +180,16 @@ func NewChatClient(config Config) (*ChatClient, error) {
 }
 
 // Chat sends one Gemini generateContent request and returns a provider-neutral agent response.
-// A request Gemini cannot take fails with a Permanent error before it is sent. Gemini cannot take a
-// message whose role is none of gepa's four, or a message with parts whose role is not user. It
-// cannot take a part that fails gepa.Part.Validate, or a tool whose parameters are not a JSON
-// object. When the request has no tools, it cannot take a response format whose schema is set, even
-// to spaces, but is not a JSON object. It also cannot take a Temperature that is NaN or infinite.
-// Failures are classified. Status 429, 5xx, dropped connections and network timeouts are transient.
-// Other 4xx statuses and TLS, host or URL misconfiguration are permanent. A cancelled or expired
-// ctx returns ctx.Err() unwrapped. The API key, which travels in the request URL, is redacted from
-// every error. So is the base64 data of a sent image that an error's text echoes. A response
-// without candidates still returns its usage with the error.
+// A request Gemini cannot take fails with a Permanent error before Chat sends it. Gemini cannot
+// take a message whose role is none of gepa's four, or a message with parts whose role is not user.
+// It cannot take a part that fails gepa.Part.Validate, or a tool whose parameters are not a JSON
+// object. Without tools, it cannot take a response format whose schema is not empty, even if only
+// spaces, and is not a JSON object. It also cannot take a Temperature that is NaN or infinite.
+// Chat classifies failures. Status 429, 5xx, dropped connections and network timeouts are
+// transient. Other 4xx statuses and TLS, host or URL misconfiguration are permanent. A cancelled or
+// expired ctx returns ctx.Err() unwrapped. Chat removes the API key, which travels in the request
+// URL, from every error. It also replaces the base64 data of a sent image that an error's text
+// echoes. A response without candidates still returns its usage with the error.
 func (c *ChatClient) Chat(ctx context.Context, req gepa.ChatRequest) (gepa.ChatResponse, error) {
 	return providerlog.Chat(ctx, c.logger, c.logCall("chat", req), func() (gepa.ChatResponse, error) {
 		return c.send(ctx, req)
@@ -249,9 +249,9 @@ func (c *ChatClient) exchange(
 // checkGoogleRequest returns why Gemini cannot take req, or nil. Gemini cannot take a message whose
 // role is none of gepa's four, or a message with parts whose role is not user. It cannot take a
 // part that fails gepa.Part.Validate, or a tool whose parameters are not a JSON object. When the
-// request has no tools, Gemini gets its response format. Then a schema that is set, even to spaces,
-// must be a JSON object. Gemini cannot take a temperature that is NaN or infinite, which JSON
-// cannot carry.
+// request has no tools, Gemini gets its response format. Then a schema that is not empty, even if
+// only spaces, must be a JSON object. Gemini cannot take a temperature that is NaN or infinite,
+// which JSON cannot carry.
 func checkGoogleRequest(req gepa.ChatRequest) error {
 	for i, message := range req.Messages {
 		switch message.Role {

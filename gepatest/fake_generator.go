@@ -37,14 +37,14 @@ var ErrToolCallsInGenerate = errors.New("gepatest: scripted reply has tool calls
 // ErrInvalidChatRequest marks a Chat request that no provider accepts, which a FakeGenerator
 // refuses as a provider does, before any script answers it. The chat clients of providers/openai,
 // providers/claude and providers/google each refuse such a request before they send it
-// (providers/pi has none). Such a request has one of these faults. A message has a role that is set
-// but is none of gepa's four. A tool has parameters that are not a JSON object. The request has no
-// tools and a strict response format whose schema is neither empty nor valid JSON, such as a schema
-// of spaces. Its Temperature is NaN or infinite, which JSON cannot carry. A message that is not a
-// user message carries parts, or a part fails gepa.Part.Validate. A request that a provider sends
-// passes, even when its API may refuse it. Claude sends no format that is not strict. Gemini sends
-// no format in a request with tools, and sends a format without a schema. OpenAI sends a strict
-// schema that is valid JSON but not an object. An empty role passes too, since tests that script
+// (providers/pi has none). Such a request has one of these faults. A message has a role that is not
+// empty and is none of gepa's four. A tool has parameters that are not a JSON object. The request
+// has no tools and a strict response format whose schema is neither empty nor valid JSON, such as a
+// schema of spaces. Its Temperature is NaN or infinite, which JSON cannot carry. A message that is
+// not a user message carries parts, or a part fails gepa.Part.Validate. A request that a provider
+// sends passes, even when its API may refuse it. Claude sends no format that is not strict. Gemini
+// sends no format in a request with tools, and sends a format without a schema. OpenAI sends a
+// strict schema that is valid JSON but not an object. An empty role passes too, since tests that script
 // replies often leave it out, but not on a message with parts. It is a Permanent error.
 var ErrInvalidChatRequest = errors.New("gepatest: invalid chat request")
 

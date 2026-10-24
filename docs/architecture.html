@@ -35,7 +35,7 @@
 </head>
 <body>
 <div class="page">
-<svg viewBox="0 0 1800 1260" role="img" aria-label="gepago v0.9.0 architecture diagram">
+<svg viewBox="0 0 1800 1260" role="img" aria-label="gepago v0.10.0 architecture diagram">
   <defs>
     <filter id="roughShadow" x="-10%" y="-10%" width="120%" height="120%">
       <feDropShadow dx="4" dy="5" stdDeviation="0" flood-color="#111827" flood-opacity="0.16" />
@@ -46,7 +46,7 @@
   </defs>
 
   <text x="50" y="72" class="title">gepago architecture</text>
-  <text x="52" y="108" class="subtitle">v0.9.0: typed pipelines with transitions, run-time fan-out, scoped tools and a trace for every run, optimised by GEPA</text>
+  <text x="52" y="108" class="subtitle">v0.10.0: typed pipelines with transitions, fan-out, bounded loops, tool middleware, image inputs and a trace for every run, optimised by GEPA</text>
 
   <!-- caller -->
   <rect x="50" y="150" width="280" height="270" class="box" fill="#ffffff" />
@@ -59,17 +59,18 @@
   <text x="80" y="393" class="small">• Redactor</text>
 
   <!-- notes -->
-  <rect x="50" y="440" width="280" height="140" class="note" />
+  <rect x="50" y="440" width="280" height="165" class="note" />
   <text x="78" y="480" class="small">Every run is bounded.</text>
   <text x="78" y="510" class="tiny">budgets, timeouts and retries;</text>
   <text x="78" y="535" class="tiny">tool call limits per run and tool;</text>
   <text x="78" y="560" class="tiny">rewinds bounded by MaxVisits</text>
+  <text x="78" y="585" class="tiny">and loops by MaxIterations</text>
 
-  <rect x="50" y="600" width="280" height="150" class="note" />
-  <text x="78" y="640" class="small">Every run leaves a trace.</text>
-  <text x="78" y="670" class="tiny">redacted events feed observers;</text>
-  <text x="78" y="695" class="tiny">PipelineTrace feeds the run</text>
-  <text x="78" y="720" class="tiny">report and reflection</text>
+  <rect x="50" y="620" width="280" height="150" class="note" />
+  <text x="78" y="660" class="small">Every run leaves a trace.</text>
+  <text x="78" y="690" class="tiny">redacted events feed observers;</text>
+  <text x="78" y="715" class="tiny">PipelineTrace feeds the run</text>
+  <text x="78" y="740" class="tiny">report and reflection</text>
 
   <!-- core -->
   <rect x="370" y="140" width="860" height="650" class="box" fill="var(--blue)" />
@@ -77,7 +78,7 @@
   <text x="400" y="212" class="tiny">provider-neutral, agent-runtime-neutral</text>
 
   <!-- pipeline -->
-  <rect x="395" y="235" width="500" height="365" class="inner" fill="#eff6ff" />
+  <rect x="395" y="235" width="500" height="385" class="inner" fill="#eff6ff" />
   <text x="420" y="268" class="small">Pipeline</text>
   <text x="500" y="268" class="tiny">Build checks keys, types, transitions, budgets</text>
 
@@ -94,66 +95,69 @@
   <path d="M741 318 L763 318" class="arrow thin" />
   <text x="420" y="375" class="tiny">typed State (Key[T]) · Defaults · writes commit on success</text>
 
-  <rect x="415" y="390" width="460" height="100" class="inner" fill="#ffffff" />
+  <rect x="415" y="390" width="460" height="125" class="inner" fill="#ffffff" />
   <text x="430" y="418" class="small">Control flow</text>
   <text x="560" y="418" class="tiny">transitions between top-level steps</text>
   <text x="430" y="447" class="tiny">skip forward · End · Fail</text>
   <text x="430" y="472" class="tiny">Branch · Fallback · Parallel</text>
   <text x="655" y="447" class="tiny">rewind, bounded by MaxVisits</text>
   <text x="655" y="472" class="tiny">Amend · Accept</text>
+  <text x="430" y="497" class="tiny">Loop: repeat until, bounded by MaxIterations</text>
 
-  <rect x="415" y="502" width="220" height="88" class="inner" fill="#ffffff" />
-  <text x="430" y="530" class="small">Map · MapCollect</text>
-  <text x="430" y="555" class="tiny">one body run per element</text>
-  <text x="430" y="578" class="tiny">shared budget and scope</text>
+  <rect x="415" y="527" width="220" height="85" class="inner" fill="#ffffff" />
+  <text x="430" y="555" class="small">Map · MapCollect</text>
+  <text x="430" y="579" class="tiny">one body run per element</text>
+  <text x="430" y="602" class="tiny">shared budget and scope</text>
 
-  <rect x="655" y="502" width="220" height="88" class="inner" fill="#ffffff" />
-  <text x="670" y="530" class="small">Policies + budgets</text>
-  <text x="670" y="555" class="tiny">WithPolicy: timeout, retry</text>
-  <text x="670" y="578" class="tiny">WithCache · RunBudget</text>
+  <rect x="655" y="527" width="220" height="85" class="inner" fill="#ffffff" />
+  <text x="670" y="555" class="small">Policies + budgets</text>
+  <text x="670" y="579" class="tiny">WithPolicy: timeout, retry</text>
+  <text x="670" y="602" class="tiny">WithCache · RunBudget</text>
 
   <!-- right column of core -->
-  <rect x="915" y="235" width="290" height="90" class="inner" fill="#eff6ff" />
+  <rect x="915" y="235" width="290" height="108" class="inner" fill="#eff6ff" />
   <text x="940" y="265" class="small">Signature + Predict</text>
-  <text x="940" y="290" class="tiny">typed fields → JSON schema</text>
-  <text x="940" y="313" class="tiny">replies checked before return</text>
+  <text x="940" y="289" class="tiny">typed fields → JSON schema</text>
+  <text x="940" y="312" class="tiny">replies checked before return</text>
+  <text x="940" y="335" class="tiny">image inputs → user Message.Parts</text>
 
-  <rect x="915" y="340" width="290" height="120" class="inner" fill="#eff6ff" />
-  <text x="940" y="370" class="small">ToolRegistry</text>
-  <text x="940" y="397" class="tiny">NewTool · Chat + ToolMiddleware</text>
-  <text x="940" y="420" class="tiny">one session per run: policy, memory</text>
-  <text x="940" y="443" class="tiny">WithToolScope · unbudgeted usage</text>
+  <rect x="915" y="355" width="290" height="135" class="inner" fill="#eff6ff" />
+  <text x="940" y="385" class="small">ToolRegistry</text>
+  <text x="940" y="409" class="tiny">NewTool · ChatMiddleware</text>
+  <text x="940" y="432" class="tiny">ToolMiddleware: pipelines, agents</text>
+  <text x="940" y="455" class="tiny">one session per run: policy, memory</text>
+  <text x="940" y="478" class="tiny">WithToolScope · unbudgeted usage</text>
 
-  <rect x="915" y="475" width="290" height="125" class="inner" fill="#eff6ff" />
-  <text x="940" y="505" class="small">RunContext</text>
-  <text x="940" y="532" class="tiny">RunID · ParentRunID · TraceID</text>
-  <text x="940" y="555" class="tiny">nested runs share a trace</text>
-  <text x="940" y="578" class="tiny">carried by events and traces</text>
+  <rect x="915" y="502" width="290" height="118" class="inner" fill="#eff6ff" />
+  <text x="940" y="532" class="small">RunContext</text>
+  <text x="940" y="557" class="tiny">RunID · ParentRunID · TraceID</text>
+  <text x="940" y="580" class="tiny">nested runs share a trace</text>
+  <text x="940" y="603" class="tiny">carried by events and traces</text>
 
   <!-- observers -->
-  <rect x="395" y="612" width="500" height="165" class="inner" fill="#eff6ff" />
-  <text x="420" y="642" class="small">Observers</text>
-  <rect x="415" y="655" width="120" height="50" class="inner" fill="#ffffff" />
-  <text x="430" y="685" class="tiny">step events</text>
-  <rect x="560" y="655" width="110" height="50" class="inner" fill="#ffffff" />
-  <text x="578" y="685" class="tiny">Redactor</text>
-  <rect x="695" y="655" width="180" height="50" class="inner" fill="#ffffff" />
-  <text x="712" y="685" class="tiny">RecordingObserver</text>
-  <path d="M536 680 L558 680" class="arrow thin" />
-  <path d="M671 680 L693 680" class="arrow thin" />
-  <text x="420" y="735" class="tiny">→ PipelineTrace → HTML run report, TraceDatasetBuilder</text>
-  <text x="420" y="760" class="tiny">visits, transitions, unbudgeted usage; values redacted</text>
+  <rect x="395" y="632" width="500" height="147" class="inner" fill="#eff6ff" />
+  <text x="420" y="660" class="small">Observers</text>
+  <rect x="415" y="672" width="120" height="46" class="inner" fill="#ffffff" />
+  <text x="430" y="700" class="tiny">step events</text>
+  <rect x="560" y="672" width="110" height="46" class="inner" fill="#ffffff" />
+  <text x="578" y="700" class="tiny">Redactor</text>
+  <rect x="695" y="672" width="180" height="46" class="inner" fill="#ffffff" />
+  <text x="712" y="700" class="tiny">RecordingObserver</text>
+  <path d="M536 695 L558 695" class="arrow thin" />
+  <path d="M671 695 L693 695" class="arrow thin" />
+  <text x="420" y="745" class="tiny">→ PipelineTrace → HTML run report, TraceDatasetBuilder</text>
+  <text x="420" y="768" class="tiny">visits, transitions, unbudgeted usage; values redacted</text>
 
-  <rect x="915" y="612" width="290" height="165" class="inner" fill="#eff6ff" />
-  <text x="940" y="642" class="small">Compile + Optimizer</text>
-  <text x="940" y="670" class="tiny">ProgramEvaluator · metrics</text>
-  <text x="940" y="693" class="tiny">exact / contains / numeric / judge</text>
-  <text x="940" y="716" class="tiny">reflection on step failures</text>
-  <text x="940" y="739" class="tiny">Pareto frontier weighted</text>
-  <text x="940" y="762" class="tiny">by per-instance wins</text>
+  <rect x="915" y="632" width="290" height="147" class="inner" fill="#eff6ff" />
+  <text x="940" y="660" class="small">Compile + Optimizer</text>
+  <text x="940" y="685" class="tiny">ProgramEvaluator · metrics</text>
+  <text x="940" y="706" class="tiny">exact / contains / numeric / judge</text>
+  <text x="940" y="727" class="tiny">reflection on step failures</text>
+  <text x="940" y="748" class="tiny">Pareto frontier weighted</text>
+  <text x="940" y="769" class="tiny">by per-instance wins</text>
 
   <!-- providers -->
-  <rect x="1270" y="140" width="480" height="300" class="box" fill="var(--purple)" />
+  <rect x="1270" y="140" width="480" height="325" class="box" fill="var(--purple)" />
   <text x="1300" y="185" class="label">providers/*</text>
   <text x="1300" y="212" class="tiny">Generator · StructuredGenerator · ChatClient</text>
   <rect x="1300" y="232" width="200" height="75" class="inner" fill="#f5f3ff" />
@@ -169,24 +173,25 @@
   <text x="1545" y="355" class="small">pi</text>
   <text x="1545" y="380" class="tiny">pi CLI</text>
   <text x="1300" y="425" class="tiny">Config.Logger logs each call with its RunContext</text>
+  <text x="1300" y="450" class="tiny">openai, claude and google send image parts</text>
 
-  <rect x="1270" y="455" width="480" height="95" class="note" />
-  <text x="1300" y="483" class="tiny">Generate(ctx, prompt) → Generation:</text>
-  <text x="1300" y="507" class="tiny">text · usage · model · finish reason</text>
-  <text x="1300" y="531" class="tiny">errors are permanent, transient or budget</text>
+  <rect x="1270" y="480" width="480" height="95" class="note" />
+  <text x="1300" y="508" class="tiny">Generate(ctx, prompt) → Generation:</text>
+  <text x="1300" y="532" class="tiny">text · usage · model · finish reason</text>
+  <text x="1300" y="556" class="tiny">errors are permanent, transient or budget</text>
 
   <!-- agents -->
-  <rect x="1270" y="575" width="480" height="215" class="box" fill="var(--green)" />
-  <text x="1300" y="618" class="label">agents package</text>
-  <text x="1300" y="645" class="tiny">optional runtime for tool-calling workflows</text>
-  <rect x="1300" y="662" width="200" height="70" class="inner" fill="#f0fdf4" />
-  <text x="1325" y="693" class="small">Agent loop</text>
-  <text x="1325" y="717" class="tiny">chat + shared tools</text>
-  <rect x="1520" y="662" width="200" height="70" class="inner" fill="#f0fdf4" />
-  <text x="1545" y="693" class="small">TraceRecorder</text>
-  <text x="1545" y="717" class="tiny">events + spans</text>
-  <rect x="1395" y="745" width="230" height="35" class="inner" fill="#f0fdf4" />
-  <text x="1420" y="768" class="tiny">TraceDatasetBuilder</text>
+  <rect x="1270" y="592" width="480" height="198" class="box" fill="var(--green)" />
+  <text x="1300" y="633" class="label">agents package</text>
+  <text x="1300" y="659" class="tiny">optional runtime for tool-calling workflows</text>
+  <rect x="1300" y="675" width="200" height="62" class="inner" fill="#f0fdf4" />
+  <text x="1325" y="703" class="small">Agent loop</text>
+  <text x="1325" y="726" class="tiny">chat + shared tools</text>
+  <rect x="1520" y="675" width="200" height="62" class="inner" fill="#f0fdf4" />
+  <text x="1545" y="703" class="small">TraceRecorder</text>
+  <text x="1545" y="726" class="tiny">events + spans</text>
+  <rect x="1395" y="747" width="230" height="33" class="inner" fill="#f0fdf4" />
+  <text x="1420" y="769" class="tiny">TraceDatasetBuilder</text>
 
   <!-- workflow -->
   <rect x="50" y="840" width="1060" height="370" class="box" fill="var(--yellow)" />
@@ -233,7 +238,7 @@
   <!-- arrows between areas -->
   <path d="M330 265 C345 262, 355 262, 369 262" class="arrow" />
   <path d="M1230 280 C1245 278, 1255 278, 1269 278" class="arrow" />
-  <path d="M1510 550 C1510 558, 1510 565, 1510 574" class="arrow dashed" />
+  <path d="M1690 575 C1690 580, 1690 585, 1690 591" class="arrow dashed" />
   <path d="M1230 700 C1245 698, 1255 698, 1269 698" class="arrow dashed" />
   <path d="M800 790 C790 812, 770 828, 742 839" class="arrow" />
   <path d="M1110 1025 C1130 1025, 1150 1025, 1169 1025" class="arrow" />

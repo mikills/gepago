@@ -31,8 +31,9 @@ const maxEntityDigits = 8
 // one of encoded. It reports whether it replaced any. It reads text as runs of base64 characters
 // (see scanRuns). It indexes each window of minEchoMatch characters of the runs (see echoIndex).
 // Then it reads the data a block of echoBlock characters at a time. When a window of the runs
-// holds the block, scrubEchoes looks up each window of the data that holds the block. A window of
-// the runs that a window of the data equals is found, and the found windows are replaced.
+// holds the block, scrubEchoes looks up each window of the data that holds the block. It marks as
+// found each window of the runs that a window of the data equals. Then it replaces the found
+// windows.
 //
 // The result is exact. A character of text goes if and only if it is part of a part of the data
 // of minEchoMatch characters or more. The reason is that such a part holds a window of the data
@@ -134,8 +135,8 @@ func base64Char(text string, i int) (byte, int) {
 //   - JSON writes '/' as `\/`, and any character as `\u` and four hex digits, such as `\u002B`
 //     for '+'. JSON held in a JSON string escapes the backslash too, so up to maxEscapes
 //     backslashes may start an escape.
-//   - A URL writes a character as '%' and two hex digits, such as %2B for '+'. A URL that is
-//     encoded twice writes %252B.
+//   - A URL writes a character as '%' and two hex digits, such as %2B for '+'. A second URL
+//     encoding writes %252B.
 //   - HTML writes a character as a numeric entity, such as `&#43;` or `&#x2B;` for '+'.
 func escapeChar(text string, i int) (byte, int) {
 	switch text[i] {
@@ -464,7 +465,7 @@ func (x *echoIndex) add(i int32) int32 {
 // the windows that hold a block only when filter has the bit of the block's hash. It skips a
 // block whose context, the characters of those windows, is the same as that of the block before
 // it. When it finds a window, it compares the windows that follow it in data and in the runs one
-// character at a time (see extend). It stops when every window is found.
+// character at a time (see extend). It stops when it has found every window.
 func (x *echoIndex) search(data string) {
 	var context string
 	left, done := -1, -1

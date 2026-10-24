@@ -50,7 +50,7 @@ func around(data []byte, at int) string {
 
 // RecordBodies starts a server that answers every request with the JSON body reply and keeps
 // each request body. The function it returns gives the bodies so far, in the order they came,
-// each followed by a newline. The server is closed when t ends.
+// each followed by a newline. The server closes when t ends.
 func RecordBodies(t *testing.T, reply string) (*httptest.Server, func() []byte) {
 	t.Helper()
 	var (

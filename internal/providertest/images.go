@@ -61,7 +61,7 @@ func InvalidPartRequests() map[string]gepa.ChatRequest {
 
 // EchoServer starts a server that answers every request with status 400 and an error body. The
 // message of the body echoes the request body, as an API that quotes a bad request does. The server
-// is closed when t ends.
+// closes when t ends.
 func EchoServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	return EchoServerWith(t, func(body string) string { return body })
