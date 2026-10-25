@@ -235,9 +235,10 @@ func (r *RecordingObserver) lastStep(runID string) *recordedStep {
 // These are the keys whose raw inputs or reads the run or the execution took as iteration numbers.
 // observeRun and observeStep decide them on the raw values, before a Redactor changes them. A
 // trace holds the redacted values as JSON decodes them, so the key alone then tells an iteration
-// number apart. Only the context that an observer gets holds the key (see observerCtx). It holds
-// the numbers of the event's own run or execution at every event, or nil. So the numbers of an
-// earlier event never reach a later one, such as in a run that an observer starts.
+// number apart. The context that an observer gets holds the key. So do the contexts derived from
+// it, such as those of the steps of a run that the observer starts. The context of each event
+// replaces the key with the numbers of the event's own run or execution, or nil (see
+// observerCtx). So the numbers of an earlier event never reach a later one.
 type tracedNumbersKey struct{}
 
 // tracedNumbers returns the traced numbers that the context of an event holds, or nil.

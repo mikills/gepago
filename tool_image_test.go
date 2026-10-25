@@ -921,6 +921,58 @@ func TestToolPassesAnImageThatAMarshalJSONToWritesAsText(t *testing.T) {
 	}
 }
 
+func TestToolRefusesAnImageThatAMarshalJSONToWritesAsTextBesideAFullSummary(t *testing.T) {
+	photo := gepatest.PNG("photo")
+	apart := textPhoto{load: func() gepa.Image { return photo }}
+	type besideLookAlike struct {
+		Photo textPhoto `json:"photo"`
+		Look  lookAlike `json:"look"`
+	}
+	type besideEmbedded struct {
+		Photo textPhoto `json:"photo"`
+		Frame embedded  `json:"frame"`
+	}
+	for name, tt := range map[string]struct {
+		out     any
+		outType string
+	}{
+		"beside a look-alike": {
+			out: besideLookAlike{
+				Photo: apart,
+				Look:  lookAlike{MediaType: "image/png", Size: 3, SHA256: strings.Repeat("ab", 32)},
+			},
+			outType: "gepa_test.besideLookAlike",
+		},
+		"beside an embedded Image": {
+			out:     besideEmbedded{Photo: apart, Frame: embedded{photo}},
+			outType: "gepa_test.besideEmbedded",
+		},
+	} {
+		t.Run("as output "+name, func(t *testing.T) {
+			_, err := imageInvoke[any](t, tt.out)
+
+			require.EqualError(t, err, `encode output of tool "render": `+tt.outType+" holds an Image, "+
+				"but tool output travels as JSON without image data", "the second encode refuses the Image too")
+		})
+	}
+	photoKey := gepa.Key[textPhoto]{Name: "a"}
+	frameKey := gepa.Key[embedded]{Name: "b"}
+	t.Run("as arguments alone", func(t *testing.T) {
+		calls, err := argumentsOf(t, refs(photoKey.Ref()), gepa.Prediction{"a": apart})
+
+		require.NoError(t, err)
+		require.Len(t, calls, 1)
+	})
+	t.Run("as arguments beside an embedded Image", func(t *testing.T) {
+		calls, err := argumentsOf(t, refs(photoKey.Ref(), frameKey.Ref()),
+			gepa.Prediction{"a": apart, "b": embedded{photo}})
+
+		require.EqualError(t, err, `pipeline step "look": encode arguments of tool "look": state key "a": `+
+			"gepa_test.textPhoto holds an Image, but tool arguments travel as JSON without image data")
+		require.Empty(t, calls)
+	})
+}
+
 // nestedPhoto encodes its photo only inside another value, where the depth of its encoder is
 // above zero. Alone it encodes as null.
 type nestedPhoto struct {
@@ -1003,7 +1055,7 @@ func (c countedText) MarshalJSON() ([]byte, error) {
 	return c.data, nil
 }
 
-func TestToolEncodeCallsMarshalJSONOnceUnlessItsJSONHoldsAFullSummary(t *testing.T) {
+func TestToolEncodeCallsMarshalJSONOnceUnlessTheWholeJSONHoldsAFullSummary(t *testing.T) {
 	photo := gepatest.PNG("photo")
 	summary, err := json.Marshal(photo)
 	require.NoError(t, err)
@@ -1072,6 +1124,23 @@ func TestToolEncodeCallsMarshalJSONOnceUnlessItsJSONHoldsAFullSummary(t *testing
 		require.NoError(t, err)
 		require.Equal(t, string(summary), string(output))
 		require.Equal(t, 1, calls, "the encode does not check JSON that no image can be in")
+	})
+	t.Run("a text-only field beside a full look-alike", func(t *testing.T) {
+		var calls int
+		out := struct {
+			C countedText `json:"c"`
+			X any         `json:"x"`
+		}{
+			C: countedText{calls: &calls, data: []byte(`"text"`)},
+			X: lookAlike{MediaType: "image/png", Size: 3, SHA256: strings.Repeat("ab", 32)},
+		}
+
+		output, err := imageInvoke[any](t, out)
+
+		require.NoError(t, err)
+		require.Equal(t, `{"c":"text","x":{"media_type":"image/png","size":3,"sha256":"`+strings.Repeat("ab", 32)+`"}}`,
+			string(output))
+		require.Equal(t, 2, calls, "the JSON of the whole value holds a full summary, so the encode runs again")
 	})
 }
 

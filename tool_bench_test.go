@@ -2,8 +2,11 @@ package gepa_test
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"math/rand/v2"
 	"strconv"
+	"strings"
 	"testing"
 
 	gepa "github.com/mikills/gepago"
@@ -192,6 +195,28 @@ func photoURLs(n int) []string {
 	return urls
 }
 
+// zURLs returns n URLs that each hold about ten "z".
+func zURLs(n int) []string {
+	urls := make([]string, n)
+	for i := range urls {
+		urls[i] = "https://cdn.example.com/static/zebra-pizza-jazz/" + strconv.Itoa(
+			i,
+		) + "?size=xl&tz=zulu&zoom=z&fizz=1"
+	}
+	return urls
+}
+
+// randomDocument returns the base64 of n seeded random bytes, as a tool that returns a file
+// might.
+func randomDocument(n int) string {
+	rng := rand.New(rand.NewPCG(1, 2))
+	data := make([]byte, n)
+	for i := range data {
+		data[i] = byte(rng.Uint32())
+	}
+	return base64.StdEncoding.EncodeToString(data)
+}
+
 // anyOf returns the values of values as a []any.
 func anyOf[T any](values []T) []any {
 	out := make([]any, len(values))
@@ -241,6 +266,9 @@ func BenchmarkToolOutputShapes(b *testing.B) {
 		{name: "snake rows as any", value: anyOf(snakeRows(n))},
 		{name: "messages", value: benchMessages(n)},
 		{name: "any slice", value: mixedValues(n)},
+		{name: "a base64 document", value: map[string]any{"pdf": randomDocument(3 << 20)}},
+		{name: "urls with many z as any", value: anyOf(zURLs(200_000))},
+		{name: "a text of z", value: map[string]any{"text": strings.Repeat("z", 1<<20)}},
 	}
 	for _, shape := range shapes {
 		b.Run(shape.name+"/Invoke", func(b *testing.B) {
@@ -259,6 +287,10 @@ func BenchmarkToolOutputShapes(b *testing.B) {
 
 func BenchmarkToolStepArgumentsSnakeRows(b *testing.B) {
 	benchToolStep(b, gepa.Key[[]snakeRow]{Name: "rows"}, snakeRows(20_000))
+}
+
+func BenchmarkToolStepArgumentsZURLs(b *testing.B) {
+	benchToolStep(b, gepa.Key[[]any]{Name: "urls"}, anyOf(zURLs(50_000)))
 }
 
 func BenchmarkToolStepArgumentsMediaMaps(b *testing.B) {

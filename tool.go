@@ -189,13 +189,15 @@ func (p Provenance) Validate() error {
 // the model gets at most the image's summary, and never the image. But a MarshalJSONTo that
 // encodes an Image it holds through its encoder still fails, since the encoder refuses that Image.
 // A MarshalJSONTo can first encode an Image apart, such as with jsonv2.Marshal and the options of
-// its encoder. When it then writes the result as a string or in another form, it passes. The
-// model then gets the summary as text. A zero Image encodes as null.
+// its encoder. When it then writes the result as a string or in another form, the model gets the
+// summary as text. That passes unless the JSON of the whole output holds the full summary of an
+// image elsewhere. The second encode then refuses that Image too. A zero Image encodes as null.
 //
 // The encode calls json.Marshal once and returns its error as it is. That is all it does when the
 // type of the output cannot hold an Image or reach a MarshalJSONTo. Otherwise it scans the JSON
 // for the full summary of an image. Only an output whose JSON holds one costs a second encode,
-// also when the output only looks like a summary. A panic in the encode is not recovered, as
+// also when the output only looks like a summary. The second encode runs the MarshalJSON and
+// MarshalJSONTo methods of the whole output again. A panic in the encode is not recovered, as
 // json.Marshal does not recover it. Arguments that give an Image of Args a value fail the call
 // with ErrInvalidToolArguments and ErrInvalidImage.
 func NewTool[Args, Out any](name, description string, fn func(context.Context, Args) (Out, error)) ToolProvider {

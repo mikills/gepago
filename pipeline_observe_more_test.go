@@ -589,17 +589,21 @@ func TestObserverRunReportsItsStepsInOrderDuringAHeldExecution(t *testing.T) {
 			Observers: []PipelineObserver{hook},
 		}
 	}
-	cacheHit := func(hook *stepHook) PipelineSpec {
-		calls := &stepCalls{}
-		return PipelineSpec{
-			Steps: []Step{WithCache(writeAmount("a", 10), nil), describeAmount(calls, "b")},
-			Transitions: []Transition{
-				{From: "b", When: func(State, error) bool { return calls.of("b") == 1 }, To: "a"},
-			},
-			MaxVisits: map[string]int{"a": 2},
-			Observers: []PipelineObserver{hook},
+	cacheHitIn := func(wrap func(Step) Step) func(hook *stepHook) PipelineSpec {
+		return func(hook *stepHook) PipelineSpec {
+			calls := &stepCalls{}
+			return PipelineSpec{
+				Steps: []Step{wrap(WithCache(writeAmount("a", 10), nil)), describeAmount(calls, "b")},
+				Transitions: []Transition{
+					{From: "b", When: func(State, error) bool { return calls.of("b") == 1 }, To: "a"},
+				},
+				MaxVisits: map[string]int{"a": 2},
+				Observers: []PipelineObserver{hook},
+			}
 		}
 	}
+	cacheHit := cacheHitIn(func(step Step) Step { return step })
+	cacheHitInAPolicy := cacheHitIn(func(step Step) Step { return WithPolicy(step, StepPolicy{}) })
 	tests := []struct {
 		name     string
 		spec     func(hook *stepHook) PipelineSpec
@@ -617,6 +621,8 @@ func TestObserverRunReportsItsStepsInOrderDuringAHeldExecution(t *testing.T) {
 		},
 		{name: "the start of a cache hit", spec: cacheHit, step: "a"},
 		{name: "the end of a cache hit", spec: cacheHit, step: "a", finished: true},
+		{name: "the start of a cache hit inside a top-level wrapper", spec: cacheHitInAPolicy, step: "a"},
+		{name: "the end of a cache hit inside a top-level wrapper", spec: cacheHitInAPolicy, step: "a", finished: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

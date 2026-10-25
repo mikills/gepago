@@ -35,9 +35,10 @@ import (
 // A zero Image encodes as null. A type that embeds an Image or a *Image, or that writes its own
 // JSON, encodes as json.Marshal writes it. So the tool gets at most the image's summary, and never
 // the image. But a MarshalJSONTo that encodes an Image it holds through its encoder still fails.
-// A MarshalJSONTo that encodes an Image apart and then writes the result as text passes. The tool
-// then gets the summary as text. The arguments cost a second encode only when
-// their JSON holds the full summary of an image (see NewTool).
+// A MarshalJSONTo that encodes an Image apart and then writes the result as text passes, and the
+// tool gets the summary as text. The JSON of all the arguments can hold the full summary of an
+// image elsewhere. Then that MarshalJSONTo fails too, and the error names its key. The arguments
+// cost a second encode only when their JSON holds the full summary of an image (see NewTool).
 func ToolStep(name, tool string, reads, writes []KeyRef) Step {
 	return &toolStep{
 		name:   strings.TrimSpace(name),

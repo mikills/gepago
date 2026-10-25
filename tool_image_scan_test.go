@@ -3,7 +3,10 @@ package gepa
 import (
 	"encoding/json"
 	"encoding/json/jsontext"
+	"fmt"
+	"math/rand/v2"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -58,6 +61,96 @@ func TestHoldsImageSummaryFindsOnlyTheFullShape(t *testing.T) {
 	} {
 		require.False(t, holdsImageSummary([]byte(data)), name)
 	}
+}
+
+func TestSummaryAnchorsStandAtTheirPlacesInEachSummary(t *testing.T) {
+	low, high := 0, 0
+	for _, data := range [][]byte{pngData(t, "a"), jpegData(t), webpData} {
+		summary, err := json.Marshal(mustImage(t, data))
+		require.NoError(t, err)
+		at := strings.Index(string(summary), imageSummarySize)
+		require.Positive(t, at)
+		for _, anchor := range summaryAnchors {
+			var places []int
+			for _, place := range anchor.offsets {
+				if i := at + place; i >= 0 && summary[i] == anchor.char {
+					places = append(places, place)
+				}
+				low, high = min(low, place), max(high, place)
+			}
+			require.Len(t, places, 1, "%q in %s", anchor.char, summary)
+		}
+	}
+	require.Less(t, high-low, anchorReach, "a switch of anchors goes back far enough")
+}
+
+// summaryPattern is a reference for holdsImageSummary.
+var summaryPattern = regexp.MustCompile(
+	`\{"media_type":"image/(?:png|jpeg|webp)","size":[0-9]+,"sha256":"[0-9a-f]{64}"\}`,
+)
+
+// randomSummaryJSON returns text built from parts of image summaries and from runs of the bytes
+// that holdsImageSummary searches for. A part is a whole summary, or a summary that is cut or
+// changed by a byte.
+func randomSummaryJSON(rng *rand.Rand) []byte {
+	types := []string{"png", "jpeg", "webp", "gif"}
+	hex := "0123456789abcdefA"
+	summary := func() string {
+		digest := make([]byte, 64)
+		for i := range digest {
+			digest[i] = hex[rng.IntN(16)]
+		}
+		return fmt.Sprintf(`{"media_type":"image/%s","size":%d,"sha256":"%s"}`,
+			types[rng.IntN(3)], rng.IntN(5_000_000), digest)
+	}
+	var out []byte
+	for range 1 + rng.IntN(12) {
+		switch rng.IntN(9) {
+		case 0:
+			out = append(out, summary()...)
+		case 1, 2:
+			part := []byte(summary())
+			switch i := rng.IntN(len(part)); rng.IntN(3) {
+			case 0:
+				part = part[:i]
+			case 1:
+				part[i] = hex[rng.IntN(len(hex))]
+			default:
+				part = append(part[:i], part[i+1:]...)
+			}
+			out = append(out, part...)
+		case 3:
+			out = append(out, strings.Repeat(string("z{_:"[rng.IntN(4)]), rng.IntN(400))...)
+		case 4:
+			out = append(out, strings.Repeat(`","size":`, rng.IntN(40))...)
+		case 5:
+			out = append(out, strings.Repeat(`{"media_type":"image/png`, rng.IntN(10))...)
+		case 6:
+			out = append(out, strings.Repeat(`{"media_type":"image/png","size":1,`, rng.IntN(10))...)
+		default:
+			filler := make([]byte, rng.IntN(300))
+			for i := range filler {
+				filler[i] = `abcz{}_:",0123456789 `[rng.IntN(21)]
+			}
+			out = append(out, filler...)
+		}
+	}
+	return out
+}
+
+func TestHoldsImageSummaryAgreesWithAReferencePattern(t *testing.T) {
+	rng := rand.New(rand.NewPCG(7, 11))
+	found := 0
+	for i := range 20_000 {
+		data := randomSummaryJSON(rng)
+		want := summaryPattern.Match(data)
+		if want {
+			found++
+		}
+		require.Equal(t, want, holdsImageSummary(data), "input %d: %q", i, data)
+	}
+	require.Greater(t, found, 2_000, "the inputs hold summaries")
+	require.Less(t, found, 18_000, "the inputs hold near misses")
 }
 
 // encodesItself is an int with its own MarshalJSONTo.

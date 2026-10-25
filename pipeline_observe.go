@@ -266,11 +266,11 @@ func withLane(ctx context.Context, lane string) context.Context {
 	return context.WithValue(ctx, observeKey{}, &laned)
 }
 
-// observerContext returns ctx, a context of the run, as observers receive it. It keeps the
-// values of ctx, but it ends only when the run's life ends (see runObservation). It leaves out the
-// run that ctx belongs to, so nothing an observer does with it counts against the run. numbers
-// are the traced numbers of the run or the execution that the event belongs to (see
-// tracedNumbersKey).
+// observerContext returns ctx, a context of the run, as observers receive it. It hides the values
+// of ctx that observerCtx lists and keeps the other values. It ends only when the run's life ends
+// (see runObservation). It leaves out the run that ctx belongs to, so nothing an observer does
+// with it counts against the run. numbers are the traced numbers of the run or the execution that
+// the event belongs to (see tracedNumbersKey).
 func (r *runObservation) observerContext(ctx context.Context, numbers iterationNumbers) context.Context {
 	return observerCtx{Context: r.life, values: context.WithoutCancel(ctx), numbers: numbers}
 }
