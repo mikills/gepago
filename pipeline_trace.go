@@ -114,7 +114,7 @@ type RecordingObserver struct {
 }
 
 // recordedRun is a run that a RecordingObserver records. numbers holds each input key whose raw
-// value the run kept as an iteration number. observeRun decided it (see withTracedNumbers). It is
+// value the run kept as an iteration number. observeRun decided it (see tracedNumbersKey). It is
 // nil when there is none.
 type recordedRun struct {
 	trace   PipelineTrace
@@ -124,7 +124,7 @@ type recordedRun struct {
 
 // recordedStep is an execution that a RecordingObserver records. numbers holds each read key whose
 // raw value the execution read as an iteration number. observeStep decided it (see
-// withTracedNumbers). It is nil when there is none.
+// tracedNumbersKey). It is nil when there is none.
 type recordedStep struct {
 	trace   StepTrace
 	steps   []*recordedStep
@@ -231,24 +231,16 @@ func (r *RecordingObserver) lastStep(runID string) *recordedStep {
 	return run.steps[len(run.steps)-1]
 }
 
-// tracedNumbersKey carries the keys whose raw values a run or an execution took as iteration
-// numbers to a RecordingObserver (see withTracedNumbers).
+// tracedNumbersKey carries the traced numbers of a run or an execution to a RecordingObserver.
+// These are the keys whose raw inputs or reads the run or the execution took as iteration numbers.
+// observeRun and observeStep decide them on the raw values, before a Redactor changes them. A
+// trace holds the redacted values as JSON decodes them, so the key alone then tells an iteration
+// number apart. Only the context that an observer gets holds the key (see observerCtx). It holds
+// the numbers of the event's own run or execution at every event, or nil. So the numbers of an
+// earlier event never reach a later one, such as in a run that an observer starts.
 type tracedNumbersKey struct{}
 
-// withTracedNumbers returns ctx with numbers, the keys whose raw inputs or reads the run or the
-// execution took as iteration numbers. observeRun and observeStep decide them on the raw values,
-// before a Redactor changes them, and pass ctx to the observers. A trace holds the redacted values
-// as JSON decodes them, so the key alone then tells an iteration number apart. It replaces the
-// numbers that ctx held, also when there are none. So the numbers of an earlier run or execution
-// never reach a later one. An example is a run that an observer starts with its context.
-func withTracedNumbers(ctx context.Context, numbers iterationNumbers) context.Context {
-	if len(numbers) == 0 {
-		numbers = nil
-	}
-	return context.WithValue(ctx, tracedNumbersKey{}, numbers)
-}
-
-// tracedNumbers returns the numbers that withTracedNumbers put in ctx, or nil when it put none.
+// tracedNumbers returns the traced numbers that the context of an event holds, or nil.
 func tracedNumbers(ctx context.Context) iterationNumbers {
 	numbers, _ := ctx.Value(tracedNumbersKey{}).(iterationNumbers)
 	return numbers

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -597,7 +599,7 @@ func TestObserverRunTakesNoIterationNumbersFromTheLoopItObserves(t *testing.T) {
 	}.Build()
 	require.NoError(t, err)
 	var audits []error
-	observer := &startHook{hook: func(ctx context.Context, event StepStartedEvent) {
+	observer := &stepHook{started: func(ctx context.Context, event StepStartedEvent) {
 		if event.Step == "count_up" {
 			_, err := audit.RunCandidate(ctx, nil, Prediction{"page": 3})
 			audits = append(audits, err)
@@ -620,11 +622,79 @@ func TestObserverRunTakesNoIterationNumbersFromTheLoopItObserves(t *testing.T) {
 	require.Nil(t, recorder.spanNumbers(), "no audit run takes its input as an iteration number")
 }
 
-func TestTracedNumbersReplaceTheNumbersThatTheContextHeld(t *testing.T) {
-	ctx := withTracedNumbers(context.Background(), iterationNumbers{"page": 3})
-	require.Equal(t, iterationNumbers{"page": 3}, tracedNumbers(ctx))
+// observerValueKey is the key of a value that an observer adds to its context.
+type observerValueKey struct{}
 
-	require.Nil(t, tracedNumbers(withTracedNumbers(ctx, nil)), "no numbers replace the earlier ones")
-	require.Nil(t, tracedNumbers(withTracedNumbers(ctx, iterationNumbers{})), "an empty set is no numbers")
+func TestObserverContextHoldsOnlyTheTracedNumbersOfItsEvent(t *testing.T) {
+	run := &runObservation{life: context.Background()}
+	stale := context.WithValue(context.Background(), tracedNumbersKey{}, iterationNumbers{"page": 9})
+	observed := run.observerContext(stale, iterationNumbers{"page": 3})
+	nested := context.WithValue(observed, observerValueKey{}, "a value an observer adds")
+
+	require.Equal(t, iterationNumbers{"page": 3}, tracedNumbers(observed))
+	require.Nil(t, tracedNumbers(run.observerContext(stale, nil)), "no numbers hide the earlier ones")
+	require.Nil(t, tracedNumbers(run.observerContext(stale, iterationNumbers{})), "an empty set is no numbers")
+	require.Nil(t, tracedNumbers(run.observerContext(nested, nil)), "a run that an observer starts")
 	require.Nil(t, tracedNumbers(context.Background()))
+}
+
+// numbersLog records the traced numbers that the context of each event holds.
+type numbersLog struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *numbersLog) add(ctx context.Context, event string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprintf("%s %v", event, map[string]int(tracedNumbers(ctx))))
+}
+
+func (l *numbersLog) RunStarted(ctx context.Context, _ RunStartedEvent) { l.add(ctx, "start run") }
+
+func (l *numbersLog) StepStarted(ctx context.Context, event StepStartedEvent) {
+	l.add(ctx, "start "+event.Step)
+}
+
+func (l *numbersLog) StepFinished(ctx context.Context, event StepFinishedEvent) {
+	l.add(ctx, "finish "+event.Step)
+}
+
+func (l *numbersLog) RunFinished(ctx context.Context, _ RunFinishedEvent) { l.add(ctx, "finish run") }
+
+func TestEveryEventHoldsTheTracedNumbersOfItsOwnRunOrExecution(t *testing.T) {
+	audits := &numbersLog{}
+	audit, err := PipelineSpec{
+		Steps:     []Step{writeAmount("audit", 1)},
+		Observers: []PipelineObserver{audits},
+	}.Build()
+	require.NoError(t, err)
+	runAudit := func(ctx context.Context, step string) {
+		if step == "count_up" {
+			_, _ = audit.RunCandidate(ctx, nil, Prediction{})
+		}
+	}
+	hook := &stepHook{
+		started:  func(ctx context.Context, event StepStartedEvent) { runAudit(ctx, event.Step) },
+		finished: func(ctx context.Context, event StepFinishedEvent) { runAudit(ctx, event.Step) },
+	}
+	events := &numbersLog{}
+	pipeline := loopPipeline(t, pagedLoop(addPages(plusPage), 3, 2), hook, events)
+
+	_, err = pipeline.RunCandidate(context.Background(), nil, Prediction{})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{
+		"start run map[]",
+		"start loop map[]",
+		"start count_up map[page:1]",
+		"finish count_up map[page:1]",
+		"start count_up map[page:2]",
+		"finish count_up map[page:2]",
+		"finish loop map[]",
+		"finish run map[]",
+	}, events.lines)
+	once := []string{"start run map[]", "start audit map[]", "finish audit map[]", "finish run map[]"}
+	require.Equal(t, slices.Concat(once, once, once, once), audits.lines,
+		"an audit at the start or the end of an iteration holds none of the iteration's numbers")
 }

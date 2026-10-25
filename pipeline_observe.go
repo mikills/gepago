@@ -83,7 +83,7 @@ import (
 //
 // ctx does not carry where the event's execution runs, such as its Map element or its Loop
 // iteration. So a run that an observer starts takes none of the iteration numbers of the Loop it
-// observes.
+// observes. ctx keeps the other values of the context, such as the tool scope.
 //
 // The values an event carries pass through PipelineSpec.Redactor; see Redactor. Each observer
 // receives its own copy of them, its RunContext's Attributes included, so changing them changes
@@ -266,11 +266,13 @@ func withLane(ctx context.Context, lane string) context.Context {
 	return context.WithValue(ctx, observeKey{}, &laned)
 }
 
-// observerContext returns ctx, a context of the run, as observers receive it: with its values,
-// but ending only when the run's life ends (see runObservation), and without the run it
-// belongs to, so nothing an observer does with it counts against the run.
-func (r *runObservation) observerContext(ctx context.Context) context.Context {
-	return observerCtx{Context: r.life, values: context.WithoutCancel(ctx)}
+// observerContext returns ctx, a context of the run, as observers receive it. It keeps the
+// values of ctx, but it ends only when the run's life ends (see runObservation). It leaves out the
+// run that ctx belongs to, so nothing an observer does with it counts against the run. numbers
+// are the traced numbers of the run or the execution that the event belongs to (see
+// tracedNumbersKey).
+func (r *runObservation) observerContext(ctx context.Context, numbers iterationNumbers) context.Context {
+	return observerCtx{Context: r.life, values: context.WithoutCancel(ctx), numbers: numbers}
 }
 
 // observerCtx takes its deadline and cancellation from a run's life and its values from a
@@ -280,15 +282,22 @@ func (r *runObservation) observerContext(ctx context.Context) context.Context {
 // and usage tally of a wrapped tool. It also hides where the execution runs. That is the visit
 // of its top-level step, its Map element, and its Loop iteration with the iteration numbers. It
 // also hides the hold of a top-level wrapper. So a run that an observer starts with it is a run
-// of its own. It keeps the numbers that a RecordingObserver reads (see withTracedNumbers), and
-// every value that the caller set, such as the tool scope.
+// of its own. Under tracedNumbersKey it holds numbers, the traced numbers of its event's run or
+// execution, or nil. So it never passes on the numbers of another event. It keeps the other
+// values of the context, such as the tool scope.
 type observerCtx struct {
 	context.Context
-	values context.Context
+	values  context.Context
+	numbers iterationNumbers
 }
 
 func (c observerCtx) Value(key any) any {
 	switch key.(type) {
+	case tracedNumbersKey:
+		if len(c.numbers) == 0 {
+			return nil
+		}
+		return c.numbers
 	case observeKey, evaluationKey, pipelineRunKey, runContextKey, usageFrameKey, usageCollectorKey, retryAdmissionKey,
 		budgetClockKey, toolEnvKey, toolMemoryKey, stepStageKey, toolAttemptsKey, recordedUsageKey, visitKey,
 		mapElementKey, loopIterationKey, finishHoldKey:
@@ -327,19 +336,21 @@ type traceObservation struct {
 	redactedText
 }
 
-// runObservation reports one run to its observers: its own and those of the runs around it,
-// with its own redactor followed by theirs. runContext is the run's RunContext as its events
-// carry it, with the attributes redacted; it is set when RunStarted is emitted. life ends when
-// the context the caller passed to the observation's top-level run ends, when the MaxDuration of
-// the run or a run around it expires, or when endLife ends it once the run has finished.
-// recording, when set, reports the same run to the RecordingObserver of an evaluation that
-// records traces, in an observation of its own; see observeScope.
+// runObservation reports one run to its observers. These are its own observers and those of the
+// runs around it. Its own redactor comes first, and then theirs. runContext is the run's
+// RunContext as its events carry it, with the attributes redacted. numbers are the run's traced
+// numbers (see tracedNumbersKey). observeRun sets both when it emits RunStarted. life ends when
+// the context that the caller passed to the observation's top-level run ends. It also ends when
+// the MaxDuration of the run or of a run around it expires. At the latest, endLife ends it after
+// the run has finished. recording, when set, reports the same run to the RecordingObserver of an
+// evaluation that records traces, in an observation of its own (see observeScope).
 type runObservation struct {
 	trace      *traceObservation
 	observers  []PipelineObserver
 	redactors  []Redactor
 	span       UsageSpan
 	runContext RunContext
+	numbers    iterationNumbers
 	start      time.Time
 	life       context.Context
 	endLife    context.CancelFunc
@@ -409,7 +420,8 @@ func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any,
 			RunContext: lane.runContext,
 			Inputs:     lane.redactStateValues(inputs, numbers),
 		}
-		observerCtx := lane.observerContext(withTracedNumbers(ctx, numbers.inputs(inputs)))
+		lane.numbers = numbers.inputs(inputs)
+		observerCtx := lane.observerContext(ctx, lane.numbers)
 		lane.deliver(func(observer PipelineObserver) {
 			event := event
 			event.RunContext = event.RunContext.clone()
@@ -484,7 +496,7 @@ func (r *runObservation) finish(ctx context.Context, err error) {
 			Unbudgeted: unbudgeted,
 			Err:        laneErr,
 		}
-		observerCtx := lane.observerContext(ctx)
+		observerCtx := lane.observerContext(ctx, lane.numbers)
 		lane.deliver(func(observer PipelineObserver) {
 			event := event
 			event.RunContext = event.RunContext.clone()
@@ -494,8 +506,9 @@ func (r *runObservation) finish(ctx context.Context, err error) {
 	}
 }
 
-// stepObservation reports one execution of a step, and recording, when set, reports it to an
-// evaluation's RecordingObserver; see runObservation.
+// stepObservation reports one execution of a step. recording, when set, reports it to an
+// evaluation's RecordingObserver (see runObservation). numbers are the execution's traced numbers
+// (see tracedNumbersKey).
 type stepObservation struct {
 	run        *runObservation
 	ctx        context.Context
@@ -503,6 +516,7 @@ type stepObservation struct {
 	step       string
 	reads      map[string]any
 	attributes map[string]int
+	numbers    iterationNumbers
 	recording  *stepObservation
 }
 
@@ -556,7 +570,7 @@ func observeStep(ctx context.Context, node *stepNode, attempt, visit int, values
 		lane.ctx = ctx
 		iteration := iterationFrom(ctx)
 		lane.reads = lane.run.redactStateValues(reads, iteration.numbers)
-		traced := withTracedNumbers(ctx, iteration.numbers.inputs(reads))
+		lane.numbers = iteration.numbers.inputs(reads)
 		lane.attributes = executionAttributes(ctx, visit)
 		if iteration.number > 0 && !lane.run.keepsAttribute(iteration.key, iteration.number) {
 			delete(lane.attributes, "iteration")
@@ -570,7 +584,7 @@ func observeStep(ctx context.Context, node *stepNode, attempt, visit int, values
 			Lane:       scope.lane,
 			Attributes: lane.attributes,
 		}
-		observerCtx := lane.run.observerContext(traced)
+		observerCtx := lane.run.observerContext(ctx, lane.numbers)
 		lane.run.deliver(func(observer PipelineObserver) {
 			event := event
 			event.RunContext = event.RunContext.clone()
@@ -635,7 +649,7 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 		event.ToolCalls = run.scrubToolCalls(toolCalls)
 		event.Err = run.redactError(outcome.Err)
 		event.Span = finishSpan(lane.span, outcome.Duration, outcome.Usage, outcome.Unbudgeted, event.Err)
-		observerCtx := run.observerContext(lane.ctx)
+		observerCtx := run.observerContext(lane.ctx, lane.numbers)
 		run.deliver(func(observer PipelineObserver) {
 			event := event
 			event.RunContext = event.RunContext.clone()
@@ -681,7 +695,7 @@ func (r *runObservation) deliverTransition(
 	r.trace.mu.Lock()
 	defer r.trace.mu.Unlock()
 	for lane := r; lane != nil; lane = lane.recording {
-		observerCtx := lane.observerContext(ctx)
+		observerCtx := lane.observerContext(ctx, lane.numbers)
 		lane.deliver(func(observer PipelineObserver) {
 			if transitions, ok := observer.(TransitionObserver); ok {
 				call(transitions, lane.runContext.clone(), observerCtx)
