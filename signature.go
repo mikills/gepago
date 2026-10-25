@@ -205,7 +205,7 @@ func (f Field) propertySchema() (any, error) {
 			return nil, fmt.Errorf("schema: %w", err)
 		}
 		schema := json.RawMessage(compact.Bytes())
-		if f.Optional && !unconstrainedJSON(schema) {
+		if f.Optional && !unconstrainedJSON(schema) && !nullJSON(schema) {
 			return schemaNode{{key: "anyOf", value: []any{schema, typeNode("null")}}}, nil
 		}
 		return schema, nil

@@ -2,6 +2,7 @@ package gepa_test
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -140,4 +141,92 @@ func TestTypedPredictRunCandidateNamesOnlyADigestOfAStateSummary(t *testing.T) {
 		require.NotContains(t, err.Error(), secret)
 	}
 	require.Empty(t, lm.Calls())
+}
+
+// messageWithSummary is a message whose image part holds an image's summary with digest.
+func messageWithSummary(digest string) string {
+	return `{"role":"assistant","parts":[{"image":{"media_type":"image/png","size":5,"sha256":"` + digest + `"}}]}`
+}
+
+func TestProgramStepOutputNamesNothingOfAnImageInTheReply(t *testing.T) {
+	digest := strings.Repeat("ab", 32)
+	lm := gepatest.NewFakeGenerator().Default(reply(`{"reply": ` + messageWithSummary(digest) + `}`))
+	answer := gepa.Predict{
+		Signature: gepa.Signature{
+			Name:    "answer",
+			Inputs:  []gepa.Field{{Name: "question"}},
+			Outputs: []gepa.Field{{Name: "reply"}},
+		},
+		LM: lm,
+	}
+	question := gepa.Key[string]{Name: "question"}
+	pipeline := fpBuild(t, gepa.PipelineSpec{
+		Inputs: refs(question.Ref()),
+		Steps: []gepa.Step{gepa.NewProgramStep(
+			"answer",
+			answer,
+			refs(question.Ref()),
+			refs(gepa.Key[gepa.Message]{Name: "reply"}.Ref()),
+		)},
+	})
+
+	_, err := pipeline.RunCandidate(context.Background(), nil, gepa.Prediction{"question": "q"})
+
+	require.ErrorIs(t, err, gepa.ErrInvalidOutput)
+	require.ErrorIs(t, err, gepa.ErrInvalidImage)
+	require.ErrorContains(t, err, "JSON holds no image data (build the image with NewImage)")
+	require.NotContains(t, err.Error(), digest, "a model reply's digest stays out of the error")
+}
+
+func TestToolStepOutputNamesNothingOfAnImageInTheToolOutput(t *testing.T) {
+	digest := strings.Repeat("ab", 32)
+	tool := gepa.NewToolFunc(
+		gepa.Tool{Name: "fetch", Description: "Fetch a message", Parameters: json.RawMessage(`{"type":"object"}`)},
+		func(context.Context, gepa.ToolCall) (gepa.ToolResult, error) {
+			return gepa.ToolResult{Output: json.RawMessage(`{"reply":` + messageWithSummary(digest) + `}`)}, nil
+		},
+	)
+	registry, err := gepa.NewToolRegistry(tool)
+	require.NoError(t, err)
+	pipeline := fpBuild(t, gepa.PipelineSpec{
+		Steps: []gepa.Step{gepa.ToolStep("fetch", "fetch", nil, refs(gepa.Key[gepa.Message]{Name: "reply"}.Ref()))},
+		Tools: registry,
+	})
+
+	_, err = pipeline.RunCandidate(context.Background(), nil, gepa.Prediction{})
+
+	require.ErrorIs(t, err, gepa.ErrInvalidOutput)
+	require.ErrorIs(t, err, gepa.ErrInvalidImage)
+	require.ErrorContains(t, err, "JSON holds no image data (build the image with NewImage)")
+	require.NotContains(t, err.Error(), digest, "a tool output's digest stays out of the error")
+}
+
+func TestSchemasGiveAnImageOnlyNull(t *testing.T) {
+	image, err := gepa.JSONSchemaFor[gepa.Image]()
+	require.NoError(t, err)
+	require.JSONEq(t, `{"type":"null"}`, string(image))
+	pointer, err := gepa.JSONSchemaFor[*gepa.Image]()
+	require.NoError(t, err)
+	require.JSONEq(t, `{"type":"null"}`, string(pointer), "null admits null already")
+	part, err := gepa.JSONSchemaFor[gepa.Part]()
+	require.NoError(t, err)
+	require.JSONEq(t, `{"type":"object","properties":{"text":{"anyOf":[{"type":"string"},{"type":"null"}]},`+
+		`"image":{"type":"null"}},"required":["text","image"],"additionalProperties":false}`, string(part))
+	require.True(t, gepa.StrictJSONSchema(part))
+
+	type figureOut struct {
+		Caption string      `json:"caption"`
+		Figure  *gepa.Image `json:"figure"`
+	}
+	type pagesIn struct {
+		Pages []gepa.Image `json:"pages"`
+	}
+	signature, err := gepa.TypedPredict[pagesIn, figureOut]{LM: gepatest.NewFakeGenerator()}.ProgramSignature()
+	require.NoError(t, err)
+	require.JSONEq(t, `{"type":"array","items":{}}`, string(signature.Signature.Inputs[0].Schema),
+		"an input image is the label of an attached image, so its schema stays {}")
+	format, err := signature.Signature.JSONSchema()
+	require.NoError(t, err)
+	require.JSONEq(t, `{"type":"object","properties":{"caption":{"type":"string"},"figure":{"type":"null"}},`+
+		`"required":["caption","figure"],"additionalProperties":false}`, string(format))
 }

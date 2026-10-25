@@ -146,7 +146,7 @@ func newMapStep[In any](
 	return asComponentStep(m, m.body)
 }
 
-// splitList returns the elements of value, a []In as convertStateValue gives it for the items
+// splitList returns the elements of value, a []In as convertValue gives it for the items
 // key.
 func splitList[In any](value any) []any {
 	list, _ := value.([]In)
@@ -338,7 +338,7 @@ func (m *mapStep) runCandidate(ctx context.Context, candidate Candidate, s State
 	if !ok {
 		return fmt.Errorf("state key %q is missing", m.items.Name)
 	}
-	list, err := convertStateValue(m.items.Name, m.items.Type, raw)
+	list, err := convertValue(m.items.Name, m.items.Type, raw, fromState)
 	if err != nil {
 		return err
 	}
@@ -482,7 +482,8 @@ func (m *mapStep) runElement(ctx context.Context, candidate Candidate, index int
 			outcome.message = eventErrorText(ctx, outcome.err)
 		}
 	}()
-	result, err := runNode(withElement(ctx, index, usage), childCandidate(candidate, m.body), m.body, view, nil)
+	elementCtx := withoutIterationNumber(withElement(ctx, index, usage), m.item.Name)
+	result, err := runNode(elementCtx, childCandidate(candidate, m.body), m.body, view, nil)
 	if err != nil {
 		return elementOutcome{err: err}
 	}

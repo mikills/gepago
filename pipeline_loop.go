@@ -8,7 +8,6 @@ import (
 	"reflect"
 	"runtime/debug"
 	"slices"
-	"strconv"
 	"strings"
 )
 
@@ -383,22 +382,22 @@ func (l *loopStep) callUntil(iteration int, values map[string]any) (done bool, e
 type loopIterationKey struct{}
 
 // loopIteration is the iteration of a Loop that executions belong to. It holds its number, from
-// one, and the Loop's iteration key, empty when the Loop has none. numbers holds the iteration
-// numbers of this Loop and of the Loops around it. The pipelines that an iteration runs keep
-// numbers, but their steps belong to no iteration, so number is zero for them.
+// one, and the Loop's iteration key, empty when the Loop has none. numbers holds the running
+// iteration number under each iteration key that the executions read as that number. A pipeline
+// that an iteration runs keeps only the keys whose input holds the number (see withRunNumbers).
+// Its steps belong to no iteration, so number is zero for them.
 type loopIteration struct {
 	number  int
 	key     string
 	numbers iterationNumbers
 }
 
-// iterationNumbers holds, for each iteration key, the highest iteration number that a Loop gave
-// under it.
+// iterationNumbers holds the running iteration number under each iteration key.
 type iterationNumbers map[string]int
 
-// with returns a copy of n that also holds number under key. An empty key leaves n as it is.
+// with returns a copy of n that holds number under key. An empty key leaves n as it is.
 func (n iterationNumbers) with(key string, number int) iterationNumbers {
-	if key == "" || n[key] >= number {
+	if key == "" {
 		return n
 	}
 	out := maps.Clone(n)
@@ -409,28 +408,42 @@ func (n iterationNumbers) with(key string, number int) iterationNumbers {
 	return out
 }
 
-// holds reports whether value, under key, is an iteration number. That is so when value is a
-// number or a string whose text is a whole number from one to the highest number under key.
-func (n iterationNumbers) holds(key string, value any) bool {
-	last := n[key]
-	if last == 0 || value == nil {
-		return false
+// without returns a copy of n without key, or n itself when it does not hold key.
+func (n iterationNumbers) without(key string) iterationNumbers {
+	if _, ok := n[key]; !ok {
+		return n
 	}
-	switch reflect.TypeOf(value).Kind() {
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
-		reflect.Float32, reflect.Float64, reflect.String:
-	default:
-		return false
-	}
-	text := fmt.Sprint(value)
-	number, err := strconv.Atoi(text)
-	return err == nil && number >= 1 && number <= last && strconv.Itoa(number) == text
+	out := maps.Clone(n)
+	delete(out, key)
+	return out
 }
 
-// without returns values without the iteration numbers it holds, or values itself when it holds
-// none.
-func (n iterationNumbers) without(values map[string]any) map[string]any {
+// holds reports whether value, under key, is the running iteration number: an int equal to the
+// number n holds under key.
+func (n iterationNumbers) holds(key string, value any) bool {
+	number, ok := n[key]
+	got, isInt := value.(int)
+	return ok && isInt && got == number
+}
+
+// inputs returns the part of n that values holds: each key whose value is its number.
+func (n iterationNumbers) inputs(values map[string]any) iterationNumbers {
+	var out iterationNumbers
+	for key, number := range n {
+		if !n.holds(key, values[key]) {
+			continue
+		}
+		if out == nil {
+			out = iterationNumbers{}
+		}
+		out[key] = number
+	}
+	return out
+}
+
+// ordinary returns values without the iteration numbers that n holds, or values itself when it
+// holds none.
+func (n iterationNumbers) ordinary(values map[string]any) map[string]any {
 	var out map[string]any
 	for key, value := range values {
 		if !n.holds(key, value) {
@@ -447,6 +460,12 @@ func (n iterationNumbers) without(values map[string]any) map[string]any {
 	return out
 }
 
+// numberFilter reports whether a value under a key is an iteration number, whose text the run
+// must not remove from error messages.
+type numberFilter interface {
+	holds(key string, value any) bool
+}
+
 // withIteration returns ctx for the executions of the iteration numbered number, from one, and of
 // the executions nested in them. key is the Loop's iteration key.
 func withIteration(ctx context.Context, key string, number int) context.Context {
@@ -455,14 +474,36 @@ func withIteration(ctx context.Context, key string, number int) context.Context 
 }
 
 // withoutIteration returns ctx for executions that belong to no iteration of a Loop, such as the
-// steps of a pipeline an iteration runs. They keep the iteration numbers of the Loops around
-// them, since the pipeline can take such a number as an input.
+// steps of a pipeline an iteration runs. They keep the numbers of ctx, which withRunNumbers
+// limited to the run's inputs.
 func withoutIteration(ctx context.Context) context.Context {
 	iteration := iterationFrom(ctx)
 	if iteration.number == 0 {
 		return ctx
 	}
 	return context.WithValue(ctx, loopIterationKey{}, loopIteration{numbers: iteration.numbers})
+}
+
+// withRunNumbers returns ctx for a pipeline run with inputs. The run keeps the iteration number of
+// a Loop around it only under a key whose input holds that number as an int. So a Default, a
+// write or another value under that key is a value as any other.
+func withRunNumbers(ctx context.Context, inputs map[string]any) context.Context {
+	numbers := iterationFrom(ctx).numbers
+	if len(numbers) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, loopIterationKey{}, loopIteration{numbers: numbers.inputs(inputs)})
+}
+
+// withoutIterationNumber returns ctx for executions in which key holds another value than the
+// iteration number, such as the item of a Map element.
+func withoutIterationNumber(ctx context.Context, key string) context.Context {
+	iteration := iterationFrom(ctx)
+	if _, ok := iteration.numbers[key]; !ok {
+		return ctx
+	}
+	iteration.numbers = iteration.numbers.without(key)
+	return context.WithValue(ctx, loopIterationKey{}, iteration)
 }
 
 // iterationFrom returns the iteration of a Loop the executions running with ctx belong to, or
@@ -499,10 +540,7 @@ func (r *runObservation) redactNumber(key string, value any) any {
 // inputs, as the run's events carry them. A value that numbers holds is an iteration number, so
 // it passes through redactNumber. Every other value passes through redact. The caller holds the
 // trace lock.
-func (r *runObservation) redactStateValues(values map[string]any, numbers iterationNumbers) map[string]any {
-	if len(numbers) == 0 {
-		return r.redactValues(values)
-	}
+func (r *runObservation) redactStateValues(values map[string]any, numbers numberFilter) map[string]any {
 	if len(values) == 0 {
 		return nil
 	}

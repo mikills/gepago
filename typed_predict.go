@@ -178,7 +178,7 @@ func typedOutputs(out any, reply Prediction) Prediction {
 		case fieldValue.CanInterface():
 			outputs[name] = fieldValue.Interface()
 		default:
-			decoded, err := convertTextValue(name, field.typ, reply[name])
+			decoded, err := convertValue(name, field.typ, reply[name], fromText)
 			if err != nil {
 				decoded = reflect.Zero(field.typ).Interface()
 			}
@@ -382,6 +382,7 @@ func structFields(typ reflect.Type, outputs bool) ([]Field, error) {
 		return nil, fmt.Errorf("%s must be a struct without its own UnmarshalJSON or UnmarshalText", typ)
 	}
 	builder := newSchemaBuilder()
+	builder.imageInputs = !outputs
 	builder.expanding[typ] = true
 	fields := jsonFields(typ)
 	names := jsonFieldOrder(fields)

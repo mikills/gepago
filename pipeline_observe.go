@@ -356,7 +356,7 @@ func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any,
 	capture := evaluationCaptureFrom(ctx)
 	recorder := capture.join(p, parent == nil)
 	numbers := iterationFrom(ctx).numbers
-	capture.offer(numbers.without(inputs))
+	capture.offer(numbers.ordinary(inputs))
 	capture.offer(attributeValues(rc))
 	if parent == nil {
 		parent = &observeScope{}

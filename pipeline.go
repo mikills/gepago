@@ -253,7 +253,8 @@ func (s programStep) RunCandidate(ctx context.Context, candidate Candidate, stat
 }
 
 // programOutput converts the output for key to the key's type. An optional output that is
-// absent or null becomes the zero value of the key's type.
+// absent or null becomes the zero value of the key's type. The output can be a model's reply, so
+// an image error names nothing of the value (see valueSource).
 func programOutput(outputs Prediction, key KeyRef, optional bool) (any, error) {
 	value, ok := outputs[key.Name]
 	switch {
@@ -264,7 +265,7 @@ func programOutput(outputs Prediction, key KeyRef, optional bool) (any, error) {
 	case value == nil:
 		return nil, fmt.Errorf("%w: %q is null", ErrInvalidOutput, key.Name)
 	}
-	converted, err := convertStateValue(key.Name, key.Type, value)
+	converted, err := convertValue(key.Name, key.Type, value, fromText)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidOutput, err)
 	}
@@ -772,7 +773,7 @@ func (p Pipeline) execute(ctx context.Context, candidate Candidate, inputs Predi
 		if !ok {
 			return State{}, nil, fmt.Errorf("pipeline input %q is missing", key.Name)
 		}
-		converted, err := convertStateValue(key.Name, key.Type, value)
+		converted, err := convertValue(key.Name, key.Type, value, fromState)
 		if err != nil {
 			return State{}, nil, fmt.Errorf("invalid pipeline input: %w", err)
 		}
@@ -798,6 +799,7 @@ func (p Pipeline) execute(ctx context.Context, candidate Candidate, inputs Predi
 		env := &toolEnv{registry: p.tools, session: session, parent: toolEnvFrom(ctx)}
 		ctx = withToolEnv(WithToolMemory(ctx, session.Memory()), env)
 	}
+	ctx = withRunNumbers(ctx, values)
 	ctx, observed := p.observeRun(ctx, caller, values, rc)
 	// each run seeds its own copy of every default, after RunStarted reported the inputs.
 	defaulted := make(map[string]bool, len(p.defaults))
@@ -870,7 +872,7 @@ func (p Pipeline) mergeWrites(node *stepNode, result stepResult, values map[stri
 			if err != nil {
 				return nil, fmt.Errorf("merge state key %q: %w", key, err)
 			}
-			if next, err = convertStateValue(key, node.writeTypes[key], merged); err != nil {
+			if next, err = convertValue(key, node.writeTypes[key], merged, fromState); err != nil {
 				return nil, err
 			}
 		}

@@ -328,7 +328,7 @@ func (k Key[T]) Set(s State, v T) {
 
 func decodeStateValue[T any](key string, raw any) (T, error) {
 	var zero T
-	value, err := convertStateValue(key, reflect.TypeFor[T](), raw)
+	value, err := convertValue(key, reflect.TypeFor[T](), raw, fromState)
 	if err != nil {
 		return zero, err
 	}
@@ -336,19 +336,8 @@ func decodeStateValue[T any](key string, raw any) (T, error) {
 	return out, nil
 }
 
-// convertStateValue returns a copy of value as typ, converting values of other types through
-// their JSON form, and checks the result with its Validate method if it has one.
-func convertStateValue(key string, typ reflect.Type, value any) (any, error) {
-	return convertValue(key, typ, value, fromState)
-}
-
-// convertTextValue is convertStateValue for a value that a model or a tool wrote, such as a field
-// of a tool's output. Its image errors name nothing of the value (see valueSource).
-func convertTextValue(key string, typ reflect.Type, value any) (any, error) {
-	return convertValue(key, typ, value, fromText)
-}
-
-// convertValue is convertStateValue for a value from source.
+// convertValue returns a copy of value, from source, as typ. It converts values of other types
+// through their JSON form, and checks the result with its Validate method if it has one.
 func convertValue(key string, typ reflect.Type, value any, source valueSource) (any, error) {
 	var out any
 	switch {
@@ -654,21 +643,17 @@ func tagOptionError(typ reflect.Type) (reflect.Type, error) {
 }
 
 // valueSource says where a value to decode comes from. A model or a tool can write any text, so
-// an image error about a value from text names nothing of the value.
+// an image error about a value from text names nothing of the value. The zero valueSource is
+// fromText, so a call site that does not name a source names nothing of the value.
 type valueSource int
 
 const (
-	// fromState is a value of the state, of a run's inputs or of a Default.
-	fromState valueSource = iota
 	// fromText is a value that a model or a tool wrote, such as a reply or tool arguments.
-	fromText
+	fromText valueSource = iota
+	// fromState is a value of the state, of a run's inputs or of a Default. An image error may
+	// name the digest of such a value.
+	fromState
 )
-
-// decodeJSONValue converts value, a value from state, to typ through its JSON form (see
-// decodeValue).
-func decodeJSONValue(typ reflect.Type, value any) (any, error) {
-	return decodeValue(typ, value, fromState)
-}
 
 // decodeValue converts value, from source, to typ through its JSON form. Some types can hold an
 // Image, or an empty interface that value may fill with one. When typ is such a type and value

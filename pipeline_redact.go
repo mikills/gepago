@@ -66,12 +66,18 @@ import (
 // Under a Loop with an iteration key, the "iteration" attribute of each iteration's executions
 // passes through the Redactor under that key as an int. So does the Loop's "iterations" attribute,
 // once for each execution that carries it. Attributes hold integers, so when the Redactor changes
-// one or panics, the events leave it out. A step that reads the iteration key reads the same
-// number, and its events carry the read as the Redactor returns it. A pipeline that an iteration
-// runs can take the number as an input. Its events, and those of the steps and pipelines in it,
-// carry the number in the same way. The run removes no iteration number from error messages,
-// since a short number such as 3 also occurs in other text. A nested pipeline can write another
-// value under the iteration key. The run redacts such a value as any other value.
+// one or panics, the events leave it out.
+//
+// The number of the running iteration is public, since the Loop's error names it ("iteration
+// 3"). A short number such as 3 also occurs in other text. So the run does not remove the number
+// from error messages in two places. The first is a read of the iteration key by the body or by
+// an execution nested in it. The second is an input under the key's name of a pipeline that the
+// iteration runs, at any depth. That input must be the running number as an int. The steps of
+// such a pipeline read it in the same way. The events carry these values as the Redactor returns
+// them. Every other value under the key's name is a value as any other. Examples are a Default,
+// a write, a Map item, another number, and the number as a string or a float. So is a copy of the
+// number under another key, or in a detail. When the Redactor changes such a value, the run
+// removes its text from error messages.
 //
 // The Attributes of the RunContext that every event carries pass through the Redactor when a
 // run starts, before RunStarted, each under the key "attribute:<name>", where <name> is the
@@ -237,7 +243,42 @@ type evaluationRedaction struct {
 	values     []stateWrite
 	details    []stateWrite
 	toolCalls  []ToolCallRecord
-	iterations iterationNumbers
+	iterations map[string]int
+}
+
+// evaluationNumbers tells which values that reflection reads are iteration numbers. highest holds,
+// for each iteration key, the highest number that a Loop gave under it. ordinary holds the int
+// values that the runs gave, wrote or offered in another way under those keys.
+type evaluationNumbers struct {
+	highest  map[string]int
+	ordinary map[string]map[int]bool
+}
+
+// numbers returns the evaluationNumbers of the example's runs.
+func (e evaluationRedaction) numbers() evaluationNumbers {
+	numbers := evaluationNumbers{highest: e.iterations}
+	for _, value := range e.values {
+		number, ok := value.value.(int)
+		if _, numbered := e.iterations[value.key]; !ok || !numbered {
+			continue
+		}
+		if numbers.ordinary == nil {
+			numbers.ordinary = map[string]map[int]bool{}
+		}
+		if numbers.ordinary[value.key] == nil {
+			numbers.ordinary[value.key] = map[int]bool{}
+		}
+		numbers.ordinary[value.key][number] = true
+	}
+	return numbers
+}
+
+// holds reports whether value, under key, is an iteration number. It must be an int from one to
+// the highest number under key, and no run gave it as an ordinary value. A Default, a Map item or
+// a write with the same number makes it ordinary. Then the run redacts it as any other value.
+func (n evaluationNumbers) holds(key string, value any) bool {
+	number, ok := value.(int)
+	return ok && number >= 1 && number <= n.highest[key] && !n.ordinary[key][number]
 }
 
 // apply returns item with the values that reflection reads passed through the redactors. When the
@@ -246,8 +287,8 @@ type evaluationRedaction struct {
 // entry of item as it redacts an event's details (see redactEntry). It first converts the
 // "inputs" and "expected" entries to their keys' types where they convert. So a Redactor sees
 // them as it sees a run's values. It redacts SideInfo's "details" one level further, as an
-// event's details. It redacts SideInfo's "reads" with redactStateValues and iterations, as an
-// execution's reads in events. It redacts the inputs, reads, writes, details and run context
+// event's details. It redacts SideInfo's "reads" with redactStateValues and evaluationNumbers, as
+// an execution's reads in events. It redacts the inputs, reads, writes, details and run context
 // attributes of each PipelineTrace in its Trace as an event's. It also redacts the tool calls of
 // their steps as an event's. Then it removes the text of every value that the redactors change from every
 // string in them, errors and attributes included. Those values include the values, details and
@@ -280,7 +321,7 @@ func (e evaluationRedaction) apply(item EvaluationItem) EvaluationItem {
 			case isMap && name == "details":
 				sideInfo[name] = run.redactEntries(details)
 			case isMap && name == "reads":
-				sideInfo[name] = run.redactStateValues(details, e.iterations)
+				sideInfo[name] = run.redactStateValues(details, e.numbers())
 			case isPrediction && (name == "inputs" || name == "expected"):
 				sideInfo[name] = run.redactTyped(example, e.types)
 			default:
@@ -327,7 +368,7 @@ func (r *runObservation) redactTyped(values Prediction, types map[string]reflect
 	out := make(Prediction, len(values))
 	for key, value := range values {
 		if typ := types[key]; typ != nil {
-			if converted, err := convertStateValue(key, typ, value); err == nil {
+			if converted, err := convertValue(key, typ, value, fromState); err == nil {
 				value = converted
 			}
 		}

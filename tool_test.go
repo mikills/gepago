@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -302,4 +304,58 @@ func TestCanonicalToolArguments(t *testing.T) {
 
 	_, err = canonicalToolArguments(`"text"`)
 	require.EqualError(t, err, "arguments are a string, not a JSON object")
+}
+
+// failingMarshal has a MarshalJSON that fails.
+type failingMarshal struct{}
+
+func (failingMarshal) MarshalJSON() ([]byte, error) { return nil, errors.New("boom") }
+
+// pointerMarshal has a MarshalJSON on its pointer.
+type pointerMarshal struct{ Value int }
+
+func (p *pointerMarshal) MarshalJSON() ([]byte, error) { return []byte(`"pointer"`), nil }
+
+func TestToolEncodesWriteWhatJSONMarshalWrites(t *testing.T) {
+	type mixed struct {
+		Text    string            `json:"text"`
+		List    []int             `json:"list"`
+		Map     map[string]int    `json:"map,omitempty"`
+		When    time.Time         `json:"when"`
+		Raw     json.RawMessage   `json:"raw"`
+		Value   pointerMarshal    `json:"value"`
+		Pointer *pointerMarshal   `json:"pointer"`
+		Any     any               `json:"any"`
+		Keys    map[int]string    `json:"keys"`
+		Nested  map[string][]bool `json:"nested"`
+		Message Message           `json:"message"`
+	}
+	values := []any{
+		mixed{
+			Text:    "<a & b> ",
+			When:    time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC),
+			Raw:     json.RawMessage(`{"z": 1, "a": [1, 2]}`),
+			Pointer: &pointerMarshal{},
+			Any:     map[string]any{"b": 1, "a": []any{nil}},
+			Keys:    map[int]string{2: "x", 1: "y"},
+			Message: Message{Role: RoleUser, Parts: []Part{{Text: "hi"}}},
+		},
+		[]mixed{{}}, nil, "x<y", math.NaN(), failingMarshal{}, map[string]any{"f": func() {}}, Image{}, make(chan int),
+	}
+	for _, value := range values {
+		want, wantErr := json.Marshal(value)
+		output, outputErr := encodeToolOutput("t", value)
+		arguments, argumentsErr := encodeToolArguments(map[string]any{"value": value})
+		wantArguments, wantArgumentsErr := json.Marshal(map[string]any{"value": value})
+
+		require.Equal(t, string(want), string(output), "%T", value)
+		require.Equal(t, string(wantArguments), string(arguments), "%T", value)
+		if wantErr != nil {
+			require.EqualError(t, outputErr, fmt.Sprintf("encode tool output %T: %v", value, wantErr))
+			require.EqualError(t, argumentsErr, wantArgumentsErr.Error())
+		} else {
+			require.NoError(t, outputErr)
+			require.NoError(t, argumentsErr)
+		}
+	}
 }

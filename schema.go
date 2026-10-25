@@ -19,9 +19,11 @@ import (
 //   - every property is listed in required, as strict providers need; a field tagged
 //     omitempty or omitzero, which Get lets the reply omit, is nullable instead;
 //   - a pointer, slice, map or interface admits null, as Get does; other types do not;
-//   - a type with its own UnmarshalJSON, UnmarshalJSONFrom or UnmarshalText, an interface, and
-//     a struct that contains itself are unconstrained ({}), since their JSON form is not known;
-//     json.Number is a string, as before Go 1.27 gave it UnmarshalJSONFrom;
+//   - an Image and a *Image have the type null. JSON holds no image data, so only null decodes
+//     into an Image.
+//   - any other type with its own UnmarshalJSON, UnmarshalJSONFrom or UnmarshalText has the
+//     schema {}, since its JSON form is not known. So do an interface and a struct that contains
+//     itself. But json.Number is a string, as it was before Go 1.27 gave it UnmarshalJSONFrom.
 //   - []byte is a (base64) string, a map is an object whose additionalProperties hold the
 //     element schema, and an array [N]T has exactly N items (minItems and maxItems);
 //   - a field with the ",string" tag option is a string with a pattern for the JSON encoding
@@ -120,23 +122,56 @@ func unconstrainedJSON(schema json.RawMessage) bool {
 	return true
 }
 
+// nullJSON reports whether a JSON schema object admits only null: the type null, with annotations
+// at most.
+func nullJSON(schema json.RawMessage) bool {
+	var object map[string]any
+	if err := json.Unmarshal(schema, &object); err != nil || object["type"] != "null" {
+		return false
+	}
+	for key := range object {
+		if key != "type" && key != "description" && key != "title" {
+			return false
+		}
+	}
+	return true
+}
+
 func typeNode(name string) schemaNode {
 	return schemaNode{{key: "type", value: name}}
 }
 
 // nullableSchema returns a schema that admits null as well as what node admits. An
-// unconstrained node already admits null and is returned as it is.
+// unconstrained node and a node of the type null already admit null, so it returns them as they
+// are.
 func nullableSchema(node schemaNode) schemaNode {
-	if !node.constrained() {
+	if !node.constrained() || nullNode(node) {
 		return node
 	}
 	return schemaNode{{key: "anyOf", value: []any{node, typeNode("null")}}}
 }
 
-// schemaBuilder converts Go types to schemas. expanding holds the structs being expanded, so
-// a struct that contains itself becomes unconstrained instead of recursing forever.
+// nullNode reports whether node admits only null: the type null, with annotations at most.
+func nullNode(node schemaNode) bool {
+	typed := false
+	for _, keyword := range node {
+		switch {
+		case keyword.key == "type" && keyword.value == "null":
+			typed = true
+		case keyword.key != "description" && keyword.key != "title":
+			return false
+		}
+	}
+	return typed
+}
+
+// schemaBuilder converts Go types to schemas. expanding holds the structs that it expands now. So a
+// struct that contains itself gets the schema {} instead of recursing forever. An Image decodes
+// only from null, so its schema is the type null. With imageInputs the builder gives it the schema
+// {} instead, as the inputs of a prompt describe it. There an image is the label "[image N]".
 type schemaBuilder struct {
-	expanding map[reflect.Type]bool
+	expanding   map[reflect.Type]bool
+	imageInputs bool
 }
 
 func newSchemaBuilder() *schemaBuilder {
@@ -146,6 +181,14 @@ func newSchemaBuilder() *schemaBuilder {
 // typeSchema returns the schema of the JSON values that decode into typ, without null, and
 // whether null decodes into typ too. path names the value in errors.
 func (b *schemaBuilder) typeSchema(typ reflect.Type, path string) (schemaNode, bool, error) {
+	if !b.imageInputs {
+		switch {
+		case typ == imageType:
+			return typeNode("null"), false, nil
+		case typ.Kind() == reflect.Pointer && typ.Elem() == imageType:
+			return typeNode("null"), true, nil
+		}
+	}
 	if customJSON(typ) {
 		return schemaNode{}, nillable(typ), nil
 	}

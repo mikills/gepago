@@ -814,7 +814,7 @@ func buildDefaults(defaults []Default, inputs map[string]reflect.Type) (map[stri
 		if _, ok := built[name]; ok {
 			return nil, fmt.Errorf("default for %q is duplicated", name)
 		}
-		value, err := convertStateValue(name, def.Key.Type, def.Value)
+		value, err := convertValue(name, def.Key.Type, def.Value, fromState)
 		if err != nil {
 			return nil, fmt.Errorf("default for %q: %w", name, err)
 		}

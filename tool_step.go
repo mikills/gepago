@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"encoding/json/jsontext"
-	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"reflect"
@@ -31,7 +29,8 @@ import (
 // Tool arguments travel as JSON, and the JSON form of an Image holds no image data. So Build
 // refuses a read whose type is Image, or reaches Image only through pointers, slices, arrays and
 // map values, such as []*Image. A read of another type can hold an Image in a struct field. When
-// its value holds an Image from NewImage, the step fails with a Permanent error. The error names
+// its value holds an Image from NewImage, the step fails with a Permanent error. So does a value
+// whose MarshalJSON writes the summary of an Image it embeds (see imageRefusal). The error names
 // the key and the Go type of its value. A zero Image encodes as null.
 func ToolStep(name, tool string, reads, writes []KeyRef) Step {
 	return &toolStep{
@@ -70,25 +69,6 @@ func (s *toolStep) Validate() error {
 		}
 	}
 	return nil
-}
-
-// imageChain reports whether typ is Image, or reaches Image through pointers, slices, arrays and
-// map values alone.
-func imageChain(typ reflect.Type) bool {
-	seen := map[reflect.Type]bool{}
-	for !seen[typ] {
-		if typ == imageType {
-			return true
-		}
-		seen[typ] = true
-		switch typ.Kind() {
-		case reflect.Pointer, reflect.Slice, reflect.Array, reflect.Map:
-			typ = typ.Elem()
-		default:
-			return false
-		}
-	}
-	return false
 }
 
 // namedTools returns the tool the step calls.
@@ -219,7 +199,7 @@ func (s *toolStep) Run(ctx context.Context, state State) error {
 		value, ok := outputs[key.Name]
 		if !ok {
 			err = fmt.Errorf("%w: tool %q output has no field %q", ErrInvalidOutput, s.tool, key.Name)
-		} else if value, err = convertTextValue(key.Name, key.Type, value); err != nil {
+		} else if value, err = convertValue(key.Name, key.Type, value, fromText); err != nil {
 			err = fmt.Errorf("%w: tool %q output: %w", ErrInvalidOutput, s.tool, err)
 		}
 		if err != nil {
@@ -232,27 +212,18 @@ func (s *toolStep) Run(ctx context.Context, state State) error {
 
 // encodeToolArguments encodes args, the value of each read under its key, as json.Marshal does.
 // The JSON form of an Image holds no image data. So an Image from NewImage in a value fails the
-// encode with a Permanent error. The error names the key and the Go type of the value. A zero
-// Image encodes as null.
+// encode with a Permanent error. So does a value that promotes the MarshalJSON of an Image it
+// embeds (see imageRefusal). The error names the key and the Go type of the value. A zero Image
+// encodes as null.
 func encodeToolArguments(args map[string]any) ([]byte, error) {
-	var at jsontext.Pointer
-	holdsImage := false
-	refuse := jsonv2.MarshalToFunc(func(enc *jsontext.Encoder, image Image) error {
-		if image.Validate() != nil {
-			return errors.ErrUnsupported
-		}
-		if !holdsImage {
-			holdsImage, at = true, enc.StackPointer()
-		}
-		return ErrInvalidImage
-	})
-	arguments, err := jsonv2.Marshal(args, json.DefaultOptionsV1(), jsonv2.WithMarshalers(refuse))
-	if !holdsImage {
+	var refusal imageRefusal
+	arguments, err := refusal.encode(args)
+	if !refusal.found {
 		return arguments, err
 	}
 	// args is an object, so the first token of the image's place is the key that holds it.
 	key := ""
-	for token := range at.Tokens() {
+	for token := range refusal.at.Tokens() {
 		key = token
 		break
 	}

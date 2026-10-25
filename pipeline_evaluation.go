@@ -25,8 +25,8 @@ const maxProgramDepth = 32
 // one holds no more than it would without the capture. A Redactor that joins when its pipeline
 // runs applies only to values offered after it joined. known holds the pipelines that the capture
 // has accounted for, by their first step. mapSteps holds one Map of each shape in shapes. So a
-// programme that builds a pipeline on each run does not add a Map per run. iterations holds the
-// iteration numbers that the Loops gave.
+// programme that builds a pipeline on each run does not add a Map per run. iterations holds, for
+// each iteration key, the highest number that a Loop gave under it.
 type evaluationCapture struct {
 	recorder   *RecordingObserver
 	mu         sync.Mutex
@@ -38,7 +38,7 @@ type evaluationCapture struct {
 	values     []stateWrite
 	details    []stateWrite
 	toolCalls  []ToolCallRecord
-	iterations iterationNumbers
+	iterations map[string]int
 }
 
 // newEvaluationCapture returns a capture holding the Redactors and key types of every Pipeline
@@ -210,14 +210,17 @@ func (c *evaluationCapture) offerStep(writes []stateWrite, err error) {
 
 // offerIteration keeps number, the number of an iteration of a Loop with the iteration key key.
 // Reflection then records no text forms of the iteration numbers that steps read (see
-// runObservation.redactStateValues).
+// evaluationNumbers).
 func (c *evaluationCapture) offerIteration(key string, number int) {
-	if c == nil {
+	if c == nil || key == "" {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.iterations = c.iterations.with(key, number)
+	if c.iterations == nil {
+		c.iterations = map[string]int{}
+	}
+	c.iterations[key] = max(c.iterations[key], number)
 }
 
 // offerToolCalls keeps the tool calls an execution made, when the capture has a Redactor.

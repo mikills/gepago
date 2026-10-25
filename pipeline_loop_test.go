@@ -1715,23 +1715,37 @@ func TestLoopRedactorThatHidesTheIterationKeepsNumbersInErrorText(t *testing.T) 
 	require.NotContains(t, report, "iteration 3</span>")
 }
 
-func TestIterationNumbersHoldOnlyTheNumbersOfTheirKeys(t *testing.T) {
+func TestIterationNumbersHoldOnlyTheRunningNumberAsAnInt(t *testing.T) {
 	numbers := iterationNumbers{}.with("page", 3).with("round", 1).with("page", 2).with("", 9)
 
-	require.Equal(t, iterationNumbers{"page": 3, "round": 1}, numbers)
-	for _, value := range []any{1, 3, int64(2), uint8(1), 2.0, json.Number("3"), "2"} {
-		require.True(t, numbers.holds("page", value), "%T %v", value, value)
-	}
-	for _, value := range []any{0, 4, -1, 2.5, "03", " 2", "T-77", true, []int{1}, nil} {
+	require.Equal(t, iterationNumbers{"page": 2, "round": 1}, numbers, "the running number replaces the last")
+	require.True(t, numbers.holds("page", 2))
+	for _, value := range []any{1, 3, int64(2), uint8(2), 2.0, json.Number("2"), "2", nil} {
 		require.False(t, numbers.holds("page", value), "%T %v", value, value)
 	}
 	require.False(t, numbers.holds("count", 1), "a key that no Loop numbers")
+	require.Equal(t, iterationNumbers{"round": 1}, numbers.without("page"))
+	require.Equal(t, iterationNumbers{"page": 2, "round": 1}, numbers, "without copies")
+	require.Equal(t, numbers, numbers.without("count"))
 
 	values := map[string]any{"page": 2, "round": "secret", "count": 1}
-	require.Equal(t, map[string]any{"round": "secret", "count": 1}, numbers.without(values))
-	require.Equal(t, map[string]any{"page": 2, "round": "secret", "count": 1}, values, "without copies")
+	require.Equal(t, iterationNumbers{"page": 2}, numbers.inputs(values))
+	require.Nil(t, numbers.inputs(map[string]any{"page": 3}))
+	require.Equal(t, map[string]any{"round": "secret", "count": 1}, numbers.ordinary(values))
+	require.Equal(t, map[string]any{"page": 2, "round": "secret", "count": 1}, values, "ordinary copies")
 	unchanged := map[string]any{"count": 1}
-	require.Equal(t, unchanged, iterationNumbers(nil).without(unchanged))
+	require.Equal(t, unchanged, iterationNumbers(nil).ordinary(unchanged))
+}
+
+func TestMapElementDropsTheIterationNumberOfItsItemKey(t *testing.T) {
+	ctx := withIteration(context.Background(), "page", 3)
+
+	element := withoutIterationNumber(ctx, "page")
+
+	require.Empty(t, iterationFrom(element).numbers)
+	require.Equal(t, 3, iterationFrom(element).number)
+	require.Equal(t, iterationNumbers{"page": 3}, iterationFrom(ctx).numbers, "the iteration keeps its number")
+	require.Equal(t, ctx, withoutIterationNumber(ctx, "count"))
 }
 
 func TestLoopRedactorHidesTheIterationAttributes(t *testing.T) {
