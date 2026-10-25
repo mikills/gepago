@@ -5,9 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
+	"strconv"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -302,4 +305,184 @@ func TestCanonicalToolArguments(t *testing.T) {
 
 	_, err = canonicalToolArguments(`"text"`)
 	require.EqualError(t, err, "arguments are a string, not a JSON object")
+}
+
+// failingMarshal has a MarshalJSON that fails.
+type failingMarshal struct{}
+
+func (failingMarshal) MarshalJSON() ([]byte, error) { return nil, errors.New("boom") }
+
+// pointerMarshal has a MarshalJSON on its pointer.
+type pointerMarshal struct{ Value int }
+
+func (p *pointerMarshal) MarshalJSON() ([]byte, error) { return []byte(`"pointer"`), nil }
+
+func TestToolEncodesWriteWhatJSONMarshalWrites(t *testing.T) {
+	type mixed struct {
+		Text    string            `json:"text"`
+		List    []int             `json:"list"`
+		Map     map[string]int    `json:"map,omitempty"`
+		When    time.Time         `json:"when"`
+		Raw     json.RawMessage   `json:"raw"`
+		Value   pointerMarshal    `json:"value"`
+		Pointer *pointerMarshal   `json:"pointer"`
+		Any     any               `json:"any"`
+		Keys    map[int]string    `json:"keys"`
+		Nested  map[string][]bool `json:"nested"`
+		Message Message           `json:"message"`
+	}
+	values := []any{
+		mixed{
+			Text:    "<a & b> ",
+			When:    time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC),
+			Raw:     json.RawMessage(`{"z": 1, "a": [1, 2]}`),
+			Pointer: &pointerMarshal{},
+			Any:     map[string]any{"b": 1, "a": []any{nil}},
+			Keys:    map[int]string{2: "x", 1: "y"},
+			Message: Message{Role: RoleUser, Parts: []Part{{Text: "hi"}}},
+		},
+		[]mixed{{}}, nil, "x<y", math.NaN(), failingMarshal{}, map[string]any{"f": func() {}}, Image{}, make(chan int),
+	}
+	for _, value := range values {
+		want, wantErr := json.Marshal(value)
+		output, outputErr := encodeToolOutput("t", value)
+		arguments, argumentsErr := encodeToolArguments(map[string]any{"value": value})
+		wantArguments, wantArgumentsErr := json.Marshal(map[string]any{"value": value})
+
+		require.Equal(t, string(want), string(output), "%T", value)
+		require.Equal(t, string(wantArguments), string(arguments), "%T", value)
+		if wantErr != nil {
+			require.EqualError(t, outputErr, fmt.Sprintf("encode tool output %T: %v", value, wantErr))
+			require.EqualError(t, argumentsErr, wantArgumentsErr.Error())
+		} else {
+			require.NoError(t, outputErr)
+			require.NoError(t, argumentsErr)
+		}
+	}
+}
+
+// timesTool is a text-only tool whose output holds 100,000 values that have their own JSON
+// methods.
+func timesTool() ToolProvider {
+	times := make([]time.Time, 100_000)
+	for i := range times {
+		times[i] = time.Unix(int64(i), 0).UTC()
+	}
+	return NewTool("times", "List times", func(context.Context, struct{}) ([]time.Time, error) { return times, nil })
+}
+
+func TestToolEncodesTextOnlyOutputWithoutAnAllocationPerValue(t *testing.T) {
+	tool := timesTool()
+	call := ToolCall{Name: "times", Arguments: `{}`}
+
+	allocs := testing.AllocsPerRun(5, func() {
+		if _, err := tool.Invoke(context.Background(), call); err != nil {
+			panic(err)
+		}
+	})
+
+	require.Less(t, allocs, 1000.0, "the image check looks at Image values only, not at each value with a method")
+}
+
+func BenchmarkToolEncodesTextOnlyOutput(b *testing.B) {
+	tool := timesTool()
+	call := ToolCall{Name: "times", Arguments: `{}`}
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := tool.Invoke(context.Background(), call); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkEncodeToolOutputSmallStruct compares encodeToolOutput with json.Marshal, which v0.9.0
+// called, on a small text-only struct.
+func BenchmarkEncodeToolOutputSmallStruct(b *testing.B) {
+	out := struct {
+		Name  string `json:"name"`
+		Count int    `json:"count"`
+		OK    bool   `json:"ok"`
+	}{Name: "total", Count: 3, OK: true}
+	b.Run("json.Marshal", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := json.Marshal(out); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("encodeToolOutput", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := encodeToolOutput("t", out); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+// BenchmarkEncodeToolArguments compares encodeToolArguments with json.Marshal, which v0.9.0
+// called, on the text-only arguments of a ToolStep.
+func BenchmarkEncodeToolArguments(b *testing.B) {
+	args := map[string]any{"query": "find the total", "limit": 10, "tags": []string{"a", "b"}}
+	b.Run("json.Marshal", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := json.Marshal(args); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("encodeToolArguments", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := encodeToolArguments(args); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+// BenchmarkEncodeTextOnlyValues compares encodeToolOutput and encodeToolArguments with
+// json.Marshal, which v0.9.0 called, on text-only messages, a []any and a map[string]any.
+func BenchmarkEncodeTextOnlyValues(b *testing.B) {
+	messages := make([]Message, 5000)
+	for i := range messages {
+		messages[i] = Message{Role: RoleUser, Content: "message " + strconv.Itoa(i)}
+	}
+	values := make([]any, 20_000)
+	for i := range values {
+		values[i] = map[string]any{"id": i, "ok": true}
+	}
+	objects := make(map[string]any, 2000)
+	for i := range 2000 {
+		objects["key "+strconv.Itoa(i)] = map[string]any{"id": i}
+	}
+	for name, value := range map[string]any{"messages": messages, "any slice": values, "map": objects} {
+		b.Run(name+"/json.Marshal", func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := json.Marshal(value); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+		b.Run(name+"/encodeToolOutput", func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := encodeToolOutput("t", value); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+		b.Run(name+"/encodeToolArguments", func(b *testing.B) {
+			args := map[string]any{"value": value}
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := encodeToolArguments(args); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
 }

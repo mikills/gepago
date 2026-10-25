@@ -147,6 +147,14 @@ func (s programStep) Validate() error {
 	return matchKeyTypes("writes", s.writes, "returns", signature.OutputTypes)
 }
 
+// namedTools returns the tools the programme names, such as a Predict's Tools.
+func (s programStep) namedTools() []string {
+	if namer, ok := s.program.(toolNamer); ok {
+		return namer.namedTools()
+	}
+	return nil
+}
+
 // bindTools binds the tools and chat middleware the programme names, such as a Predict's Tools.
 func (s programStep) bindTools(registry *ToolRegistry, policy ToolPolicy) error {
 	if binder, ok := s.program.(toolBinder); ok {
@@ -245,7 +253,8 @@ func (s programStep) RunCandidate(ctx context.Context, candidate Candidate, stat
 }
 
 // programOutput converts the output for key to the key's type. An optional output that is
-// absent or null becomes the zero value of the key's type.
+// absent or null becomes the zero value of the key's type. The output can be a model's reply, so
+// an image error names nothing of the value (see valueSource).
 func programOutput(outputs Prediction, key KeyRef, optional bool) (any, error) {
 	value, ok := outputs[key.Name]
 	switch {
@@ -256,7 +265,7 @@ func programOutput(outputs Prediction, key KeyRef, optional bool) (any, error) {
 	case value == nil:
 		return nil, fmt.Errorf("%w: %q is null", ErrInvalidOutput, key.Name)
 	}
-	converted, err := convertStateValue(key.Name, key.Type, value)
+	converted, err := convertValue(key.Name, key.Type, value, fromText)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidOutput, err)
 	}
@@ -328,16 +337,16 @@ type PipelineSpec struct {
 	// Budget limits every run of the pipeline; the zero value sets no limits.
 	Budget           RunBudget
 	AllowExtraInputs bool
-	// Tools holds the tools and chat middleware that ToolSteps and Predict steps name. Build
-	// binds every name and fails on one that is not registered, and on a Predict or
-	// TypedPredict step that sets a ToolRegistry other than Tools, since every tool call of a
-	// run goes through the run's one ToolSession. Its ToolMemory is the one the run's context
-	// carries (see WithToolMemory) or a new one; each step's memory writes reach it only when
-	// the step's state writes commit (see ToolMemory), and so do the results the step adds to
-	// the session's cache under ToolPolicy.Cache, so a retry or a later step, such as a Fallback's, that
-	// repeats a call of a failed step invokes the tool again. Within one step execution a
-	// repeated call is answered from the results that execution and the steps it runs inside
-	// staged.
+	// Tools holds the tools and chat middleware that ToolSteps and Predict steps name, and the
+	// tool middleware that ToolMiddleware names. Build binds every name and fails on one that is
+	// not registered. Every tool call of a run goes through the run's one ToolSession. So Build
+	// also fails on a Predict or TypedPredict step that sets a ToolRegistry other than Tools. Its
+	// ToolMemory is the one the run's context carries (see WithToolMemory) or a new one. Each
+	// step's memory writes reach it only when the step's state writes commit (see ToolMemory).
+	// The results that the step adds to the session's cache under ToolPolicy.Cache reach it in
+	// the same way. So a retry or a later step that repeats a call of a failed step, such as a
+	// Fallback's, invokes the tool again. Within one step execution, the results that the
+	// execution and the steps around it staged answer a repeated call.
 	Tools *ToolRegistry
 	// ToolPolicy governs every tool call made during a run: those of its ToolSteps and Predict
 	// steps, which call through the run's session, and those of sessions started inside the
@@ -352,6 +361,17 @@ type PipelineSpec struct {
 	// that names a tool the policy does not allow, and a Predict or TypedPredict step that sets
 	// a ToolPolicy of its own.
 	ToolPolicy ToolPolicy
+	// ToolMiddleware names tool middleware from Tools, outermost first. It wraps every tool call
+	// that the run's own session makes. Those are the calls of the run's ToolSteps and Predict
+	// steps. It also wraps the calls of a Predict in a nested pipeline run that has a
+	// ToolPolicy but no Tools. A session that starts inside the run uses only its own tool
+	// middleware (see ToolMiddleware). An agent's session and that of a nested pipeline with
+	// Tools are such sessions. Build fails on a name that is not registered, a repeated name and
+	// ToolMiddleware without Tools. Build also applies the middleware to each tool that the steps
+	// name. It fails when the middleware panics, returns nil or changes the schema of such a
+	// tool. A run applies the middleware to each tool on the first call of the tool in the run.
+	// If that fails, only the calls to that tool fail.
+	ToolMiddleware []string
 	// Observers receive the events of every run, in this order; see PipelineObserver.
 	Observers []PipelineObserver
 	// Redactor rewrites the values events carry; see Redactor. Nil lets them through.
@@ -375,6 +395,7 @@ type Pipeline struct {
 	budget           RunBudget
 	tools            *ToolRegistry
 	toolPolicy       ToolPolicy
+	toolMiddleware   []string
 	observers        []PipelineObserver
 	redactor         Redactor
 	// optional holds, for each programme step, the outputs its signature marked Optional when
@@ -382,18 +403,32 @@ type Pipeline struct {
 	optional map[string]map[string]bool
 }
 
-// keySource records the type of an available key and where it comes from: a step, the first
-// that writes it, or else a pipeline input, or a Default when def is set.
+// keySource records the type of an available key and where the key comes from. step names the
+// first step that writes the key. Without such a step, a pipeline input gives the key, or a
+// Default when def is true. view, when not empty, says that step holds the key only in the views
+// of the steps nested in it. It is viewItem for a Map's item and viewIteration for a Loop's iteration key.
 type keySource struct {
 	typ     reflect.Type
 	step    string
 	def     bool
 	writers int
+	view    string
 }
+
+const (
+	viewItem      = "item"
+	viewIteration = "iteration"
+)
 
 // describe names where a key from a step or a pipeline input comes from; Build words a
 // mismatch with a Default itself.
 func (s keySource) describe(key string) string {
+	switch s.view {
+	case viewItem:
+		return fmt.Sprintf("Map %q holds each element under it as %s", s.step, s.typ)
+	case viewIteration:
+		return fmt.Sprintf("Loop %q numbers its iterations with it as %s", s.step, s.typ)
+	}
 	if s.step != "" {
 		return fmt.Sprintf("step %q writes it as %s", s.step, s.typ)
 	}
@@ -412,14 +447,16 @@ func (s keySource) describe(key string) string {
 // that always writes, and every read must be guaranteed. Build makes one pass over the
 // transitions and then one over the steps; it never enumerates paths.
 //
-// Steps nested in WithPolicy, WithCache, WithAmendable, Parallel, Map and MapCollect are checked
-// by the same rules against the keys available before the top-level step that contains them,
-// a Map's body also seeing the Map's item (see Map), and every step name, nested ones included,
-// must be unique.
+// Build checks the steps nested in WithPolicy, WithCache, WithAmendable, Parallel, Map, MapCollect
+// and Loop by the same rules. It checks them against the keys available before the top-level step
+// that contains them. A Map's body also sees the Map's item (see Map), and a Loop's body its
+// iteration key (see Loop). Every step name, nested ones included, must be unique. A Loop needs a
+// cap.
 //
-// Every tool and chat middleware that a ToolStep, or a Predict or TypedPredict run by
-// NewProgramStep, names must be registered on Tools, and every such tool allowed by
-// ToolPolicy; a ToolStep's keys must also fit its tool (see ToolStep).
+// Tools must hold every tool and chat middleware that a ToolStep names. It must also hold those
+// that a Predict or TypedPredict names when NewProgramStep runs it. ToolPolicy must allow every
+// such tool. A ToolStep's keys must also fit its tool (see ToolStep). Build checks
+// ToolMiddleware as its documentation says.
 func (s PipelineSpec) Build() (Pipeline, error) {
 	return s.build(nil)
 }
@@ -445,13 +482,8 @@ func (s PipelineSpec) build(work *int) (Pipeline, error) {
 	if err := s.Budget.validate(); err != nil {
 		return Pipeline{}, err
 	}
-	if err := s.ToolPolicy.check(registered(s.Tools)); err != nil {
-		return Pipeline{}, fmt.Errorf("pipeline %w", err)
-	}
-	for i, observer := range s.Observers {
-		if isNil(observer) {
-			return Pipeline{}, fmt.Errorf("pipeline observer %d is nil", i)
-		}
+	if err := s.checkToolsAndObservers(); err != nil {
+		return Pipeline{}, err
 	}
 	steps := make([]*stepNode, len(s.Steps))
 	index := make(map[string]int, len(s.Steps))
@@ -503,6 +535,9 @@ func (s PipelineSpec) build(work *int) (Pipeline, error) {
 	if err := builder.checkBudget(s.Budget, steps, index); err != nil {
 		return Pipeline{}, err
 	}
+	if err := s.wrapNamedTools(builder.namedTools); err != nil {
+		return Pipeline{}, err
+	}
 	defaultValues := make(map[string]any, len(defaults))
 	for name, def := range defaults {
 		defaultValues[name] = def.Value
@@ -518,10 +553,58 @@ func (s PipelineSpec) build(work *int) (Pipeline, error) {
 		budget:           s.Budget.clone(),
 		tools:            s.Tools,
 		toolPolicy:       s.ToolPolicy.clone(),
+		toolMiddleware:   slices.Clone(s.ToolMiddleware),
 		optional:         builder.optional,
 		observers:        slices.Clone(s.Observers),
 		redactor:         s.Redactor,
 	}, nil
+}
+
+// checkToolsAndObservers checks ToolPolicy and ToolMiddleware against Tools and refuses a nil observer.
+func (s PipelineSpec) checkToolsAndObservers() error {
+	if err := s.ToolPolicy.check(registered(s.Tools)); err != nil {
+		return fmt.Errorf("pipeline %w", err)
+	}
+	if err := s.checkToolMiddleware(); err != nil {
+		return err
+	}
+	for i, observer := range s.Observers {
+		if isNil(observer) {
+			return fmt.Errorf("pipeline observer %d is nil", i)
+		}
+	}
+	return nil
+}
+
+// checkToolMiddleware checks the names in ToolMiddleware against Tools.
+func (s PipelineSpec) checkToolMiddleware() error {
+	if len(s.ToolMiddleware) == 0 {
+		return nil
+	}
+	if s.Tools == nil {
+		return fmt.Errorf("pipeline ToolMiddleware %q needs a tool registry in PipelineSpec.Tools", s.ToolMiddleware)
+	}
+	if err := s.Tools.checkToolMiddleware(s.ToolMiddleware); err != nil {
+		return fmt.Errorf("pipeline %w", err)
+	}
+	return nil
+}
+
+// wrapNamedTools applies ToolMiddleware to each tool the steps name, in name order.
+func (s PipelineSpec) wrapNamedTools(named map[string]bool) error {
+	if len(s.ToolMiddleware) == 0 {
+		return nil
+	}
+	for _, name := range slices.Sorted(maps.Keys(named)) {
+		provider, ok := s.Tools.Lookup(name)
+		if !ok {
+			continue
+		}
+		if _, err := s.Tools.WrapTool(provider, s.ToolMiddleware...); err != nil {
+			return fmt.Errorf("pipeline %w", err)
+		}
+	}
+	return nil
 }
 
 func stateKeyTypes(keys []KeyRef) (map[string]reflect.Type, error) {
@@ -556,10 +639,10 @@ func isNil(value any) bool {
 // state accumulated by the steps before it. Details holds diagnostics the step attached with
 // WithStepDetails; a step that panicked has the stack under "stack".
 //
-// When a step nested in a composite step (a Parallel or the body of a Map)
-// fails, the composite's StepError wraps a StepError for the nested step, so the message
-// names each step from the top-level one down, with a Map's element index between the two, and
-// Details holds the innermost diagnostics.
+// A step can fail inside a Parallel or in the body of a Map or a Loop. Then the composite's
+// StepError wraps a StepError for that step. So the message names each step from the top-level one
+// down. A Map's element index or a Loop's iteration comes between the two. Details holds the
+// innermost diagnostics.
 //
 // Reads holds copies of the values of the step's declared reads that were in state when it
 // ran, for diagnosis and reflection; Error does not print them. A PipelineTrace and its run
@@ -571,6 +654,9 @@ type StepError struct {
 	Err     error
 	Details map[string]any
 	Reads   map[string]any
+	// numbers holds the iteration numbers that were in effect where the step ran. So reflection
+	// tells an iteration number among Reads as the step's events do.
+	numbers iterationNumbers
 }
 
 func (e *StepError) Error() string {
@@ -690,7 +776,7 @@ func (p Pipeline) execute(ctx context.Context, candidate Candidate, inputs Predi
 		if !ok {
 			return State{}, nil, fmt.Errorf("pipeline input %q is missing", key.Name)
 		}
-		converted, err := convertStateValue(key.Name, key.Type, value)
+		converted, err := convertValue(key.Name, key.Type, value, fromState)
 		if err != nil {
 			return State{}, nil, fmt.Errorf("invalid pipeline input: %w", err)
 		}
@@ -703,7 +789,11 @@ func (p Pipeline) execute(ctx context.Context, candidate Candidate, inputs Predi
 	ctx, release := startRunBudget(context.WithValue(ctx, pipelineRunKey{}, run), p.budget)
 	defer release()
 	if p.tools != nil || !p.toolPolicy.isZero() {
-		session, err := NewToolSession(p.tools.providers(), p.toolPolicy, ToolMemoryFrom(ctx))
+		providers := p.tools.providers()
+		if len(p.toolMiddleware) > 0 {
+			providers = p.tools.wrapOnFirstCall(providers, p.toolMiddleware)
+		}
+		session, err := NewToolSession(providers, p.toolPolicy, ToolMemoryFrom(ctx))
 		if err != nil {
 			return State{}, nil, err
 		}
@@ -712,6 +802,7 @@ func (p Pipeline) execute(ctx context.Context, candidate Candidate, inputs Predi
 		env := &toolEnv{registry: p.tools, session: session, parent: toolEnvFrom(ctx)}
 		ctx = withToolEnv(WithToolMemory(ctx, session.Memory()), env)
 	}
+	ctx = withRunNumbers(ctx, values)
 	ctx, observed := p.observeRun(ctx, caller, values, rc)
 	// each run seeds its own copy of every default, after RunStarted reported the inputs.
 	defaulted := make(map[string]bool, len(p.defaults))
@@ -784,7 +875,7 @@ func (p Pipeline) mergeWrites(node *stepNode, result stepResult, values map[stri
 			if err != nil {
 				return nil, fmt.Errorf("merge state key %q: %w", key, err)
 			}
-			if next, err = convertStateValue(key, node.writeTypes[key], merged); err != nil {
+			if next, err = convertValue(key, node.writeTypes[key], merged, fromState); err != nil {
 				return nil, err
 			}
 		}

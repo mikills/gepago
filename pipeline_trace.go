@@ -65,9 +65,9 @@ type StepTrace struct {
 	// nested in them too. The executions of different lanes of a
 	// Parallel ran side by side, so they may have started in any order.
 	Lane string `json:"lane,omitempty"`
-	// Attributes are the execution's, as StepStartedEvent reported them, such as its "visit" and
-	// a Map element's "index", and once it has finished as StepFinishedEvent did, with a Map's
-	// "failed".
+	// Attributes are the execution's, as StepStartedEvent reported them, such as its "visit", a Map
+	// element's "index" and a Loop iteration's "iteration". Once it has finished they are as
+	// StepFinishedEvent reported them, with a Map's "failed" and a Loop's "iterations".
 	Attributes map[string]int `json:"attributes,omitempty"`
 	// Transition is the transition the run took after this execution, the last of a top-level
 	// step's visit, as TransitionTakenEvent reported it.
@@ -79,10 +79,12 @@ type StepTrace struct {
 	// with each Output compacted as encoding/json writes it, or stored as a JSON string when it
 	// is not JSON.
 	ToolCalls []ToolCallRecord `json:"tool_calls,omitempty"`
-	// Steps holds the executions nested in this one, such as the attempts of a WithPolicy, the
-	// steps of a Parallel or the elements of a Map, in the order they started. A Map's elements
-	// start in input order only at a MaxConcurrency of zero or one, and in any order above it, so
-	// each carries its index in the list under Attributes["index"] (see PipelineObserver).
+	// Steps holds the executions nested in this one, in the order they started. They are such as
+	// the attempts of a WithPolicy, the steps of a Parallel, the elements of a Map or the
+	// iterations of a Loop. A Map's elements start in input order only at a MaxConcurrency of zero
+	// or one, and in any order above it, so each carries its index in the list under
+	// Attributes["index"] (see PipelineObserver). A Loop's iterations start in order, and each
+	// carries its number under Attributes["iteration"].
 	Steps []StepTrace `json:"steps,omitempty"`
 	// Runs holds the pipeline runs this execution started, such as the run of a pipeline
 	// adapted with NewProgramStep.
@@ -111,19 +113,27 @@ type RecordingObserver struct {
 	steps  map[string]*recordedStep
 }
 
+// recordedRun is a run that a RecordingObserver records. numbers holds each input key whose raw
+// value the run kept as an iteration number. observeRun decided it (see tracedNumbersKey). It is
+// nil when there is none.
 type recordedRun struct {
-	trace PipelineTrace
-	steps []*recordedStep
+	trace   PipelineTrace
+	steps   []*recordedStep
+	numbers iterationNumbers
 }
 
+// recordedStep is an execution that a RecordingObserver records. numbers holds each read key whose
+// raw value the execution read as an iteration number. observeStep decided it (see
+// tracedNumbersKey). It is nil when there is none.
 type recordedStep struct {
-	trace StepTrace
-	steps []*recordedStep
-	runs  []*recordedRun
+	trace   StepTrace
+	steps   []*recordedStep
+	runs    []*recordedRun
+	numbers iterationNumbers
 }
 
 // RunStarted records the start of a run.
-func (r *RecordingObserver) RunStarted(_ context.Context, event RunStartedEvent) {
+func (r *RecordingObserver) RunStarted(ctx context.Context, event RunStartedEvent) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.runs == nil {
@@ -137,7 +147,7 @@ func (r *RecordingObserver) RunStarted(_ context.Context, event RunStartedEvent)
 		RunContext: event.RunContext.clone(),
 		StartedAt:  event.Span.StartedAt,
 		Inputs:     traceValues(event.Inputs),
-	}}
+	}, numbers: tracedNumbers(ctx)}
 	r.runs[event.Span.ID] = run
 	if parent, ok := r.steps[event.Span.ParentID]; ok {
 		parent.runs = append(parent.runs, run)
@@ -147,7 +157,7 @@ func (r *RecordingObserver) RunStarted(_ context.Context, event RunStartedEvent)
 }
 
 // StepStarted records the start of a step execution.
-func (r *RecordingObserver) StepStarted(_ context.Context, event StepStartedEvent) {
+func (r *RecordingObserver) StepStarted(ctx context.Context, event StepStartedEvent) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	step := &recordedStep{trace: StepTrace{
@@ -159,7 +169,7 @@ func (r *RecordingObserver) StepStarted(_ context.Context, event StepStartedEven
 		Reads:      traceValues(event.Reads),
 		Lane:       event.Lane,
 		Attributes: traceAttributes(event.Attributes),
-	}}
+	}, numbers: tracedNumbers(ctx)}
 	if run, ok := r.runs[event.Span.ParentID]; ok {
 		run.steps = append(run.steps, step)
 	} else if parent, ok := r.steps[event.Span.ParentID]; ok {
@@ -221,6 +231,22 @@ func (r *RecordingObserver) lastStep(runID string) *recordedStep {
 	return run.steps[len(run.steps)-1]
 }
 
+// tracedNumbersKey carries the traced numbers of a run or an execution to a RecordingObserver.
+// These are the keys whose raw inputs or reads the run or the execution took as iteration numbers.
+// observeRun and observeStep decide them on the raw values, before a Redactor changes them. A
+// trace holds the redacted values as JSON decodes them, so the key alone then tells an iteration
+// number apart. The context that an observer gets holds the key. So do the contexts derived from
+// it, such as those of the steps of a run that the observer starts. The context of each event
+// replaces the key with the numbers of the event's own run or execution, or nil (see
+// observerCtx). So the numbers of an earlier event never reach a later one.
+type tracedNumbersKey struct{}
+
+// tracedNumbers returns the traced numbers that the context of an event holds, or nil.
+func tracedNumbers(ctx context.Context) iterationNumbers {
+	numbers, _ := ctx.Value(tracedNumbersKey{}).(iterationNumbers)
+	return numbers
+}
+
 // traceAttributes returns a copy of attributes, or nil when there are none.
 func traceAttributes(attributes map[string]int) map[string]int {
 	if len(attributes) == 0 {
@@ -276,6 +302,46 @@ func (r *RecordingObserver) Traces() []PipelineTrace {
 		traces = append(traces, run.snapshot())
 	}
 	return traces
+}
+
+// spanNumbers returns, for each run and execution recorded so far, by its span ID, the keys whose
+// inputs or reads it took as iteration numbers. It leaves out a span without any, and returns nil
+// when no span has any. So ProgramEvaluator tells an iteration number among a trace's reads and
+// inputs as their events did, though the traces themselves hold no numbers.
+func (r *RecordingObserver) spanNumbers() map[string]iterationNumbers {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	spans := map[string]iterationNumbers{}
+	for _, run := range r.traces {
+		run.addNumbers(spans)
+	}
+	if len(spans) == 0 {
+		return nil
+	}
+	return spans
+}
+
+// addNumbers adds the numbers of the run and of everything in it to spans, by span ID.
+func (r *recordedRun) addNumbers(spans map[string]iterationNumbers) {
+	if r.numbers != nil {
+		spans[r.trace.SpanID] = r.numbers
+	}
+	for _, step := range r.steps {
+		step.addNumbers(spans)
+	}
+}
+
+// addNumbers adds the numbers of the execution and of everything in it to spans, by span ID.
+func (s *recordedStep) addNumbers(spans map[string]iterationNumbers) {
+	if s.numbers != nil {
+		spans[s.trace.SpanID] = s.numbers
+	}
+	for _, step := range s.steps {
+		step.addNumbers(spans)
+	}
+	for _, run := range s.runs {
+		run.addNumbers(spans)
+	}
 }
 
 func (r *recordedRun) snapshot() PipelineTrace {

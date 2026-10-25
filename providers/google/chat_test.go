@@ -240,3 +240,25 @@ func TestLanguageModelChatAppliesConfiguredDefaults(t *testing.T) {
 		(*requests)[1]["generationConfig"],
 	)
 }
+
+func TestChatSendsMessageSchemasWithNullImages(t *testing.T) {
+	url, requests := recordingServer(t, okReply)
+	client, err := NewChatClient(Config{APIKey: "secret", BaseURL: url, Model: "gemini-test"})
+	require.NoError(t, err)
+	history, err := gepa.JSONSchemaFor[struct {
+		History []gepa.Message `json:"history"`
+	}]()
+	require.NoError(t, err)
+
+	_, err = client.Chat(context.Background(), gepa.ChatRequest{
+		Messages: []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}},
+		Tools:    []gepa.Tool{{Name: "history", Description: "Read a history", Parameters: history}},
+	})
+
+	require.NoError(t, err)
+	declaration := (*requests)[0]["tools"].([]any)[0].(map[string]any)["functionDeclarations"].([]any)[0]
+	sent, err := json.Marshal(declaration.(map[string]any)["parametersJsonSchema"])
+	require.NoError(t, err)
+	require.JSONEq(t, string(history), string(sent), "the tool's schema is sent as it is")
+	require.Contains(t, string(sent), `"image":{"type":"null"}`)
+}

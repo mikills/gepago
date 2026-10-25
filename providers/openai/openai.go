@@ -256,18 +256,25 @@ func classifyErrorAs(ctx context.Context, operation string, err error) error {
 // format's Strict flag. Assistant messages carry their tool calls and tool messages their
 // call's id, so a transcript round-trips.
 //
+// Chat sends a user message with Parts as content parts. The first is its Content, when it is not
+// blank. Then each part becomes a text part or an image_url part with a base64 data URL. A message
+// of another role with parts, or a part that fails gepa.Part.Validate, fails with a Permanent error
+// before Chat sends the request. When an error's text echoes the base64 data of a sent image, Chat
+// replaces that data in the error.
+//
 // Failures are classified as Generate's are, and a refusal is not an error: it becomes the
 // reply text with FinishContentFilter. A reply with no text and no tool call is an error unless
 // it stopped at the token limit or under a content policy. A reply that fails after the API
 // reported usage returns that usage with the error.
 func (m *LanguageModel) Chat(ctx context.Context, req gepa.ChatRequest) (gepa.ChatResponse, error) {
-	params, err := m.chatParams(req)
+	params, images, err := m.chatParams(req)
 	if err != nil {
 		return gepa.ChatResponse{}, gepa.PermanentError(fmt.Errorf("openai chat completion: %w", err))
 	}
 	call := providerlog.Call{Provider: "openai", Operation: "chat", Model: string(params.Model)}
 	return providerlog.Chat(ctx, m.logger, call, func() (gepa.ChatResponse, error) {
-		return m.chat(ctx, params)
+		resp, err := m.chat(ctx, params)
+		return resp, providererr.ScrubImages(err, images...)
 	})
 }
 
@@ -306,7 +313,9 @@ func (m *LanguageModel) chat(ctx context.Context, params openai.ChatCompletionNe
 	return resp, nil
 }
 
-func (m *LanguageModel) chatParams(req gepa.ChatRequest) (openai.ChatCompletionNewParams, error) {
+// chatParams converts req to the request Chat sends, and returns the base64 data of the images
+// it carries.
+func (m *LanguageModel) chatParams(req gepa.ChatRequest) (openai.ChatCompletionNewParams, []string, error) {
 	model := m.model
 	if strings.TrimSpace(req.Model) != "" {
 		model = req.Model
@@ -324,14 +333,18 @@ func (m *LanguageModel) chatParams(req gepa.ChatRequest) (openai.ChatCompletionN
 			temperature = m.temperature
 		}
 		if err := checkTemperature(temperature); err != nil {
-			return params, err
+			return params, nil, err
 		}
 		params.Temperature = openai.Float(*temperature)
 	}
+	if err := providererr.CheckParts(req.Messages); err != nil {
+		return params, nil, err
+	}
+	var images []string
 	for _, message := range req.Messages {
-		converted, err := openAIMessage(message)
+		converted, err := openAIMessage(message, &images)
 		if err != nil {
-			return params, err
+			return params, nil, err
 		}
 		params.Messages = append(params.Messages, converted)
 	}
@@ -339,7 +352,7 @@ func (m *LanguageModel) chatParams(req gepa.ChatRequest) (openai.ChatCompletionN
 		schema := tool.InputSchema()
 		parameters, err := rawObject(schema)
 		if err != nil {
-			return params, fmt.Errorf("tool %q parameters: %w", tool.Name, err)
+			return params, nil, fmt.Errorf("tool %q parameters: %w", tool.Name, err)
 		}
 		function := shared.FunctionDefinitionParam{Name: tool.Name, Parameters: parameters}
 		if tool.Description != "" {
@@ -354,7 +367,7 @@ func (m *LanguageModel) chatParams(req gepa.ChatRequest) (openai.ChatCompletionN
 	}
 	if format := req.ResponseFormat; format != nil {
 		if !json.Valid(format.Schema) {
-			return params, errors.New("response format schema is not valid JSON")
+			return params, nil, errors.New("response format schema is not valid JSON")
 		}
 		name := format.Name
 		if name == "" {
@@ -370,16 +383,20 @@ func (m *LanguageModel) chatParams(req gepa.ChatRequest) (openai.ChatCompletionN
 			},
 		}
 	}
-	return params, nil
+	return params, images, nil
 }
 
-// openAIMessage converts one transcript message to its chat completion form.
-func openAIMessage(message gepa.Message) (openai.ChatCompletionMessageParamUnion, error) {
+// openAIMessage converts one transcript message to its chat completion form, and adds the
+// base64 data of each image it sends to images.
+func openAIMessage(message gepa.Message, images *[]string) (openai.ChatCompletionMessageParamUnion, error) {
 	switch message.Role {
 	case gepa.RoleSystem:
 		return openai.SystemMessage(message.Content), nil
 	case gepa.RoleUser:
-		return openai.UserMessage(message.Content), nil
+		if len(message.Parts) == 0 {
+			return openai.UserMessage(message.Content), nil
+		}
+		return openai.UserMessage(openAIUserParts(message, images)), nil
 	case gepa.RoleTool:
 		return openai.ToolMessage(message.Content, message.ToolCallID), nil
 	case gepa.RoleAssistant:
@@ -401,6 +418,28 @@ func openAIMessage(message gepa.Message) (openai.ChatCompletionMessageParamUnion
 		return openai.ChatCompletionMessageParamUnion{OfAssistant: &assistant}, nil
 	}
 	return openai.ChatCompletionMessageParamUnion{}, fmt.Errorf("message role %q is not supported", message.Role)
+}
+
+// openAIUserParts returns the content parts of a user message with parts. The first is its Content,
+// when it is not blank. Then each part becomes a text part or an image part with a base64 data URL.
+// It adds the base64 data of each image to images.
+func openAIUserParts(message gepa.Message, images *[]string) []openai.ChatCompletionContentPartUnionParam {
+	parts := make([]openai.ChatCompletionContentPartUnionParam, 0, len(message.Parts)+1)
+	if strings.TrimSpace(message.Content) != "" {
+		parts = append(parts, openai.TextContentPart(message.Content))
+	}
+	for _, part := range message.Parts {
+		if part.Text != "" {
+			parts = append(parts, openai.TextContentPart(part.Text))
+			continue
+		}
+		data := providererr.EncodeImage(part.Image)
+		*images = append(*images, data)
+		parts = append(parts, openai.ImageContentPart(openai.ChatCompletionContentPartImageImageURLParam{
+			URL: "data:" + part.Image.MediaType() + ";base64," + data,
+		}))
+	}
+	return parts
 }
 
 // rawObject converts a JSON object to the SDK's map form. Each value stays raw JSON, so nested

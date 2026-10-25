@@ -1,8 +1,8 @@
 // Package gepatest provides test doubles and assertions for code built on gepa, as
-// net/http/httptest does for net/http: FakeGenerator, a scripted model, AssertTrace, which
-// compares a PipelineTrace with what a test expects, and CheckToolProvider and CheckChatClient,
-// which check that a tool or a chat client, such as an adapter of a consumer's own, meets the
-// contracts gepa relies on. It does not import testing, so tests that use testify or another
+// net/http/httptest does for net/http. FakeGenerator is a scripted model. AssertTrace compares a
+// PipelineTrace with what a test expects. CheckToolProvider and CheckChatClient check that a tool
+// or a chat client, such as an adapter of a consumer's own, meets the contracts gepa relies on. PNG
+// returns a small test image. It does not import testing, so tests that use testify or another
 // wrapper around testing.T can use it too.
 package gepatest
 
@@ -20,6 +20,7 @@ import (
 	"sync"
 
 	gepa "github.com/mikills/gepago"
+	"github.com/mikills/gepago/internal/providererr"
 )
 
 // ErrNoScript marks a call that no script of a FakeGenerator answers. It is a Permanent error
@@ -34,16 +35,17 @@ var ErrNoScript = errors.New("gepatest: no scripted reply")
 var ErrToolCallsInGenerate = errors.New("gepatest: scripted reply has tool calls, which only Chat returns")
 
 // ErrInvalidChatRequest marks a Chat request that no provider accepts, which a FakeGenerator
-// refuses as a provider does, before any script answers it. The chat clients of
-// providers/openai, providers/claude and providers/google each refuse such a request before
-// sending it (providers/pi has none): one with a message whose role is set but none of gepa's
-// four, one with a tool whose parameters are not a JSON object, one without tools whose
-// response format is strict and has a schema that is neither empty nor valid JSON, such as one
-// of spaces, and one whose Temperature is NaN or infinite, which JSON cannot carry. A request
-// that a provider sends passes, even when its API may refuse it: Claude sends no format that is
-// not strict, Gemini sends no format in a request with tools and sends one without a schema,
-// and OpenAI sends a strict schema that is valid JSON but not an object. An empty role passes
-// too, since tests that script replies often leave it out. It is a Permanent error.
+// refuses as a provider does, before any script answers it. The chat clients of providers/openai,
+// providers/claude and providers/google each refuse such a request before they send it
+// (providers/pi has none). Such a request has one of these faults. A message has a role that is not
+// empty and is none of gepa's four. A tool has parameters that are not a JSON object. The request
+// has no tools and a strict response format whose schema is neither empty nor valid JSON, such as a
+// schema of spaces. Its Temperature is NaN or infinite, which JSON cannot carry. A message that is
+// not a user message carries parts, or a part fails gepa.Part.Validate. A request that a provider
+// sends passes, even when its API may refuse it. Claude sends no format that is not strict. Gemini
+// sends no format in a request with tools, and sends a format without a schema. OpenAI sends a
+// strict schema that is valid JSON but not an object. An empty role passes too, since tests that script
+// replies often leave it out, but not on a message with parts. It is a Permanent error.
 var ErrInvalidChatRequest = errors.New("gepatest: invalid chat request")
 
 // Method names the FakeGenerator method a Call went through.
@@ -123,18 +125,22 @@ type Call struct {
 	// Step is the path of the pipeline step that made the call, as gepa.StepPathFrom reports
 	// it, and empty outside a step.
 	Step string
-	// Prompt is the prompt of a Generate or GenerateStructured call, and for a Chat call the
-	// content of its messages joined with newlines, which is the text prompt scripts match.
+	// Prompt is the prompt of a Generate or GenerateStructured call. For a Chat call it is the
+	// content of its messages joined with newlines. Prompt scripts match this text. A message with
+	// parts adds its Content, when it is not empty, and then the text of each text part.
 	Prompt string
+	// Images are the images in the parts of a Chat call's messages, in order, and nil when it
+	// carried none.
+	Images []gepa.Image
 	// Format is the response format of a GenerateStructured call, or of a Chat request that
 	// set one, and nil otherwise.
 	Format *gepa.ResponseFormat
 	// Request is a copy of a Chat call's request, and nil for the other methods.
 	Request *gepa.ChatRequest
 	// Attributes are those of the pipeline step execution that made the call, as
-	// gepa.StepAttributesFrom reports them: its "visit" and, for an execution of a Map element,
-	// its "index", which a step of a pipeline that the element runs does not have. It is nil
-	// outside a step.
+	// gepa.StepAttributesFrom reports them. They hold its "visit", its "index" when it runs in a
+	// Map element and its "iteration" when it runs in a Loop iteration. A step of a pipeline that
+	// the element or the iteration runs has neither. It is nil outside a step.
 	Attributes map[string]int
 	// RunContext is the gepa.RunContext the call's context carried, and the zero value when it
 	// carried none.
@@ -387,13 +393,25 @@ func (f *FakeGenerator) GenerateStructured(
 // it all the same.
 func (f *FakeGenerator) Chat(ctx context.Context, req gepa.ChatRequest) (gepa.ChatResponse, error) {
 	request := cloneRequest(req)
-	contents := make([]string, len(req.Messages))
-	for i, message := range req.Messages {
-		contents[i] = message.Content
+	contents := make([]string, 0, len(req.Messages))
+	var images []gepa.Image
+	for _, message := range req.Messages {
+		if len(message.Parts) == 0 || message.Content != "" {
+			contents = append(contents, message.Content)
+		}
+		for _, part := range message.Parts {
+			if part.Text != "" {
+				contents = append(contents, part.Text)
+			}
+			if part.Image.Validate() == nil {
+				images = append(images, part.Image)
+			}
+		}
 	}
 	call := Call{
 		Method:  MethodChat,
 		Prompt:  strings.Join(contents, "\n"),
+		Images:  images,
 		Format:  cloneFormat(req.ResponseFormat),
 		Request: &request,
 	}
@@ -532,6 +550,7 @@ func excerpt(prompt string) string {
 }
 
 func cloneCall(call Call) Call {
+	call.Images = slices.Clone(call.Images)
 	call.Format = cloneFormat(call.Format)
 	if call.Request != nil {
 		request := cloneRequest(*call.Request)
@@ -551,6 +570,9 @@ func checkChatRequest(req gepa.ChatRequest) error {
 		default:
 			return fmt.Errorf("message %d has the role %q, none of gepa's four", i, message.Role)
 		}
+	}
+	if err := providererr.CheckParts(req.Messages); err != nil {
+		return err
 	}
 	for _, tool := range req.Tools {
 		var object map[string]json.RawMessage
@@ -581,6 +603,7 @@ func cloneRequest(req gepa.ChatRequest) gepa.ChatRequest {
 	out := req
 	out.Messages = slices.Clone(req.Messages)
 	for i := range out.Messages {
+		out.Messages[i].Parts = slices.Clone(out.Messages[i].Parts)
 		out.Messages[i].ToolCalls = slices.Clone(out.Messages[i].ToolCalls)
 	}
 	out.Tools = slices.Clone(req.Tools)

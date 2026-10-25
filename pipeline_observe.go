@@ -18,12 +18,14 @@ import (
 // of a run has the TraceID of the run's RunContext, which the runs nested in it share (see
 // RunContext), and every event carries the run's RunContext, with its attributes redacted (see
 // Redactor). An execution is one run of a step: each retry attempt and each cache hit is an
-// execution of its own, numbered by Attempt. WithPolicy and WithCache are not executions of
-// their own; their attempts and cache hits are. A top-level step's writes are merged into the state as part of its execution, so a
-// MergeRule that fails fails that execution; for a top-level WithPolicy or WithCache step it
-// adds a failed execution after the one that wrote. The same holds for the step's transitions
-// on success, evaluated before its execution ends: a When, Amend or Accept that fails or panics
-// fails that execution. Each execution reports the visit of its top-level step in Attributes.
+// execution of its own, numbered by Attempt. WithPolicy, WithCache and WithAmendable are not
+// executions of their own. The executions of the steps they wrap are, and so are the cache hits of
+// WithCache. A top-level step's writes merge into the state as part of its execution, so a
+// MergeRule that fails fails that execution. For a top-level WithPolicy, WithCache or WithAmendable
+// step, that failure adds a failed execution after the one that wrote. The same holds for the
+// step's transitions on success, evaluated before its execution ends: a When, Amend or Accept that
+// fails or panics fails that execution. Each execution reports the visit of its top-level step in
+// Attributes.
 //
 // The events of a run are ordered:
 //   - RunStarted comes before every other event of the run and RunFinished after them. A run
@@ -31,9 +33,9 @@ import (
 //     invalid, emits no events.
 //   - Every execution emits StepStarted and later StepFinished with the same span.
 //   - A top-level step finishes before the next one starts, and a top-level step a transition
-//     skips over emits nothing (see Transition). An execution nested in a composite step (a
-//     Parallel or an element of a Map) starts after the composite starts and finishes before it
-//     finishes.
+//     skips over emits nothing (see Transition). An execution nested in a composite step starts
+//     after the composite starts and finishes before it finishes. Such an execution is a step of
+//     a Parallel, an element of a Map or an iteration of a Loop.
 //   - The attempts of a step follow each other in order, except for the steps of a Map's body
 //     above a MaxConcurrency of one (see below).
 //   - With a MaxConcurrency of zero or one, the elements of a Map run in input order, each
@@ -42,6 +44,9 @@ import (
 //     nested in it interleave in any order, those of one element still following each other in
 //     order. The events of an element, and of the executions nested in it, carry its index in
 //     the list under Attributes["index"].
+//   - The iterations of a Loop run in order, each finishing before the next starts. The events
+//     of an iteration, and of the executions nested in it, carry its number, from one, under
+//     Attributes["iteration"].
 //   - A pipeline run by a step, through NewProgramStep or a step that runs it with its
 //     context, joins the observation of the run: its RunStarted and RunFinished come between
 //     that step's StepStarted and StepFinished, and its run span's parent is the step's span.
@@ -75,6 +80,10 @@ import (
 // count in its usage or tool records, are not logged under its RunContext, and a pipeline run
 // with ctx starts a trace of its own. An observer that wants its work correlated with the run
 // can pass the event's RunContext to WithRunContext.
+//
+// ctx does not carry where the event's execution runs, such as its Map element or its Loop
+// iteration. So a run that an observer starts takes none of the iteration numbers of the Loop it
+// observes. ctx keeps the other values of the context, such as the tool scope.
 //
 // The values an event carries pass through PipelineSpec.Redactor; see Redactor. Each observer
 // receives its own copy of them, its RunContext's Attributes included, so changing them changes
@@ -175,6 +184,9 @@ type StepStartedEvent struct {
 	// top-level step it belongs to: a rewind visits a step again (see Transition). "index" is set
 	// for the executions of an element of a Map, those nested in them included, to the element's
 	// index in the list, from zero; above a MaxConcurrency of one, elements start in any order.
+	// "iteration" gives the executions of an iteration of a Loop, those nested in them included,
+	// the number of the iteration, from one. Where Loops nest, the nearest Loop gives it. The
+	// event leaves it out when the run's Redactors change it under the Loop's iteration key.
 	Attributes map[string]int
 }
 
@@ -206,8 +218,12 @@ type StepFinishedEvent struct {
 	Writes map[string]any
 	// Cached reports a WithCache hit: the step did not run and its cached writes were committed.
 	Cached bool
-	// Attributes are those StepStarted reported, and for a Map or MapCollect also "failed", the
-	// number of its elements that failed.
+	// Attributes are those StepStarted reported. A Map or MapCollect adds "failed", the number of
+	// its elements that failed. A Loop adds "iterations", the number of its iterations that ran,
+	// the failed one included. Only the nearest execution with the Map's or Loop's name carries the
+	// count. That is its own execution, or else that of a step with its name that runs it. A
+	// decorator that embeds the Map or Loop and keeps its name is such a step. The event leaves
+	// "iterations" out when the run's Redactors change it under the Loop's iteration key.
 	Attributes map[string]int
 	// ToolCalls holds the tool calls the execution made, through the run's ToolSession or any
 	// other, such as an agent's, in the order they finished, after redaction (see Redactor). The
@@ -250,26 +266,41 @@ func withLane(ctx context.Context, lane string) context.Context {
 	return context.WithValue(ctx, observeKey{}, &laned)
 }
 
-// observerContext returns ctx, a context of the run, as observers receive it: with its values,
-// but ending only when the run's life ends (see runObservation), and without the run it
-// belongs to, so nothing an observer does with it counts against the run.
-func (r *runObservation) observerContext(ctx context.Context) context.Context {
-	return observerCtx{Context: r.life, values: context.WithoutCancel(ctx)}
+// observerContext returns ctx, a context of the run, as observers receive it. It hides the values
+// of ctx that observerCtx lists and keeps the other values. It ends only when the run's life ends
+// (see runObservation). It leaves out the run that ctx belongs to, so nothing an observer does
+// with it counts against the run. numbers are the traced numbers of the run or the execution that
+// the event belongs to (see tracedNumbersKey).
+func (r *runObservation) observerContext(ctx context.Context, numbers iterationNumbers) context.Context {
+	return observerCtx{Context: r.life, values: context.WithoutCancel(ctx), numbers: numbers}
 }
 
 // observerCtx takes its deadline and cancellation from a run's life and its values from a
-// run's context, hiding those that tie it to a pipeline run: its trace, step frame, run
-// context, budget, usage collection, step cache, evaluation capture, tool session, tool memory
-// and staged tool results.
+// run's context. It hides the values that tie it to a pipeline run. These are the trace, the
+// step frame, the run context, the budget, usage collection and the step cache. They are also
+// evaluation capture, the tool session, tool memory, staged tool results, and the tool call
+// and usage tally of a wrapped tool. It also hides where the execution runs. That is the visit
+// of its top-level step, its Map element, and its Loop iteration with the iteration numbers. It
+// also hides the hold of a top-level wrapper. So a run that an observer starts with it is a run
+// of its own. Under tracedNumbersKey it holds numbers, the traced numbers of its event's run or
+// execution, or nil. So it never passes on the numbers of another event. It keeps the other
+// values of the context, such as the tool scope.
 type observerCtx struct {
 	context.Context
-	values context.Context
+	values  context.Context
+	numbers iterationNumbers
 }
 
 func (c observerCtx) Value(key any) any {
 	switch key.(type) {
+	case tracedNumbersKey:
+		if len(c.numbers) == 0 {
+			return nil
+		}
+		return c.numbers
 	case observeKey, evaluationKey, pipelineRunKey, runContextKey, usageFrameKey, usageCollectorKey, retryAdmissionKey,
-		budgetClockKey, toolEnvKey, toolMemoryKey, stepStageKey:
+		budgetClockKey, toolEnvKey, toolMemoryKey, stepStageKey, toolAttemptsKey, recordedUsageKey, visitKey,
+		mapElementKey, loopIterationKey, finishHoldKey:
 		return nil
 	}
 	return c.values.Value(key)
@@ -305,19 +336,21 @@ type traceObservation struct {
 	redactedText
 }
 
-// runObservation reports one run to its observers: its own and those of the runs around it,
-// with its own redactor followed by theirs. runContext is the run's RunContext as its events
-// carry it, with the attributes redacted; it is set when RunStarted is emitted. life ends when
-// the context the caller passed to the observation's top-level run ends, when the MaxDuration of
-// the run or a run around it expires, or when endLife ends it once the run has finished.
-// recording, when set, reports the same run to the RecordingObserver of an evaluation that
-// records traces, in an observation of its own; see observeScope.
+// runObservation reports one run to its observers. These are its own observers and those of the
+// runs around it. Its own redactor comes first, and then theirs. runContext is the run's
+// RunContext as its events carry it, with the attributes redacted. numbers are the run's traced
+// numbers (see tracedNumbersKey). observeRun sets both when it emits RunStarted. life ends when
+// the context that the caller passed to the observation's top-level run ends. It also ends when
+// the MaxDuration of the run or of a run around it expires. At the latest, endLife ends it after
+// the run has finished. recording, when set, reports the same run to the RecordingObserver of an
+// evaluation that records traces, in an observation of its own (see observeScope).
 type runObservation struct {
 	trace      *traceObservation
 	observers  []PipelineObserver
 	redactors  []Redactor
 	span       UsageSpan
 	runContext RunContext
+	numbers    iterationNumbers
 	start      time.Time
 	life       context.Context
 	endLife    context.CancelFunc
@@ -342,7 +375,8 @@ func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any,
 	parent := observeScopeFrom(ctx)
 	capture := evaluationCaptureFrom(ctx)
 	recorder := capture.join(p, parent == nil)
-	capture.offer(inputs)
+	numbers := iterationFrom(ctx).numbers
+	capture.offer(numbers.ordinary(inputs))
 	capture.offer(attributeValues(rc))
 	if parent == nil {
 		parent = &observeScope{}
@@ -381,8 +415,13 @@ func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any,
 	defer run.trace.mu.Unlock()
 	for lane := run; lane != nil; lane = lane.recording {
 		lane.runContext = lane.redactRunContext(rc)
-		event := RunStartedEvent{Span: lane.span, RunContext: lane.runContext, Inputs: lane.redactValues(inputs)}
-		observerCtx := lane.observerContext(ctx)
+		event := RunStartedEvent{
+			Span:       lane.span,
+			RunContext: lane.runContext,
+			Inputs:     lane.redactStateValues(inputs, numbers),
+		}
+		lane.numbers = numbers.inputs(inputs)
+		observerCtx := lane.observerContext(ctx, lane.numbers)
 		lane.deliver(func(observer PipelineObserver) {
 			event := event
 			event.RunContext = event.RunContext.clone()
@@ -457,7 +496,7 @@ func (r *runObservation) finish(ctx context.Context, err error) {
 			Unbudgeted: unbudgeted,
 			Err:        laneErr,
 		}
-		observerCtx := lane.observerContext(ctx)
+		observerCtx := lane.observerContext(ctx, lane.numbers)
 		lane.deliver(func(observer PipelineObserver) {
 			event := event
 			event.RunContext = event.RunContext.clone()
@@ -467,8 +506,9 @@ func (r *runObservation) finish(ctx context.Context, err error) {
 	}
 }
 
-// stepObservation reports one execution of a step, and recording, when set, reports it to an
-// evaluation's RecordingObserver; see runObservation.
+// stepObservation reports one execution of a step. recording, when set, reports it to an
+// evaluation's RecordingObserver (see runObservation). numbers are the execution's traced numbers
+// (see tracedNumbersKey).
 type stepObservation struct {
 	run        *runObservation
 	ctx        context.Context
@@ -476,14 +516,17 @@ type stepObservation struct {
 	step       string
 	reads      map[string]any
 	attributes map[string]int
+	numbers    iterationNumbers
 	recording  *stepObservation
 }
 
 // observeStep emits StepStarted for an execution of node over values, the state its view
 // reads, when the run in ctx is observed. visit is the visit of the top-level step the execution
 // belongs to. The events of a Map's executions, and of those nested in them, hide its elements'
-// items and outputs (see hideElements). It returns ctx carrying the execution's span, and nil
-// when nothing observes the run.
+// items and outputs (see hideElements). The "iteration" attribute of an execution in a Loop's
+// iteration passes through the redactors under the Loop's iteration key. So does the "iterations"
+// attribute of a Loop. The events leave out one that the redactors change. It returns ctx carrying
+// the execution's span, and nil when nothing observes the run.
 func observeStep(ctx context.Context, node *stepNode, attempt, visit int, values map[string]any) (
 	context.Context,
 	*stepObservation,
@@ -525,8 +568,13 @@ func observeStep(ctx context.Context, node *stepNode, attempt, visit int, values
 			lanes[i-1].recording = lane
 		}
 		lane.ctx = ctx
-		lane.reads = lane.run.redactValues(reads)
+		iteration := iterationFrom(ctx)
+		lane.reads = lane.run.redactStateValues(reads, iteration.numbers)
+		lane.numbers = iteration.numbers.inputs(reads)
 		lane.attributes = executionAttributes(ctx, visit)
+		if iteration.number > 0 && !lane.run.keepsAttribute(iteration.key, iteration.number) {
+			delete(lane.attributes, "iteration")
+		}
 		event := StepStartedEvent{
 			Span:       lane.span,
 			RunContext: lane.run.runContext,
@@ -536,7 +584,7 @@ func observeStep(ctx context.Context, node *stepNode, attempt, visit int, values
 			Lane:       scope.lane,
 			Attributes: lane.attributes,
 		}
-		observerCtx := lane.run.observerContext(ctx)
+		observerCtx := lane.run.observerContext(ctx, lane.numbers)
 		lane.run.deliver(func(observer PipelineObserver) {
 			event := event
 			event.RunContext = event.RunContext.clone()
@@ -581,6 +629,9 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 		if len(outcome.Attributes) > 0 {
 			attributes = maps.Clone(attributes)
 			maps.Copy(attributes, outcome.Attributes)
+			if count, ok := outcome.Attributes["iterations"]; ok && !run.keepsAttribute(outcome.loopKey, count) {
+				delete(attributes, "iterations")
+			}
 		}
 		event := StepFinishedEvent{
 			RunContext: run.runContext,
@@ -598,7 +649,7 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 		event.ToolCalls = run.scrubToolCalls(toolCalls)
 		event.Err = run.redactError(outcome.Err)
 		event.Span = finishSpan(lane.span, outcome.Duration, outcome.Usage, outcome.Unbudgeted, event.Err)
-		observerCtx := run.observerContext(lane.ctx)
+		observerCtx := run.observerContext(lane.ctx, lane.numbers)
 		run.deliver(func(observer PipelineObserver) {
 			event := event
 			event.RunContext = event.RunContext.clone()
@@ -644,7 +695,7 @@ func (r *runObservation) deliverTransition(
 	r.trace.mu.Lock()
 	defer r.trace.mu.Unlock()
 	for lane := r; lane != nil; lane = lane.recording {
-		observerCtx := lane.observerContext(ctx)
+		observerCtx := lane.observerContext(ctx, lane.numbers)
 		lane.deliver(func(observer PipelineObserver) {
 			if transitions, ok := observer.(TransitionObserver); ok {
 				call(transitions, lane.runContext.clone(), observerCtx)

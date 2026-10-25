@@ -16,16 +16,21 @@ type evaluationKey struct{}
 // maxProgramDepth bounds how deep newEvaluationCapture looks into nested programmes.
 const maxProgramDepth = 32
 
-// evaluationCapture collects what ProgramEvaluator needs to redact one evaluated example: the
-// Redactors, key types and Maps of the pipelines the programme holds or runs, the values those
-// runs were given, wrote, tried to write or attached to their errors while the capture had a
-// Redactor, the items their Maps gave their elements among them, the tool calls their steps
-// made, and, when recorder is set, the traces of the top-level runs. Without a Redactor it keeps
-// no values, so an evaluation without one holds no more than it would without the capture; a
-// Redactor that joins when its pipeline runs applies only to values offered after it joined.
-// known holds the pipelines already accounted for, by their first step, and mapSteps one Map of
-// each shape in shapes, so a programme that builds a pipeline on each run does not add a Map
-// per run.
+// evaluationCapture collects what ProgramEvaluator needs to redact one evaluated example. It holds
+// the Redactors, key types and Maps of the pipelines that the programme holds or runs. It keeps
+// the values that those runs took as inputs, wrote, tried to write or attached to their errors
+// while the capture had a Redactor. Among them are the items that their Maps gave their elements.
+// It also keeps the tool calls that their steps made. When recorder is not nil, it keeps the
+// traces of the top-level runs. Without a Redactor it keeps no values. So an evaluation without
+// one holds no more than it would without the capture. A Redactor that joins when its pipeline
+// runs applies only to values offered after it joined. known holds the pipelines that the capture
+// has accounted for, by their first step. mapSteps holds one Map of each shape in shapes. So a
+// programme that builds a pipeline on each run does not add a Map per run.
+//
+// The capture keeps no iteration number of a Loop. A run offers its inputs without the numbers
+// that it keeps (see withRunNumbers), and the Loop offers no number. A failed step's StepError
+// carries the numbers that were in effect where it ran. So apply tells an iteration number among
+// its Reads as the step's events do.
 type evaluationCapture struct {
 	recorder  *RecordingObserver
 	mu        sync.Mutex
@@ -220,10 +225,15 @@ func (c *evaluationCapture) offerToolCalls(records []ToolCallRecord) {
 }
 
 // apply returns the evaluation item of the example the capture watched, with the traces it
-// recorded and its reflection values redacted with everything it collected.
-func (c *evaluationCapture) apply(item EvaluationItem) EvaluationItem {
+// recorded and its reflection values redacted with everything it collected. The traces' reads
+// and inputs keep the iteration numbers that their executions and runs kept. numbers holds the
+// iteration numbers of the step that SideInfo's "reads" come from. It is nil when the item has no
+// such step.
+func (c *evaluationCapture) apply(item EvaluationItem, numbers iterationNumbers) EvaluationItem {
+	var spans map[string]iterationNumbers
 	if trace := evaluationTrace(c.recorder); trace != nil {
 		item.Trace = trace
+		spans = c.recorder.spanNumbers()
 	}
 	c.mu.Lock()
 	redaction := evaluationRedaction{
@@ -233,6 +243,8 @@ func (c *evaluationCapture) apply(item EvaluationItem) EvaluationItem {
 		values:    slices.Clone(c.values),
 		details:   slices.Clone(c.details),
 		toolCalls: cloneRecords(c.toolCalls),
+		numbers:   numbers,
+		spans:     spans,
 	}
 	c.mu.Unlock()
 	return redaction.apply(item)

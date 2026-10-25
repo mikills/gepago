@@ -33,6 +33,57 @@ type ToolProvider interface {
 	Invoke(ctx context.Context, call ToolCall) (ToolResult, error)
 }
 
+// ToolMiddleware wraps a ToolProvider, for example to limit, log, audit or fall back around
+// tool calls. Register it on a ToolRegistry by name. Attach it by name to a pipeline or an
+// agent. The first name listed is the outermost wrapper. It sees each call first and each
+// result last. The middleware must keep the schema of the tool it wraps. It must be safe for
+// concurrent use.
+//
+// The middleware runs only for the calls a ToolSession invokes. It never sees a refused call or
+// a call the cache answers. Only the session that makes a call wraps it. An agent's session,
+// or that of a nested pipeline with its own Tools, uses only its own tool middleware. So the
+// middleware of an enclosing pipeline does not see those calls. The enclosing ToolPolicy still
+// governs them.
+//
+// Each call to next is an attempt, and each attempt runs the tool once. An attempt belongs to
+// the call whose context it carries, so pass ctx, or a context derived from it, to next. The
+// first attempt of a call is the first attempt that carries its context. An attempt whose
+// context carries no call of the tool fails, and the tool does not run. An attempt that starts
+// after its call has returned also fails. When the middleware returns, the call cancels the
+// context of the attempts that still run. The call returns only when every attempt has
+// returned. So a timeout in middleware cannot bound a tool that ignores its context.
+//
+// Each attempt records the usage of its result with RecordUsage and RecordUnbudgetedUsage as
+// soon as it returns. A ToolSession records a call without middleware in the same way. The
+// session's record of the call shows the usage of all the attempts. The middleware sees the
+// result of each attempt as the tool returned it. It may return the result of one of its own
+// call's attempts as it is. Any other result it returns must carry no usage, or the call fails.
+// So a middleware that reuses a result across calls, such as a cache or a singleflight, must
+// return that result without usage. The error of such a call keeps the kind of the error that
+// the middleware returned. It is Permanent when the middleware returned no error or an
+// unclassified error. Middleware that spends tokens itself records them with RecordUsage or
+// RecordUnbudgetedUsage, as any code does.
+//
+// The first attempt always runs. A later attempt fails, and the tool does not run, when its
+// context has ended. It fails with the context's cause. The run's budget can also refuse a
+// later attempt, as it refuses a model call. The attempt then fails with the budget error. The
+// budget refuses it when the tokens of the run or of the step exceed a limit. It also refuses
+// it when the run has reached MaxDuration or has already failed with a budget error. A spent
+// MaxModelCalls does not refuse an attempt.
+//
+// An attempt turns a panic of the tool into the error a ToolSession gives a panicking tool. The
+// error keeps the stack in its step details. The attempt also checks the result as the session
+// does. Output that is not valid JSON and a Provenance entry that fails Validate fail the
+// attempt with the session's error. So the middleware sees these failures and can replace the
+// result. The session checks the result that the middleware returns too.
+//
+// The function runs for each tool that the steps of a pipeline name when Build runs. It runs
+// for each tool of an agent when Agent.Validate runs. It runs again for each tool on the first
+// call of the tool in each run. If it fails then, only the calls to that tool fail. So the
+// function must have no side effects. All runs share the state in the function. State in the
+// provider it returns lasts one tool for one run.
+type ToolMiddleware func(next ToolProvider) ToolProvider
+
 // ToolResult is what a tool call returns.
 //
 // Output is the structured result, a JSON value; a ToolStep converts its fields into state.
@@ -120,13 +171,43 @@ func (p Provenance) Validate() error {
 // ToolScopeFrom(ctx) returns the run's scope (see WithToolScope), or the decoded scope of a
 // call a remote tool host serves.
 //
-// A schema that cannot be derived, an empty name or description, or a nil fn is reported by
-// the tool's Validate method, so ToolRegistry.Register rejects the tool.
+// The tool's Validate method reports a schema that JSONSchemaFor cannot derive, an empty name or
+// description, and a nil fn. So ToolRegistry.Register refuses such a tool. Images follow two
+// rules. Validate reports Args that no JSON value can decode into, because the decode requires an
+// Image there and JSON holds no image data. An example is a field of the type Image without
+// omitempty or omitzero. A *Image, a slice and a map take null, so they pass. Validate cannot see
+// a decoder that a type takes from an embedded Image, such as struct{ Image }. So it passes Args
+// that require such a type, and their calls fail. Every other Image fails at call time, when a
+// value holds one. That covers every Out. An Out value fails for an image only when it holds
+// one, so Validate does not check Out.
+//
+// Tool arguments and output travel as JSON, and the JSON form of an Image holds no image data.
+// So an Image from NewImage in fn's output fails the call with a Permanent error. The error names
+// the tool and the Go type of the output. The encode finds an Image where json.Marshal encodes
+// one, also in an interface value. It skips unexported fields and fields tagged "-". A type that
+// embeds an Image or a *Image, or that writes its own JSON, encodes as json.Marshal writes it. So
+// the model gets at most the image's summary, and never the image. But a MarshalJSONTo that
+// encodes an Image it holds through its encoder still fails, since the encoder refuses that Image.
+// A MarshalJSONTo can first encode an Image apart, such as with jsonv2.Marshal and the options of
+// its encoder. When it then writes the result as a string or in another form, the model gets the
+// summary as text. That passes unless the JSON of the whole output holds the full summary of an
+// image elsewhere. The second encode then refuses that Image too. A zero Image encodes as null.
+//
+// The encode calls json.Marshal once and returns its error as it is. That is all it does when the
+// type of the output cannot hold an Image or reach a MarshalJSONTo. Otherwise it scans the JSON
+// for the full summary of an image. Only an output whose JSON holds one costs a second encode,
+// also when the output only looks like a summary. The second encode runs the MarshalJSON and
+// MarshalJSONTo methods of the whole output again. A panic in the encode is not recovered, as
+// json.Marshal does not recover it. Arguments that give an Image of Args a value fail the call
+// with ErrInvalidToolArguments and ErrInvalidImage.
 func NewTool[Args, Out any](name, description string, fn func(context.Context, Args) (Out, error)) ToolProvider {
 	tool := &typedTool[Args, Out]{fn: fn, schema: Tool{Name: name, Description: description}}
 	schema, err := JSONSchemaFor[Args]()
 	if err == nil && !structType(reflect.TypeFor[Args]()) {
 		err = fmt.Errorf("arguments type %s must be a struct, so its JSON form is an object", reflect.TypeFor[Args]())
+	}
+	if err == nil {
+		err = checkToolArguments(reflect.TypeFor[Args]())
 	}
 	if err != nil {
 		tool.err = fmt.Errorf("tool %q: %w", name, err)
@@ -149,8 +230,8 @@ func (t *typedTool[Args, Out]) Schema() Tool {
 	return schema
 }
 
-// Validate reports a schema that could not be derived, a missing name or description, or a
-// nil function.
+// Validate reports a schema that JSONSchemaFor cannot derive, and Args that no JSON value can
+// decode into (see NewTool). It also reports a missing name or description, or a nil function.
 func (t *typedTool[Args, Out]) Validate() error {
 	if t.err != nil {
 		return t.err
@@ -175,15 +256,40 @@ func (t *typedTool[Args, Out]) Invoke(ctx context.Context, call ToolCall) (ToolR
 	if err != nil {
 		return ToolResult{}, err
 	}
-	output, err := json.Marshal(out)
+	output, err := encodeToolOutput(t.schema.Name, out)
 	if err != nil {
-		return ToolResult{}, fmt.Errorf("encode tool output %T: %w", out, err)
+		return ToolResult{}, err
 	}
 	result := ToolResult{Output: output}
 	if value := reflect.ValueOf(out); value.IsValid() && value.Kind() == reflect.String {
 		result.Text = value.String()
 	}
 	return result, nil
+}
+
+// encodeToolOutput encodes out, the output of the tool named tool, as json.Marshal does. The JSON
+// form of an Image holds no image data. So an Image from NewImage in out fails the encode with a
+// Permanent error (see encodeRefusingImages). The error names the tool and the type of out. A zero
+// Image encodes as null.
+func encodeToolOutput(tool string, out any) ([]byte, error) {
+	output, err := encodeRefusingImages(out)
+	switch {
+	case errors.Is(err, errImageRefused):
+		return nil, PermanentError(fmt.Errorf(
+			"encode output of tool %q: %T holds an Image, but tool output travels as JSON without image data",
+			tool,
+			out,
+		))
+	case err != nil:
+		return nil, fmt.Errorf("encode tool output %T: %w", out, err)
+	}
+	return output, nil
+}
+
+// typedProvider is a tool that knows the Go types of its arguments and output, as one made by
+// NewTool does. Build checks the keys of a ToolStep against these types.
+type typedProvider interface {
+	toolTypes() (reflect.Type, reflect.Type)
 }
 
 // toolTypes returns the Go types of the tool's arguments and output, so Build can check the
@@ -200,7 +306,7 @@ func decodeToolArguments[T any](arguments string) (T, error) {
 	if err != nil {
 		return zero, err
 	}
-	return decodeTypedValue[T](value)
+	return decodeTypedValue[T](value, fromText)
 }
 
 // parseToolArguments parses a call's JSON arguments, keeping numbers as json.Number; empty

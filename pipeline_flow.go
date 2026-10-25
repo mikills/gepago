@@ -19,6 +19,15 @@ import (
 // Parallel's and the run's. Each step is a nested step: its name must be unique in the
 // pipeline and its components are scoped as "<parallel>.<step>.<component>". The Parallel is a
 // ComponentStep when a step is one. The steps must be safe to run concurrently with each other.
+// When a caller runs the Parallel with Run or RunCandidate, its steps see only the keys that the
+// caller's State exposes (see Loop). Its error is then a StepError that names the Parallel, as in a
+// pipeline. A step with the Parallel's name that runs it in its own execution gets the error as it
+// is, and its execution names the Parallel. A step that is not a wrapper has its own execution when
+// a pipeline, a Parallel, a Map, a Loop or a wrapper runs it. WithPolicy, WithCache and
+// WithAmendable return wrappers. A decorator you write is never a wrapper, even when it embeds one.
+// So a decorator that embeds the Parallel and keeps its name gets the error as it is. That is so
+// when a pipeline, a Parallel, a Map, a Loop or a wrapper runs the decorator. A caller that runs
+// the Parallel outside such an execution gets the StepError.
 func Parallel(name string, steps ...Step) Step {
 	p := &parallelStep{name: strings.TrimSpace(name)}
 	for _, step := range steps {
@@ -87,16 +96,18 @@ func (p *parallelStep) Run(ctx context.Context, s State) error {
 	return p.runCandidate(ctx, nil, s)
 }
 
-func (p *parallelStep) runCandidate(ctx context.Context, candidate Candidate, s State) error {
+func (p *parallelStep) runCandidate(ctx context.Context, candidate Candidate, s State) (err error) {
+	defer func() { err = nameItself(ctx, p.name, p.reads, s, err) }()
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	results := make([]stepResult, len(p.steps))
 	var mu sync.Mutex
 	var failures []error
 	var wg sync.WaitGroup
+	values := s.childView(p)
 	for i, node := range p.steps {
 		wg.Go(func() {
-			result, err := runChild(withLane(ctx, node.name), candidate, p.name, node, s.values)
+			result, err := runChild(withLane(ctx, node.name), candidate, p.name, node, values)
 			if err == nil {
 				results[i] = result
 				return

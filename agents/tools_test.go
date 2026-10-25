@@ -3,7 +3,9 @@ package agents
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -548,4 +550,252 @@ func TestMemoryIsAToolMemory(t *testing.T) {
 	nilMemory.Set("a", 1)
 	_, ok = nilMemory.Get("a")
 	require.False(t, ok)
+}
+
+// echoBinding is a binding named echo that answers "ok".
+func echoBinding() ToolBinding {
+	return ToolBinding{
+		Definition: Tool{Name: "echo", Description: "echo"},
+		Handler:    func(context.Context, *Memory, string) (string, error) { return "ok", nil },
+	}
+}
+
+// auditToolMiddleware appends "<name> <tool>" to seen for each call it wraps.
+func auditToolMiddleware(name string, mu *sync.Mutex, seen *[]string) gepa.ToolMiddleware {
+	return func(next gepa.ToolProvider) gepa.ToolProvider {
+		return gepa.NewToolFunc(next.Schema(), func(ctx context.Context, call ToolCall) (gepa.ToolResult, error) {
+			mu.Lock()
+			*seen = append(*seen, name+" "+call.Name)
+			mu.Unlock()
+			return next.Invoke(ctx, call)
+		})
+	}
+}
+
+func TestAgentToolMiddlewareWrapsBindingsAndRegistryTools(t *testing.T) {
+	calls := &atomic.Int32{}
+	registry := orderRegistry(t, calls)
+	var mu sync.Mutex
+	var seen []string
+	applied := map[string]int{}
+	audit := auditToolMiddleware("audit", &mu, &seen)
+	require.NoError(t, registry.RegisterToolMiddleware("audit", func(next gepa.ToolProvider) gepa.ToolProvider {
+		mu.Lock()
+		applied[next.Schema().Name]++
+		mu.Unlock()
+		return audit(next)
+	}))
+	client := gepatest.NewFakeGenerator().Default(
+		gepatest.ToolCall("call-1", "echo", `{}`),
+		gepatest.ToolCall("call-2", "lookup_order", `{"order_id":"A-1"}`),
+		gepatest.Text("done"),
+	)
+	agent := Agent{
+		Name:           "orders",
+		Client:         client,
+		Model:          "fake",
+		Tools:          []ToolBinding{echoBinding()},
+		ToolRegistry:   registry,
+		ToolNames:      []string{"lookup_order"},
+		ToolMiddleware: []string{"audit"},
+	}
+	require.NoError(t, agent.Validate())
+	require.Equal(t, map[string]int{"echo": 1, "lookup_order": 1}, applied, "Validate applies it once to each tool")
+	memory := NewMemory("run")
+
+	result, err := runAgent(t, agent, memory)
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"audit echo", "audit lookup_order"}, seen)
+	require.Equal(t, map[string]int{"echo": 2, "lookup_order": 2}, applied, "a run applies it once to each tool")
+	require.EqualValues(t, 1, calls.Load())
+	lookup, _ := registry.Lookup("lookup_order")
+	require.Equal(t, []Tool{echoBinding().Definition, lookup.Schema()}, chatRequests(client)[0].Tools,
+		"the model sees the schemas of the tools the middleware wraps")
+	require.Len(t, result.ToolCalls, 2)
+	require.Equal(t, "ok", result.ToolCalls[0].Output)
+	require.Equal(t, `{"status":"shipped"}`, result.ToolCalls[1].Output)
+	last, ok := memory.Get("last_order")
+	require.True(t, ok, "the wrapped call's memory writes reach the run's Memory")
+	require.Equal(t, `{"order_id":"A-1"}`, last)
+}
+
+func TestAgentToolMiddlewareValidateErrors(t *testing.T) {
+	calls := &atomic.Int32{}
+	registry := orderRegistry(t, calls)
+	for name, middleware := range map[string]gepa.ToolMiddleware{
+		"audit":        func(next gepa.ToolProvider) gepa.ToolProvider { return next },
+		"panics":       func(gepa.ToolProvider) gepa.ToolProvider { panic("boom") },
+		"nil-provider": func(gepa.ToolProvider) gepa.ToolProvider { return nil },
+		"renames": func(next gepa.ToolProvider) gepa.ToolProvider {
+			schema := next.Schema()
+			schema.Name += "_v2"
+			return gepa.NewToolFunc(schema, next.Invoke)
+		},
+		"picky": func(next gepa.ToolProvider) gepa.ToolProvider {
+			if next.Schema().Name == "lookup_order" {
+				panic("cannot wrap")
+			}
+			return next
+		},
+	} {
+		require.NoError(t, registry.RegisterToolMiddleware(name, middleware))
+	}
+	// a run checks the names but wraps each tool on its first call. So a tool the middleware
+	// cannot wrap fails only its own calls, and the tools in calls before it keep working.
+	tests := []struct {
+		name    string
+		agent   Agent
+		wantErr string
+		calls   []string
+	}{
+		{
+			name:    "no registry",
+			agent:   Agent{Tools: []ToolBinding{echoBinding()}, ToolMiddleware: []string{"audit"}},
+			wantErr: `agent tool middleware ["audit"] needs a ToolRegistry`,
+		},
+		{
+			name:    "an unknown name",
+			agent:   Agent{ToolRegistry: registry, Tools: []ToolBinding{echoBinding()}, ToolMiddleware: []string{"x"}},
+			wantErr: `tool middleware "x" is not registered`,
+		},
+		{
+			name:    "an unknown name on an agent without tools",
+			agent:   Agent{ToolRegistry: registry, ToolMiddleware: []string{"x"}},
+			wantErr: `tool middleware "x" is not registered`,
+		},
+		{
+			name:    "a repeated name",
+			agent:   Agent{ToolRegistry: registry, ToolMiddleware: []string{"audit", "audit"}},
+			wantErr: `tool middleware "audit" is listed twice`,
+		},
+		{
+			name: "middleware that panics on a binding",
+			agent: Agent{
+				ToolRegistry:   registry,
+				Tools:          []ToolBinding{echoBinding()},
+				ToolMiddleware: []string{"panics"},
+			},
+			wantErr: `tool middleware "panics" panicked on tool "echo": boom`,
+			calls:   []string{"echo"},
+		},
+		{
+			name: "middleware that panics on a registry tool",
+			agent: Agent{
+				ToolRegistry:   registry,
+				Tools:          []ToolBinding{echoBinding()},
+				ToolNames:      []string{"lookup_order"},
+				ToolMiddleware: []string{"audit", "picky"},
+			},
+			wantErr: `tool middleware "picky" panicked on tool "lookup_order": cannot wrap`,
+			calls:   []string{"echo", "lookup_order"},
+		},
+		{
+			name: "middleware that returns nil",
+			agent: Agent{
+				ToolRegistry:   registry,
+				ToolNames:      []string{"order_status"},
+				ToolMiddleware: []string{"nil-provider"},
+			},
+			wantErr: `tool middleware "nil-provider" returned a nil provider for tool "order_status"`,
+			calls:   []string{"order_status"},
+		},
+		{
+			name: "middleware that changes the schema",
+			agent: Agent{
+				ToolRegistry:   registry,
+				Tools:          []ToolBinding{echoBinding()},
+				ToolMiddleware: []string{"renames"},
+			},
+			wantErr: `tool middleware "renames" must keep the schema of tool "echo" but changed its name`,
+			calls:   []string{"echo"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var replies []gepatest.Reply
+			for i, name := range tt.calls {
+				replies = append(replies, gepatest.ToolCall(fmt.Sprintf("call-%d", i), name, `{"order_id":"A-1"}`))
+			}
+			tt.agent.Name, tt.agent.Model = "test", "fake"
+			tt.agent.Client = gepatest.NewFakeGenerator().Default(append(replies, gepatest.Text("done"))...)
+			require.EqualError(t, tt.agent.Validate(), tt.wantErr)
+
+			result, err := runAgent(t, tt.agent, NewMemory("run"))
+
+			if len(tt.calls) == 0 {
+				require.EqualError(t, err, tt.wantErr, "Run checks the names first")
+				return
+			}
+			failing := tt.calls[len(tt.calls)-1]
+			require.EqualError(t, err, fmt.Sprintf(`agent "test" tool %q: %s`, failing, tt.wantErr))
+			require.Equal(t, StopToolError, result.StopReason)
+			require.Len(t, result.ToolCalls, len(tt.calls))
+			for i, call := range result.ToolCalls[:len(tt.calls)-1] {
+				require.Empty(t, call.Err, "call %d, to a tool the middleware wraps, succeeds", i)
+			}
+			require.Equal(t, fmt.Sprintf("tool %q: %s", failing, tt.wantErr), result.ToolCalls[len(tt.calls)-1].Err)
+		})
+	}
+}
+
+func TestAgentInPipelineUsesOnlyItsOwnToolMiddleware(t *testing.T) {
+	calls := &atomic.Int32{}
+	registry := orderRegistry(t, calls)
+	var mu sync.Mutex
+	var seen []string
+	require.NoError(t, registry.RegisterToolMiddleware("pipeline", auditToolMiddleware("pipeline", &mu, &seen)))
+	require.NoError(t, registry.RegisterToolMiddleware("agent", auditToolMiddleware("agent", &mu, &seen)))
+	client := gepatest.NewFakeGenerator().Default(
+		gepatest.ToolCall("call-1", "lookup_order", `{"order_id":"A-1"}`),
+		gepatest.Text("done"),
+	)
+	agent := &Agent{
+		Name:           "orders",
+		Client:         client,
+		Model:          "fake",
+		ToolRegistry:   registry,
+		ToolNames:      []string{"lookup_order"},
+		ToolMiddleware: []string{"agent"},
+	}
+	pipeline := agentPipelineSpec(t, agent, gepa.PipelineSpec{Tools: registry, ToolMiddleware: []string{"pipeline"}})
+
+	_, err := pipeline.Run(context.Background(), gepa.NewState(gepa.Prediction{"question": "hi"}))
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"agent lookup_order"}, seen, "only the agent's session invokes the tool")
+	require.EqualValues(t, 1, calls.Load())
+}
+
+func TestAgentToolMiddlewareWrapsEachToolOnItsFirstCall(t *testing.T) {
+	registry := orderRegistry(t, &atomic.Int32{})
+	var mu sync.Mutex
+	applied := map[string]int{}
+	require.NoError(t, registry.RegisterToolMiddleware("count", func(next gepa.ToolProvider) gepa.ToolProvider {
+		mu.Lock()
+		applied[next.Schema().Name]++
+		mu.Unlock()
+		return next
+	}))
+	agent := Agent{
+		Name: "orders",
+		Client: gepatest.NewFakeGenerator().Default(
+			gepatest.ToolCall("call-1", "echo", `{}`),
+			gepatest.ToolCall("call-2", "echo", `{}`),
+			gepatest.Text("done"),
+		),
+		Model:          "fake",
+		Tools:          []ToolBinding{echoBinding()},
+		ToolRegistry:   registry,
+		ToolNames:      []string{"lookup_order"},
+		ToolMiddleware: []string{"count"},
+	}
+	require.NoError(t, agent.Validate())
+	require.Equal(t, map[string]int{"echo": 1, "lookup_order": 1}, applied, "Validate applies it to each tool")
+
+	_, err := runAgent(t, agent, NewMemory("run"))
+
+	require.NoError(t, err)
+	require.Equal(t, map[string]int{"echo": 2, "lookup_order": 1}, applied,
+		"the run applies it once to the tool it calls, and not to the tool it does not call")
 }

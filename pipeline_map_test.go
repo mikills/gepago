@@ -1422,3 +1422,413 @@ func TestMapElementErrorWrapsWithIndex(t *testing.T) {
 	require.ErrorIs(t, runErr, err)
 	require.EqualError(t, runErr, `pipeline step "lengths": element 0: pipeline step "measure": broken`)
 }
+
+func TestMapAndParallelErrorsNameThemOnce(t *testing.T) {
+	boom := func(context.Context, string) (int, error) { return 0, errors.New("boom") }
+	failing := NewStep("first", refs(mapWordsKey.Ref()), refs(mapLengthKey.Ref()), func(context.Context, State) error {
+		return errors.New("boom")
+	})
+	other := NewStep("other", nil, nil, func(context.Context, State) error { return nil })
+	causes := []struct {
+		name string
+		step func() Step
+		want string
+	}{
+		{
+			name: "a Map whose element fails",
+			step: func() Step { return lengthsOf(measureWith(boom), MapOptions{}) },
+			want: `pipeline step "lengths": element 0: pipeline step "measure": boom`,
+		},
+		{
+			name: "a MapCollect over too many items",
+			step: func() Step { return collectLengths(measureWith(wordLength), MapOptions{MaxItems: 1}) },
+			want: `pipeline step "lengths": "words" holds 2 items, more than MaxItems 1`,
+		},
+		{
+			name: "a Parallel whose step fails",
+			step: func() Step { return Parallel("par", failing, other) },
+			want: `pipeline step "par": pipeline step "first": boom`,
+		},
+	}
+	runners := []struct {
+		name   string
+		prefix string
+		run    func(t *testing.T, step Step) error
+	}{
+		{
+			name: "run directly",
+			run: func(_ *testing.T, step Step) error {
+				return step.Run(context.Background(), NewState(wordsInput("a", "bb")))
+			},
+		},
+		{
+			name: "run directly under a policy",
+			run: func(_ *testing.T, step Step) error {
+				return WithPolicy(step, StepPolicy{}).Run(context.Background(), NewState(wordsInput("a", "bb")))
+			},
+		},
+		{
+			name:   "run by another step on its State",
+			prefix: `pipeline step "outer": `,
+			run: func(t *testing.T, step Step) error {
+				outer := NewStep("outer", step.Reads(), step.Writes(), func(ctx context.Context, s State) error {
+					return step.Run(ctx, s)
+				})
+				_, err := mapPipeline(t, outer).RunCandidate(context.Background(), nil, wordsInput("a", "bb"))
+				return err
+			},
+		},
+		{
+			name: "run as a step of a pipeline",
+			run: func(t *testing.T, step Step) error {
+				_, err := mapPipeline(t, step).RunCandidate(context.Background(), nil, wordsInput("a", "bb"))
+				return err
+			},
+		},
+	}
+	for _, runner := range runners {
+		for _, cause := range causes {
+			t.Run(runner.name+" failing in "+cause.name, func(t *testing.T) {
+				step := cause.step()
+
+				err := runner.run(t, step)
+
+				require.EqualError(t, err, runner.prefix+cause.want)
+				var stepErr *StepError
+				require.ErrorAs(t, err, &stepErr)
+				if runner.prefix != "" {
+					require.ErrorAs(t, stepErr.Err, &stepErr)
+				}
+				require.Equal(t, step.Name(), stepErr.Step)
+			})
+		}
+	}
+}
+
+// decorated is a step that runs the step it embeds on its own State, as a user's decorator does.
+type decorated struct{ Step }
+
+func (d decorated) Run(ctx context.Context, s State) error { return d.Step.Run(ctx, s) }
+
+// padded is a decorator whose name has spaces around the name of the step it embeds, which the
+// pipeline trims.
+type padded struct{ decorated }
+
+func (p padded) Name() string { return " " + p.Step.Name() + " " }
+
+func TestStepThatSharesACompositesNameNamesItOnce(t *testing.T) {
+	failing := NewStep("first", refs(mapWordsKey.Ref()), refs(mapLengthKey.Ref()), func(context.Context, State) error {
+		return errors.New("boom")
+	})
+	other := NewStep("other", nil, nil, func(context.Context, State) error { return nil })
+	tests := []struct {
+		name  string
+		step  Step
+		want  string
+		steps []string
+	}{
+		{
+			name: "a Map",
+			step: lengthsOf(measureWith(func(_ context.Context, word string) (int, error) {
+				if word == "bb" {
+					return 0, errors.New("boom")
+				}
+				return len(word), nil
+			}), MapOptions{}),
+			want:  `pipeline step "lengths": element 1: pipeline step "measure": boom`,
+			steps: []string{"lengths", "measure"},
+		},
+		{
+			name:  "a Parallel",
+			step:  Parallel("par", failing, other),
+			want:  `pipeline step "par": pipeline step "first": boom`,
+			steps: []string{"par", "first"},
+		},
+		{
+			name:  "a WithPolicy",
+			step:  WithPolicy(failing, StepPolicy{}),
+			want:  `pipeline step "first": boom`,
+			steps: []string{"first"},
+		},
+	}
+	decorators := map[string]func(Step) Step{
+		"decorated":                       func(step Step) Step { return decorated{step} },
+		"decorated with spaces around it": func(step Step) Step { return padded{decorated{step}} },
+	}
+	for way, decorate := range decorators {
+		for _, tt := range tests {
+			t.Run(way+" "+tt.name, func(t *testing.T) {
+				log := &eventLog{}
+				pipeline := mapPipeline(t, decorate(tt.step), log)
+
+				_, err := pipeline.RunCandidate(context.Background(), nil, wordsInput("a", "bb"))
+
+				require.EqualError(t, err, tt.want)
+				if tt.name == "a Map" {
+					require.Equal(
+						t,
+						map[string]int{"visit": 1, "failed": 1},
+						log.finishedStep(t, "lengths", 1).Attributes,
+					)
+				}
+				var steps []string
+				for err != nil {
+					var stepErr *StepError
+					if !errors.As(err, &stepErr) {
+						break
+					}
+					steps = append(steps, stepErr.Step)
+					err = stepErr.Err
+				}
+				require.Equal(t, tt.steps, steps)
+			})
+		}
+	}
+}
+
+func TestStepThatSharesALoopsNameReportsItsIterations(t *testing.T) {
+	decorators := map[string]func(Step) Step{
+		"decorated":                       func(step Step) Step { return decorated{step} },
+		"decorated with spaces around it": func(step Step) Step { return padded{decorated{step}} },
+	}
+	redactors := map[string]Redactor{"no Redactor": nil, "a Redactor that hides the iteration key": hiding("page")}
+	for way, decorate := range decorators {
+		for name, redactor := range redactors {
+			t.Run(way+" under "+name, func(t *testing.T) {
+				log := &eventLog{}
+				pipeline, err := PipelineSpec{
+					Steps:     []Step{decorate(pagedLoop(addPages(plusPage), 6, 5))},
+					Defaults:  []Default{DefaultValue(loopCountKey, 0)},
+					Observers: []PipelineObserver{log},
+					Redactor:  redactor,
+				}.Build()
+				require.NoError(t, err)
+
+				got, err := pipeline.RunCandidate(context.Background(), nil, Prediction{})
+
+				require.NoError(t, err)
+				require.Equal(t, Prediction{"count": 6}, got)
+				want := map[string]int{"visit": 1, "iterations": 3}
+				if redactor != nil {
+					want = map[string]int{"visit": 1}
+				}
+				require.Equal(t, want, log.finishedStep(t, "loop", 1).Attributes)
+			})
+		}
+	}
+}
+
+func TestMapRunChecksThatItsBodyReadsTheItem(t *testing.T) {
+	items := Key[[]int]{Name: "items"}
+	out := Key[[]MapResult[int]]{Name: "out"}
+	var ran atomic.Int32
+	loop := func() Step {
+		return Loop("loop", NewStep("count_up", refs(loopPageKey.Ref()), refs(loopCountKey.Ref()),
+			func(_ context.Context, s State) error {
+				ran.Add(1)
+				loopCountKey.Set(s, 1)
+				return nil
+			}), func(State) (bool, error) { return true, nil }, LoopOptions{MaxIterations: 1, Iteration: loopPageKey})
+	}
+	bodies := []struct {
+		name string
+		body func() Step
+		want string
+	}{
+		{
+			name: "a decorated Loop whose iteration key is the item key",
+			body: func() Step { return decorated{loop()} },
+			want: `body "loop" must read the item key "page"`,
+		},
+		{
+			name: "a Loop whose iteration key is the item key",
+			body: func() Step { return WithPolicy(loop(), StepPolicy{}) },
+			want: `body "loop" is a Loop whose iteration key is the item key "page", but a Loop in a Map needs an ` +
+				`iteration key of its own`,
+		},
+	}
+	runners := []struct {
+		name   string
+		prefix string
+		run    func(t *testing.T, step Step) error
+	}{
+		{
+			name:   "built in a pipeline",
+			prefix: `pipeline step "each": `,
+			run: func(_ *testing.T, step Step) error {
+				_, err := PipelineSpec{Inputs: refs(items.Ref()), Steps: []Step{step}}.Build()
+				return err
+			},
+		},
+		{
+			name:   "run directly",
+			prefix: `pipeline step "each": `,
+			run: func(_ *testing.T, step Step) error {
+				return step.Run(context.Background(), NewState(Prediction{"items": []int{40, 50}}))
+			},
+		},
+		{
+			name:   "run directly under a policy",
+			prefix: `pipeline step "each": `,
+			run: func(_ *testing.T, step Step) error {
+				return WithPolicy(
+					step,
+					StepPolicy{},
+				).Run(context.Background(), NewState(Prediction{"items": []int{40, 50}}))
+			},
+		},
+		{
+			name:   "run by a decorator in a pipeline",
+			prefix: `pipeline step "each": `,
+			run: func(t *testing.T, step Step) error {
+				pipeline, err := PipelineSpec{Inputs: refs(items.Ref()), Steps: []Step{decorated{step}}}.Build()
+				require.NoError(t, err)
+				_, err = pipeline.RunCandidate(context.Background(), nil, Prediction{"items": []int{40, 50}})
+				return err
+			},
+		},
+		{
+			name:   "run by another step on its State",
+			prefix: `pipeline step "outer": pipeline step "each": `,
+			run: func(t *testing.T, step Step) error {
+				outer := NewStep("outer", refs(items.Ref()), refs(out.Ref()), func(ctx context.Context, s State) error {
+					return step.Run(ctx, s)
+				})
+				pipeline, err := PipelineSpec{Inputs: refs(items.Ref()), Steps: []Step{outer}}.Build()
+				require.NoError(t, err)
+				_, err = pipeline.RunCandidate(context.Background(), nil, Prediction{"items": []int{40, 50}})
+				return err
+			},
+		},
+	}
+	for _, runner := range runners {
+		for _, tt := range bodies {
+			t.Run(runner.name+" with "+tt.name, func(t *testing.T) {
+				err := runner.run(t, MapCollect("each", items, loopPageKey, tt.body(), out, MapOptions{}))
+
+				require.EqualError(t, err, runner.prefix+tt.want)
+			})
+		}
+	}
+	require.Zero(t, ran.Load(), "no body runs")
+}
+
+func TestMapRunOnAStepStateReadsItsItemsOnlyWhenTheStepExposesThem(t *testing.T) {
+	collect := collectLengths(measureWith(wordLength), MapOptions{})
+	tests := []struct {
+		name    string
+		reads   []KeyRef
+		wantErr string
+	}{
+		{
+			name:    "a step that does not read the items",
+			wantErr: `pipeline step "outer": pipeline step "lengths": state key "words" is missing`,
+		},
+		{name: "a step that reads the items", reads: refs(mapWordsKey.Ref())},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			outer := NewStep("outer", tt.reads, refs(mapCollectedKey.Ref()), func(ctx context.Context, s State) error {
+				return collect.Run(ctx, s)
+			})
+
+			got, err := mapPipeline(t, outer).RunCandidate(context.Background(), nil, wordsInput("a", "bb"))
+
+			if tt.wantErr != "" {
+				require.EqualError(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, got["collected"], 2)
+		})
+	}
+}
+
+func TestMapRunConvertsTheItemToTheTypeItsBodyReads(t *testing.T) {
+	items := Key[[]int]{Name: "items"}
+	item := Key[int64]{Name: "item"}
+	out := Key[[]MapResult[int]]{Name: "out"}
+	doubled := Key[int]{Name: "doubled"}
+	collect := func() Step {
+		body := NewStep("double", refs(item.Ref()), refs(doubled.Ref()), func(_ context.Context, s State) error {
+			value, err := item.Get(s)
+			doubled.Set(s, int(value)*2)
+			return err
+		})
+		return MapCollect("each", items, Key[int]{Name: "item"}, body, out, MapOptions{})
+	}
+	want := []MapResult[int]{{Index: 0, Value: 2}, {Index: 1, Value: 4}}
+	values := func(results []MapResult[int]) []MapResult[int] {
+		kept := make([]MapResult[int], 0, len(results))
+		for _, result := range results {
+			kept = append(kept, MapResult[int]{Index: result.Index, Value: result.Value, Error: result.Error})
+		}
+		return kept
+	}
+
+	t.Run("built in a pipeline", func(t *testing.T) {
+		_, err := PipelineSpec{Inputs: refs(items.Ref()), Steps: []Step{collect()}}.Build()
+
+		require.EqualError(
+			t,
+			err,
+			`pipeline step "each": body "double" reads item "item" as int64, but the items are int`,
+		)
+	})
+	t.Run("run directly", func(t *testing.T) {
+		state := NewState(Prediction{"items": []int{1, 2}})
+
+		require.NoError(t, collect().Run(context.Background(), state))
+
+		results, err := out.Get(state)
+		require.NoError(t, err)
+		require.Equal(t, want, values(results))
+	})
+	t.Run("run by a decorator in a pipeline", func(t *testing.T) {
+		pipeline, err := PipelineSpec{Inputs: refs(items.Ref()), Steps: []Step{decorated{collect()}}}.Build()
+		require.NoError(t, err)
+
+		got, err := pipeline.RunCandidate(context.Background(), nil, Prediction{"items": []int{1, 2}})
+
+		require.NoError(t, err)
+		results, ok := got["out"].([]MapResult[int])
+		require.True(t, ok)
+		require.Equal(t, want, values(results))
+	})
+}
+
+func TestNearestExecutionWithACompositesNameReportsItsCountOnce(t *testing.T) {
+	t.Run("a decorated Loop under a policy", func(t *testing.T) {
+		log := &eventLog{}
+		pipeline, err := PipelineSpec{
+			Steps:     []Step{decorated{WithPolicy(pagedLoop(addPages(plusPage), 6, 5), StepPolicy{})}},
+			Defaults:  []Default{DefaultValue(loopCountKey, 0)},
+			Observers: []PipelineObserver{log},
+		}.Build()
+		require.NoError(t, err)
+
+		_, err = pipeline.RunCandidate(context.Background(), nil, Prediction{})
+
+		require.NoError(t, err)
+		require.Equal(t, map[string]int{"visit": 1}, log.finishedStep(t, "loop", 1).Attributes, "the decorator")
+		require.Equal(t, map[string]int{"visit": 1, "iterations": 3}, log.finishedStep(t, "loop", 2).Attributes,
+			"the Loop's own execution")
+	})
+	t.Run("a decorated Map under a policy", func(t *testing.T) {
+		log := &eventLog{}
+		body := measureWith(func(_ context.Context, word string) (int, error) {
+			if word == "bb" {
+				return 0, errors.New("boom")
+			}
+			return len(word), nil
+		})
+		pipeline := mapPipeline(t, decorated{WithPolicy(collectLengths(body, MapOptions{}), StepPolicy{})}, log)
+
+		_, err := pipeline.RunCandidate(context.Background(), nil, wordsInput("a", "bb"))
+
+		require.NoError(t, err)
+		require.Equal(t, map[string]int{"visit": 1}, log.finishedStep(t, "lengths", 1).Attributes, "the decorator")
+		require.Equal(t, map[string]int{"visit": 1, "failed": 1}, log.finishedStep(t, "lengths", 2).Attributes,
+			"the Map's own execution")
+	})
+}

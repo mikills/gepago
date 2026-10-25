@@ -116,6 +116,11 @@ func TestCheckToolProviderPassesTheRepositoryTools(t *testing.T) {
 	require.NoError(t, err)
 	registered, ok := registry.Lookup("raw_lookup")
 	require.True(t, ok)
+	require.NoError(t, registry.RegisterToolMiddleware("audit", func(next gepa.ToolProvider) gepa.ToolProvider {
+		return gepa.NewToolFunc(next.Schema(), next.Invoke)
+	}))
+	wrapped, err := registry.WrapTool(lookup(), "audit")
+	require.NoError(t, err)
 	text := gepa.NewTool("echo", "Echo the text back.", func(_ context.Context, args struct {
 		Text string `json:"text"`
 	}) (string, error) {
@@ -147,6 +152,7 @@ func TestCheckToolProviderPassesTheRepositoryTools(t *testing.T) {
 		"NewTool of a string":                     text,
 		"NewToolFunc":                             rawLookup(),
 		"a registry's tool":                       registered,
+		"a tool wrapped in tool middleware":       wrapped,
 		"an enum and a list":                      enum,
 		"NewTool with an omitempty field first":   echo[omitemptyFirstArgs]("search"),
 		"NewTool with an omitzero field first":    echo[omitzeroFirstArgs]("search"),

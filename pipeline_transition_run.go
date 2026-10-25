@@ -12,9 +12,10 @@ import (
 type visitKey struct{}
 
 // withVisit returns ctx for the executions of one visit of a top-level step, numbered from one.
-// They belong to no element of a Map, even when their pipeline runs inside one.
+// They belong to no element of a Map and no iteration of a Loop, even when their pipeline runs
+// inside one.
 func withVisit(ctx context.Context, visit int) context.Context {
-	return context.WithValue(withoutElement(ctx), visitKey{}, visit)
+	return context.WithValue(withoutIteration(withoutElement(ctx)), visitKey{}, visit)
 }
 
 // visitFrom returns the visit the executions running with ctx belong to, or zero outside a
@@ -24,13 +25,17 @@ func visitFrom(ctx context.Context) int {
 	return visit
 }
 
-// executionAttributes returns the attributes of an execution of the given visit running with
-// ctx: its visit and, inside an element of a Map, the element's index. Only a pipeline run
-// observes executions, and it numbers every visit.
+// executionAttributes returns the attributes of an execution of the given visit running with ctx.
+// They hold its visit, the element's index inside an element of a Map, and the iteration's number
+// inside an iteration of a Loop. Only a pipeline run observes executions, and it numbers every
+// visit.
 func executionAttributes(ctx context.Context, visit int) map[string]int {
 	attributes := map[string]int{"visit": visit}
 	if element := elementFrom(ctx); element != nil {
 		attributes["index"] = element.index
+	}
+	if iteration := iterationFrom(ctx); iteration.number > 0 {
+		attributes["iteration"] = iteration.number
 	}
 	return attributes
 }
@@ -260,7 +265,7 @@ func (f *flowRun) succeeded(i int, visit stepVisit) (int, error) {
 	f.taken(rule)
 	switch {
 	case rule.to == failTarget:
-		return 0, failStep(node, reads, PermanentError(fmt.Errorf("%s to %s", rule.describe(f.p.steps), Fail)))
+		return 0, failStep(f.ctx, node, reads, PermanentError(fmt.Errorf("%s to %s", rule.describe(f.p.steps), Fail)))
 	case rule.to == endTarget:
 		return len(f.p.steps), nil
 	case rule.rewind:
@@ -290,7 +295,7 @@ func (f *flowRun) failed(i int, visit stepVisit) (int, error) {
 	}
 	err := visit.err
 	if f.ctx.Err() != nil {
-		return 0, failStep(node, reads, err)
+		return 0, failStep(f.ctx, node, reads, err)
 	}
 	view := readOnlyView(visit.view, node.readTypes)
 	exhausted := visit.maxed
@@ -302,7 +307,7 @@ evaluate:
 			}
 			match, whenErr := callWhen(rule, f.p.steps, view, err)
 			if whenErr != nil {
-				return 0, failStep(node, reads, fmt.Errorf("%w; %w", err, whenErr))
+				return 0, failStep(f.ctx, node, reads, fmt.Errorf("%w; %w", err, whenErr))
 			}
 			if !match {
 				continue
@@ -315,13 +320,13 @@ evaluate:
 				}
 				var amendErr error
 				if amended, amendErr = f.callAmend(rule, visit.view, node.readTypes); amendErr != nil {
-					return 0, failStep(node, reads, fmt.Errorf("%w; %w", err, amendErr))
+					return 0, failStep(f.ctx, node, reads, fmt.Errorf("%w; %w", err, amendErr))
 				}
 			}
 			f.taken(rule)
 			switch {
 			case rule.to == failTarget:
-				return 0, failStep(node, reads, PermanentError(
+				return 0, failStep(f.ctx, node, reads, PermanentError(
 					fmt.Errorf("%s to %s: %w", rule.describe(f.p.steps), Fail, err),
 				))
 			case rule.to == endTarget:
@@ -331,7 +336,7 @@ evaluate:
 			}
 			return rule.to, nil
 		}
-		return 0, failStep(node, reads, err)
+		return 0, failStep(f.ctx, node, reads, err)
 	}
 }
 

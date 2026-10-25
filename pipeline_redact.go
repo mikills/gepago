@@ -63,6 +63,25 @@ import (
 // hides a Map's items hides every element's item, and one that hides its results every element's
 // output, in MapResult.Error too, and in what ProgramEvaluator gives reflection.
 //
+// Under a Loop with an iteration key, the "iteration" attribute of each iteration's executions
+// passes through the Redactor under that key as an int. So does the Loop's "iterations" attribute,
+// once for each execution that carries it. Attributes hold integers, so when the Redactor changes
+// one or panics, the events leave it out.
+//
+// The number of the running iteration is public, since the Loop's error names it ("iteration
+// 3"). A short number such as 3 also occurs in other text. So the run does not remove the number
+// from error messages in two places. The first is a read of the iteration key by the body or by
+// an execution nested in it. The second is an input under the key's name of a pipeline that the
+// iteration runs, at any depth. That input must be the running number as an int. The steps of
+// such a pipeline read it in the same way. The events carry these values as the Redactor returns
+// them. Every other value under the key's name is a value as any other. Examples are a Default,
+// a write, a Map item, another number, and the number as a string or a float. So is a copy of the
+// number under another key, or in a detail. When the Redactor changes such a value, the run
+// removes its text from error messages. ProgramEvaluator keeps the number in reflection in the same
+// two places. As for every redacted value, this errs on the side of removing text. When another
+// hidden value has the same text, the run removes the number too. It removes it from the events
+// of the whole trace, and from reflection for the whole example.
+//
 // The Attributes of the RunContext that every event carries pass through the Redactor when a
 // run starts, before RunStarted, each under the key "attribute:<name>", where <name> is the
 // attribute's, with its value as a string; its events then carry the result. A result that is
@@ -214,11 +233,14 @@ func (r *runObservation) scrubValues(values map[string]any) map[string]any {
 	return values
 }
 
-// evaluationRedaction redacts the values an evaluation item carries for reflection: redactors
-// are those of the pipelines the programme holds or ran, types the types of the keys those
-// pipelines declare, mapSteps their Maps, values the values the example's runs were given,
-// wrote or tried to write, the items of their Maps' elements included, details the details
-// their steps attached to errors, and toolCalls the tool calls their steps made.
+// evaluationRedaction redacts the values that an evaluation item carries for reflection. redactors
+// holds the Redactors of the pipelines that the programme holds or ran. types holds the types of
+// the keys those pipelines declare, and mapSteps their Maps. values holds the values that the
+// example's runs took as inputs, wrote or tried to write, the items of their Maps' elements
+// included. details holds the details that their steps attached to errors, and toolCalls the tool
+// calls that their steps made. numbers holds the iteration numbers that were in effect where the
+// step that SideInfo's "reads" come from ran. spans holds, for each run and execution of the
+// item's Trace by span ID, the keys whose values it took as iteration numbers.
 type evaluationRedaction struct {
 	redactors []Redactor
 	types     map[string]reflect.Type
@@ -226,19 +248,24 @@ type evaluationRedaction struct {
 	values    []stateWrite
 	details   []stateWrite
 	toolCalls []ToolCallRecord
+	numbers   iterationNumbers
+	spans     map[string]iterationNumbers
 }
 
-// apply returns item with the values reflection reads passed through the redactors, followed,
-// when the pipelines hold Maps, by hideMapElements, so that it hides each element's item and
-// output wherever the events of the runs do. Its Output and each SideInfo entry are redacted as
-// an event's details are (see redactEntry), with the "inputs" and "expected" entries first
-// converted to their keys' types where they convert, so a Redactor sees them as it sees a run's
-// values, SideInfo's "details" one level further, as an event's details, and the inputs, reads,
-// writes, details and run context attributes of any PipelineTrace in its Trace as an event's,
-// with the tool calls of its steps redacted as an event's are. Then the text of every value the
-// redactors change, among those and the values, details and tool calls of the runs, is removed
-// from every string in them, errors and attributes included. Without redactors it returns item
-// unchanged.
+// apply returns item with the values that reflection reads passed through the redactors. When the
+// pipelines hold Maps, hideMapElements follows the redactors. So apply hides each element's item
+// and output wherever the events of the runs hide them. apply redacts the Output and each SideInfo
+// entry of item as it redacts an event's details (see redactEntry). It first converts the
+// "inputs" and "expected" entries to their keys' types where they convert. So a Redactor sees
+// them as it sees a run's values. It redacts SideInfo's "details" one level further, as an
+// event's details. It redacts SideInfo's "reads" with redactStateValues and the numbers of the
+// failed step, as that step's events redact its reads. It redacts the reads and inputs of each
+// PipelineTrace in the same way. There spans gives the keys that each execution and run took as
+// iteration numbers (see redactTraceValues). It redacts the inputs, reads, writes, details and run context
+// attributes of each PipelineTrace in its Trace as an event's. It also redacts the tool calls of
+// their steps as an event's. Then it removes the text of every value that the redactors change from every
+// string in them, errors and attributes included. Those values include the values, details and
+// tool calls of the runs. Without redactors it returns item unchanged.
 func (e evaluationRedaction) apply(item EvaluationItem) EvaluationItem {
 	if len(e.redactors) == 0 {
 		return item
@@ -266,6 +293,8 @@ func (e evaluationRedaction) apply(item EvaluationItem) EvaluationItem {
 			switch {
 			case isMap && name == "details":
 				sideInfo[name] = run.redactEntries(details)
+			case isMap && name == "reads":
+				sideInfo[name] = run.redactStateValues(details, e.numbers)
 			case isPrediction && (name == "inputs" || name == "expected"):
 				sideInfo[name] = run.redactTyped(example, e.types)
 			default:
@@ -276,6 +305,9 @@ func (e evaluationRedaction) apply(item EvaluationItem) EvaluationItem {
 	}
 	item.Trace = mapTraces(item.Trace, func(trace PipelineTrace) PipelineTrace {
 		return mapTrace(trace, traceMapping{
+			reads: func(values map[string]any, span string) map[string]any {
+				return run.redactTraceValues(values, e.spans[span])
+			},
 			values:     run.redactValues,
 			details:    run.redactEntries,
 			tools:      run.redactToolCalls,
@@ -292,6 +324,7 @@ func (e evaluationRedaction) apply(item EvaluationItem) EvaluationItem {
 	}
 	item.Trace = mapTraces(item.Trace, func(trace PipelineTrace) PipelineTrace {
 		return mapTrace(trace, traceMapping{
+			reads:      func(values map[string]any, _ string) map[string]any { return run.scrubValues(values) },
 			values:     run.scrubValues,
 			details:    run.scrubValues,
 			tools:      run.scrubToolCalls,
@@ -300,6 +333,25 @@ func (e evaluationRedaction) apply(item EvaluationItem) EvaluationItem {
 		})
 	})
 	return item
+}
+
+// redactTraceValues returns copies of the reads or inputs of a trace as redactStateValues returns
+// those of an execution or run. numbers holds each key whose value the execution or run took as an
+// iteration number. A trace holds its values as JSON decodes them, as a float64 for a number. So
+// the key alone tells the iteration number apart, and the value passes through redactNumber.
+func (r *runObservation) redactTraceValues(values map[string]any, numbers iterationNumbers) map[string]any {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(values))
+	for key, value := range values {
+		if _, ok := numbers[key]; ok {
+			out[key] = r.redactNumber(key, value)
+		} else {
+			out[key] = r.redact(key, value)
+		}
+	}
+	return out
 }
 
 // redactTyped returns a copy of values with each one converted to its key's type in types
@@ -312,7 +364,7 @@ func (r *runObservation) redactTyped(values Prediction, types map[string]reflect
 	out := make(Prediction, len(values))
 	for key, value := range values {
 		if typ := types[key]; typ != nil {
-			if converted, err := convertStateValue(key, typ, value); err == nil {
+			if converted, err := convertValue(key, typ, value, fromState); err == nil {
 				value = converted
 			}
 		}
@@ -343,10 +395,12 @@ func mapTraces(value any, fn func(PipelineTrace) PipelineTrace) any {
 	return value
 }
 
-// traceMapping holds what mapTrace applies to a trace: values to its inputs and to each step's
-// reads and writes, details to each step's details, tools to each step's tool calls, text to its
-// errors and runContext to its RunContext.
+// traceMapping holds what mapTrace applies to a trace. reads applies to its inputs and to each
+// step's reads, with the span ID of the run or the step. values applies to each step's writes,
+// details to each step's details and tools to each step's tool calls. text applies to its errors
+// and runContext to its RunContext.
 type traceMapping struct {
+	reads           func(map[string]any, string) map[string]any
 	values, details func(map[string]any) map[string]any
 	tools           func([]ToolCallRecord) []ToolCallRecord
 	text            func(string) string
@@ -356,14 +410,14 @@ type traceMapping struct {
 // mapTrace returns a copy of trace, its nested runs included, with mapping applied.
 func mapTrace(trace PipelineTrace, mapping traceMapping) PipelineTrace {
 	trace.RunContext = mapping.runContext(trace.RunContext)
-	trace.Inputs = mapping.values(trace.Inputs)
+	trace.Inputs = mapping.reads(trace.Inputs, trace.SpanID)
 	trace.Err = mapping.text(trace.Err)
 	if trace.Steps == nil {
 		return trace
 	}
 	steps := make([]StepTrace, len(trace.Steps))
 	for i, step := range trace.Steps {
-		step.Reads = mapping.values(step.Reads)
+		step.Reads = mapping.reads(step.Reads, step.SpanID)
 		step.Writes = mapping.values(step.Writes)
 		step.Details = mapping.details(step.Details)
 		step.ToolCalls = mapping.tools(step.ToolCalls)
@@ -800,11 +854,12 @@ func (e *redactedError) Is(target error) bool {
 	return slices.Contains(e.matches, target)
 }
 
-// textForms returns the ways value may appear in an error message: each string it holds, as
-// it is, quoted and JSON-encoded, and for a value that is not a string its %v, %+v and JSON
+// textForms returns the ways value may appear in an error message. They are each string it holds,
+// as it is, quoted and JSON-encoded. They are also the String text and JSON summary of each Image
+// it holds at any depth. For a value that is not a string, they are also its %v, %+v and JSON
 // forms. A panic in a value's String or MarshalJSON method only drops that form.
 func textForms(value any) []string {
-	forms := stringForms(value)
+	forms := append(stringForms(value), imageForms(value)...)
 	if value == nil || reflect.TypeOf(value).Kind() == reflect.String {
 		return forms
 	}
@@ -831,7 +886,8 @@ func stringForms(value any) []string {
 	return forms
 }
 
-// walkStrings calls visit with every string v holds, unexported fields included.
+// walkStrings calls visit with every string v holds, unexported fields included. It skips a
+// slice or an array of numbers or booleans, such as an Image's data, without a walk.
 func walkStrings(v reflect.Value, seen map[uintptr]bool, visit func(string)) {
 	switch v.Kind() {
 	case reflect.String:
@@ -853,14 +909,28 @@ func walkStrings(v reflect.Value, seen map[uintptr]bool, visit func(string)) {
 	case reflect.Interface:
 		walkStrings(v.Elem(), seen, visit)
 	case reflect.Slice, reflect.Array:
-		for i := range v.Len() {
-			walkStrings(v.Index(i), seen, visit)
+		if !holdsNoStrings(v.Type().Elem().Kind()) {
+			for i := range v.Len() {
+				walkStrings(v.Index(i), seen, visit)
+			}
 		}
 	case reflect.Struct:
 		for i := range v.NumField() {
 			walkStrings(v.Field(i), seen, visit)
 		}
 	}
+}
+
+// holdsNoStrings reports whether a value of kind is a number or a boolean, which holds no
+// string.
+func holdsNoStrings(kind reflect.Kind) bool {
+	switch kind {
+	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128:
+		return true
+	}
+	return false
 }
 
 // replaceStrings returns a copy of value with replace applied to every string it holds that

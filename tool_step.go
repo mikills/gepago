@@ -25,6 +25,20 @@ import (
 // and every required property must be read. For a tool made by NewTool, each read must also
 // have the Go type of the argument field it fills and each write the Go type of the output
 // field it takes, when the output is a struct.
+//
+// Tool arguments travel as JSON, and the JSON form of an Image holds no image data. So Build
+// refuses a read whose type is Image, or reaches Image only through pointers, slices, arrays and
+// map values, such as []*Image. A read of another type can hold an Image in a struct field. When
+// its value holds an Image from NewImage, the step fails with a Permanent error. The error names
+// the key and the Go type of its value only when that value alone holds the image. Otherwise,
+// such as for a MarshalJSONTo that encodes an Image only inside another value, it names no key.
+// A zero Image encodes as null. A type that embeds an Image or a *Image, or that writes its own
+// JSON, encodes as json.Marshal writes it. So the tool gets at most the image's summary, and never
+// the image. But a MarshalJSONTo that encodes an Image it holds through its encoder still fails.
+// A MarshalJSONTo that encodes an Image apart and then writes the result as text passes, and the
+// tool gets the summary as text. The JSON of all the arguments can hold the full summary of an
+// image elsewhere. Then that MarshalJSONTo fails too, and the error names its key. The arguments
+// cost a second encode only when their JSON holds the full summary of an image (see NewTool).
 func ToolStep(name, tool string, reads, writes []KeyRef) Step {
 	return &toolStep{
 		name:   strings.TrimSpace(name),
@@ -45,12 +59,28 @@ func (s *toolStep) Name() string     { return s.name }
 func (s *toolStep) Reads() []KeyRef  { return slices.Clone(s.reads) }
 func (s *toolStep) Writes() []KeyRef { return slices.Clone(s.writes) }
 
-// Validate requires a tool name.
+// Validate requires a tool name. It also refuses a read whose type is an Image, or a chain of
+// pointers, slices, arrays and map values that ends at one.
 func (s *toolStep) Validate() error {
 	if strings.TrimSpace(s.tool) == "" {
 		return errors.New("tool step tool name is required")
 	}
+	for _, key := range s.reads {
+		if key.Type != nil && imageChain(key.Type) {
+			return fmt.Errorf(
+				"reads %q as %s, which holds an Image, but the arguments of tool %q travel as JSON without image data",
+				key.Name,
+				key.Type,
+				s.tool,
+			)
+		}
+	}
 	return nil
+}
+
+// namedTools returns the tool the step calls.
+func (s *toolStep) namedTools() []string {
+	return []string{s.tool}
 }
 
 // bindTools checks that the tool is registered and allowed and that the step's keys fit it.
@@ -66,9 +96,7 @@ func (s *toolStep) bindTools(registry *ToolRegistry, policy ToolPolicy) error {
 	if err := s.checkArgumentSchema(schema.Parameters); err != nil {
 		return err
 	}
-	typed, ok := provider.(interface {
-		toolTypes() (reflect.Type, reflect.Type)
-	})
+	typed, ok := provider.(typedProvider)
 	if !ok {
 		return nil
 	}
@@ -162,7 +190,7 @@ func (s *toolStep) Run(ctx context.Context, state State) error {
 		}
 		args[key.Name] = value
 	}
-	arguments, err := json.Marshal(args)
+	arguments, err := encodeToolArguments(args)
 	if err != nil {
 		return fmt.Errorf("encode arguments of tool %q: %w", s.tool, err)
 	}
@@ -178,7 +206,7 @@ func (s *toolStep) Run(ctx context.Context, state State) error {
 		value, ok := outputs[key.Name]
 		if !ok {
 			err = fmt.Errorf("%w: tool %q output has no field %q", ErrInvalidOutput, s.tool, key.Name)
-		} else if value, err = convertStateValue(key.Name, key.Type, value); err != nil {
+		} else if value, err = convertValue(key.Name, key.Type, value, fromText); err != nil {
 			err = fmt.Errorf("%w: tool %q output: %w", ErrInvalidOutput, s.tool, err)
 		}
 		if err != nil {
@@ -187,6 +215,31 @@ func (s *toolStep) Run(ctx context.Context, state State) error {
 		state.store(key.Name, key.Type, value, true)
 	}
 	return nil
+}
+
+// encodeToolArguments encodes args, the value of each read under its key, as json.Marshal does.
+// The JSON form of an Image holds no image data. So an Image from NewImage in a value fails the
+// encode with a Permanent error (see encodeCheckingImages). It checks the JSON only when the type
+// of a value may encode an Image (see argumentsMayEncodeImage). The error names the key whose
+// value fails when it encodes alone, and the Go type of that value. It names no key when no value
+// fails alone, or when another value fails alone with another error first (see refusedArgument).
+// A zero Image encodes as null.
+func encodeToolArguments(args map[string]any) ([]byte, error) {
+	arguments, err := encodeCheckingImages(args, argumentsMayEncodeImage(args))
+	if !errors.Is(err, errImageRefused) {
+		return arguments, err
+	}
+	key, found := refusedArgument(args)
+	if !found {
+		return nil, PermanentError(errors.New(
+			"tool arguments hold an Image, but tool arguments travel as JSON without image data",
+		))
+	}
+	return nil, PermanentError(fmt.Errorf(
+		"state key %q: %T holds an Image, but tool arguments travel as JSON without image data",
+		key,
+		args[key],
+	))
 }
 
 // toolOutputObject decodes a tool's output as a JSON object, keeping numbers as json.Number.

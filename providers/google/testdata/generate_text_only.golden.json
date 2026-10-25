@@ -1,0 +1,1 @@
+{"systemInstruction":{"parts":[{"text":"You are a precise optimisation assistant. Follow the requested output format exactly."}]},"contents":[{"role":"user","parts":[{"text":"make \"this\" \u003cbetter\u003e \u0026 shorter"}]}],"generationConfig":{"maxOutputTokens":512}}

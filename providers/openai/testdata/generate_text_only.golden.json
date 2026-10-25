@@ -1,0 +1,1 @@
+{"messages":[{"content":"You are a precise optimisation assistant. Follow the requested output format exactly.","role":"system"},{"content":"make \"this\" <better> & shorter","role":"user"}],"model":"requested-model","max_completion_tokens":512}

@@ -223,7 +223,10 @@ func (e ProgramEvaluator) Evaluate(
 		actual, err := e.Program.RunCandidate(withEvaluationCapture(runCtx, capture), candidate, ioExample.Inputs)
 		usage = usage.Add(collector.Usage())
 		if errors.Is(err, ErrInvalidOutput) {
-			items = append(items, capture.apply(invalidOutputItem(example.ID, ioExample, actual, err)))
+			items = append(
+				items,
+				capture.apply(invalidOutputItem(example.ID, ioExample, actual, err), readNumbers(err)),
+			)
 			continue
 		}
 		if err != nil {
@@ -249,7 +252,7 @@ func (e ProgramEvaluator) Evaluate(
 				"feedback": metricResult.Feedback,
 				"details":  metricResult.Details,
 			},
-		}))
+		}, nil))
 	}
 	return EvaluationResult{Items: items, Usage: usage}, nil
 }
@@ -272,6 +275,16 @@ func invalidOutputItem(exampleID string, example IOExample, actual Prediction, e
 		sideInfo["reads"] = reflectionValues(stepErr.Reads)
 	}
 	return EvaluationItem{ExampleID: exampleID, Output: actual, SideInfo: sideInfo}
+}
+
+// readNumbers returns the iteration numbers of the step that produced the invalid output in err.
+// They are the numbers that were in effect where the step ran. It returns nil when no pipeline
+// step produced the output.
+func readNumbers(err error) iterationNumbers {
+	if stepErr := invalidOutputStep(err); stepErr != nil {
+		return stepErr.numbers
+	}
+	return nil
 }
 
 func bestCandidateFromState(state OptimizationState) CandidateRecord {

@@ -40,7 +40,15 @@ type RetryPolicy struct {
 // pipeline's candidate keys nor how budgets, transitions and other steps refer to step. It is
 // a ComponentStep when step is one. Its own SeedCandidate and RunCandidate use keys already
 // scoped by step's name, because it shares the candidate namespace of the steps around it.
-// Build rejects a negative Timeout or MaxAttempts.
+// Build rejects a negative Timeout or MaxAttempts. When a caller runs the returned step with Run or
+// RunCandidate, step sees only the keys that the caller's State exposes (see Loop). An error of
+// step is then a StepError that names step. A step with step's name that runs the returned step in
+// its own execution gets the error as it is, and its execution names step. A step that is not a
+// wrapper has its own execution when a pipeline, a Parallel, a Map, a Loop or a wrapper runs it.
+// WithPolicy, WithCache and WithAmendable return wrappers. A decorator you write is never a
+// wrapper, even when it embeds one. So a decorator that embeds the returned step and keeps its name
+// gets the error as it is. That is so when a pipeline, a Parallel, a Map, a Loop or a wrapper runs
+// the decorator. A caller that runs the returned step outside such an execution gets the StepError.
 func WithPolicy(step Step, policy StepPolicy) Step {
 	p := &policyStep{child: newStepNode(step), policy: policy}
 	return asComponentStep(p, p.child)
@@ -80,10 +88,12 @@ func (p *policyStep) Run(ctx context.Context, s State) error {
 	return p.runCandidate(ctx, nil, s)
 }
 
-func (p *policyStep) runCandidate(ctx context.Context, candidate Candidate, s State) error {
+func (p *policyStep) runCandidate(ctx context.Context, candidate Candidate, s State) (err error) {
+	defer func() { err = nameWrapped(ctx, s, p.child, err) }()
 	attempts := max(p.policy.Retry.MaxAttempts, 1)
+	values := s.childView(p)
 	for attempt := 1; ; attempt++ {
-		result, err := p.attempt(ctx, candidate, s.values, attempt)
+		result, err := p.attempt(ctx, candidate, values, attempt)
 		if err == nil {
 			result.commitTo(s, p.child)
 			return nil

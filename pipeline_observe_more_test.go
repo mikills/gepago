@@ -537,3 +537,133 @@ func TestPipelineObserverStress(t *testing.T) {
 		})
 	}
 }
+
+// stepHook is an observer that audits the executions of a run. Unless started is nil, it calls
+// started with the context and the event of each StepStarted event. Unless finished is nil, it
+// calls finished with those of each StepFinished event.
+type stepHook struct {
+	started  func(ctx context.Context, event StepStartedEvent)
+	finished func(ctx context.Context, event StepFinishedEvent)
+}
+
+func (*stepHook) RunStarted(context.Context, RunStartedEvent) {}
+
+func (o *stepHook) StepStarted(ctx context.Context, event StepStartedEvent) {
+	if o.started != nil {
+		o.started(ctx, event)
+	}
+}
+
+func (o *stepHook) StepFinished(ctx context.Context, event StepFinishedEvent) {
+	if o.finished != nil {
+		o.finished(ctx, event)
+	}
+}
+
+func (*stepHook) RunFinished(context.Context, RunFinishedEvent) {}
+
+func TestObserverContextHidesWhereTheExecutionRuns(t *testing.T) {
+	ctx := withIteration(withElement(withVisit(WithToolScope(context.Background(), "account"), 2), 1, &elementUsage{}),
+		"page", 3)
+	ctx = context.WithValue(ctx, finishHoldKey{}, &finishHold{})
+	require.Equal(t, 2, visitFrom(ctx))
+	require.NotNil(t, elementFrom(ctx))
+	require.Equal(t, 3, iterationFrom(ctx).number)
+	require.NotNil(t, finishHoldFrom(ctx))
+
+	observed := (&runObservation{life: context.Background()}).observerContext(ctx, nil)
+
+	require.Zero(t, visitFrom(observed), "the visit of the top-level step")
+	require.Nil(t, elementFrom(observed), "the element of a Map")
+	require.Zero(t, iterationFrom(observed), "the iteration of a Loop")
+	require.Nil(t, finishHoldFrom(observed), "the hold of a top-level wrapper")
+	require.Equal(t, "account", ToolScopeFrom(observed), "the other values of the context")
+}
+
+func TestObserverRunReportsItsStepsInOrderDuringAHeldExecution(t *testing.T) {
+	disagree := MergeWith(amountKey, func(int, int) (int, error) { return 0, errors.New("amounts disagree") })
+	failedCommit := func(hook *stepHook) PipelineSpec {
+		return PipelineSpec{
+			Steps:     []Step{writeAmount("first", 1), WithPolicy(writeAmount("second", 2), StepPolicy{})},
+			Merges:    []MergeRule{disagree},
+			Observers: []PipelineObserver{hook},
+		}
+	}
+	cacheHitIn := func(wrap func(Step) Step) func(hook *stepHook) PipelineSpec {
+		return func(hook *stepHook) PipelineSpec {
+			calls := &stepCalls{}
+			return PipelineSpec{
+				Steps: []Step{wrap(WithCache(writeAmount("a", 10), nil)), describeAmount(calls, "b")},
+				Transitions: []Transition{
+					{From: "b", When: func(State, error) bool { return calls.of("b") == 1 }, To: "a"},
+				},
+				MaxVisits: map[string]int{"a": 2},
+				Observers: []PipelineObserver{hook},
+			}
+		}
+	}
+	cacheHit := cacheHitIn(func(step Step) Step { return step })
+	cacheHitInAPolicy := cacheHitIn(func(step Step) Step { return WithPolicy(step, StepPolicy{}) })
+	tests := []struct {
+		name     string
+		spec     func(hook *stepHook) PipelineSpec
+		step     string
+		finished bool
+		err      string
+	}{
+		{name: "the start of a failed commit", spec: failedCommit, step: "second", err: "amounts disagree"},
+		{
+			name:     "the end of a failed commit",
+			spec:     failedCommit,
+			step:     "second",
+			finished: true,
+			err:      "amounts disagree",
+		},
+		{name: "the start of a cache hit", spec: cacheHit, step: "a"},
+		{name: "the end of a cache hit", spec: cacheHit, step: "a", finished: true},
+		{name: "the start of a cache hit inside a top-level wrapper", spec: cacheHitInAPolicy, step: "a"},
+		{name: "the end of a cache hit inside a top-level wrapper", spec: cacheHitInAPolicy, step: "a", finished: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			log := &eventLog{}
+			recorder := &RecordingObserver{}
+			audit, err := PipelineSpec{
+				Steps:     []Step{writeAmount("audit", 1)},
+				Observers: []PipelineObserver{log, recorder},
+			}.Build()
+			require.NoError(t, err)
+			var audits []error
+			run := func(ctx context.Context, step string, attempt int) {
+				// the second execution of the step is the stand-in: the failed commit or the cache hit.
+				if step == tt.step && attempt == 2 {
+					_, err := audit.RunCandidate(ctx, nil, Prediction{})
+					audits = append(audits, err)
+				}
+			}
+			hook := &stepHook{}
+			if tt.finished {
+				hook.finished = func(ctx context.Context, event StepFinishedEvent) { run(ctx, event.Step, event.Attempt) }
+			} else {
+				hook.started = func(ctx context.Context, event StepStartedEvent) { run(ctx, event.Step, event.Attempt) }
+			}
+			pipeline, err := tt.spec(hook).Build()
+			require.NoError(t, err)
+
+			_, err = pipeline.RunCandidate(context.Background(), nil, Prediction{})
+
+			if tt.err != "" {
+				require.ErrorContains(t, err, tt.err)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Equal(t, []error{nil}, audits)
+			require.Equal(t, []string{"start run", "start audit#1 in run", "finish audit#1", "finish run"}, log.Lines(),
+				"the audit reports the end of its step in its own run")
+			traces := recorder.Traces()
+			require.Len(t, traces, 1)
+			require.Len(t, traces[0].Steps, 1)
+			require.False(t, traces[0].Steps[0].EndedAt.IsZero(), "the trace of the audit's step has an end")
+		})
+	}
+}

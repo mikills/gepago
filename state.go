@@ -47,6 +47,80 @@ type stepScope struct {
 	// attributes holds what the step reports about its execution, which its StepFinished adds
 	// to the Attributes StepStarted reported, such as the elements of a Map that failed.
 	attributes map[string]int
+	// step is the step whose execution the scope belongs to, or nil for a scope of no execution.
+	// name is that step's name as the pipeline knows it.
+	step Step
+	name string
+	// loopKey is the iteration key of the Loop whose "iterations" attribute the scope reports,
+	// under which the run's Redactors see it.
+	loopKey string
+}
+
+// runs reports whether the scope belongs to an execution of step. It reports false for a step that
+// runs step itself with its own State. step must have a comparable type, such as a pointer.
+func (s *stepScope) runs(step Step) bool {
+	return s != nil && s.step != nil && unwrapComposite(s.step) == step
+}
+
+// named reports whether the scope belongs to an execution of a step named name. That execution
+// names the error of a step with the same name that it runs, so the step must not name it again.
+// runChild does not name such a child either.
+func (s *stepScope) named(name string) bool {
+	return s != nil && s.step != nil && s.name == name
+}
+
+// visible returns the value a step reading key through s gets, without a copy, and whether s
+// exposes one. Inside a step that is a value the step has set or a declared read that the state
+// holds. Outside a step it is any value the state holds.
+func (s State) visible(key string) (any, bool) {
+	if s.scope != nil {
+		if value, ok := s.scope.pending[key]; ok {
+			return value, true
+		}
+		if _, ok := s.scope.reads[key]; !ok {
+			return nil, false
+		}
+	}
+	value, ok := s.values[key]
+	return value, ok
+}
+
+// visibleValues returns the values of keys that s exposes (see visible).
+func (s State) visibleValues(keys []KeyRef) map[string]any {
+	values := make(map[string]any, len(keys))
+	for _, key := range keys {
+		if value, ok := s.visible(key.Name); ok {
+			values[key.Name] = value
+		}
+	}
+	return values
+}
+
+// exposed returns the values of every key that s exposes (see visible), without copies. It is the
+// view a step that runs another step on s gives it. Outside a step it returns the values s holds.
+func (s State) exposed() map[string]any {
+	if s.scope == nil {
+		return s.values
+	}
+	values := make(map[string]any, len(s.scope.reads)+len(s.scope.pending))
+	for key := range s.scope.reads {
+		if value, ok := s.values[key]; ok {
+			values[key] = value
+		}
+	}
+	maps.Copy(values, s.scope.pending)
+	return values
+}
+
+// childView returns the values that c, a composite step that runs on s, gives the steps it runs.
+// Under c's own execution they are the values s holds, the view that whatever runs c built for
+// it. Otherwise, as when a step runs c with its own State, they are the values of the keys s
+// exposes (see exposed).
+func (s State) childView(c Step) map[string]any {
+	if s.scope.runs(c) {
+		return s.values
+	}
+	return s.exposed()
 }
 
 // report sets an attribute of the step's execution. Outside a step there is nothing to report
@@ -59,6 +133,25 @@ func (s *stepScope) report(name string, value int) {
 		s.attributes = map[string]int{}
 	}
 	s.attributes[name] = value
+}
+
+// reportIterations sets the "iterations" attribute of the step's execution to count, the iterations
+// of a Loop. The run's Redactors see the attribute under key, the Loop's iteration key.
+func (s *stepScope) reportIterations(key string, count int) {
+	if s == nil {
+		return
+	}
+	s.loopKey = key
+	s.report("iterations", count)
+}
+
+// iterationKey returns the iteration key under which the run's Redactors see the "iterations"
+// attribute the step reported, or "" when there is none.
+func (s *stepScope) iterationKey() string {
+	if s == nil {
+		return ""
+	}
+	return s.loopKey
 }
 
 // reported returns a copy of the attributes the step reported, or nil when there are none.
@@ -194,6 +287,11 @@ func (s State) store(key string, typ reflect.Type, value any, fresh bool) {
 // `json:"-,"`, or with a ",string" field that is not a boolean, number or string or whose type
 // has its own unmarshal method (json.Number aside), is refused for every object.
 //
+// An Image's JSON form is a summary without its data. So an Image converts only from a value that
+// holds the same Image. Get converts between Image and *Image, and into a struct, slice, map or any
+// that holds Images. It takes each Image from the stored value by its digest. A summary of an image
+// that the stored value does not hold fails with an error that matches ErrInvalidImage.
+//
 // If T or *T has a Validate() error method, Get calls it on every value it returns (except a
 // nil pointer) and returns its error, so a value that decodes but breaks T's invariants is
 // still refused.
@@ -230,7 +328,7 @@ func (k Key[T]) Set(s State, v T) {
 
 func decodeStateValue[T any](key string, raw any) (T, error) {
 	var zero T
-	value, err := convertStateValue(key, reflect.TypeFor[T](), raw)
+	value, err := convertValue(key, reflect.TypeFor[T](), raw, fromState)
 	if err != nil {
 		return zero, err
 	}
@@ -238,9 +336,9 @@ func decodeStateValue[T any](key string, raw any) (T, error) {
 	return out, nil
 }
 
-// convertStateValue returns a copy of value as typ, converting values of other types through
-// their JSON form, and checks the result with its Validate method if it has one.
-func convertStateValue(key string, typ reflect.Type, value any) (any, error) {
+// convertValue returns a copy of value, from source, as typ. It converts values of other types
+// through their JSON form, and checks the result with its Validate method if it has one.
+func convertValue(key string, typ reflect.Type, value any, source valueSource) (any, error) {
 	var out any
 	switch {
 	case value == nil:
@@ -252,7 +350,7 @@ func convertStateValue(key string, typ reflect.Type, value any) (any, error) {
 		typ.Kind() == reflect.Interface && reflect.TypeOf(value).Implements(typ):
 		out = deepCopy(value)
 	default:
-		decoded, err := decodeJSONValue(typ, value)
+		decoded, err := decodeValue(typ, value, source)
 		if err != nil {
 			return nil, fmt.Errorf("state key %q: decode as %s: %w", key, typ, err)
 		}
@@ -277,12 +375,16 @@ var decodeOptions = jsonv2.JoinOptions(
 	json.FormatDurationAsNano(true),
 	json.FormatByteArrayAsArray(true),
 	json.FormatBytesWithLegacySemantics(true),
-	jsonv2.WithUnmarshalers(jsonv2.JoinUnmarshalers(
-		jsonv2.UnmarshalFromFunc(decodeMethodMapKey[json.Unmarshaler]),
-		jsonv2.UnmarshalFromFunc(decodeMethodMapKey[jsonv2.UnmarshalerFrom]),
-		jsonv2.UnmarshalFromFunc(decodeMethodMapKey[encoding.TextUnmarshaler]),
-		jsonv2.UnmarshalFromFunc(decodeQuotedNumber),
-	)),
+	jsonv2.WithUnmarshalers(decodeUnmarshalers),
+)
+
+// decodeUnmarshalers are the unmarshalers of decodeOptions. A later WithUnmarshalers option
+// replaces them, so options that add unmarshalers join these (see imagePlaces.decodeOptions).
+var decodeUnmarshalers = jsonv2.JoinUnmarshalers(
+	jsonv2.UnmarshalFromFunc(decodeMethodMapKey[json.Unmarshaler]),
+	jsonv2.UnmarshalFromFunc(decodeMethodMapKey[jsonv2.UnmarshalerFrom]),
+	jsonv2.UnmarshalFromFunc(decodeMethodMapKey[encoding.TextUnmarshaler]),
+	jsonv2.UnmarshalFromFunc(decodeQuotedNumber),
 )
 
 // decodeQuotedNumber is called by encoding/json/v2 before it decodes a json.Number. In a
@@ -540,10 +642,41 @@ func tagOptionError(typ reflect.Type) (reflect.Type, error) {
 	return nil, nil
 }
 
-func decodeJSONValue(typ reflect.Type, value any) (any, error) {
-	data, err := json.Marshal(value)
+// valueSource says where a value to decode comes from. A model or a tool can write any text, so
+// an image error about a value from text names nothing of the value. The zero valueSource is
+// fromText, so a call site that does not name a source names nothing of the value.
+type valueSource int
+
+const (
+	// fromText is a value that a model or a tool wrote, such as a reply or tool arguments.
+	fromText valueSource = iota
+	// fromState is a value of the state, of a run's inputs or of a Default. An image error may
+	// name the digest of such a value.
+	fromState
+)
+
+// decodeValue converts value, from source, to typ through its JSON form. Some types can hold an
+// Image, or an empty interface that value may fill with one. When typ is such a type and value
+// holds images, each Image of value decodes at its place as itself (see imagePlaces.decodeOptions).
+// This is necessary because the JSON form of an Image, a summary, holds no data. For any other
+// type it never walks value for images. The type check is only a fast path before that walk.
+func decodeValue(typ reflect.Type, value any, source valueSource) (any, error) {
+	var (
+		data   []byte
+		places imagePlaces
+		err    error
+	)
+	if mayHoldImage(typ, true) && holdsImage(value) {
+		data, places, err = encodeImages(value)
+	} else {
+		data, err = json.Marshal(value)
+	}
 	if err != nil {
 		return nil, err
+	}
+	options := decodeOptions
+	if places != nil || mayHoldImage(typ, false) {
+		options = places.decodeOptions(source)
 	}
 	var generic any
 	decoder := json.NewDecoder(bytes.NewReader(data))
@@ -552,7 +685,7 @@ func decodeJSONValue(typ reflect.Type, value any) (any, error) {
 		return nil, err
 	}
 	out := reflect.New(typ)
-	err = jsonv2.Unmarshal(data, out.Interface(), decodeOptions)
+	err = jsonv2.Unmarshal(data, out.Interface(), options)
 	// an unknown member, such as a renamed field, explains a missing field, so it comes first,
 	// unless it is inside an object for a struct whose definition is refused, which explains it.
 	if errors.Is(err, jsonv2.ErrUnknownName) {
@@ -969,11 +1102,13 @@ func joinJSONPath(path, key string) string {
 }
 
 // jsonField is one JSON object key of a struct. index is the path of the struct field it
-// resolves to, quoted reports the ",string" tag option, and description holds the field's
-// description tag for JSON Schema.
+// resolves to. quoted reports the ",string" tag option. description holds the field's
+// description tag for JSON Schema. optional reports the omitempty or omitzero tag option, and
+// omitzero reports omitzero alone.
 type jsonField struct {
 	typ         reflect.Type
 	optional    bool
+	omitzero    bool
 	quoted      bool
 	description string
 	index       []int
@@ -1076,6 +1211,7 @@ func addJSONFieldCandidates(
 			field: jsonField{
 				typ:         field.Type,
 				optional:    slices.Contains(opts, "omitempty") || slices.Contains(opts, "omitzero"),
+				omitzero:    slices.Contains(opts, "omitzero"),
 				quoted:      slices.Contains(opts, "string"),
 				description: field.Tag.Get("description"),
 				index:       index,

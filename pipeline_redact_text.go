@@ -29,7 +29,8 @@ type formNode struct {
 }
 
 // remember records the text forms of original, which a redactor turned into redacted. The
-// forms of a string redacted still holds, such as a field the redactor kept, are not recorded.
+// forms of a string or an Image redacted still holds, such as a field the redactor kept, are not
+// recorded.
 func (t *redactedText) remember(original, redacted any) {
 	t.rememberForms(textForms(original), redacted)
 }
@@ -51,7 +52,7 @@ func (t *redactedText) rememberForms(forms []string, redacted any) {
 		replacement = text
 	}
 	kept := map[string]bool{}
-	for _, form := range stringForms(redacted) {
+	for _, form := range append(stringForms(redacted), imageForms(redacted)...) {
 		kept[form] = true
 	}
 	for _, form := range forms {

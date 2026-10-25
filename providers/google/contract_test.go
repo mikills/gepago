@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -39,8 +40,8 @@ func TestChatClientMeetsTheChatContract(t *testing.T) {
 	client, err := NewChatClient(Config{APIKey: "secret", BaseURL: server.URL, Model: "gemini-test"})
 	require.NoError(t, err)
 
-	require.True(t, gepatest.CheckChatClient(t, client))
-	require.True(t, gepatest.CheckChatClient(t, testModel(t, server.URL)))
+	require.True(t, gepatest.CheckChatClient(t, client, gepatest.ChatImages()))
+	require.True(t, gepatest.CheckChatClient(t, testModel(t, server.URL), gepatest.ChatImages()))
 	require.Greater(t, requests.Load(), int32(2), "the checks reached the server")
 }
 
@@ -151,4 +152,35 @@ func TestChatRefusesARequestGeminiCannotTake(t *testing.T) {
 			require.Equal(t, sent+1, requests.Load(), "the request was sent")
 		})
 	}
+}
+
+func TestChatRefusesInvalidPart(t *testing.T) {
+	server, requests := cachingServer(t)
+	client, err := NewChatClient(Config{APIKey: "secret", BaseURL: server.URL, Model: "gemini-test"})
+	require.NoError(t, err)
+	fake := gepatest.NewFakeGenerator().Default(gepatest.Text("ok"))
+
+	for name, req := range providertest.InvalidPartRequests() {
+		t.Run(name, func(t *testing.T) {
+			_, fakeErr := fake.Chat(context.Background(), req)
+			require.ErrorIs(t, fakeErr, gepatest.ErrInvalidChatRequest)
+
+			resp, err := client.Chat(context.Background(), req)
+
+			require.Error(t, err)
+			require.True(t, gepa.IsPermanent(err), "%v", err)
+			require.Equal(t, gepa.ChatResponse{}, resp)
+			require.Zero(t, requests.Load(), "the request was not sent")
+			require.True(t, strings.HasSuffix(fakeErr.Error(), strings.SplitN(err.Error(), ": ", 2)[1]),
+				"the fake refuses for the reason the provider gives: %v, %v", fakeErr, err)
+		})
+	}
+
+	// a request with image parts on a user message, which both send.
+	req, _, _ := providertest.ImageChatRequest()
+	_, err = fake.Chat(context.Background(), req)
+	require.NoError(t, err)
+	_, err = client.Chat(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, int32(1), requests.Load(), "the request was sent")
 }

@@ -16,11 +16,11 @@ import (
 // omitempty or omitzero, or of a pointer, slice, map or interface type, is an Optional output
 // (the reply may set it to null). Signature.Outputs must be left empty.
 //
-// The signature's inputs are Signature.Inputs when given; otherwise In must be a struct and the
-// inputs are its JSON fields. Given inputs must name exactly In's JSON fields when In is a
-// struct, and every struct In holds must decode, as JSONSchemaFor requires of derived inputs:
-// RunCandidate decodes its inputs into In. An In value is encoded to JSON to make the prompt's
-// inputs.
+// The signature's inputs are Signature.Inputs when given. Otherwise In must be a struct, and the
+// inputs are its JSON fields. When In is a struct or a pointer to one, given inputs must name
+// exactly its JSON fields. Every struct that In holds must decode, as JSONSchemaFor requires of
+// derived inputs, because RunCandidate decodes its inputs into In. An In value is encoded to JSON
+// to make the prompt's inputs.
 //
 // The reply is decoded into Out with the strict rules Key.Get uses: unknown fields, fields that
 // match only by case, missing fields not tagged omitempty or omitzero, nulls in non-nullable
@@ -28,6 +28,34 @@ import (
 // accept the value. A reply that fails to decode is an ErrInvalidOutput and, when
 // MaxParseRetries is above zero, goes through Predict's repair loop like any other invalid
 // reply.
+//
+// In may hold Images, as described on Predict. A derived input of type Image has the Type "image",
+// so it must hold an Image from NewImage. A field of another type that holds Images, such as *Image
+// or []Image, keeps the schema {}. So does an Image field tagged omitempty or omitzero, which is
+// optional. A zero Image there sends no image. The prompt's input JSON leaves it out (omitzero) or
+// writes it as null (omitempty), as encoding/json does. The input type of an optional Image field
+// is *Image. So in a pipeline a step reads it from a *Image key, nil for no image, since State
+// refuses the zero Image. A step reads a required Image field from an Image key. A given input of
+// the Type "image" on such an optional field is optional in the same way. A given input of the Type
+// "image" must name an Image field when In is a struct or a pointer to one. When In is not a struct
+// or a pointer to one, a decode must be able to put an Image in the input's place. Then In must be
+// an empty interface, or a map whose values are Image or an empty interface, such as Prediction.
+// Pointers to these work too, as do map values behind pointers, such as *map[string]Image or
+// map[string]*any. The Images reach the model as Go values. RunCandidate takes each Image of In
+// from its inputs at its place, so a step can read an Image key.
+//
+// An input of the Type "image" needs an LM that can chat, or Validate fails with a Permanent error
+// that matches ErrImagesUnsupported (see Predict.Validate). A run checks every other input against
+// its value, as Predict does. So a field of a type such as *Image, []Image or []Message passes
+// Validate with any LM. When a value of the inputs holds an Image, the run needs an LM that can
+// chat and a MaxToolTurns that is not negative. Otherwise it fails with a Permanent error before
+// it calls the model.
+//
+// A model reply cannot carry an image. So an Out field of type Image fails Validate, since the
+// Type "image" applies to inputs only. Out can hold an Image in other places, such as in the Parts
+// of a Message. A reply that gives such an Image a value other than null fails to decode with an
+// error that matches ErrInvalidImage. It goes through the repair loop like any other invalid
+// reply. The error names nothing of the reply.
 //
 // TypedPredict implements Program and SignatureProgram, so Compile can optimise it and
 // NewProgramStep can run it as a pipeline step that reads In's fields and writes Out's.
@@ -89,7 +117,7 @@ func (p TypedPredict[In, Out]) RunCandidate(
 	candidate Candidate,
 	inputs Prediction,
 ) (Prediction, error) {
-	in, err := decodeTypedValue[In](map[string]any(inputs))
+	in, err := decodeTypedValue[In](map[string]any(inputs), fromState)
 	if err != nil {
 		return nil, fmt.Errorf("typed predict inputs: %w", err)
 	}
@@ -104,10 +132,12 @@ func (p TypedPredict[In, Out]) RunCandidate(
 	return typedOutputs(out, reply), nil
 }
 
-// ProgramSignature implements SignatureProgram: the derived signature, the Go type of each of
-// In's fields when In is a struct, and the Go type of each of Out's fields. Out's optional
-// fields, those tagged omitempty or omitzero and those that admit null, such as pointers, are
-// OmittableOutputs, so a step may leave them out of its writes.
+// ProgramSignature implements SignatureProgram. It returns the derived signature and the Go type of
+// each of Out's fields. When In is a struct, it returns the Go type of each of In's fields, but
+// *Image for an Image field tagged omitempty or omitzero. Otherwise it returns Image for each input
+// with the Type "image". Out's optional fields are OmittableOutputs, so a step may leave them out
+// of its writes. They are the fields tagged omitempty or omitzero and those that admit null, such
+// as pointers.
 func (p TypedPredict[In, Out]) ProgramSignature() (ProgramSignature, error) {
 	predict, err := p.predict()
 	if err != nil {
@@ -121,6 +151,14 @@ func (p TypedPredict[In, Out]) ProgramSignature() (ProgramSignature, error) {
 	}
 	if in := reflect.TypeFor[In](); structType(in) {
 		signature.InputTypes = fieldTypesOf(in)
+		// a step reads an optional image from a *Image key, since State refuses the zero Image.
+		for name, field := range jsonFields(in) {
+			if field.typ == imageType && field.optional {
+				signature.InputTypes[name] = reflect.TypeFor[*Image]()
+			}
+		}
+	} else {
+		signature.InputTypes = imageInputTypes(predict.Signature)
 	}
 	return signature, nil
 }
@@ -140,7 +178,7 @@ func typedOutputs(out any, reply Prediction) Prediction {
 		case fieldValue.CanInterface():
 			outputs[name] = fieldValue.Interface()
 		default:
-			decoded, err := convertStateValue(name, field.typ, reply[name])
+			decoded, err := convertValue(name, field.typ, reply[name], fromText)
 			if err != nil {
 				decoded = reflect.Zero(field.typ).Interface()
 			}
@@ -176,7 +214,7 @@ func (p TypedPredict[In, Out]) run(
 		return out, nil, err
 	}
 	reply, err := predict.run(ctx, candidate, inputs, func(reply Prediction) error {
-		decoded, err := decodeTypedValue[Out](map[string]any(reply))
+		decoded, err := decodeTypedValue[Out](map[string]any(reply), fromText)
 		if err != nil {
 			return fmt.Errorf("%w: %s%w", ErrInvalidOutput, signaturePrefix(predict.Signature.Name), err)
 		}
@@ -208,6 +246,11 @@ func (p TypedPredict[In, Out]) predict() (Predict, error) {
 	return predict, predict.Validate()
 }
 
+// namedTools returns the tools the programme offers its model.
+func (p TypedPredict[In, Out]) namedTools() []string {
+	return p.Tools
+}
+
 // bindTools checks the programme's tools and middleware against a pipeline's registry and
 // policy, as Predict's are.
 func (p TypedPredict[In, Out]) bindTools(registry *ToolRegistry, policy ToolPolicy) error {
@@ -229,7 +272,11 @@ func typedSignature(base Signature, in, out reflect.Type) (Signature, error) {
 	}
 	signature.Outputs = outputs
 	if len(base.Inputs) > 0 {
-		return signature, checkGivenInputs(base.Inputs, in)
+		if err := checkGivenInputs(base.Inputs, in); err != nil {
+			return Signature{}, err
+		}
+		signature.Inputs = optionalImageInputs(base.Inputs, in)
+		return signature, nil
 	}
 	inputs, err := structFields(in, false)
 	if err != nil {
@@ -239,36 +286,113 @@ func typedSignature(base Signature, in, out reflect.Type) (Signature, error) {
 	return signature, nil
 }
 
-// checkGivenInputs checks that inputs given for a struct In name exactly its JSON fields, and
-// that every struct In holds decodes, as JSONSchemaFor checks the structs of derived inputs:
-// RunCandidate decodes its inputs into In.
+// checkGivenInputs checks inputs given for In. When In is a struct or a pointer to one, they must
+// name exactly its JSON fields. An input of the Type "image" must then be an Image field. Otherwise
+// a decode must be able to put an Image where In holds an input of the Type "image" (see
+// imageValues). Every struct that In holds must decode, because RunCandidate decodes its inputs
+// into In. JSONSchemaFor checks the structs of derived inputs in the same way.
 func checkGivenInputs(inputs []Field, in reflect.Type) error {
 	if err := reachableDefinitionError(in, "", map[reflect.Type]bool{}); err != nil {
 		return fmt.Errorf("typed predict inputs: %w", err)
 	}
-	if !structType(in) {
+	base := pointee(in)
+	if !structType(base) {
+		for _, input := range inputs {
+			if input.Type == imageFieldType && !imageValues(in) {
+				return fmt.Errorf(
+					"typed predict input %q has the type %q, but an input of %s cannot be an Image",
+					input.Name,
+					imageFieldType,
+					in,
+				)
+			}
+		}
 		return nil
 	}
-	want := jsonFieldOrder(jsonFields(in))
+	fields := jsonFields(base)
+	want := jsonFieldOrder(fields)
 	given := fieldNames(inputs)
-	if slices.Equal(slices.Sorted(slices.Values(given)), slices.Sorted(slices.Values(want))) {
-		return nil
+	if !slices.Equal(slices.Sorted(slices.Values(given)), slices.Sorted(slices.Values(want))) {
+		return fmt.Errorf("typed predict inputs %q do not match the JSON fields %q of %s", given, want, base)
 	}
-	return fmt.Errorf("typed predict inputs %q do not match the JSON fields %q of %s", given, want, in)
+	for _, input := range inputs {
+		if input.Type == imageFieldType && fields[input.Name].typ != imageType {
+			return fmt.Errorf(
+				"typed predict input %q has the type %q, but its field in %s is a %s, not an Image",
+				input.Name,
+				imageFieldType,
+				base,
+				fields[input.Name].typ,
+			)
+		}
+	}
+	return nil
 }
 
-// structFields lists the JSON fields of a struct type as signature fields.
+// pointee returns typ without its pointers: T for *T or **T.
+func pointee(typ reflect.Type) reflect.Type {
+	for typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	return typ
+}
+
+// imageValues reports whether in, a type that is not a struct, holds its inputs where a decode can
+// put an Image. That is so when in is an empty interface, or a map whose values are Image or an
+// empty interface. Pointers to these count too, and so do map values behind pointers. A decode puts
+// an Image in no other interface (see imagePlaces).
+func imageValues(in reflect.Type) bool {
+	emptyInterface := func(typ reflect.Type) bool { return typ.Kind() == reflect.Interface && typ.NumMethod() == 0 }
+	in = pointee(in)
+	if emptyInterface(in) {
+		return true
+	}
+	if in.Kind() != reflect.Map {
+		return false
+	}
+	elem := pointee(in.Elem())
+	return elem == imageType || emptyInterface(elem)
+}
+
+// optionalImageInputs returns inputs, given for In, with some inputs of the Type "image" made
+// optional, as a derived one is. Such an input has an Image field tagged omitempty or omitzero, in
+// a struct In or in the struct a pointer In points to. The Type "image" gives way to the schema {},
+// so nil or a zero Image is no image.
+func optionalImageInputs(inputs []Field, in reflect.Type) []Field {
+	in = pointee(in)
+	if !structType(in) {
+		return inputs
+	}
+	fields := jsonFields(in)
+	out := slices.Clone(inputs)
+	for i, input := range out {
+		if input.Type == imageFieldType && fields[input.Name].optional {
+			out[i].Type, out[i].Schema = "", json.RawMessage(`{}`)
+		}
+	}
+	return out
+}
+
+// structFields lists the JSON fields of a struct type as signature fields. An input of type
+// Image has the Type "image" in place of a schema, unless its tag has omitempty or omitzero,
+// which makes it optional. An output of type Image has the Type "image" too, so
+// Signature.Validate refuses it.
 func structFields(typ reflect.Type, outputs bool) ([]Field, error) {
 	if !structType(typ) {
 		return nil, fmt.Errorf("%s must be a struct without its own UnmarshalJSON or UnmarshalText", typ)
 	}
 	builder := newSchemaBuilder()
+	builder.imageInputs = !outputs
 	builder.expanding[typ] = true
 	fields := jsonFields(typ)
 	names := jsonFieldOrder(fields)
 	result := make([]Field, 0, len(names))
 	for _, name := range names {
 		field := fields[name]
+		if field.typ == imageType && (outputs || !field.optional) {
+			result = append(result, Field{Name: name, Description: field.description, Type: imageFieldType})
+			continue
+		}
 		node, nullable, err := builder.fieldSchema(field, name)
 		if err != nil {
 			return nil, err
@@ -293,12 +417,12 @@ func structFields(typ reflect.Type, outputs bool) ([]Field, error) {
 	return result, nil
 }
 
-// decodeTypedValue converts a JSON value to T with Key.Get's strict rules and T's Validate
-// method.
-func decodeTypedValue[T any](value any) (T, error) {
+// decodeTypedValue converts a JSON value from source to T with Key.Get's strict rules and T's
+// Validate method.
+func decodeTypedValue[T any](value any, source valueSource) (T, error) {
 	var zero T
 	typ := reflect.TypeFor[T]()
-	decoded, err := decodeJSONValue(typ, value)
+	decoded, err := decodeValue(typ, value, source)
 	if err != nil {
 		return zero, fmt.Errorf("decode as %s: %w", typ, err)
 	}
@@ -308,10 +432,19 @@ func decodeTypedValue[T any](value any) (T, error) {
 	return decoded.(T), nil
 }
 
-// encodePrediction encodes value as a JSON object, keeping numbers as json.Number as model
-// replies do.
+// encodePrediction encodes value as a JSON object. It keeps numbers as json.Number, as model
+// replies do. It keeps each Image of value at its place as the Image, not its summary.
 func encodePrediction(value any) (Prediction, error) {
-	data, err := json.Marshal(value)
+	var (
+		data   []byte
+		places imagePlaces
+		err    error
+	)
+	if holdsImage(value) {
+		data, places, err = encodeImages(value)
+	} else {
+		data, err = json.Marshal(value)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -324,5 +457,6 @@ func encodePrediction(value any) (Prediction, error) {
 	if prediction == nil {
 		return nil, errors.New("value encodes to null, not a JSON object")
 	}
+	places.restore(map[string]any(prediction))
 	return prediction, nil
 }

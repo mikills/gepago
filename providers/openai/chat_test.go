@@ -306,3 +306,41 @@ func TestChatClassifiesErrors(t *testing.T) {
 		providertest.RunTransportCases(t, chat)
 	})
 }
+
+func TestChatSendsMessageSchemasWithNullImages(t *testing.T) {
+	url, requests := chatServer(t, http.StatusOK, `{
+		"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+		"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+	}`)
+	lm, err := NewLanguageModel(Config{BaseURL: url, Model: "m"})
+	require.NoError(t, err)
+	history, err := gepa.JSONSchemaFor[struct {
+		History []gepa.Message `json:"history"`
+	}]()
+	require.NoError(t, err)
+	parts, err := gepa.JSONSchemaFor[struct {
+		Parts []gepa.Part `json:"parts"`
+	}]()
+	require.NoError(t, err)
+
+	_, err = lm.Chat(context.Background(), gepa.ChatRequest{
+		Messages: []gepa.Message{{Role: gepa.RoleUser, Content: "hi"}},
+		Tools: []gepa.Tool{
+			{Name: "history", Description: "Read a history", Parameters: history},
+			{Name: "parts", Description: "Read parts", Parameters: parts},
+		},
+	})
+
+	require.NoError(t, err)
+	tools := (*requests)[0]["tools"].([]any)
+	for i, schema := range []json.RawMessage{history, parts} {
+		function := tools[i].(map[string]any)["function"].(map[string]any)
+		sent, err := json.Marshal(function["parameters"])
+		require.NoError(t, err)
+		require.JSONEq(t, string(schema), string(sent), "the tool's schema is sent as it is")
+		require.Contains(t, string(sent), `"image":{"type":"null"}`)
+	}
+	require.NotContains(t, tools[0].(map[string]any)["function"], "strict", "a tool call's scope is unconstrained")
+	require.Equal(t, true, tools[1].(map[string]any)["function"].(map[string]any)["strict"],
+		"an image that takes only null keeps the schema strict")
+}

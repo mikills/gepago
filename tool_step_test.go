@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1182,4 +1183,25 @@ func TestToolStepPerToolLimitTripsInAPipeline(t *testing.T) {
 	_, err = pipeline.Run(context.Background(), NewState(Prediction{"order_id": "A-1"}))
 	require.Error(t, err, "each run starts with fresh limits")
 	require.EqualValues(t, 2, calls.Load())
+}
+
+func TestImageChainFollowsElementsOnly(t *testing.T) {
+	type nested []nested
+	type framed struct{ Photo Image }
+	for _, typ := range []reflect.Type{
+		reflect.TypeFor[Image](),
+		reflect.TypeFor[**Image](),
+		reflect.TypeFor[map[string][3][]Image](),
+	} {
+		require.True(t, imageChain(typ), typ)
+	}
+	for _, typ := range []reflect.Type{
+		reflect.TypeFor[nested](),
+		reflect.TypeFor[framed](),
+		reflect.TypeFor[[]framed](),
+		reflect.TypeFor[map[string]framed](),
+		reflect.TypeFor[any](),
+	} {
+		require.False(t, imageChain(typ), typ)
+	}
 }

@@ -141,8 +141,10 @@ func (m *LanguageModel) Chat(ctx context.Context, req gepa.ChatRequest) (gepa.Ch
 // produces it. Gemini models before Gemini 3 reject a JSON response type together with
 // function declarations, so a request with tools is sent without its response format; a
 // gepa.Predict still checks the final reply against its signature. A function call's id, when
-// Gemini gives one, becomes the ToolCall's ID and is sent back with its result; otherwise the
-// ID is the function's name.
+// Gemini gives one, becomes the ToolCall's ID, and the client sends it back with its result.
+// Otherwise the ID is the function's name. A user message with Parts becomes its Content, when it
+// is not blank, and then one Gemini part for each of its parts. That part is a text part or an
+// inlineData part with base64 data.
 type ChatClient struct {
 	apiKey  string
 	baseURL string
@@ -178,13 +180,16 @@ func NewChatClient(config Config) (*ChatClient, error) {
 }
 
 // Chat sends one Gemini generateContent request and returns a provider-neutral agent response.
-// A request Gemini cannot take fails with a Permanent error before it is sent: a message whose
-// role is none of gepa's four, a tool whose parameters are not a JSON object, a response
-// format, when the request has no tools, whose schema is set, even to spaces, but not a JSON
-// object, or a Temperature that is NaN or infinite. Failures are classified: 429, 5xx, dropped
-// connections and network timeouts are transient; other 4xx and TLS, host or URL
-// misconfiguration are permanent; a cancelled or expired ctx returns ctx.Err() unwrapped. The API key, which travels in the request URL, is redacted
-// from every error. A response without candidates still returns its usage with the error.
+// A request Gemini cannot take fails with a Permanent error before Chat sends it. Gemini cannot
+// take a message whose role is none of gepa's four, or a message with parts whose role is not user.
+// It cannot take a part that fails gepa.Part.Validate, or a tool whose parameters are not a JSON
+// object. Without tools, it cannot take a response format whose schema is not empty, even if only
+// spaces, and is not a JSON object. It also cannot take a Temperature that is NaN or infinite.
+// Chat classifies failures. Status 429, 5xx, dropped connections and network timeouts are
+// transient. Other 4xx statuses and TLS, host or URL misconfiguration are permanent. A cancelled or
+// expired ctx returns ctx.Err() unwrapped. Chat removes the API key, which travels in the request
+// URL, from every error. It also replaces the base64 data of a sent image that an error's text
+// echoes. A response without candidates still returns its usage with the error.
 func (c *ChatClient) Chat(ctx context.Context, req gepa.ChatRequest) (gepa.ChatResponse, error) {
 	return providerlog.Chat(ctx, c.logger, c.logCall("chat", req), func() (gepa.ChatResponse, error) {
 		return c.send(ctx, req)
@@ -212,28 +217,41 @@ func (c *ChatClient) chat(ctx context.Context, req gepa.ChatRequest) (gepa.ChatR
 	if err := checkGoogleRequest(req); err != nil {
 		return gepa.ChatResponse{}, gepa.PermanentError(fmt.Errorf("google chat: %w", err))
 	}
-	toolNames := googleToolNameMap(req.Tools)
+	contents, images := googleContents(req.Messages)
 	payload := googleGenerateRequest{
 		SystemInstruction: googleSystemInstruction(req.Messages),
-		Contents:          googleContents(req.Messages),
+		Contents:          contents,
 		Tools:             googleTools(req.Tools),
 		GenerationConfig:  googleGenerationSettings(req),
 	}
+	resp, err := c.exchange(ctx, googleRequestModel(c.model, req.Model), payload, googleToolNameMap(req.Tools))
+	return resp, providererr.ScrubImages(err, images...)
+}
+
+// exchange sends payload to model and converts the reply.
+func (c *ChatClient) exchange(
+	ctx context.Context,
+	model string,
+	payload googleGenerateRequest,
+	toolNames map[string]string,
+) (gepa.ChatResponse, error) {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return gepa.ChatResponse{}, err
 	}
-	body, err := c.post(ctx, googleRequestModel(c.model, req.Model), data)
+	body, err := c.post(ctx, model, data)
 	if err != nil {
 		return gepa.ChatResponse{}, err
 	}
 	return decodeGoogleResponse(body, toolNames)
 }
 
-// checkGoogleRequest returns why Gemini cannot take req, or nil: a message whose role is none
-// of gepa's four, a tool whose parameters are not a JSON object, a response format that is
-// sent, since the request has no tools, whose schema is set, even to spaces, but not a JSON
-// object, or a temperature that is NaN or infinite, which JSON cannot carry.
+// checkGoogleRequest returns why Gemini cannot take req, or nil. Gemini cannot take a message whose
+// role is none of gepa's four, or a message with parts whose role is not user. It cannot take a
+// part that fails gepa.Part.Validate, or a tool whose parameters are not a JSON object. When the
+// request has no tools, Gemini gets its response format. Then a schema that is not empty, even if
+// only spaces, must be a JSON object. Gemini cannot take a temperature that is NaN or infinite,
+// which JSON cannot carry.
 func checkGoogleRequest(req gepa.ChatRequest) error {
 	for i, message := range req.Messages {
 		switch message.Role {
@@ -241,6 +259,9 @@ func checkGoogleRequest(req gepa.ChatRequest) error {
 		default:
 			return fmt.Errorf("message %d: role %q is not supported", i, message.Role)
 		}
+	}
+	if err := providererr.CheckParts(req.Messages); err != nil {
+		return err
 	}
 	for _, tool := range req.Tools {
 		if !jsonObject(tool.InputSchema()) {
@@ -375,8 +396,15 @@ type googleContent struct {
 
 type googlePart struct {
 	Text             string                  `json:"text,omitempty"`
+	InlineData       *googleBlob             `json:"inlineData,omitempty"`
 	FunctionCall     *googleFunctionCall     `json:"functionCall,omitempty"`
 	FunctionResponse *googleFunctionResponse `json:"functionResponse,omitempty"`
+}
+
+// googleBlob is the base64 data of an image and its media type.
+type googleBlob struct {
+	MIMEType string `json:"mimeType"`
+	Data     string `json:"data"`
 }
 
 type googleFunctionCall struct {
@@ -451,15 +479,17 @@ func googleSystemInstruction(messages []gepa.Message) *googleContent {
 	return &googleContent{Parts: parts}
 }
 
-// googleContents converts the transcript to contents. The results of consecutive tool
-// messages, such as one reply's parallel calls, travel in one content.
-func googleContents(messages []gepa.Message) []googleContent {
+// googleContents converts the transcript to contents, and returns the base64 data of the images
+// they carry. The results of consecutive tool messages, such as one reply's parallel calls,
+// travel in one content.
+func googleContents(messages []gepa.Message) ([]googleContent, []string) {
 	out := make([]googleContent, 0, len(messages))
+	var images []string
 	for index, message := range messages {
 		if message.Role == gepa.RoleSystem {
 			continue
 		}
-		content := googleContent{Role: googleRole(message.Role), Parts: googleParts(messages, index, message)}
+		content := googleContent{Role: googleRole(message.Role), Parts: googleParts(messages, index, message, &images)}
 		if len(content.Parts) == 0 {
 			continue
 		}
@@ -469,10 +499,12 @@ func googleContents(messages []gepa.Message) []googleContent {
 		}
 		out = append(out, content)
 	}
-	return out
+	return out, images
 }
 
-func googleParts(messages []gepa.Message, index int, message gepa.Message) []googlePart {
+// googleParts returns the parts of messages[index], and adds the base64 data of each image it
+// sends to images.
+func googleParts(messages []gepa.Message, index int, message gepa.Message, images *[]string) []googlePart {
 	if message.Role == gepa.RoleTool {
 		name := googleToolName(messages[:index], message.ToolCallID)
 		return []googlePart{{FunctionResponse: &googleFunctionResponse{
@@ -481,9 +513,18 @@ func googleParts(messages []gepa.Message, index int, message gepa.Message) []goo
 			Response: map[string]any{"result": message.Content},
 		}}}
 	}
-	parts := make([]googlePart, 0, len(message.ToolCalls)+1)
+	parts := make([]googlePart, 0, len(message.ToolCalls)+len(message.Parts)+1)
 	if strings.TrimSpace(message.Content) != "" {
 		parts = append(parts, googlePart{Text: message.Content})
+	}
+	for _, part := range message.Parts {
+		if part.Text != "" {
+			parts = append(parts, googlePart{Text: part.Text})
+			continue
+		}
+		data := providererr.EncodeImage(part.Image)
+		*images = append(*images, data)
+		parts = append(parts, googlePart{InlineData: &googleBlob{MIMEType: part.Image.MediaType(), Data: data}})
 	}
 	for _, call := range message.ToolCalls {
 		parts = append(parts, googlePart{FunctionCall: googleFunctionCallFromAgent(call)})

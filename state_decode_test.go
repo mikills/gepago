@@ -16,6 +16,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// decodeJSONValue converts value, a value from state, to typ (see decodeValue).
+func decodeJSONValue(typ reflect.Type, value any) (any, error) {
+	return decodeValue(typ, value, fromState)
+}
+
 // TestDecodeV2RejectsWhatTheDeletedChecksRejected proves that encoding/json/v2, with the options
 // decodeJSONValue passes, refuses on its own what checkJSONShape used to look for, and that Get
 // still words an unknown member as before.
@@ -329,7 +334,7 @@ func TestDecodeTimeDurationNumberAndBytes(t *testing.T) {
 		require.Equal(t, want, got)
 	})
 	t.Run("typed predict output", func(t *testing.T) {
-		got, err := decodeTypedValue[decodedKinds](reply("blob", nil))
+		got, err := decodeTypedValue[decodedKinds](reply("blob", nil), fromText)
 		require.NoError(t, err)
 		require.Equal(t, time.Duration(1500*time.Millisecond), got.Wait)
 		require.Nil(t, got.Blob)

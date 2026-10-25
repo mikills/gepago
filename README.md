@@ -14,8 +14,10 @@ Original paper:
 
 - Call any model through the provider-neutral `Generator` interface, with usage, the resolved model and a finish reason on every call.
 - Ask for structured output: typed signature fields, strict JSON schemas, native structured output where the provider has it, and validation before a reply is returned.
-- Build typed `Pipeline`s with retries, timeouts, forward skips, bounded rewinds, branches, fallbacks, parallel steps, run-time fan-out with `Map`, step caching and run budgets.
+- Build typed `Pipeline`s with retries, timeouts, forward skips, bounded rewinds, branches, fallbacks and parallel steps. Add run-time fan-out with `Map`, bounded repeats with `Loop`, step caching and run budgets.
 - Give model steps tools from a registry, under a per-run policy with call limits and caching, with the caller's scope, such as a tenant, on every call.
+- Wrap tool calls in tool middleware. It wraps every tool call that a pipeline run or an agent run makes through its own session. Write limiting, logging, auditing and fallback once, not in each tool.
+- Send PNG, JPEG and WebP images in user chat messages to the OpenAI, Claude and Google chat clients, and as `Predict` and `TypedPredict` inputs.
 - Observe every run with events, recorded traces, HTML run reports, a run context and redaction.
 - Run optional agent loops from the composable `agents` package, with full trace events for runs, turns, LLM calls, tool calls, errors, and run completion.
 - Track usage with spans and ledgers instead of relying only on turn counts.
@@ -154,6 +156,29 @@ extract := gepa.TypedPredict[Document, Extraction]{
 }
 result, err := extract.Run(ctx, Document{Document: "Bond obligation for 125,000."})
 ```
+
+### Image inputs
+
+A `Predict` or `TypedPredict` input can hold a `gepa.Image` (see [Images in chat messages](#images-in-chat-messages)), at any depth. Give a top-level image input the `Type` `"image"`, so `Validate` and `Build` check it. A `TypedPredict` derives that `Type` for an `In` field of type `gepa.Image`. Tag the field `omitempty` or `omitzero` to make the image optional: a zero `gepa.Image` there sends no image. Such an optional field takes a `*gepa.Image` key in a pipeline, nil for no image, since `State` refuses the zero `Image`. A required field takes a `Key[gepa.Image]`:
+
+```go
+type Figure struct {
+    Chart gepa.Image `json:"chart" description:"the chart to read"`
+    Title string     `json:"title"`
+}
+
+read := gepa.TypedPredict[Figure, Extraction]{
+    Signature: gepa.Signature{Name: "read_chart"},
+    LM:        chatModel, // a gepa.ChatClient
+}
+result, err := read.Run(ctx, Figure{Chart: chart, Title: "Q3 revenue"})
+```
+
+A call with images chats, also without tools. Its one user message has an empty `Content`. Its `Parts` hold, for each distinct image, the text `[image N]` and then the image. The last part is the prompt. A `ChatClient` or `ChatMiddleware` that reads only `Content` sees no prompt in such a call, so read the text parts too. In the prompt's input JSON each image is its label, such as `"chart": "[image 1]"`, and `BuildPrompt` returns that text. The repairs continue the same chat, so the images stay in its first message. The model must be a `ChatClient`. With another model, such as `providers/pi`, an input of `Type` `"image"` fails `Validate`. An image in any other input fails the run before any call. Both fail with a Permanent `ErrImagesUnsupported`. Demos cannot hold images. A reply cannot carry one either, so a `TypedPredict` `Out` field of type `gepa.Image` fails `Validate`. Elsewhere in `Out`, such as in a `Message` part, a reply that gives an image a value fails to decode with `ErrInvalidImage`. The repair loop then asks again. Inputs without images send the same request as before.
+
+gepago checks images against values, not types. Only the `Type` `"image"` and some `ToolStep` reads fail `Build`. Such a read has the type `gepa.Image`, or pointers, slices, arrays or map values that end at `gepa.Image`. `ToolRegistry.Register` also refuses a `NewTool` whose `Args` no JSON value can decode into, such as a required `gepa.Image` field. Every other image in tool arguments or output fails at call time, when a value holds one. Apart from these refusals, a type that holds an image in a struct field works as in v0.9.0 while its values hold no image. Examples are `gepa.Message` and `gepa.Part`.
+
+In a pipeline, read an image input from a `Key[gepa.Image]`. `Key.Get` converts between `gepa.Image` and `*gepa.Image`, and into structs, slices, maps and `any` values that hold images. It puts each image back where the stored value held it. An image reaches the model, and comes back from `Key.Get`, only where `encoding/json` meets it as a `gepa.Image`. Behind a type's own `MarshalJSON` it is that method's JSON, the summary. So `Predict` sends no image for it, and `Key.Get` into an `any` gives the summary as a map. Traces, reports, `WithCache` keys, optimiser fingerprints and reflection records hold the image's summary, never its data. A `Redactor` gets the `gepa.Image` under its key. When the Redactor changes it, gepa removes the image's summary text and JSON from error messages.
 
 ## Pipelines
 
@@ -307,6 +332,31 @@ The body reads the element under `page` and writes exactly one key; each element
 
 [`examples/map_reduce`](examples/map_reduce) puts skips, `MapCollect`, a rewind with `Amend` and `Accept`, and a scoped tool into one runnable pipeline.
 
+`Loop` runs a body step, and runs it again until a typed condition on the state holds, at most `MaxIterations` times in all:
+
+```go
+pages := gepa.Key[[]string]{Name: "pages"}
+page := gepa.Key[int]{Name: "page"}
+total := gepa.Key[string]{Name: "total"}
+
+readPage := gepa.NewProgramStep("read_page", pageProgram, []gepa.KeyRef{pages.Ref(), page.Ref()}, []gepa.KeyRef{total.Ref()})
+done := func(s gepa.State) (bool, error) {
+    found, err := total.Get(s)
+    if err != nil {
+        return false, err
+    }
+    n, err := page.Get(s)
+    if err != nil {
+        return false, err
+    }
+    list, err := pages.Get(s)
+    return found != "" || n == len(list), err
+}
+scan := gepa.Loop("scan", readPage, done, gepa.LoopOptions{MaxIterations: 50, Iteration: page})
+```
+
+Each iteration runs the body on its own view of the keys it reads. `Iteration` holds the number of the iteration, from one, and never reaches the state. A key that the body reads and writes carries from one iteration to the next, and starts from its `Default` or an earlier write. A `Default` is the usual seed. An earlier write also needs a `MergeRule`. The Loop's value already holds the seed, so a rule that adds or appends counts the seed twice. After each iteration the condition (`done` here) reads the body's keys. When it holds, the Loop commits the writes of that iteration. `Build` refuses a Loop without `MaxIterations` or a condition, and a body that writes nothing. A Loop that reaches its cap fails with a Permanent error that wraps `ErrMaxIterations` and commits nothing, and an `OnError` transition can catch it. So write the condition to hold when the work ends, found or not, and keep the cap as a guard. A failed iteration fails the Loop with the kind of its error and commits nothing. Cancellation or a spent budget stops the Loop before the next iteration. Each iteration sees the tool memory and cached tool results of the iterations before it, and its events carry `Attributes["iteration"]`. A `Redactor` that hides the iteration key also hides that attribute and the Loop's `"iterations"`. Events, traces and the run report then leave them out. The Loop's error names the running iteration, so the run keeps that number in error text where the iteration reads the key. It also keeps it where a nested pipeline takes the number as an `int` input under the key's name. The run redacts any other value under that name, such as a `Default` or a write, as any other value. When another hidden value has the same text, the run still removes the number. It removes it from the events of the whole trace and from reflection for the whole example. A Loop can be the body of a `Map` or `MapCollect`. There the keys it writes cannot have a seed. To carry a key in each element, run the Loop in a nested pipeline whose `Defaults` seed it. Then make `NewProgramStep` of that pipeline the Map's body. To retry a step, use a rewind with `MaxVisits` instead.
+
 ## Tools
 
 Register tools once and refer to them by name:
@@ -323,7 +373,9 @@ lookup := gepa.NewTool("lookup_customer", "Look up a customer's plan.",
 tools, err := gepa.NewToolRegistry(lookup)
 ```
 
-`NewTool` derives the argument schema from `Args` and encodes `Out` as the result; `NewToolFunc` takes a hand-written schema. In a pipeline, set `PipelineSpec.Tools` and either call a tool deterministically with `gepa.ToolStep("lookup", "lookup_customer", reads, writes)` or give a `Predict` step a bounded tool loop with `Predict.Tools` (its `LM` must be a `ChatClient`, which the OpenAI, Claude and Google providers are). `PipelineSpec.ToolPolicy` sets the run's allow-list, total and per-tool call limits and result cache, and a tool's memory writes commit only with its step's writes. `Build` fails on a tool that is not registered or not allowed. Chat middleware registered with `RegisterMiddleware` wraps a step's or an agent's chat client by name, outermost first.
+`NewTool` derives the argument schema from `Args` and encodes `Out` as the result. `NewToolFunc` takes a hand-written schema. In a pipeline, set `PipelineSpec.Tools`. Then call a tool deterministically with `gepa.ToolStep("lookup", "lookup_customer", reads, writes)`, or give a `Predict` step a bounded tool loop with `Predict.Tools`. Its `LM` must be a `ChatClient`, which the OpenAI, Claude and Google providers are. `PipelineSpec.ToolPolicy` sets the run's allow-list, total and per-tool call limits and result cache, and a tool's memory writes commit only with its step's writes. `Build` fails on a tool that is not registered or not allowed. Chat middleware registered with `RegisterMiddleware` wraps a step's or an agent's chat client by name, outermost first. A middleware or a chat client that reads the text of a request must read each message's `Parts` as well as its `Content`. A `Predict` with image inputs sends its prompt as the last text part of a message with an empty `Content`.
+
+Tool arguments and output travel as JSON, and the JSON form of an `Image` holds no image data. So an `Image` in the output of a `NewTool` fails the call with a Permanent error. Arguments that give an `Image` of `Args` a value fail the call with `ErrInvalidImage`. A `ToolStep` read whose value holds an `Image` fails the step with a Permanent error. A type that embeds an `Image` or a `*Image`, or that writes its own JSON, encodes as `json.Marshal` writes it. So the model gets at most the image's summary, and never the image. But a `MarshalJSONTo` that encodes an `Image` it holds through its encoder still fails. In the schema that a model follows, an image position takes only null.
 
 Tools often act for someone: a tenant, a user, an account. Set that scope on the run's context and every tool call of the run carries it as `ToolCall.Scope`, from a `ToolStep`, a `Predict` tool loop, a `Map` element or an agent. The model never sees it, and gepago never inspects it.
 
@@ -358,9 +410,39 @@ A tool reports usage it did not record itself in `ToolResult.Usage`, which count
 
 `Provenance` names a protected resource the result touched (`Kind` and `ID`, for audit), where it came from (`Source`, with `Detail` locating the part used), or both. An entry that names neither, has only one of `Kind` and `ID`, or has `Detail` without `Source` fails the call (see `Provenance.Validate`).
 
+### Tool middleware
+
+Tool middleware wraps every tool call that the run's own session makes. Write limiting, logging, auditing and fallback once, not in each tool. Register the middleware by name and attach it to a pipeline with `PipelineSpec.ToolMiddleware` or to an agent with `Agent.ToolMiddleware`. The first name is the outermost wrapper.
+
+```go
+audit := func(next gepa.ToolProvider) gepa.ToolProvider {
+    return gepa.NewToolFunc(next.Schema(), func(ctx context.Context, call gepa.ToolCall) (gepa.ToolResult, error) {
+        start := time.Now()
+        result, err := next.Invoke(ctx, call)
+        slog.InfoContext(ctx, "tool call", "tool", call.Name, "duration", time.Since(start), "failed", err != nil)
+        return result, err
+    })
+}
+err := tools.RegisterToolMiddleware("audit", audit)
+if err != nil {
+    return err
+}
+spec := gepa.PipelineSpec{Tools: tools, ToolMiddleware: []string{"audit"} /* inputs, steps */}
+```
+
+The middleware runs inside the run's `ToolSession`. It sees only the calls the session invokes. It does not see unknown, disallowed or refused calls, or calls the cache answers. A retry inside the middleware is one call, one record and one unit of `MaxCalls`. The session checks, caches and applies the result the middleware returns, so a fallback result counts as the tool's result. The middleware's context carries the run's tool scope, tool memory, `RunContext`, step path and budget.
+
+Each call to `next` is an attempt that runs the tool once. An attempt belongs to the call whose context it carries, so pass `ctx`, or a context derived from it, to `next`. The first attempt of a call is the first attempt that carries its context. An attempt whose context carries no call of the tool fails, and so does an attempt that starts after its call has returned. When the middleware returns, the call cancels the attempts that still run and waits for them. So a timeout in middleware cannot bound a tool that ignores its context.
+
+Each attempt records its usage with `RecordUsage` and `RecordUnbudgetedUsage` as soon as it returns, as the session records a call without middleware. The call's record shows the usage of all its attempts. The middleware may return the result of one of its own call's attempts as it is. Any other result it returns must carry no usage, or the call fails. So a middleware that reuses a result across calls, such as a cache or a singleflight, must return that result without usage. The error of such a call keeps the kind of the error that the middleware returned. It is Permanent when the middleware returned no error or an unclassified error. Middleware that spends tokens itself records them with `gepa.RecordUsage` or `gepa.RecordUnbudgetedUsage`. The first attempt always runs. A later attempt fails with the context's cause when its context has ended. The run's budget refuses a later attempt as it refuses a model call. It refuses one when the tokens of the run or the step exceed a limit. It also refuses one when the run has reached `MaxDuration` or has already failed with a budget error. A spent `MaxModelCalls` does not refuse an attempt.
+
+An attempt turns a panic of the tool into the error `tool panicked: ...`. It fails output that is not valid JSON and provenance that is not valid with the session's errors. So the middleware sees these failures and can fall back.
+
+The middleware must keep the schema of the tool it wraps. `Build` applies it to each tool the pipeline's steps name, and `Agent.Validate` to each tool of the agent. Both fail on middleware that panics, returns nil or changes a schema. A run applies it again to each tool on the tool's first call. If that fails, only the calls to that tool fail. So give the function no side effects. State in the provider it returns lasts one tool for one run. Only the session that makes a call wraps it. An agent in a step, or a nested pipeline with its own `Tools`, uses its own tool middleware and not that of the enclosing run. The enclosing `ToolPolicy` still governs those calls. `ToolRegistry.WrapTool` applies middleware to one provider, for example to register the result elsewhere or to check it with `gepatest.CheckToolProvider`. Its result carries no usage, since the attempts recorded it. `gepatest.CheckToolMiddleware` checks your middleware against these rules (see Test kit).
+
 ## Observability and redaction
 
-`PipelineSpec.Observers` receive `RunStarted`, `StepStarted`, `StepFinished` (duration, usage and unbudgeted usage, error, reads, writes, tool calls, attempt, attributes such as the visit and a Map element's index, and whether the result was cached) and `RunFinished` events, and a `TransitionObserver` also `TransitionTaken` and `RewindRejected`; an observer that panics does not fail the run. `RecordingObserver` turns the events into serialisable `PipelineTrace`s, which `WriteHTMLRunReport` renders step by step and `TraceDatasetBuilder` turns into reflection records during `Compile`.
+`PipelineSpec.Observers` receive `RunStarted`, `StepStarted`, `StepFinished` and `RunFinished` events. A `TransitionObserver` also receives `TransitionTaken` and `RewindRejected`. `StepFinished` carries the duration, usage and unbudgeted usage, error, reads, writes, tool calls and attempt. It also carries attributes, such as the visit, a Map element's index and a Loop iteration's number, and whether a cache gave the result. An observer that panics does not fail the run. `RecordingObserver` turns the events into serialisable `PipelineTrace`s, which `WriteHTMLRunReport` renders step by step and `TraceDatasetBuilder` turns into reflection records during `Compile`.
 
 ```go
 recorder := &gepa.RecordingObserver{}
@@ -401,7 +483,7 @@ artifact := compiled.Artifact("internal-program")
 err := gepa.SaveProgramArtifact("internal-program.program.json", artifact)
 ```
 
-`compiled.Artifact` records the programme's fingerprint. `Pipeline.Fingerprint()` is derived from the step names, keys and types, the transitions, `MaxVisits`, amendable keys and each `Map`'s keys and `MapOptions` (so changing `MaxConcurrency` changes it), and every loader refuses an artefact whose fingerprint differs from the programme's with a `*FingerprintMismatchError` that shows both, so a renamed key or step never silently picks up a stale prompt. Artefacts saved before v0.8.0 have no fingerprint and still load. To load an artefact across a shape change you know is compatible, record the same `ProgramVersion` on the artefact and pass it to `LoadCompiledProgramVersion` or `LoadCompiledVersion`.
+`compiled.Artifact` records the programme's fingerprint. `Pipeline.Fingerprint()` covers the step names, keys and types, the transitions, `MaxVisits` and amendable keys. It also covers each `Map`'s keys and `MapOptions` (so changing `MaxConcurrency` changes it) and each `Loop`'s `MaxIterations` and iteration key. Every loader refuses an artefact whose fingerprint differs from the programme's with a `*FingerprintMismatchError` that shows both. So a renamed key or step never silently picks up a stale prompt. Artefacts saved before v0.8.0 have no fingerprint and still load. To load an artefact across a shape change you know is compatible, record the same `ProgramVersion` on the artefact and pass it to `LoadCompiledProgramVersion` or `LoadCompiledVersion`.
 
 At runtime, register factories that inject app dependencies such as models, tools, stores, or retrievers:
 
@@ -440,17 +522,28 @@ Lower-level optimiser APIs remain available when you need full control.
 
 ## Test kit
 
-Package `gepatest` provides `FakeGenerator`, a model with scripted replies, usage, finish reasons and errors per call, and `AssertTrace`, which compares a recorded run's steps, the order they ran in, their errors, usage, attributes and transitions; the steps of a pipeline that a Map element runs take that element's index.
+Package `gepatest` provides `FakeGenerator`, a model with scripted replies, usage, finish reasons and errors per call. It also provides `AssertTrace`, which compares a recorded run's steps, the order they ran in, their errors, usage, attributes and transitions. The steps of a pipeline that a Map element runs take that element's index. The iterations of a Loop share one step path, `<loop>.<body>`, and `Attempt` numbers them in the order they ran.
 
-A call takes the next reply of the script for its Map element (`OnElement`), else its visit (`OnVisit`), else its step (`OnStep`), each tried by step path, as `gepa.StepPathFrom` reports it, and then by step name; else the first prompt substring it contains, else the default. `OnElement` does not match the calls of a pipeline that an element runs; script those by step path. A script repeats its last reply once used up. `Chat` refuses the requests `ErrInvalidChatRequest` lists, which no provider accepts, with that error; a message without a role passes, though all three providers refuse it. `Calls` returns every call the fake received, `Unmatched` the calls no script answered (an `OnError` transition can hide their error), and `Plain` hides its structured and chat methods to test the prompt-only path.
+A call takes the next reply of the script for its Map element (`OnElement`), else its visit (`OnVisit`), else its step (`OnStep`). The fake tries each by step path, as `gepa.StepPathFrom` reports it, and then by step name. Else it takes the reply for the first prompt substring it contains, else the default. `OnElement` does not match the calls of a pipeline that an element runs. Script those by step path. A script repeats its last reply once used up. `Chat` refuses the requests `ErrInvalidChatRequest` lists, which no provider accepts, with that error. A message without a role passes, unless it carries parts, though all three providers refuse it. `Calls` returns every call the fake received. `Unmatched` returns the calls no script answered, as an `OnError` transition can hide their error. `Plain` hides its structured and chat methods to test the prompt-only path.
 
-`CheckToolProvider(t, provider, options...)` and `CheckChatClient(t, client)` are contract tests for your own tools and chat clients, and report each requirement one breaks. `CheckToolProvider` checks that a `ToolRegistry` registers the tool's schema, that it refuses invalid arguments with a Permanent `ErrInvalidToolArguments`, never panics and reports usage a run can count, that on an ended context it returns promptly and fails, if at all, with the context's error, that valid calls succeed through a `ToolSession`, that a caching session answers the same arguments laid out differently from its cache, and that concurrent calls succeed. `CheckChatClient` checks that the client refuses requests no provider accepts with a Permanent error and no usage, never panics and reports usage a run can count, that it fails promptly with the context's error on an ended context, that a valid request succeeds, that the same request sent again, which a provider may answer from its prompt cache, reports the same `PromptTokens`, or zero usage when the client answers it from its own cache without calling the provider, and that concurrent requests succeed. Equal counts catch only counting that differs between a cache miss and a hit, not cached tokens left out of `PromptTokens` on both. Pass `ToolArguments(...)` to a tool that refuses the arguments the check derives from its schema, and `ToolScope(...)` to one that needs a scope.
+`CheckToolProvider(t, provider, options...)` and `CheckChatClient(t, client, options...)` are contract tests for your own tools and chat clients, and report each requirement one breaks. `CheckToolProvider` checks that a `ToolRegistry` registers the tool's schema, and that the tool refuses invalid arguments with a Permanent `ErrInvalidToolArguments`. The tool must never panic and must report usage a run can count. On an ended context it must return promptly and fail, if at all, with the context's error. Valid calls must succeed through a `ToolSession`. A caching session must answer the same arguments laid out differently from its cache. Concurrent calls must succeed. `CheckChatClient` checks that the client refuses requests no provider accepts with a Permanent error and no usage. The client must never panic and must report usage a run can count. On an ended context it must fail promptly with the context's error. A valid request must succeed. The same request sent again, which a provider may answer from its prompt cache, must report the same `PromptTokens`. When the client answers it from its own cache without calling the provider, it may report zero usage instead. Concurrent requests must succeed. Equal counts catch only counting that differs between a cache miss and a hit, not cached tokens left out of `PromptTokens` on both. Pass `ToolArguments(...)` to a tool that refuses the arguments the check derives from its schema, and `ToolScope(...)` to one that needs a scope. Pass `ChatImages()` to `CheckChatClient` for a client that sends image parts. The check then also requires it to refuse invalid parts, and parts on a message that is not a user message. It must refuse them with a Permanent error and no usage, and answer a request with a PNG.
+
+`PNG(label)` returns a small, valid PNG `gepa.Image` for tests. The same label gives the same image, and different labels give different digests. It stores its pixels uncompressed, so its bytes and digest do not change with the Go toolchain. A `Call` of `Chat` records the images of its message parts in `Images`, and its `Prompt` holds the text parts too.
+
+`CheckToolMiddleware(t, middleware, options...)` is a contract test for your own tool middleware. It runs the middleware in pipelines around a scripted tool. The first case makes two calls with the same arguments at once, and a third call after them. In the next cases the tool fails once with usage, panics once, or returns output that is not JSON once. Then the check cancels a run during its first attempt, and a run while an attempt runs on. In the last case a call waits inside the middleware when the check cancels its run. Meanwhile a second run holds up to eight attempts, so a limiter that the runs share is full.
+
+The check reports middleware that `Build` or a run cannot wrap the tool with, and middleware that panics. A report gives only the type of a panic value. It reports an attempt with a context that carries no call, or a call of another run. It reports an attempt that reaches the next of another run or of an earlier wrap of the tool. It reports an attempt with the context or the ID of another call, and an attempt that starts after its call returned. It reports a result with usage that no attempt of its own call returned. A retry that adds up the usage of its attempts returns such a result. So does a cache or a singleflight that shares a result with its usage. It reports the usage of an attempt that the run's usage collector misses. It reports a run that does not return within five seconds after the check cancels it, and then it stops. It also stops at a `Build` that does not return within the deadline and five seconds. It stops at a run that cannot wrap the tool because the middleware does not return. It fails middleware that makes no attempt in any case. When the middleware makes no attempt in one case, the check logs the case with `t.Logf` and does not check it. A limiter, a quota or an open breaker can refuse the calls of a case.
+
+The check cancels a case that runs longer than ten seconds. A slow middleware passes when it stops its wait as its context ends. Pass `MiddlewareDeadline(...)` to change the ten seconds. Pass `MiddlewareToolName(...)`, `MiddlewareArguments(...)` or `MiddlewareScope(...)` to middleware that acts only on one tool, on some arguments or with a scope. Without `MiddlewareArguments`, each case has arguments of its own. So a cache that the runs share does not answer the later cases. A retry, a fallback, an audit log, a limiter and a timeout that keep to the rules of `gepa.ToolMiddleware` pass.
+
+The check finds the call of an attempt by the ID of its `gepa.ToolCall`. So it misses an attempt with the context of another call when the middleware changes the ID. An attempt with the context of a call of another run can come from the middleware of either run. The check cannot tell which, so it reports the attempt on both runs. It does not report a late attempt in a run that the check cancelled, or on a context that the middleware ended itself. It sees a late attempt only when the attempt starts before the check ends. It does not find goroutines that the middleware leaks, or usage of an attempt that the middleware records a second time.
 
 ## Key extension points
 
 - `Generator`: provider-neutral model interface; `StructuredGenerator` and `ChatClient` add response formats and tool calls.
 - `Step` and `ComponentStep`: pipeline steps, deterministic or optimisable.
 - `ToolProvider`: a tool a registry can hold.
+- `ToolMiddleware` and `ChatMiddleware`: wrap tool calls and chat calls. A `ToolRegistry` holds them by name.
 - `PipelineObserver`, `TransitionObserver` and `Redactor`: watch runs and control what leaves them.
 - `Evaluator`: scores candidates against examples.
 - `ReflectiveDatasetBuilder`: turns outputs, feedback, and traces into reflection records.
@@ -573,6 +666,23 @@ chatClient, err := gepagoogle.NewChatClient(gepagoogle.Config{
     Model:  "gemini-1.5-flash",
 })
 ```
+
+### Images in chat messages
+
+A user `gepa.Message` can carry `Parts`. Each `gepa.Part` holds a text or a `gepa.Image`. The model reads the message's `Content`, when it is not blank, and then each part in order:
+
+```go
+figure, err := gepa.NewImage(pngBytes) // PNG, JPEG or WebP, at most gepa.MaxImageBytes
+resp, err := chatClient.Chat(ctx, gepa.ChatRequest{Messages: []gepa.Message{{
+    Role:    gepa.RoleUser,
+    Content: "What does the chart show?",
+    Parts:   []gepa.Part{{Image: figure}},
+}}})
+```
+
+`NewImage` reads the media type from the first bytes of the data and checks the start of the structure that follows them. It copies the data and hashes it once. An `Image` is immutable. Its `String`, every `fmt` verb and its JSON form give a summary, such as `{"media_type":"image/png","size":48213,"sha256":"..."}`, and never the data. So traces, logs and errors hold the summary. Where `fmt` cannot call its methods, such as for `%p` or in an unexported struct field, a print shows an address. Each provider also limits the size of a whole request, such as about 20 MB of inline data for Gemini. So several large images in one request can fail at the provider. JSON cannot decode into an `Image`. Build it with `NewImage`.
+
+The OpenAI, Claude and Google chat clients send each image as base64 data. OpenAI gets an `image_url` part with a data URL, Claude a base64 `image` block and Google an `inlineData` part. Only a user message can carry parts. A request with parts on a message that is not a user message fails with a Permanent error before the client sends it. So does a request with a part that fails `Part.Validate`. When a provider's error quotes the request, the clients replace the base64 data of the images in the error text. The clients send a message without parts as the same bytes as before. Claude's OpenTelemetry content mode exports images as base64 data in its spans.
 
 ## Examples
 

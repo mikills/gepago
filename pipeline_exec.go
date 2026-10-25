@@ -51,6 +51,9 @@ type stepOutcome struct {
 	Err        error
 	ToolCalls  []ToolCallRecord
 	Attributes map[string]int
+	// loopKey is the iteration key under which the run's Redactors see the "iterations"
+	// attribute.
+	loopKey string
 }
 
 func newPipelineRun(optional map[string]map[string]bool) *pipelineRun {
@@ -323,34 +326,57 @@ func (m *stepStage) snapshot() stagedTools {
 
 // runChild runs a step nested in the composite step named parent, on a fresh view over the
 // values the composite sees, and returns its result for the composite to commit. candidate is
-// the composite's candidate namespace. The child's error is wrapped in a StepError naming it,
-// unless the child is the step a WithPolicy or WithCache wrapper wraps, which shares the
-// wrapper's name.
+// the composite's candidate namespace. runChild wraps the child's error in a StepError naming it.
+// It does not when a WithPolicy, WithCache or WithAmendable wrapper wraps the child, which shares
+// the wrapper's name.
 func runChild(ctx context.Context, candidate Candidate, parent string, child *stepNode, values map[string]any) (
 	stepResult,
 	error,
 ) {
 	result, err := runNode(ctx, childCandidate(candidate, child), child, values, nil)
 	if err != nil && child.name != parent {
-		return stepResult{}, failStep(child, values, err)
+		return stepResult{}, failStep(ctx, child, values, err)
 	}
 	return result, err
 }
 
-// runNode runs one step on a fresh view of values limited to its declared keys and returns its
-// writes when it succeeds, with the tool memory writes and cached tool results it staged;
-// those of a step that fails are dropped with its state writes. The candidate is the step's, as
-// childCandidate selects it. Each execution of a step other than a WithPolicy or WithCache
-// wrapper gets its own usage frame, observer events and outcome record. A panic becomes an
-// error with the stack in its details. When the step's context ended because a budget ran out
-// or an attempt timed out, that cause replaces the step's result, unless the step's error
-// already carries it, so a step that finishes late still fails and its writes are dropped.
+// nameWrapped returns err, the error of child, the step that a wrapper ran on s. It returns it as a
+// StepError naming child when no execution with child's name will name it. That is so when a caller
+// runs the wrapper outside such an execution. A pipeline names the wrapped step through the
+// wrapper's execution, which shares its name.
+func nameWrapped(ctx context.Context, s State, child *stepNode, err error) error {
+	if err == nil || s.scope.named(child.name) {
+		return err
+	}
+	return failStep(ctx, child, s.visibleValues(child.reads), err)
+}
+
+// nameItself returns err, the error of a composite step named name and reading reads that ran on s.
+// It returns it as a StepError naming the step when no execution with that name will name it. That
+// is so when a caller runs the composite outside such an execution.
+func nameItself(ctx context.Context, name string, reads []KeyRef, s State, err error) error {
+	if err == nil || s.scope.named(name) {
+		return err
+	}
+	return failStep(ctx, &stepNode{name: name, reads: reads}, s.visibleValues(reads), err)
+}
+
+// runNode runs one step on a fresh view of values. The view holds only the step's declared keys.
+// When the step succeeds, runNode returns its writes with the tool memory writes and cached tool
+// results it staged. When the step fails, runNode drops what it staged with its state writes. The
+// candidate is the step's, as childCandidate selects it. Each execution of a step other than a
+// WithPolicy, WithCache or WithAmendable wrapper gets its own usage frame, observer events and
+// outcome record. A panic becomes an error with the stack in its details. A budget that runs out
+// or an attempt that times out can end the step's context. That cause then replaces the step's
+// result, unless the step's error already carries it. So a step that finishes late still fails,
+// and runNode drops its writes.
 //
-// commit, when set, checks the result before the execution ends, so an error it returns fails
-// the execution and drops what it staged. A wrapper has no execution of its own, so the last
-// execution inside it that succeeds is held until commit has checked the result: it fails with
-// an error commit marks with failsExecution, and otherwise ends as it did, without what waits
-// for its result to commit, and the failure is recorded as an execution that commits nothing.
+// commit, when set, checks the result before the execution ends. An error that it returns fails
+// the execution and drops what the execution staged. A wrapper has no execution of its own. So
+// runNode holds the last execution inside the wrapper that succeeds until commit has checked the
+// result. That execution fails with an error that commit marks with failsExecution. With any
+// other error it ends as it did, but without the work that waits for its result to commit.
+// runNode then records the failure as an execution that commits nothing.
 func runNode(
 	ctx context.Context,
 	candidate Candidate,
@@ -385,7 +411,13 @@ func runNode(
 	if err := stepCanStart(ctx); err != nil {
 		return stepResult{}, err
 	}
-	scope = &stepScope{reads: node.readTypes, writes: node.writeTypes, pending: map[string]any{}}
+	scope = &stepScope{
+		reads:   node.readTypes,
+		writes:  node.writeTypes,
+		pending: map[string]any{},
+		step:    node.step,
+		name:    node.name,
+	}
 	ctx, scope.stage = beginStepStage(ctx)
 	view := State{values: values, scope: scope}
 	var runErr error
@@ -558,6 +590,7 @@ func beginExecution(ctx context.Context, node *stepNode, values map[string]any) 
 			Err:        err,
 			ToolCalls:  frame.toolCallRecords(),
 			Attributes: scope.reported(),
+			loopKey:    scope.iterationKey(),
 		}
 		element.add(outcome.Usage.Add(outcome.Unbudgeted))
 		hold.finish(outcome, result, func(outcome stepOutcome, result stepResult) {
@@ -575,8 +608,8 @@ type standIn int
 const (
 	// cacheHit commits a WithCache step's cached writes.
 	cacheHit standIn = iota
-	// commitFailed fails a top-level WithPolicy or WithCache step whose writes cannot be merged
-	// into the state.
+	// commitFailed fails a top-level WithPolicy, WithCache or WithAmendable step whose writes the
+	// pipeline cannot merge into the state.
 	commitFailed
 )
 

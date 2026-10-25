@@ -64,13 +64,21 @@ type ExpectedStep struct {
 	// enclosing elements' indices.
 	Attempt int `json:"attempt,omitempty"`
 	// Attributes are attributes the execution must have, each with the value given, as
-	// gepa.StepStartedEvent and gepa.StepFinishedEvent report them: "visit", the visit of the
-	// top-level step it belongs to, "index", the index of the Map element it belongs to, and a
-	// Map's "failed". An attribute it does not list is not compared. An expected execution that
-	// lists "index" stands for an execution of that element or one nested in it, the nearest
-	// element that contains it where Maps nest; one that does not never stands for such an
-	// execution. gepa records no "index" on the steps of a pipeline that an element runs (see
-	// gepa.StepAttributesFrom), so AssertTrace gives them the index of their element.
+	// gepa.StepStartedEvent and gepa.StepFinishedEvent report them. "visit" is the visit of the
+	// top-level step it belongs to, and "index" the index of the Map element it belongs to.
+	// "iteration" is the number of the Loop iteration it belongs to. "failed" is a Map's count of
+	// failed elements, and "iterations" a Loop's count of iterations. The nearest execution with
+	// the Map's or Loop's name reports each count. That is the composite's own execution, or else
+	// that of a step with its name that runs it. A decorator that embeds the composite and keeps
+	// its name is such a step. AssertTrace does not compare an attribute it does not list. A trace
+	// leaves out a Loop's "iteration" and "iterations" when a gepa.Redactor hides them through the
+	// Loop's iteration key. An expected execution that lists one of them then does not match. The
+	// iterations of a Loop "l" whose body is "b" all have the path "l.b". Attempt numbers them in
+	// the order they ran, within their Map element when the Loop runs in one. An expected execution
+	// that lists "index" stands for an execution of that element or one nested in it. Where Maps
+	// nest, the element is the nearest one that contains it. One without "index" never stands for
+	// such an execution. gepa records no "index" on the steps of a pipeline that an element runs
+	// (see gepa.StepAttributesFrom), so AssertTrace gives them the index of their element.
 	Attributes map[string]int `json:"attributes,omitempty"`
 	// Failed reports that the execution failed, whatever its error's message. Err and ErrKind,
 	// when set, imply it.

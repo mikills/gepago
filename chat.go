@@ -22,9 +22,19 @@ const (
 
 // Message is one chat transcript entry. An assistant message may carry tool calls; a tool
 // message carries the result of the call named by ToolCallID.
+//
+// A user message may also carry Parts, such as images: the model reads Content, when it is not
+// blank, and then each part in order. Each part must pass Part.Validate. Only a user message may
+// carry parts. The chat clients of the providers refuse any other message with parts. They return a
+// Permanent error before they send the request. A message without parts encodes to the same JSON
+// as before parts existed, and the chat clients send the same request. A message may have an empty
+// Content and its text in Parts. For example, a Predict whose inputs hold images sends its whole
+// prompt as the last text part (see Predict). Code that reads a message's text, such as a
+// ChatClient or a ChatMiddleware, must read the text parts too.
 type Message struct {
 	Role       Role       `json:"role"`
 	Content    string     `json:"content,omitempty"`
+	Parts      []Part     `json:"parts,omitempty"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
@@ -149,7 +159,10 @@ func (fn ChatClientFunc) Chat(ctx context.Context, req ChatRequest) (ChatRespons
 	return fn(ctx, req)
 }
 
-// ChatMiddleware wraps a ChatClient, for example to log, redact or retry chat calls. Register
-// it on a ToolRegistry by name and attach it by name to an agent or a Predict; the first name
-// listed is the outermost wrapper, so it sees each request first and each response last.
+// ChatMiddleware wraps a ChatClient, for example to log, redact or retry chat calls. Register it on
+// a ToolRegistry by name, and attach it by name to an agent or a Predict. The first name listed is
+// the outermost wrapper. So it sees each request first and each response last. A middleware that
+// reads or changes the text of a request must read each message's Parts as well as its Content. A
+// Predict whose inputs hold images sends one user message with an empty Content. Its prompt is the
+// last text part.
 type ChatMiddleware func(next ChatClient) ChatClient
