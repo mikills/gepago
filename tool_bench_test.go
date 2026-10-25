@@ -217,14 +217,22 @@ func randomDocument(n int) string {
 	return base64.StdEncoding.EncodeToString(data)
 }
 
-// densePrefix returns n small nested objects whose JSON holds each anchor of the image scan: a "z",
-// a "{", a "_" and a colon.
+// densePrefix returns n small nested objects. Their JSON holds all five anchors of the image scan:
+// a "z", a "{", a "_", a colon and quotes.
 func densePrefix(n int) []any {
 	prefix := make([]any, n)
 	for i := range prefix {
 		prefix[i] = map[string]any{"zone": map[string]any{"x_a": map[string]any{"y_b": "1:2:3:" + strconv.Itoa(i)}}}
 	}
 	return prefix
+}
+
+// sparsestAnchorAttack returns 1 MiB of text that makes every anchor of the image scan dense near
+// the start of each window. "z" is the sparsest of them there, and then "z" fills the rest of the
+// window.
+func sparsestAnchorAttack() string {
+	head := "z" + strings.Repeat("a", 49) + "z" + strings.Repeat("a", 49) + "z" + `{{{___:::"""`
+	return head + strings.Repeat("z", 3974) + strings.Repeat(head+strings.Repeat("z", 3980), 255)
 }
 
 // fileRecords returns n records of files with a "size" key, as a tool that lists files might.
@@ -297,6 +305,7 @@ func BenchmarkToolOutputShapes(b *testing.B) {
 		{name: "file records and a base64 document", value: map[string]any{
 			"files": fileRecords(100), "pdf": randomDocument(3 << 20),
 		}},
+		{name: "a sparsest anchor that turns dense", value: map[string]any{"t": sparsestAnchorAttack()}},
 		{name: "a log with a z every 71 bytes", value: map[string]any{
 			"log": strings.Repeat("GET /images/photo.png?size=large&format=webp HTTP/1.1 200 1234 bytes\n", 15_000),
 		}},

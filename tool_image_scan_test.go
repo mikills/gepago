@@ -153,6 +153,55 @@ func TestHoldsImageSummaryAgreesWithAReferencePattern(t *testing.T) {
 	require.Less(t, found, 18_000, "the inputs hold near misses")
 }
 
+// sparsestAttack returns 1 MiB of text that makes every anchor dense near the start of each
+// window. char is the sparsest of them there, with its hits gap bytes apart. Then char fills the
+// rest of the window. So the search keeps char as the sparsest anchor, and it finds char at every
+// byte.
+func sparsestAttack(char byte, gap int) string {
+	var others strings.Builder
+	for _, anchor := range summaryAnchors {
+		if anchor.char != char {
+			others.WriteString(strings.Repeat(string(anchor.char), 3))
+		}
+	}
+	spaced := string(char) + strings.Repeat("a", gap-1)
+	head := spaced + spaced + string(char) + others.String()
+	window := head + strings.Repeat(string(char), scanWindow-len(head))
+	return strings.Repeat(window, (1<<20)/len(window)+1)[:1<<20]
+}
+
+func TestImageSummaryScanBoundsTheHitsOfEachWindow(t *testing.T) {
+	span := scanWindow + len(summaryAnchors)*anchorReach
+	bound := len(summaryAnchors)*(denseHits+1+span/denseSpan) + denseHits + 1 + span/fallbackSpan
+	head := "z" + strings.Repeat("a", 49) + "z" + strings.Repeat("a", 49) + "z" + `{{{___:::"""`
+	texts := map[string]string{
+		"the reviewer's text": head + strings.Repeat("z", 3974) + strings.Repeat(head+strings.Repeat("z", 3980), 255),
+	}
+	for _, anchor := range summaryAnchors {
+		for _, gap := range []int{50, 64, 300, 1000} {
+			texts[fmt.Sprintf("%q every %d", anchor.char, gap)] = sparsestAttack(anchor.char, gap)
+		}
+	}
+	for name, text := range texts {
+		data, err := json.Marshal(map[string]any{"t": text})
+		require.NoError(t, err)
+		scan := summaryScan{data: data}
+		windows, most := 0, 0
+		for {
+			before := scan.hits
+			result := scan.window()
+			windows++
+			most = max(most, scan.hits-before)
+			if result != scanWindowEnd {
+				require.Equal(t, scanNone, result, name)
+				break
+			}
+		}
+		require.LessOrEqual(t, most, bound, "%s: the hits of one window", name)
+		require.Greater(t, windows, len(data)/scanWindow/2, "%s: the windows", name)
+	}
+}
+
 // switchingBases returns JSON-like texts without a summary that make holdsImageSummary switch. It
 // switches from one anchor to the next, and from the anchors to the sparsest one or to
 // bytes.Index. It also goes from one window to the next.
@@ -161,14 +210,17 @@ func switchingBases() map[string]string {
 		return strings.Repeat(text, n/len(text)+1)[:n]
 	}
 	return map[string]string{
-		"a dense z, then text":            filler("za", 600) + filler("abc ", 8400),
-		"every anchor dense":              filler(`z{_:"`, 6000) + filler("abc ", 3000),
-		"every anchor dense, { sparsest":  filler(`zz{__::""`, 6000) + filler("abc ", 3000),
-		"every anchor dense, _ sparsest":  filler(`zz{{_::""`, 6000) + filler("abc ", 3000),
-		"heads of summaries":              filler(`{"media_type":"image/png","size":1,`, 9000),
-		"size keys":                       filler(`","size":`, 4500) + filler("abc ", 4500),
-		"a sparse z over three windows":   filler("z"+strings.Repeat("a", 999), 9000),
-		"a dense z after a sparse window": filler("abc ", 4200) + filler("zz{", 4800),
+		"a dense z, then text":              filler("za", 600) + filler("abc ", 8400),
+		"every anchor dense":                filler(`z{_:"`, 6000) + filler("abc ", 3000),
+		"every anchor dense, { sparsest":    filler(`zz{__::""`, 6000) + filler("abc ", 3000),
+		"every anchor dense, _ sparsest":    filler(`zz{{_::""`, 6000) + filler("abc ", 3000),
+		"heads of summaries":                filler(`{"media_type":"image/png","size":1,`, 9000),
+		"size keys":                         filler(`","size":`, 4500) + filler("abc ", 4500),
+		"a sparse z over three windows":     filler("z"+strings.Repeat("a", 999), 9000),
+		"a dense z after a sparse window":   filler("abc ", 4200) + filler("zz{", 4800),
+		"a sparsest z that turns dense":     sparsestAttack('z', 50)[:9000],
+		"a sparsest { that turns dense":     sparsestAttack('{', 50)[:9000],
+		"a sparsest colon that turns dense": sparsestAttack(':', 64)[:9000],
 	}
 }
 

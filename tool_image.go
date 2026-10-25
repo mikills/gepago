@@ -109,11 +109,13 @@ type summaryAnchor struct {
 	offsets []int
 }
 
-// summaryAnchors are the bytes that holdsImageSummary searches for, in the order it tries them.
-// The first is the "z" of the key "size", and the second is the "{" that starts the summary. The
-// third is the "_" of the key "media_type", and the fourth is the colon after the key "size". The
-// last is the quote that starts imageSummarySize. Text-only JSON seldom holds a "z", so the search
-// starts with it. Most JSON holds many quotes, so the search tries them last.
+// summaryAnchors are the bytes that holdsImageSummary searches for. The first is the "z" of the key
+// "size", and the second is the "{" that starts the summary. The third is the "_" of the key
+// "media_type", and the fourth is the colon after the key "size". The last is the quote that
+// starts imageSummarySize. The search tries them in this order, and goes on from the last one to
+// the first. The first window starts with the "z", since text-only JSON seldom holds one. Each
+// later window starts with the anchor that the window before it used last. Most JSON holds many
+// quotes, so the first window tries them last.
 var summaryAnchors = []summaryAnchor{
 	{char: 'z', offsets: []int{strings.IndexByte(imageSummarySize, 'z')}},
 	{char: '{', offsets: headOffsets('{')},
@@ -134,13 +136,23 @@ func headOffsets(char byte) []int {
 }
 
 // These constants tune holdsImageSummary. A false hit of an anchor costs a call of
-// bytes.IndexByte, about 9 ns. An anchor is dense when it has more than denseHits hits, and more
-// than one hit in each denseSpan bytes. The search then tries the next anchor. The search decides
-// again in each window of scanWindow bytes, so a hit count never covers more than one window. When
-// every anchor proves dense in one window, the search keeps the sparsest one for the rest of the
-// window. When even its hits come more often than once in fallbackSpan bytes, bytes.Index finds
-// imageSummarySize itself there, at about 0.3 ns a byte. A switch goes back anchorReach bytes,
-// more than the distance between two anchors of one summary. So it misses no summary.
+// bytes.IndexByte, about 9 ns. An anchor is dense when its hits are more than denseHits plus one
+// for each denseSpan bytes that its search covered. The search then tries the next anchor. Each
+// search counts its hits afresh, and it ends at the end of its window of scanWindow bytes. So a
+// hit count covers at most one window and the bytes that the switches before it went back.
+//
+// When every anchor proves dense in one window, the search keeps the sparsest one for the rest of
+// the window. That search proves dense when its hits are more than denseHits plus one for each
+// fallbackSpan bytes. Then, or when the sparsest anchor was already that dense, bytes.Index finds
+// imageSummarySize itself in the rest of the window. bytes.Index costs at most about 9 ns for each
+// 16 bytes. For text that holds many of its first byte, it costs about 0.3 ns a byte.
+//
+// A switch goes back anchorReach bytes. A switch between anchors must go back at least 15 bytes.
+// The reason is that the quote of a summary 11 bytes before imageSummarySize can make the quote
+// anchor dense. That quote is 14 bytes after the "{" that starts the summary. After bytes.Index,
+// the next window must go back at least 25 bytes, the distance from imageSummarySize back to that
+// "{". The search goes back 64 bytes to keep a margin, and the tests catch a back-up of 24 bytes.
+// So it misses no summary.
 const (
 	scanWindow   = 4096
 	denseHits    = 2
@@ -174,7 +186,8 @@ const (
 // It searches for one of summaryAnchors with bytes.IndexByte, which skips text that does not hold
 // the anchor at memory speed. It checks for a summary around each hit. When an anchor proves dense,
 // it tries the next one, and it decides again in each window (see scanWindow). So no JSON costs
-// more than about 0.7 ns a byte, and JSON that seldom holds an anchor costs about 0.02 ns a byte.
+// more than about 0.6 ns a byte on an Apple M4, about 9 ns for each 16 bytes. JSON that seldom
+// holds an anchor costs about 0.01 to 0.02 ns a byte.
 func holdsImageSummary(data []byte) bool {
 	scan := summaryScan{data: data}
 	for {
@@ -188,24 +201,27 @@ func holdsImageSummary(data []byte) bool {
 }
 
 // summaryScan is the state of holdsImageSummary: the JSON, the anchor that it searches for and
-// the index that it searches from.
+// the index that it searches from. hits counts the hits of every anchor search so far, so a test
+// can check how many calls of bytes.IndexByte a scan makes.
 type summaryScan struct {
 	data   []byte
 	anchor int
 	offset int
+	hits   int
 }
 
 // window searches the window of scanWindow bytes from offset on. It tries the anchors in turn
 // while they prove dense. When every anchor proves dense, it searches the rest of the window with
 // the sparsest one. When even that one is too dense (see fallbackSpan), it uses bytes.Index. It
-// returns scanWindowEnd when the next window follows. A search in a window spans at most
-// scanWindow bytes and a switch back for each anchor, and it has at most a few hits. So each
-// product that window compares stays below 100,000, and no product overflows a 32-bit int.
+// returns scanWindowEnd when the next window follows. An anchor search that proves dense spans at
+// most scanWindow bytes and a back-up for each anchor. It has at most denseHits plus three hits. So each product that window compares stays below 100,000, and no product overflows a
+// 32-bit int.
 func (s *summaryScan) window() scanResult {
 	end := s.offset + scanWindow
 	sparsest, sparsestHits, sparsestSpan := 0, 0, 0
 	for range summaryAnchors {
-		result, stop, hits := summaryAnchors[s.anchor].search(s.data, s.offset, end, true)
+		result, stop, hits := summaryAnchors[s.anchor].search(s.data, s.offset, end, denseSpan)
+		s.hits += hits
 		if result != scanDense {
 			s.offset = stop
 			return result
@@ -218,9 +234,13 @@ func (s *summaryScan) window() scanResult {
 	}
 	s.anchor = sparsest
 	if sparsestHits*fallbackSpan < sparsestSpan {
-		result, stop, _ := summaryAnchors[sparsest].search(s.data, s.offset, end, false)
-		s.offset = stop
-		return result
+		result, stop, hits := summaryAnchors[sparsest].search(s.data, s.offset, end, fallbackSpan)
+		s.hits += hits
+		if result != scanDense {
+			s.offset = stop
+			return result
+		}
+		s.offset = max(0, stop-anchorReach)
 	}
 	if sizeKeyBefore(s.data, s.offset, end) {
 		return scanFound
@@ -254,10 +274,10 @@ func sizeKeyBefore(data []byte, from, end int) bool {
 // search checks for a summary around each place of the anchor in data from index from on, up to
 // end. It returns the result, stop and the number of hits. stop is where the next search starts.
 // With scanFound, stop is the place of the last hit. With scanNone, it is the end of data. With
-// scanWindowEnd, it is the first place at end or after it. With switching, the search stops with
-// scanDense after more false hits than the bytes it searched allow (see denseSpan). Then stop is
-// the index after the last hit.
-func (a summaryAnchor) search(data []byte, from, end int, switching bool) (scanResult, int, int) {
+// scanWindowEnd, it is the first place at end or after it. The search stops with scanDense when
+// hits is more than denseHits plus one for each span bytes that it searched. Then stop is the
+// index after the last hit.
+func (a summaryAnchor) search(data []byte, from, end, span int) (scanResult, int, int) {
 	offset, hits := from, 0
 	for {
 		i := bytes.IndexByte(data[offset:], a.char)
@@ -274,7 +294,7 @@ func (a summaryAnchor) search(data []byte, from, end int, switching bool) (scanR
 			}
 		}
 		offset, hits = at+1, hits+1
-		if switching && hits > denseHits+(offset-from)/denseSpan {
+		if hits > denseHits+(offset-from)/span {
 			return scanDense, offset, hits
 		}
 	}
