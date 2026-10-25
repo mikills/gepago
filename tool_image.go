@@ -10,6 +10,7 @@ import (
 	"maps"
 	"reflect"
 	"slices"
+	"sync"
 )
 
 // errImageRefused is the error with which imageRefusalOptions stop an encode at an Image from
@@ -20,7 +21,9 @@ var errImageRefused = fmt.Errorf("%w: refused", ErrInvalidImage)
 // errImageRefused. A zero Image encodes as null, as its MarshalJSON writes it. The marshaler sees
 // only the Image type itself. A type that embeds an Image or a *Image, or that writes its own
 // JSON, encodes as json.Marshal writes it. A MarshalJSONTo that encodes an Image it holds through
-// its encoder gets these options, so that Image fails too.
+// its encoder gets these options, so that Image fails too. encodeCheckingImages uses these options
+// only for JSON that holds the full summary of an image. So a MarshalJSONTo that encodes an Image
+// apart and writes the result as a string, or in another form, passes with the summary as text.
 var imageRefusalOptions = jsonv2.JoinOptions(
 	json.DefaultOptionsV1(),
 	jsonv2.WithMarshalers(jsonv2.MarshalToFunc(func(_ *jsontext.Encoder, image Image) error {
@@ -31,47 +34,178 @@ var imageRefusalOptions = jsonv2.JoinOptions(
 	})),
 )
 
-// imageSummaryMark starts the JSON summary of every Image from NewImage, as MarshalJSON writes
-// it. A JSON string holds its quotes escaped. So the mark occurs in JSON only at an object that
-// starts with the key "media_type" and a value that starts with "image/".
-var imageSummaryMark = []byte(`{"media_type":"image/`)
+// marshalerToType is the interface of a type that writes its own JSON through an encoder.
+var marshalerToType = reflect.TypeFor[jsonv2.MarshalerTo]()
 
-// summaryAnchor is the offset of the rarest byte of imageSummaryMark, the underscore. A search for
-// the mark from there skips most of the text that JSON holds.
-var summaryAnchor = bytes.IndexByte(imageSummaryMark, '_')
+// imageEncodeCache holds what mayEncodeImage found for each type. A reflect.Type key needs no
+// allocation, so a lookup costs none.
+var imageEncodeCache sync.Map
 
-// holdsImageSummary reports whether data, the JSON that json.Marshal wrote, holds
-// imageSummaryMark. It holds it wherever the value holds an Image from NewImage that the encode
-// met. It may also hold it for another value of the same shape.
+// mayEncodeImage reports whether json.Marshal can meet an Image in a value of typ. That is so when
+// typ is Image, or reaches it through pointers, slices, arrays, map keys and values, struct fields
+// and interfaces. The dynamic value of an interface may be an Image. It is also so when typ
+// reaches a type that has a MarshalJSONTo method, also through a pointer. That method gets the
+// encoder, so it can encode an Image that no field holds.
+func mayEncodeImage(typ reflect.Type) bool {
+	if cached, ok := imageEncodeCache.Load(typ); ok {
+		return cached.(bool)
+	}
+	found := reachesEncodedImage(typ, map[reflect.Type]bool{})
+	imageEncodeCache.Store(typ, found)
+	return found
+}
+
+// reachesEncodedImage is mayEncodeImage without the cache. visiting holds the types already on the
+// path, so a recursive type ends.
+func reachesEncodedImage(typ reflect.Type, visiting map[reflect.Type]bool) bool {
+	if typ == imageType || typ.Implements(marshalerToType) || reflect.PointerTo(typ).Implements(marshalerToType) {
+		return true
+	}
+	if visiting[typ] {
+		return false
+	}
+	visiting[typ] = true
+	switch typ.Kind() {
+	case reflect.Interface:
+		return true
+	case reflect.Pointer, reflect.Slice, reflect.Array:
+		return reachesEncodedImage(typ.Elem(), visiting)
+	case reflect.Map:
+		return reachesEncodedImage(typ.Key(), visiting) || reachesEncodedImage(typ.Elem(), visiting)
+	case reflect.Struct:
+		for i := range typ.NumField() {
+			if reachesEncodedImage(typ.Field(i).Type, visiting) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// imageSummarySize is the text in the JSON summary of an Image from NewImage between its media
+// type and its size. imageSummaryDigest is the text between its size and its digest.
+const (
+	imageSummarySize   = `","size":`
+	imageSummaryDigest = `,"sha256":"`
+)
+
+// imageSummaryTypes are the starts of the JSON summary of an Image from NewImage as MarshalJSON
+// writes it, one for each media type, up to imageSummarySize.
+var imageSummaryTypes = []string{
+	`{"media_type":"image/png`,
+	`{"media_type":"image/jpeg`,
+	`{"media_type":"image/webp`,
+}
+
+// summaryAnchor is the byte at which holdsImageSummary looks for a summary: the "z" of the key
+// "size", at index anchorOffset of imageSummarySize. JSON keys and text seldom hold it, so a
+// search for it skips most of the JSON.
+const (
+	summaryAnchor = 'z'
+	anchorOffset  = 5
+)
+
+// holdsImageSummary reports whether data, the JSON that json.Marshal wrote, holds the full JSON
+// summary of an image. That is an object with three keys in this order and without spaces. The
+// key "media_type" holds "image/png", "image/jpeg" or "image/webp". The key "size" holds an
+// integer. The key "sha256" holds 64 lower-case hex digits. The summary is there wherever the
+// value holds an Image from NewImage that the encode met. It may also be there for another value
+// of the same shape. A JSON string holds its quotes escaped, so a summary in a string does not
+// count.
 func holdsImageSummary(data []byte) bool {
-	tail := imageSummaryMark[summaryAnchor:]
 	for offset := 0; ; {
-		i := bytes.Index(data[offset:], tail)
+		i := bytes.IndexByte(data[offset:], summaryAnchor)
 		if i < 0 {
 			return false
 		}
-		if start := offset + i - summaryAnchor; start >= 0 &&
-			bytes.Equal(data[start:start+summaryAnchor], imageSummaryMark[:summaryAnchor]) {
+		if imageSummaryAt(data, offset+i-anchorOffset) {
 			return true
 		}
 		offset += i + 1
 	}
 }
 
+// imageSummaryAt reports whether data holds the full JSON summary of an image whose
+// imageSummarySize starts at index at.
+func imageSummaryAt(data []byte, at int) bool {
+	return at >= 0 && textAt(data, at, imageSummarySize) && summaryTypeEndsAt(data, at) &&
+		summaryTail(data[at+len(imageSummarySize):])
+}
+
+// textAt reports whether data holds text at index at.
+func textAt(data []byte, at int, text string) bool {
+	return len(data)-at >= len(text) && string(data[at:at+len(text)]) == text
+}
+
+// summaryTypeEndsAt reports whether one of imageSummaryTypes ends at index at of data.
+func summaryTypeEndsAt(data []byte, at int) bool {
+	for _, start := range imageSummaryTypes {
+		if at >= len(start) && string(data[at-len(start):at]) == start {
+			return true
+		}
+	}
+	return false
+}
+
+// summaryTail reports whether rest starts with the end of the JSON summary of an image after
+// imageSummarySize. That is the digits of the size, imageSummaryDigest, 64 lower-case hex digits
+// and the end of the digest and of the object.
+func summaryTail(rest []byte) bool {
+	digits := 0
+	for digits < len(rest) && rest[digits] >= '0' && rest[digits] <= '9' {
+		digits++
+	}
+	if digits == 0 || !textAt(rest, digits, imageSummaryDigest) {
+		return false
+	}
+	digest := rest[digits+len(imageSummaryDigest):]
+	if len(digest) < 66 || digest[64] != '"' || digest[65] != '}' {
+		return false
+	}
+	for _, c := range digest[:64] {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // encodeRefusingImages encodes value as json.Marshal does, but fails with an error that matches
-// errImageRefused at an Image from NewImage. It calls json.Marshal first. The encode then writes
-// the summary of each Image from NewImage that it meets. Only when the JSON holds a summary, or
-// json.Marshal fails, does it encode again with imageRefusalOptions. So a text-only value costs
-// what json.Marshal costs and a scan of its JSON. An error of json.Marshal stays as it is.
+// errImageRefused at an Image from NewImage. It checks for images only when the type of value
+// may encode one (see mayEncodeImage and encodeCheckingImages).
 func encodeRefusingImages(value any) ([]byte, error) {
+	return encodeCheckingImages(value, value != nil && mayEncodeImage(reflect.TypeOf(value)))
+}
+
+// argumentsMayEncodeImage reports whether the value of a key of args may encode an Image (see
+// mayEncodeImage). It looks at the type of each value, so a map of text-only values needs no
+// check.
+func argumentsMayEncodeImage(args map[string]any) bool {
+	for _, value := range args {
+		if value != nil && mayEncodeImage(reflect.TypeOf(value)) {
+			return true
+		}
+	}
+	return false
+}
+
+// encodeCheckingImages encodes value with json.Marshal. When json.Marshal fails, it returns that
+// error as it is. Without check, it returns the JSON as it is. With check, it scans the JSON for
+// the full summary of an image (see holdsImageSummary). The encode writes one for each Image from
+// NewImage that it meets. Only when the JSON holds one does it encode value again with
+// imageRefusalOptions. When that encode refuses an Image, it returns the refusal. Otherwise it
+// returns the JSON of the first encode. So a value of a type that cannot encode an Image costs what
+// json.Marshal costs. Another value costs a scan of its JSON too. A value whose JSON holds the full
+// shape of a summary costs a second encode. That is so also for a value that only looks like one.
+func encodeCheckingImages(value any, check bool) ([]byte, error) {
 	data, err := json.Marshal(value)
-	if err == nil && !holdsImageSummary(data) {
-		return data, nil
+	if err != nil || !check || !holdsImageSummary(data) {
+		return data, err
 	}
 	if _, refusal := jsonv2.Marshal(value, imageRefusalOptions); errors.Is(refusal, errImageRefused) {
 		return nil, refusal
 	}
-	return data, err
+	return data, nil
 }
 
 // refusedArgument returns the key of the first value of args, in key order, whose encode fails at
@@ -120,8 +254,11 @@ func imageChain(typ reflect.Type) bool {
 //     requires a field without omitempty or omitzero, also when an embedded pointer promotes it.
 //     A field tagged "-" and an unexported field do not count.
 //
-// A type with its own JSON decode and every other type count as decodable. visiting holds the
-// types on the path, so a recursive type ends.
+// A type with its own JSON decode and every other type count as decodable. A type that embeds an
+// Image takes the Image's UnmarshalJSON as its own, which accepts only null. So it counts as
+// decodable, though the strict decode refuses null for it. Only user code can tell a promoted
+// decoder from an own one. So Register passes such Args, and their calls fail. visiting holds the types
+// on the path, so a recursive type ends.
 func undecodable(typ reflect.Type, visiting map[reflect.Type]bool) bool {
 	if typ == imageType {
 		return true

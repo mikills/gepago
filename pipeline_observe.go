@@ -81,6 +81,10 @@ import (
 // with ctx starts a trace of its own. An observer that wants its work correlated with the run
 // can pass the event's RunContext to WithRunContext.
 //
+// ctx does not carry where the event's execution runs, such as its Map element or its Loop
+// iteration. So a run that an observer starts takes none of the iteration numbers of the Loop it
+// observes.
+//
 // The values an event carries pass through PipelineSpec.Redactor; see Redactor. Each observer
 // receives its own copy of them, its RunContext's Attributes included, so changing them changes
 // neither the run nor what other observers receive.
@@ -273,7 +277,11 @@ func (r *runObservation) observerContext(ctx context.Context) context.Context {
 // run's context. It hides the values that tie it to a pipeline run. These are the trace, the
 // step frame, the run context, the budget, usage collection and the step cache. They are also
 // evaluation capture, the tool session, tool memory, staged tool results, and the tool call
-// and usage tally of a wrapped tool.
+// and usage tally of a wrapped tool. It also hides where the execution runs. That is the visit
+// of its top-level step, its Map element, and its Loop iteration with the iteration numbers. It
+// also hides the hold of a top-level wrapper. So a run that an observer starts with it is a run
+// of its own. It keeps the numbers that a RecordingObserver reads (see withTracedNumbers), and
+// every value that the caller set, such as the tool scope.
 type observerCtx struct {
 	context.Context
 	values context.Context
@@ -282,7 +290,8 @@ type observerCtx struct {
 func (c observerCtx) Value(key any) any {
 	switch key.(type) {
 	case observeKey, evaluationKey, pipelineRunKey, runContextKey, usageFrameKey, usageCollectorKey, retryAdmissionKey,
-		budgetClockKey, toolEnvKey, toolMemoryKey, stepStageKey, toolAttemptsKey, recordedUsageKey:
+		budgetClockKey, toolEnvKey, toolMemoryKey, stepStageKey, toolAttemptsKey, recordedUsageKey, visitKey,
+		mapElementKey, loopIterationKey, finishHoldKey:
 		return nil
 	}
 	return c.values.Value(key)

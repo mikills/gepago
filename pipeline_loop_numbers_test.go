@@ -446,14 +446,21 @@ func reflectWithTraces(t *testing.T, program Program, traces bool) EvaluationIte
 
 // iterationTrace returns the trace of the body's execution in the given iteration of the Loop
 // that is the top-level step named loop. A Loop's iterations start in order, so it finds the
-// execution by its place, also when a Redactor leaves the "iteration" attribute out.
+// execution by its place, also when a Redactor leaves the "iteration" attribute out. This works
+// only for a body that runs once in each iteration. The retries of a WithPolicy body are more
+// executions under the Loop, which move the later iterations to other places. Where the
+// attribute stays, the helper checks that it names the iteration.
 func iterationTrace(t *testing.T, item EvaluationItem, loop string, iteration int) StepTrace {
 	t.Helper()
 	trace, ok := item.Trace.(PipelineTrace)
 	require.True(t, ok, "one trace")
 	for _, step := range trace.Steps {
 		if step.Step == loop && len(step.Steps) >= iteration {
-			return step.Steps[iteration-1]
+			found := step.Steps[iteration-1]
+			if number, ok := found.Attributes["iteration"]; ok {
+				require.Equal(t, iteration, number, "the body runs once in each iteration")
+			}
+			return found
 		}
 	}
 	t.Fatalf("no iteration %d of %s", iteration, loop)
@@ -578,4 +585,46 @@ func TestReflectionKeepsTheIterationNumberWithAndWithoutTraces(t *testing.T) {
 			require.Contains(t, iterationTrace(t, traced, "loop", 3).Err, tt.want)
 		})
 	}
+}
+
+func TestObserverRunTakesNoIterationNumbersFromTheLoopItObserves(t *testing.T) {
+	recorder := &RecordingObserver{}
+	audit, err := PipelineSpec{
+		Inputs:    refs(loopPageKey.Ref()),
+		Steps:     []Step{rejectCode(loopPageKey)},
+		Observers: []PipelineObserver{recorder},
+		Redactor:  hiding("page"),
+	}.Build()
+	require.NoError(t, err)
+	var audits []error
+	observer := &startHook{hook: func(ctx context.Context, event StepStartedEvent) {
+		if event.Step == "count_up" {
+			_, err := audit.RunCandidate(ctx, nil, Prediction{"page": 3})
+			audits = append(audits, err)
+		}
+	}}
+	pipeline := loopPipeline(t, pagedLoop(addPages(plusPage), 15, 5), observer)
+
+	_, err = pipeline.RunCandidate(context.Background(), nil, Prediction{})
+
+	require.NoError(t, err)
+	require.Len(t, audits, 5)
+	traces := recorder.Traces()
+	require.Len(t, traces, 5)
+	for i, trace := range traces {
+		require.ErrorIs(t, audits[i], ErrInvalidOutput)
+		require.Len(t, trace.Steps, 1)
+		require.Equal(t, "invalid programme output: code [redacted] rejected", trace.Steps[0].Err,
+			"the audit run in iteration %d redacts its own input", i+1)
+	}
+	require.Nil(t, recorder.spanNumbers(), "no audit run takes its input as an iteration number")
+}
+
+func TestTracedNumbersReplaceTheNumbersThatTheContextHeld(t *testing.T) {
+	ctx := withTracedNumbers(context.Background(), iterationNumbers{"page": 3})
+	require.Equal(t, iterationNumbers{"page": 3}, tracedNumbers(ctx))
+
+	require.Nil(t, tracedNumbers(withTracedNumbers(ctx, nil)), "no numbers replace the earlier ones")
+	require.Nil(t, tracedNumbers(withTracedNumbers(ctx, iterationNumbers{})), "an empty set is no numbers")
+	require.Nil(t, tracedNumbers(context.Background()))
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -536,4 +537,69 @@ func TestPipelineObserverStress(t *testing.T) {
 			require.Equal(t, map[string]any{"document": "[doc]"}, step.Reads, step.Step)
 		})
 	}
+}
+
+// startHook is an observer that calls hook with the context and the event of each StepStarted
+// event. An observer that audits the executions of a run can do this.
+type startHook struct {
+	hook func(ctx context.Context, event StepStartedEvent)
+}
+
+func (*startHook) RunStarted(context.Context, RunStartedEvent) {}
+
+func (o *startHook) StepStarted(ctx context.Context, event StepStartedEvent) { o.hook(ctx, event) }
+
+func (*startHook) StepFinished(context.Context, StepFinishedEvent) {}
+
+func (*startHook) RunFinished(context.Context, RunFinishedEvent) {}
+
+func TestObserverContextHidesWhereTheExecutionRuns(t *testing.T) {
+	numbers := iterationNumbers{"page": 3}
+	ctx := withIteration(withElement(withVisit(WithToolScope(context.Background(), "account"), 2), 1, &elementUsage{}),
+		"page", 3)
+	ctx = context.WithValue(withTracedNumbers(ctx, numbers), finishHoldKey{}, &finishHold{})
+	require.Equal(t, 2, visitFrom(ctx))
+	require.NotNil(t, elementFrom(ctx))
+	require.Equal(t, 3, iterationFrom(ctx).number)
+	require.NotNil(t, finishHoldFrom(ctx))
+
+	observed := (&runObservation{life: context.Background()}).observerContext(ctx)
+
+	require.Zero(t, visitFrom(observed), "the visit of the top-level step")
+	require.Nil(t, elementFrom(observed), "the element of a Map")
+	require.Zero(t, iterationFrom(observed), "the iteration of a Loop")
+	require.Nil(t, finishHoldFrom(observed), "the hold of a top-level wrapper")
+	require.Equal(t, numbers, tracedNumbers(observed), "a RecordingObserver reads the traced numbers")
+	require.Equal(t, "account", ToolScopeFrom(observed), "the caller's tool scope")
+}
+
+func TestObserverRunReportsItsStepsInOrderDuringAHeldExecution(t *testing.T) {
+	log := &eventLog{}
+	audit, err := PipelineSpec{
+		Steps:     []Step{writeAmount("audit", 1)},
+		Observers: []PipelineObserver{log},
+	}.Build()
+	require.NoError(t, err)
+	var audits []error
+	observer := &startHook{hook: func(ctx context.Context, event StepStartedEvent) {
+		if event.Step == "second" {
+			_, err := audit.RunCandidate(ctx, nil, Prediction{})
+			audits = append(audits, err)
+		}
+	}}
+	disagree := MergeWith(amountKey, func(int, int) (int, error) { return 0, errors.New("amounts disagree") })
+	pipeline, err := PipelineSpec{
+		Steps:     []Step{writeAmount("first", 1), WithPolicy(writeAmount("second", 2), StepPolicy{})},
+		Merges:    []MergeRule{disagree},
+		Observers: []PipelineObserver{observer},
+	}.Build()
+	require.NoError(t, err)
+
+	_, err = pipeline.RunCandidate(context.Background(), nil, Prediction{})
+
+	require.ErrorContains(t, err, "amounts disagree")
+	require.Equal(t, []error{nil, nil}, audits, "one audit for the execution and one for the failed commit")
+	once := []string{"start run", "start audit#1 in run", "finish audit#1", "finish run"}
+	require.Equal(t, append(slices.Clone(once), once...), log.Lines(),
+		"the audit during the failed commit does not hold its step's end for the wrapper")
 }

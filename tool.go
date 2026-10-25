@@ -175,21 +175,29 @@ func (p Provenance) Validate() error {
 // description, and a nil fn. So ToolRegistry.Register refuses such a tool. Images follow two
 // rules. Validate reports Args that no JSON value can decode into, because the decode requires an
 // Image there and JSON holds no image data. An example is a field of the type Image without
-// omitempty or omitzero. A *Image, a slice and a map take null, so they pass. Every other Image
-// fails at call time, when a value holds one. That covers every Out, since a value without an image
-// always encodes.
+// omitempty or omitzero. A *Image, a slice and a map take null, so they pass. Validate cannot see
+// a decoder that a type takes from an embedded Image, such as struct{ Image }. So it passes Args
+// that require such a type, and their calls fail. Every other Image fails at call time, when a
+// value holds one. That covers every Out. An Out value fails for an image only when it holds
+// one, so Validate does not check Out.
 //
 // Tool arguments and output travel as JSON, and the JSON form of an Image holds no image data.
 // So an Image from NewImage in fn's output fails the call with a Permanent error. The error names
 // the tool and the Go type of the output. The encode finds an Image where json.Marshal encodes
-// one, also in an interface value. It skips unexported fields and fields tagged "-". The encode
-// calls json.Marshal first, so a text-only output costs what json.Marshal costs. A type that
+// one, also in an interface value. It skips unexported fields and fields tagged "-". A type that
 // embeds an Image or a *Image, or that writes its own JSON, encodes as json.Marshal writes it. So
 // the model gets at most the image's summary, and never the image. But a MarshalJSONTo that
 // encodes an Image it holds through its encoder still fails, since the encoder refuses that Image.
-// A zero Image encodes as null. A panic in the encode is not recovered, as json.Marshal does not
-// recover it. Arguments that give an Image of Args a value fail the call with
-// ErrInvalidToolArguments and ErrInvalidImage.
+// A MarshalJSONTo can first encode an Image apart, such as with jsonv2.Marshal and the options of
+// its encoder. When it then writes the result as a string or in another form, it passes. The
+// model then gets the summary as text. A zero Image encodes as null.
+//
+// The encode calls json.Marshal once and returns its error as it is. That is all it does when the
+// type of the output cannot hold an Image or reach a MarshalJSONTo. Otherwise it scans the JSON
+// for the full summary of an image. Only an output whose JSON holds one costs a second encode,
+// also when the output only looks like a summary. A panic in the encode is not recovered, as
+// json.Marshal does not recover it. Arguments that give an Image of Args a value fail the call
+// with ErrInvalidToolArguments and ErrInvalidImage.
 func NewTool[Args, Out any](name, description string, fn func(context.Context, Args) (Out, error)) ToolProvider {
 	tool := &typedTool[Args, Out]{fn: fn, schema: Tool{Name: name, Description: description}}
 	schema, err := JSONSchemaFor[Args]()
@@ -220,9 +228,8 @@ func (t *typedTool[Args, Out]) Schema() Tool {
 	return schema
 }
 
-// Validate reports a schema that JSONSchemaFor cannot derive, and an Image in Args or Out that
-// makes every value with an image fail (see NewTool). It also reports a missing name or
-// description, or a nil function.
+// Validate reports a schema that JSONSchemaFor cannot derive, and Args that no JSON value can
+// decode into (see NewTool). It also reports a missing name or description, or a nil function.
 func (t *typedTool[Args, Out]) Validate() error {
 	if t.err != nil {
 		return t.err

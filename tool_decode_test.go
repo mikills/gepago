@@ -12,17 +12,24 @@ type photoHolder struct {
 	Img Image `json:"img"`
 }
 
+// embeddedPhoto embeds an Image, so it takes the Image's JSON methods as its own.
+type embeddedPhoto struct {
+	Image
+}
+
 // fieldArgs holds a value of T under "x".
 type fieldArgs[T any] struct {
 	X T `json:"x"`
 }
 
 // argumentShape is a type of tool arguments: whether Register refuses it, and whether each
-// attempt decodes into it.
+// attempt decodes into it. A shape with a limit is one that Register passes, though no attempt
+// decodes into it.
 type argumentShape struct {
 	name     string
 	register func() error
 	decode   func(arguments string) error
+	call     func(arguments string) error
 }
 
 func argumentShapeOf[Args any](name string) argumentShape {
@@ -36,10 +43,15 @@ func argumentShapeOf[Args any](name string) argumentShape {
 			_, err := decodeToolArguments[Args](arguments)
 			return err
 		},
+		call: func(arguments string) error {
+			tool := NewTool("t", "d", func(context.Context, Args) (string, error) { return "", nil })
+			_, err := tool.Invoke(context.Background(), ToolCall{Name: "t", Arguments: arguments})
+			return err
+		},
 	}
 }
 
-func TestNewToolRefusesExactlyTheArgumentsThatNoJSONValueDecodesInto(t *testing.T) {
+func TestNewToolRefusesTheArgumentsThatNoJSONValueDecodesInto(t *testing.T) {
 	attempts := []string{
 		`{"x":null}`, `{"x":{}}`, `{"x":[]}`, `{"x":[null]}`, `{}`,
 		`{"x":{"img":null}}`, `{"x":{"in":{"img":null}}}`, `{"x":[{}]}`, `{"x":{"text":"a"}}`,
@@ -48,6 +60,7 @@ func TestNewToolRefusesExactlyTheArgumentsThatNoJSONValueDecodesInto(t *testing.
 	tests := []struct {
 		shape   argumentShape
 		refused bool
+		limit   bool
 	}{
 		{shape: argumentShapeOf[fieldArgs[Image]]("Image"), refused: true},
 		{shape: argumentShapeOf[fieldArgs[*Image]]("*Image")},
@@ -85,6 +98,10 @@ func TestNewToolRefusesExactlyTheArgumentsThatNoJSONValueDecodesInto(t *testing.
 		}]("Image omitempty")},
 		{shape: argumentShapeOf[fieldArgs[Part]]("Part")},
 		{shape: argumentShapeOf[Part]("arguments that are a Part")},
+		// Register cannot tell a decoder that a type takes from an embedded Image from its own.
+		{shape: argumentShapeOf[fieldArgs[embeddedPhoto]]("a named struct{Image}"), limit: true},
+		{shape: argumentShapeOf[fieldArgs[struct{ Image }]]("struct{Image}"), limit: true},
+		{shape: argumentShapeOf[fieldArgs[[1]embeddedPhoto]]("[1]struct{Image}"), limit: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.shape.name, func(t *testing.T) {
@@ -96,11 +113,22 @@ func TestNewToolRefusesExactlyTheArgumentsThatNoJSONValueDecodesInto(t *testing.
 			}
 			err := tt.shape.register()
 
-			require.Equal(t, tt.refused, len(decoded) == 0, "the attempts that decode: %v", decoded)
-			require.Equal(t, tt.refused, err != nil, "Register refuses exactly when no attempt decodes: %v", err)
+			require.Equal(t, tt.refused || tt.limit, len(decoded) == 0, "the attempts that decode: %v", decoded)
+			require.Equal(
+				t,
+				tt.refused,
+				err != nil,
+				"Register refuses when no attempt decodes, but for a limit: %v",
+				err,
+			)
 			if tt.refused {
 				require.ErrorContains(t, err, "but tool arguments travel as JSON without image data, "+
 					"so no value decodes into it")
+			}
+			if tt.limit {
+				for _, attempt := range attempts {
+					require.ErrorIs(t, tt.shape.call(attempt), ErrInvalidToolArguments, "a call fails: %s", attempt)
+				}
 			}
 		})
 	}

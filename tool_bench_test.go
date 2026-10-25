@@ -135,3 +135,132 @@ func BenchmarkToolStepArgumentsStructs(b *testing.B) {
 func BenchmarkToolStepArgumentsMessages(b *testing.B) {
 	benchToolStep(b, gepa.Key[[]gepa.Message]{Name: "history"}, benchMessages(5000))
 }
+
+// snakeRow is a text-only row whose JSON keys are snake_case.
+type snakeRow struct {
+	UserID      int    `json:"user_id"`
+	DisplayName string `json:"display_name"`
+	CreatedAt   string `json:"created_at"`
+	IsActive    bool   `json:"is_active"`
+}
+
+// snakeRows returns n snake_case rows.
+func snakeRows(n int) []snakeRow {
+	rows := make([]snakeRow, n)
+	for i := range rows {
+		rows[i] = snakeRow{
+			UserID:      i,
+			DisplayName: "user " + strconv.Itoa(i),
+			CreatedAt:   "2026-10-25T10:00:00Z",
+			IsActive:    i%2 == 0,
+		}
+	}
+	return rows
+}
+
+// mediaRow is a text-only row that starts as an image's JSON summary does, but is not one.
+type mediaRow struct {
+	MediaType string `json:"media_type"`
+	Name      string `json:"name"`
+	Size      int    `json:"size"`
+}
+
+// mediaRows returns n rows that look like image summaries.
+func mediaRows(n int) []mediaRow {
+	rows := make([]mediaRow, n)
+	for i := range rows {
+		rows[i] = mediaRow{MediaType: "image/png", Name: "photo_" + strconv.Itoa(i) + ".png", Size: 1000 + i}
+	}
+	return rows
+}
+
+// mediaMaps returns n rows that look like image summaries, as maps.
+func mediaMaps(n int) []any {
+	rows := make([]any, n)
+	for i := range rows {
+		rows[i] = map[string]any{"media_type": "image/png", "size": 1000 + i, "sha256": "not a digest"}
+	}
+	return rows
+}
+
+// photoURLs returns n URLs of photos, each with a query that holds a "z".
+func photoURLs(n int) []string {
+	urls := make([]string, n)
+	for i := range urls {
+		urls[i] = "https://example.com/images/photo_" + strconv.Itoa(i) + ".png?size=large&format=webp"
+	}
+	return urls
+}
+
+// anyOf returns the values of values as a []any.
+func anyOf[T any](values []T) []any {
+	out := make([]any, len(values))
+	for i, value := range values {
+		out[i] = value
+	}
+	return out
+}
+
+// mixedValues returns n text-only strings, numbers and maps in a []any.
+func mixedValues(n int) []any {
+	values := make([]any, n)
+	for i := range values {
+		switch i % 3 {
+		case 0:
+			values[i] = "value " + strconv.Itoa(i)
+		case 1:
+			values[i] = i
+		default:
+			values[i] = map[string]any{"id": i, "ok": true}
+		}
+	}
+	return values
+}
+
+// BenchmarkToolOutputShapes compares an Invoke of a tool that returns each text-only value with
+// json.Marshal of the value. The values hold the bytes that the image scan looks for.
+func BenchmarkToolOutputShapes(b *testing.B) {
+	const n = 20_000
+	shapes := []struct {
+		name  string
+		value any
+	}{
+		{name: "snake rows", value: snakeRows(n)},
+		{name: "media rows", value: mediaRows(n)},
+		{name: "media maps", value: mediaMaps(n)},
+		{name: "one media row among records", value: struct {
+			Meta    mediaRow   `json:"meta"`
+			Records []snakeRow `json:"records"`
+		}{Meta: mediaRows(1)[0], Records: snakeRows(n)}},
+		{name: "one media map among records", value: struct {
+			Meta    map[string]any `json:"meta"`
+			Records []snakeRow     `json:"records"`
+		}{Meta: mediaMaps(1)[0].(map[string]any), Records: snakeRows(n)}},
+		{name: "urls", value: photoURLs(n)},
+		{name: "urls as any", value: anyOf(photoURLs(n))},
+		{name: "snake rows as any", value: anyOf(snakeRows(n))},
+		{name: "messages", value: benchMessages(n)},
+		{name: "any slice", value: mixedValues(n)},
+	}
+	for _, shape := range shapes {
+		b.Run(shape.name+"/Invoke", func(b *testing.B) {
+			benchInvoke(b, shape.value)
+		})
+		b.Run(shape.name+"/json.Marshal", func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := json.Marshal(shape.value); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkToolStepArgumentsSnakeRows(b *testing.B) {
+	benchToolStep(b, gepa.Key[[]snakeRow]{Name: "rows"}, snakeRows(20_000))
+}
+
+func BenchmarkToolStepArgumentsMediaMaps(b *testing.B) {
+	benchToolStep(b, gepa.Key[[]any]{Name: "rows"}, mediaMaps(20_000))
+}

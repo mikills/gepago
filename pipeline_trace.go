@@ -238,16 +238,17 @@ type tracedNumbersKey struct{}
 // withTracedNumbers returns ctx with numbers, the keys whose raw inputs or reads the run or the
 // execution took as iteration numbers. observeRun and observeStep decide them on the raw values,
 // before a Redactor changes them, and pass ctx to the observers. A trace holds the redacted values
-// as JSON decodes them, so the key alone then tells an iteration number apart. Without numbers it
-// returns ctx as it is.
+// as JSON decodes them, so the key alone then tells an iteration number apart. It replaces the
+// numbers that ctx held, also when there are none. So the numbers of an earlier run or execution
+// never reach a later one. An example is a run that an observer starts with its context.
 func withTracedNumbers(ctx context.Context, numbers iterationNumbers) context.Context {
 	if len(numbers) == 0 {
-		return ctx
+		numbers = nil
 	}
 	return context.WithValue(ctx, tracedNumbersKey{}, numbers)
 }
 
-// tracedNumbers returns the numbers that withTracedNumbers put in ctx, or nil.
+// tracedNumbers returns the numbers that withTracedNumbers put in ctx, or nil when it put none.
 func tracedNumbers(ctx context.Context) iterationNumbers {
 	numbers, _ := ctx.Value(tracedNumbersKey{}).(iterationNumbers)
 	return numbers
