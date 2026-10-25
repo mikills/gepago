@@ -425,3 +425,140 @@ func TestStepErrorHoldsNoIterationNumbersWhereNoneAreInEffect(t *testing.T) {
 		}
 	})
 }
+
+// reflectWithTraces runs program on one example through ProgramEvaluator, with traces recorded
+// or not, and returns the item.
+func reflectWithTraces(t *testing.T, program Program, traces bool) EvaluationItem {
+	t.Helper()
+	evaluator := ProgramEvaluator{
+		Program:      program,
+		Metric:       ExactMatchMetric{Fields: []string{"count"}},
+		RecordTraces: traces,
+	}
+	examples := []Example{NewIOExample("1", Prediction{}, Prediction{"count": 6})}
+
+	result, err := evaluator.Evaluate(context.Background(), nil, examples, traces)
+
+	require.NoError(t, err)
+	require.Len(t, result.Items, 1)
+	return result.Items[0]
+}
+
+// iterationTrace returns the trace of the body's execution in the given iteration of the Loop
+// that is the top-level step named loop.
+func iterationTrace(t *testing.T, item EvaluationItem, loop string, iteration int) StepTrace {
+	t.Helper()
+	trace, ok := item.Trace.(PipelineTrace)
+	require.True(t, ok, "one trace")
+	for _, step := range trace.Steps {
+		if step.Step != loop {
+			continue
+		}
+		for _, body := range step.Steps {
+			if body.Attributes["iteration"] == iteration {
+				return body
+			}
+		}
+	}
+	t.Fatalf("no iteration %d of %s", iteration, loop)
+	return StepTrace{}
+}
+
+func TestReflectionKeepsTheIterationNumberWithAndWithoutTraces(t *testing.T) {
+	pages := Key[[]int]{Name: "pages"}
+	marks := Key[[]string]{Name: "marks"}
+	mark := Key[string]{Name: "mark"}
+	ticket := Key[string]{Name: "ticket"}
+	build := func(spec PipelineSpec) Pipeline {
+		pipeline, err := spec.Build()
+		require.NoError(t, err)
+		return pipeline
+	}
+	elem := NewStep("elem", refs(loopPageKey.Ref()), refs(mark.Ref()), func(_ context.Context, s State) error {
+		mark.Set(s, "m")
+		return nil
+	})
+	body := addPages(func(_ context.Context, count, page int) (int, error) {
+		if page == 3 {
+			return 0, fmt.Errorf("%w: code %d rejected", ErrInvalidOutput, page)
+		}
+		return count + 1, nil
+	})
+	// a Map whose items the Redactor hides hides the item key in reflection too.
+	mapped := build(PipelineSpec{
+		Steps:    []Step{Map("each", pages, loopPageKey, elem, marks, MapOptions{}), pagedLoop(body, 100, 5)},
+		Defaults: []Default{DefaultValue(loopCountKey, 0), DefaultValue(pages, []int{9})},
+		Redactor: hiding("pages"),
+	})
+	greeting := Key[string]{Name: "greeting"}
+	hello := NewStep("hello", nil, refs(greeting.Ref()), func(_ context.Context, s State) error {
+		greeting.Set(s, "hi")
+		return nil
+	})
+	ticketed := NewStep("count_up", refs(loopCountKey.Ref(), loopPageKey.Ref(), ticket.Ref()), refs(loopCountKey.Ref()),
+		func(_ context.Context, s State) error {
+			count, err := loopCountKey.Get(s)
+			if err != nil {
+				return err
+			}
+			page, err := loopPageKey.Get(s)
+			if err != nil {
+				return err
+			}
+			held, err := ticket.Get(s)
+			if err != nil {
+				return err
+			}
+			if page == 3 {
+				return fmt.Errorf("%w: code %d rejected for %s", ErrInvalidOutput, page, held)
+			}
+			loopCountKey.Set(s, count+1)
+			return nil
+		})
+	// the Loop's pipeline has no Redactor. The pipeline that its other step runs hides the key.
+	nested := build(PipelineSpec{
+		Steps:    []Step{hello},
+		Redactor: hiding("page", "ticket"),
+	})
+	another := build(PipelineSpec{
+		Steps: []Step{
+			NewProgramStep("lookup", nested, nil, refs(greeting.Ref())),
+			pagedLoop(ticketed, 100, 5),
+		},
+		Defaults: []Default{DefaultValue(loopCountKey, 0), DefaultValue(ticket, "T-77")},
+	})
+	tests := []struct {
+		name     string
+		pipeline Pipeline
+		want     string
+		reads    map[string]any
+	}{
+		{
+			name:     "a Map that hides the item key",
+			pipeline: mapped,
+			want:     "code 3 rejected",
+			reads:    map[string]any{"count": float64(2), "page": RedactedText},
+		},
+		{
+			name:     "another pipeline that hides the key",
+			pipeline: another,
+			want:     "code 3 rejected for [redacted]",
+			reads:    map[string]any{"count": float64(2), "page": RedactedText, "ticket": RedactedText},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plain := reflectWithTraces(t, tt.pipeline, false)
+			traced := reflectWithTraces(t, tt.pipeline, true)
+
+			require.Contains(t, plain.SideInfo["feedback"], "iteration 3: ")
+			require.Contains(t, plain.SideInfo["feedback"], tt.want)
+			require.NotContains(t, plain.SideInfo["feedback"], "T-77")
+			require.Equal(t, plain.SideInfo["feedback"], traced.SideInfo["feedback"], "traces change nothing")
+			require.Equal(t, plain.SideInfo["reads"], traced.SideInfo["reads"])
+			require.Equal(t, tt.reads, iterationTrace(t, traced, "loop", 3).Reads,
+				"the trace keeps the number as its events did and hides the ticket")
+			require.Contains(t, iterationTrace(t, traced, "loop", 3).Err, tt.want)
+		})
+	}
+}

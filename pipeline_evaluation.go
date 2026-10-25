@@ -225,12 +225,15 @@ func (c *evaluationCapture) offerToolCalls(records []ToolCallRecord) {
 }
 
 // apply returns the evaluation item of the example the capture watched, with the traces it
-// recorded and its reflection values redacted with everything it collected. numbers holds the
+// recorded and its reflection values redacted with everything it collected. The traces' reads
+// and inputs keep the iteration numbers that their executions and runs kept. numbers holds the
 // iteration numbers of the step that SideInfo's "reads" come from. It is nil when the item has no
 // such step.
 func (c *evaluationCapture) apply(item EvaluationItem, numbers iterationNumbers) EvaluationItem {
+	var spans map[string]iterationNumbers
 	if trace := evaluationTrace(c.recorder); trace != nil {
 		item.Trace = trace
+		spans = c.recorder.spanNumbers()
 	}
 	c.mu.Lock()
 	redaction := evaluationRedaction{
@@ -241,6 +244,7 @@ func (c *evaluationCapture) apply(item EvaluationItem, numbers iterationNumbers)
 		details:   slices.Clone(c.details),
 		toolCalls: cloneRecords(c.toolCalls),
 		numbers:   numbers,
+		spans:     spans,
 	}
 	c.mu.Unlock()
 	return redaction.apply(item)

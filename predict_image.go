@@ -23,13 +23,9 @@ func imageLabel(n int) string {
 
 var imageType = reflect.TypeFor[Image]()
 
-// imageReach is a key of imageReachCache.
-type imageReach struct {
-	typ     reflect.Type
-	dynamic bool
-}
-
-var imageReachCache sync.Map
+// imageReachCache holds what mayHoldImage found for each type, without dynamic at index 0 and with
+// it at index 1. A reflect.Type key needs no allocation, so a lookup costs none.
+var imageReachCache [2]sync.Map
 
 // mayHoldImage reports whether a value of typ can hold an Image. That is so when typ is Image, or
 // reaches it through pointers, slices, arrays, map values or struct fields. With dynamic, an
@@ -47,12 +43,15 @@ func mayHoldImage(typ reflect.Type, dynamic bool) bool {
 	case reflect.Interface:
 		return dynamic
 	}
-	key := imageReach{typ: typ, dynamic: dynamic}
-	if cached, ok := imageReachCache.Load(key); ok {
+	cache := &imageReachCache[0]
+	if dynamic {
+		cache = &imageReachCache[1]
+	}
+	if cached, ok := cache.Load(typ); ok {
 		return cached.(bool)
 	}
 	found := reachesImage(typ, dynamic, map[reflect.Type]bool{})
-	imageReachCache.Store(key, found)
+	cache.Store(typ, found)
 	return found
 }
 

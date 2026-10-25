@@ -30,9 +30,10 @@ import (
 // refuses a read whose type is Image, or reaches Image only through pointers, slices, arrays and
 // map values, such as []*Image. A read of another type can hold an Image in a struct field. When
 // its value holds an Image from NewImage, the step fails with a Permanent error. The error names
-// the key and the Go type of its value. A zero Image encodes as null. A type that embeds an Image,
-// or that writes its own JSON, encodes as json.Marshal writes it. So the tool gets at most the
-// image's summary, and never the image.
+// the key and the Go type of its value. A zero Image encodes as null. A type that embeds an Image
+// or a *Image, or that writes its own JSON, encodes as json.Marshal writes it. So the tool gets at
+// most the image's summary, and never the image. But a MarshalJSONTo that encodes an Image it
+// holds through its encoder still fails.
 func ToolStep(name, tool string, reads, writes []KeyRef) Step {
 	return &toolStep{
 		name:   strings.TrimSpace(name),
@@ -213,17 +214,25 @@ func (s *toolStep) Run(ctx context.Context, state State) error {
 
 // encodeToolArguments encodes args, the value of each read under its key, as json.Marshal does.
 // The JSON form of an Image holds no image data. So an Image from NewImage in a value fails the
-// encode with a Permanent error (see imageRefusal). The error names the key and the Go type of the
-// value. A zero Image encodes as null.
+// encode with a Permanent error (see imageRefusalOptions). The error names the key and the Go type
+// of the value. A zero Image encodes as null. When no value can hold an Image, args encodes with
+// json.Marshal itself.
 func encodeToolArguments(args map[string]any) ([]byte, error) {
-	var refusal imageRefusal
-	arguments, err := refusal.encode(args)
-	if !refusal.found {
+	check := false
+	for _, value := range args {
+		if valueMayHoldImage(value) {
+			check = true
+			break
+		}
+	}
+	arguments, err := encodeRefusingImages(args, check)
+	refused := refusedImage(err)
+	if refused == nil {
 		return arguments, err
 	}
 	// args is an object, so the first token of the image's place is the key that holds it.
 	key := ""
-	for token := range refusal.at.Tokens() {
+	for token := range refused.at.Tokens() {
 		key = token
 		break
 	}

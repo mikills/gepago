@@ -393,3 +393,51 @@ func BenchmarkToolEncodesTextOnlyOutput(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkEncodeToolOutputSmallStruct compares encodeToolOutput with json.Marshal, which v0.9.0
+// called, on a small text-only struct.
+func BenchmarkEncodeToolOutputSmallStruct(b *testing.B) {
+	out := struct {
+		Name  string `json:"name"`
+		Count int    `json:"count"`
+		OK    bool   `json:"ok"`
+	}{Name: "total", Count: 3, OK: true}
+	b.Run("json.Marshal", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := json.Marshal(out); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("encodeToolOutput", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := encodeToolOutput("t", out); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+// BenchmarkEncodeToolArguments compares encodeToolArguments with json.Marshal, which v0.9.0
+// called, on the text-only arguments of a ToolStep.
+func BenchmarkEncodeToolArguments(b *testing.B) {
+	args := map[string]any{"query": "find the total", "limit": 10, "tags": []string{"a", "b"}}
+	b.Run("json.Marshal", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := json.Marshal(args); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("encodeToolArguments", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := encodeToolArguments(args); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}

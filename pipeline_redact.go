@@ -239,7 +239,8 @@ func (r *runObservation) scrubValues(values map[string]any) map[string]any {
 // example's runs took as inputs, wrote or tried to write, the items of their Maps' elements
 // included. details holds the details that their steps attached to errors, and toolCalls the tool
 // calls that their steps made. numbers holds the iteration numbers that were in effect where the
-// step that SideInfo's "reads" come from ran.
+// step that SideInfo's "reads" come from ran. spans holds, for each run and execution of the
+// item's Trace by span ID, the keys whose values it took as iteration numbers.
 type evaluationRedaction struct {
 	redactors []Redactor
 	types     map[string]reflect.Type
@@ -248,6 +249,7 @@ type evaluationRedaction struct {
 	details   []stateWrite
 	toolCalls []ToolCallRecord
 	numbers   iterationNumbers
+	spans     map[string]iterationNumbers
 }
 
 // apply returns item with the values that reflection reads passed through the redactors. When the
@@ -257,7 +259,9 @@ type evaluationRedaction struct {
 // "inputs" and "expected" entries to their keys' types where they convert. So a Redactor sees
 // them as it sees a run's values. It redacts SideInfo's "details" one level further, as an
 // event's details. It redacts SideInfo's "reads" with redactStateValues and the numbers of the
-// failed step, as that step's events redact its reads. It redacts the inputs, reads, writes, details and run context
+// failed step, as that step's events redact its reads. It redacts the reads and inputs of each
+// PipelineTrace in the same way. There spans gives the keys that each execution and run took as
+// iteration numbers (see redactTraceValues). It redacts the inputs, reads, writes, details and run context
 // attributes of each PipelineTrace in its Trace as an event's. It also redacts the tool calls of
 // their steps as an event's. Then it removes the text of every value that the redactors change from every
 // string in them, errors and attributes included. Those values include the values, details and
@@ -301,6 +305,9 @@ func (e evaluationRedaction) apply(item EvaluationItem) EvaluationItem {
 	}
 	item.Trace = mapTraces(item.Trace, func(trace PipelineTrace) PipelineTrace {
 		return mapTrace(trace, traceMapping{
+			reads: func(values map[string]any, span string) map[string]any {
+				return run.redactTraceValues(values, e.spans[span])
+			},
 			values:     run.redactValues,
 			details:    run.redactEntries,
 			tools:      run.redactToolCalls,
@@ -317,6 +324,7 @@ func (e evaluationRedaction) apply(item EvaluationItem) EvaluationItem {
 	}
 	item.Trace = mapTraces(item.Trace, func(trace PipelineTrace) PipelineTrace {
 		return mapTrace(trace, traceMapping{
+			reads:      func(values map[string]any, _ string) map[string]any { return run.scrubValues(values) },
 			values:     run.scrubValues,
 			details:    run.scrubValues,
 			tools:      run.scrubToolCalls,
@@ -325,6 +333,25 @@ func (e evaluationRedaction) apply(item EvaluationItem) EvaluationItem {
 		})
 	})
 	return item
+}
+
+// redactTraceValues returns copies of the reads or inputs of a trace as redactStateValues returns
+// those of an execution or run. numbers holds each key whose value the execution or run took as an
+// iteration number. A trace holds its values as JSON decodes them, as a float64 for a number. So
+// the key alone tells the iteration number apart, and the value passes through redactNumber.
+func (r *runObservation) redactTraceValues(values map[string]any, numbers iterationNumbers) map[string]any {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(values))
+	for key, value := range values {
+		if _, ok := numbers[key]; ok {
+			out[key] = r.redactNumber(key, value)
+		} else {
+			out[key] = r.redact(key, value)
+		}
+	}
+	return out
 }
 
 // redactTyped returns a copy of values with each one converted to its key's type in types
@@ -368,10 +395,12 @@ func mapTraces(value any, fn func(PipelineTrace) PipelineTrace) any {
 	return value
 }
 
-// traceMapping holds what mapTrace applies to a trace: values to its inputs and to each step's
-// reads and writes, details to each step's details, tools to each step's tool calls, text to its
-// errors and runContext to its RunContext.
+// traceMapping holds what mapTrace applies to a trace. reads applies to its inputs and to each
+// step's reads, with the span ID of the run or the step. values applies to each step's writes,
+// details to each step's details and tools to each step's tool calls. text applies to its errors
+// and runContext to its RunContext.
 type traceMapping struct {
+	reads           func(map[string]any, string) map[string]any
 	values, details func(map[string]any) map[string]any
 	tools           func([]ToolCallRecord) []ToolCallRecord
 	text            func(string) string
@@ -381,14 +410,14 @@ type traceMapping struct {
 // mapTrace returns a copy of trace, its nested runs included, with mapping applied.
 func mapTrace(trace PipelineTrace, mapping traceMapping) PipelineTrace {
 	trace.RunContext = mapping.runContext(trace.RunContext)
-	trace.Inputs = mapping.values(trace.Inputs)
+	trace.Inputs = mapping.reads(trace.Inputs, trace.SpanID)
 	trace.Err = mapping.text(trace.Err)
 	if trace.Steps == nil {
 		return trace
 	}
 	steps := make([]StepTrace, len(trace.Steps))
 	for i, step := range trace.Steps {
-		step.Reads = mapping.values(step.Reads)
+		step.Reads = mapping.reads(step.Reads, step.SpanID)
 		step.Writes = mapping.values(step.Writes)
 		step.Details = mapping.details(step.Details)
 		step.ToolCalls = mapping.tools(step.ToolCalls)

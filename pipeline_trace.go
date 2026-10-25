@@ -113,19 +113,25 @@ type RecordingObserver struct {
 	steps  map[string]*recordedStep
 }
 
+// recordedRun is a run that a RecordingObserver records. numbers holds each input key whose value
+// the run kept as an iteration number, nil when there is none (see withRunNumbers).
 type recordedRun struct {
-	trace PipelineTrace
-	steps []*recordedStep
+	trace   PipelineTrace
+	steps   []*recordedStep
+	numbers iterationNumbers
 }
 
+// recordedStep is an execution that a RecordingObserver records. numbers holds each read key whose
+// value the execution read as an iteration number, nil when there is none.
 type recordedStep struct {
-	trace StepTrace
-	steps []*recordedStep
-	runs  []*recordedRun
+	trace   StepTrace
+	steps   []*recordedStep
+	runs    []*recordedRun
+	numbers iterationNumbers
 }
 
 // RunStarted records the start of a run.
-func (r *RecordingObserver) RunStarted(_ context.Context, event RunStartedEvent) {
+func (r *RecordingObserver) RunStarted(ctx context.Context, event RunStartedEvent) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.runs == nil {
@@ -139,7 +145,7 @@ func (r *RecordingObserver) RunStarted(_ context.Context, event RunStartedEvent)
 		RunContext: event.RunContext.clone(),
 		StartedAt:  event.Span.StartedAt,
 		Inputs:     traceValues(event.Inputs),
-	}}
+	}, numbers: tracedNumbers(ctx, event.Inputs)}
 	r.runs[event.Span.ID] = run
 	if parent, ok := r.steps[event.Span.ParentID]; ok {
 		parent.runs = append(parent.runs, run)
@@ -149,7 +155,7 @@ func (r *RecordingObserver) RunStarted(_ context.Context, event RunStartedEvent)
 }
 
 // StepStarted records the start of a step execution.
-func (r *RecordingObserver) StepStarted(_ context.Context, event StepStartedEvent) {
+func (r *RecordingObserver) StepStarted(ctx context.Context, event StepStartedEvent) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	step := &recordedStep{trace: StepTrace{
@@ -161,7 +167,7 @@ func (r *RecordingObserver) StepStarted(_ context.Context, event StepStartedEven
 		Reads:      traceValues(event.Reads),
 		Lane:       event.Lane,
 		Attributes: traceAttributes(event.Attributes),
-	}}
+	}, numbers: tracedNumbers(ctx, event.Reads)}
 	if run, ok := r.runs[event.Span.ParentID]; ok {
 		run.steps = append(run.steps, step)
 	} else if parent, ok := r.steps[event.Span.ParentID]; ok {
@@ -223,6 +229,14 @@ func (r *RecordingObserver) lastStep(runID string) *recordedStep {
 	return run.steps[len(run.steps)-1]
 }
 
+// tracedNumbers returns the iteration numbers in effect in ctx, the context of an observed run or
+// execution. It keeps only the keys of values that hold their number, and returns nil when no key
+// does. values are the run's inputs or the execution's reads as the events carry them. A trace
+// holds them as JSON decodes them, so the key alone then tells an iteration number apart.
+func tracedNumbers(ctx context.Context, values map[string]any) iterationNumbers {
+	return iterationFrom(ctx).numbers.inputs(values)
+}
+
 // traceAttributes returns a copy of attributes, or nil when there are none.
 func traceAttributes(attributes map[string]int) map[string]int {
 	if len(attributes) == 0 {
@@ -278,6 +292,46 @@ func (r *RecordingObserver) Traces() []PipelineTrace {
 		traces = append(traces, run.snapshot())
 	}
 	return traces
+}
+
+// spanNumbers returns, for each run and execution recorded so far, by its span ID, the keys whose
+// inputs or reads it took as iteration numbers. It leaves out a span without any, and returns nil
+// when no span has any. So ProgramEvaluator tells an iteration number among a trace's reads and
+// inputs as their events did, though the traces themselves hold no numbers.
+func (r *RecordingObserver) spanNumbers() map[string]iterationNumbers {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	spans := map[string]iterationNumbers{}
+	for _, run := range r.traces {
+		run.addNumbers(spans)
+	}
+	if len(spans) == 0 {
+		return nil
+	}
+	return spans
+}
+
+// addNumbers adds the numbers of the run and of everything in it to spans, by span ID.
+func (r *recordedRun) addNumbers(spans map[string]iterationNumbers) {
+	if r.numbers != nil {
+		spans[r.trace.SpanID] = r.numbers
+	}
+	for _, step := range r.steps {
+		step.addNumbers(spans)
+	}
+}
+
+// addNumbers adds the numbers of the execution and of everything in it to spans, by span ID.
+func (s *recordedStep) addNumbers(spans map[string]iterationNumbers) {
+	if s.numbers != nil {
+		spans[s.trace.SpanID] = s.numbers
+	}
+	for _, step := range s.steps {
+		step.addNumbers(spans)
+	}
+	for _, run := range s.runs {
+		run.addNumbers(spans)
+	}
 }
 
 func (r *recordedRun) snapshot() PipelineTrace {
