@@ -153,6 +153,52 @@ func TestHoldsImageSummaryAgreesWithAReferencePattern(t *testing.T) {
 	require.Less(t, found, 18_000, "the inputs hold near misses")
 }
 
+// switchingBases returns JSON-like texts without a summary that make holdsImageSummary switch. It
+// switches from one anchor to the next, and from the anchors to the sparsest one or to
+// bytes.Index. It also goes from one window to the next.
+func switchingBases() map[string]string {
+	filler := func(text string, n int) string {
+		return strings.Repeat(text, n/len(text)+1)[:n]
+	}
+	return map[string]string{
+		"a dense z, then text":            filler("za", 600) + filler("abc ", 8400),
+		"every anchor dense":              filler(`z{_:"`, 6000) + filler("abc ", 3000),
+		"every anchor dense, { sparsest":  filler(`zz{__::""`, 6000) + filler("abc ", 3000),
+		"every anchor dense, _ sparsest":  filler(`zz{{_::""`, 6000) + filler("abc ", 3000),
+		"heads of summaries":              filler(`{"media_type":"image/png","size":1,`, 9000),
+		"size keys":                       filler(`","size":`, 4500) + filler("abc ", 4500),
+		"a sparse z over three windows":   filler("z"+strings.Repeat("a", 999), 9000),
+		"a dense z after a sparse window": filler("abc ", 4200) + filler("zz{", 4800),
+	}
+}
+
+func TestHoldsImageSummaryFindsASummaryAtEveryPlaceAroundTheSwitches(t *testing.T) {
+	digest := strings.Repeat("0a", 32)
+	summary := `{"media_type":"image/jpeg","size":12,"sha256":"` + digest + `"}`
+	nearMiss := `{"media_type":"image/jpeg","size":12,"sha256":"` + digest[:10] + "G" + digest[11:] + `"}`
+	var data []byte
+	for name, base := range switchingBases() {
+		require.False(t, summaryPattern.MatchString(base), name)
+		for at := 0; at <= len(base); at++ {
+			data = append(append(append(data[:0], base[:at]...), summary...), base[at:]...)
+			if !holdsImageSummary(data) {
+				t.Fatalf("%s: no summary found at %d", name, at)
+			}
+			if at%7 != 0 {
+				continue
+			}
+			// the base holds no summary, and the near miss makes none.
+			data = append(append(append(data[:0], base[:at]...), nearMiss...), base[at:]...)
+			if holdsImageSummary(data) {
+				t.Fatalf("%s: a near miss at %d", name, at)
+			}
+			if at%301 == 0 {
+				require.False(t, summaryPattern.Match(data), "%s: the near miss at %d makes no summary", name, at)
+			}
+		}
+	}
+}
+
 // encodesItself is an int with its own MarshalJSONTo.
 type encodesItself int
 

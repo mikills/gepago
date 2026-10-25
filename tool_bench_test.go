@@ -217,6 +217,25 @@ func randomDocument(n int) string {
 	return base64.StdEncoding.EncodeToString(data)
 }
 
+// densePrefix returns n small nested objects whose JSON holds each anchor of the image scan: a "z",
+// a "{", a "_" and a colon.
+func densePrefix(n int) []any {
+	prefix := make([]any, n)
+	for i := range prefix {
+		prefix[i] = map[string]any{"zone": map[string]any{"x_a": map[string]any{"y_b": "1:2:3:" + strconv.Itoa(i)}}}
+	}
+	return prefix
+}
+
+// fileRecords returns n records of files with a "size" key, as a tool that lists files might.
+func fileRecords(n int) []any {
+	files := make([]any, n)
+	for i := range files {
+		files[i] = map[string]any{"file_id": i, "name": "report_" + strconv.Itoa(i) + ".pdf", "size": 1000 + i}
+	}
+	return files
+}
+
 // anyOf returns the values of values as a []any.
 func anyOf[T any](values []T) []any {
 	out := make([]any, len(values))
@@ -269,6 +288,18 @@ func BenchmarkToolOutputShapes(b *testing.B) {
 		{name: "a base64 document", value: map[string]any{"pdf": randomDocument(3 << 20)}},
 		{name: "urls with many z as any", value: anyOf(zURLs(200_000))},
 		{name: "a text of z", value: map[string]any{"text": strings.Repeat("z", 1<<20)}},
+		{name: "a dense prefix and a text of z", value: map[string]any{
+			"a": densePrefix(100), "text": strings.Repeat("z", 1<<20),
+		}},
+		{name: "a dense prefix and urls with many z", value: map[string]any{
+			"a": densePrefix(100), "urls": anyOf(zURLs(200_000)),
+		}},
+		{name: "file records and a base64 document", value: map[string]any{
+			"files": fileRecords(100), "pdf": randomDocument(3 << 20),
+		}},
+		{name: "a log with a z every 71 bytes", value: map[string]any{
+			"log": strings.Repeat("GET /images/photo.png?size=large&format=webp HTTP/1.1 200 1234 bytes\n", 15_000),
+		}},
 	}
 	for _, shape := range shapes {
 		b.Run(shape.name+"/Invoke", func(b *testing.B) {

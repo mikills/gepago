@@ -1055,6 +1055,18 @@ func (c countedText) MarshalJSON() ([]byte, error) {
 	return c.data, nil
 }
 
+// countedTextTo holds no Image, but has a MarshalJSONTo, so the encode checks its JSON. The method
+// counts its calls and writes data.
+type countedTextTo struct {
+	calls *int
+	data  []byte
+}
+
+func (c countedTextTo) MarshalJSONTo(enc *jsontext.Encoder) error {
+	*c.calls++
+	return enc.WriteValue(c.data)
+}
+
 func TestToolEncodeCallsMarshalJSONOnceUnlessTheWholeJSONHoldsAFullSummary(t *testing.T) {
 	photo := gepatest.PNG("photo")
 	summary, err := json.Marshal(photo)
@@ -1124,6 +1136,29 @@ func TestToolEncodeCallsMarshalJSONOnceUnlessTheWholeJSONHoldsAFullSummary(t *te
 		require.NoError(t, err)
 		require.Equal(t, string(summary), string(output))
 		require.Equal(t, 1, calls, "the encode does not check JSON that no image can be in")
+	})
+	t.Run("a ToolStep read of the type any that holds a type that cannot hold an Image", func(t *testing.T) {
+		var calls int
+		value := gepa.Key[any]{Name: "value"}
+
+		args, err := argumentsOf(
+			t,
+			refs(value.Ref()),
+			gepa.Prediction{"value": countedText{calls: &calls, data: summary}},
+		)
+
+		require.NoError(t, err)
+		require.Equal(t, []string{`{"value":` + string(summary) + `}`}, args)
+		require.Equal(t, 1, calls, "the encode decides on the dynamic type of each value")
+	})
+	t.Run("a MarshalJSONTo that writes a full look-alike", func(t *testing.T) {
+		var calls int
+
+		output, err := imageInvoke[any](t, countedTextTo{calls: &calls, data: summary})
+
+		require.NoError(t, err)
+		require.Equal(t, string(summary), string(output))
+		require.Equal(t, 2, calls, "a MarshalJSONTo can encode an Image, so the encode checks its JSON")
 	})
 	t.Run("a text-only field beside a full look-alike", func(t *testing.T) {
 		var calls int
