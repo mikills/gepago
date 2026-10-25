@@ -335,7 +335,7 @@ func runChild(ctx context.Context, candidate Candidate, parent string, child *st
 ) {
 	result, err := runNode(ctx, childCandidate(candidate, child), child, values, nil)
 	if err != nil && child.name != parent {
-		return stepResult{}, failStep(child, values, err)
+		return stepResult{}, failStep(ctx, child, values, err)
 	}
 	return result, err
 }
@@ -344,21 +344,21 @@ func runChild(ctx context.Context, candidate Candidate, parent string, child *st
 // StepError naming child when no execution with child's name will name it. That is so when a caller
 // runs the wrapper outside such an execution. A pipeline names the wrapped step through the
 // wrapper's execution, which shares its name.
-func nameWrapped(s State, child *stepNode, err error) error {
+func nameWrapped(ctx context.Context, s State, child *stepNode, err error) error {
 	if err == nil || s.scope.named(child.name) {
 		return err
 	}
-	return failStep(child, s.visibleValues(child.reads), err)
+	return failStep(ctx, child, s.visibleValues(child.reads), err)
 }
 
 // nameItself returns err, the error of a composite step named name and reading reads that ran on s.
 // It returns it as a StepError naming the step when no execution with that name will name it. That
 // is so when a caller runs the composite outside such an execution.
-func nameItself(name string, reads []KeyRef, s State, err error) error {
+func nameItself(ctx context.Context, name string, reads []KeyRef, s State, err error) error {
 	if err == nil || s.scope.named(name) {
 		return err
 	}
-	return failStep(&stepNode{name: name, reads: reads}, s.visibleValues(reads), err)
+	return failStep(ctx, &stepNode{name: name, reads: reads}, s.visibleValues(reads), err)
 }
 
 // runNode runs one step on a fresh view of values. The view holds only the step's declared keys.

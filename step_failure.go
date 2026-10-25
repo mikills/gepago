@@ -1,16 +1,22 @@
 package gepa
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 )
 
 // failStep wraps err as the failure of node, as newStepError does, and records copies of the
-// values of node's declared reads found in values.
-func failStep(node *stepNode, values map[string]any, err error) *StepError {
+// values of node's declared reads found in values. ctx is the context that node ran with. So the
+// StepError keeps the iteration numbers that were in effect there. Without any, numbers stays nil,
+// so a StepError compares as it did before Loops had iteration keys.
+func failStep(ctx context.Context, node *stepNode, values map[string]any, err error) *StepError {
 	stepErr := newStepError(node.name, err)
 	stepErr.Reads = stepReads(node, values)
+	if numbers := iterationFrom(ctx).numbers; len(numbers) > 0 {
+		stepErr.numbers = numbers
+	}
 	return stepErr
 }
 

@@ -29,9 +29,10 @@ import (
 // Tool arguments travel as JSON, and the JSON form of an Image holds no image data. So Build
 // refuses a read whose type is Image, or reaches Image only through pointers, slices, arrays and
 // map values, such as []*Image. A read of another type can hold an Image in a struct field. When
-// its value holds an Image from NewImage, the step fails with a Permanent error. So does a value
-// whose MarshalJSON writes the summary of an Image it embeds (see imageRefusal). The error names
-// the key and the Go type of its value. A zero Image encodes as null.
+// its value holds an Image from NewImage, the step fails with a Permanent error. The error names
+// the key and the Go type of its value. A zero Image encodes as null. A type that embeds an Image,
+// or that writes its own JSON, encodes as json.Marshal writes it. So the tool gets at most the
+// image's summary, and never the image.
 func ToolStep(name, tool string, reads, writes []KeyRef) Step {
 	return &toolStep{
 		name:   strings.TrimSpace(name),
@@ -212,9 +213,8 @@ func (s *toolStep) Run(ctx context.Context, state State) error {
 
 // encodeToolArguments encodes args, the value of each read under its key, as json.Marshal does.
 // The JSON form of an Image holds no image data. So an Image from NewImage in a value fails the
-// encode with a Permanent error. So does a value that promotes the MarshalJSON of an Image it
-// embeds (see imageRefusal). The error names the key and the Go type of the value. A zero Image
-// encodes as null.
+// encode with a Permanent error (see imageRefusal). The error names the key and the Go type of the
+// value. A zero Image encodes as null.
 func encodeToolArguments(args map[string]any) ([]byte, error) {
 	var refusal imageRefusal
 	arguments, err := refusal.encode(args)

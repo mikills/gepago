@@ -319,7 +319,7 @@ func (m *mapStep) Run(ctx context.Context, s State) error {
 }
 
 func (m *mapStep) runCandidate(ctx context.Context, candidate Candidate, s State) (err error) {
-	defer func() { err = nameItself(m.name, m.reads, s, err) }()
+	defer func() { err = nameItself(ctx, m.name, m.reads, s, err) }()
 	failed := 0
 	// the execution of the map, or of a step with its name that runs it, reports its failed
 	// elements.
@@ -452,7 +452,9 @@ func (m *mapStep) stopsWith(ctx context.Context, outcome elementOutcome) error {
 
 // runElement runs body once, over element, on a view holding the element under the item key
 // and the other keys body reads from values. Under ProgramEvaluator the element counts among the
-// values the run was given, so reflection removes its text where the events do.
+// values that the run took, so reflection removes its text where the events do. Build refuses a
+// Map whose item key is a Loop's iteration key. But a Loop body can run a Map itself. In the
+// element the item key then holds the item, so the element drops the iteration number of that key.
 func (m *mapStep) runElement(ctx context.Context, candidate Candidate, index int, element any, values map[string]any) (
 	outcome elementOutcome,
 ) {
@@ -465,6 +467,7 @@ func (m *mapStep) runElement(ctx context.Context, candidate Candidate, index int
 	view[m.item.Name] = element
 	evaluationCaptureFrom(ctx).offer(map[string]any{m.item.Name: element})
 	usage := &elementUsage{}
+	elementCtx := withoutIterationNumber(withElement(ctx, index, usage), m.item.Name)
 	start := time.Now()
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -477,12 +480,11 @@ func (m *mapStep) runElement(ctx context.Context, candidate Candidate, index int
 		if outcome.err == nil {
 			return
 		}
-		outcome.failure = fmt.Errorf("element %d: %w", index, failStep(m.body, view, outcome.err))
+		outcome.failure = fmt.Errorf("element %d: %w", index, failStep(elementCtx, m.body, view, outcome.err))
 		if m.collect {
 			outcome.message = eventErrorText(ctx, outcome.err)
 		}
 	}()
-	elementCtx := withoutIterationNumber(withElement(ctx, index, usage), m.item.Name)
 	result, err := runNode(elementCtx, childCandidate(candidate, m.body), m.body, view, nil)
 	if err != nil {
 		return elementOutcome{err: err}

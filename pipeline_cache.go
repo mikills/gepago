@@ -62,7 +62,7 @@ func (c *cacheStep) Run(ctx context.Context, s State) error {
 }
 
 func (c *cacheStep) runCandidate(ctx context.Context, candidate Candidate, s State) (err error) {
-	defer func() { err = nameWrapped(s, c.child, err) }()
+	defer func() { err = nameWrapped(ctx, s, c.child, err) }()
 	run := pipelineRunFrom(ctx)
 	values := s.childView(c)
 	key, keyErr := c.cacheKey(readOnlyView(values, c.child.readTypes))

@@ -162,7 +162,7 @@ func (a *amendableStep) Run(ctx context.Context, s State) error {
 func (a *amendableStep) runCandidate(ctx context.Context, candidate Candidate, s State) error {
 	result, err := runChild(ctx, candidate, a.child.name, a.child, s.childView(a))
 	if err != nil {
-		return nameWrapped(s, a.child, err)
+		return nameWrapped(ctx, s, a.child, err)
 	}
 	result.commitTo(s, a.child)
 	return nil

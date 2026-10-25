@@ -25,20 +25,23 @@ const maxProgramDepth = 32
 // one holds no more than it would without the capture. A Redactor that joins when its pipeline
 // runs applies only to values offered after it joined. known holds the pipelines that the capture
 // has accounted for, by their first step. mapSteps holds one Map of each shape in shapes. So a
-// programme that builds a pipeline on each run does not add a Map per run. iterations holds, for
-// each iteration key, the highest number that a Loop gave under it.
+// programme that builds a pipeline on each run does not add a Map per run.
+//
+// The capture keeps no iteration number of a Loop. A run offers its inputs without the numbers
+// that it keeps (see withRunNumbers), and the Loop offers no number. A failed step's StepError
+// carries the numbers that were in effect where it ran. So apply tells an iteration number among
+// its Reads as the step's events do.
 type evaluationCapture struct {
-	recorder   *RecordingObserver
-	mu         sync.Mutex
-	redactors  []Redactor
-	types      map[string]reflect.Type
-	mapSteps   []*mapStep
-	shapes     map[elementShape]bool
-	known      map[*stepNode]bool
-	values     []stateWrite
-	details    []stateWrite
-	toolCalls  []ToolCallRecord
-	iterations map[string]int
+	recorder  *RecordingObserver
+	mu        sync.Mutex
+	redactors []Redactor
+	types     map[string]reflect.Type
+	mapSteps  []*mapStep
+	shapes    map[elementShape]bool
+	known     map[*stepNode]bool
+	values    []stateWrite
+	details   []stateWrite
+	toolCalls []ToolCallRecord
 }
 
 // newEvaluationCapture returns a capture holding the Redactors and key types of every Pipeline
@@ -208,21 +211,6 @@ func (c *evaluationCapture) offerStep(writes []stateWrite, err error) {
 	}
 }
 
-// offerIteration keeps number, the number of an iteration of a Loop with the iteration key key.
-// Reflection then records no text forms of the iteration numbers that steps read (see
-// evaluationNumbers).
-func (c *evaluationCapture) offerIteration(key string, number int) {
-	if c == nil || key == "" {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.iterations == nil {
-		c.iterations = map[string]int{}
-	}
-	c.iterations[key] = max(c.iterations[key], number)
-}
-
 // offerToolCalls keeps the tool calls an execution made, when the capture has a Redactor.
 func (c *evaluationCapture) offerToolCalls(records []ToolCallRecord) {
 	if c == nil || len(records) == 0 {
@@ -237,20 +225,22 @@ func (c *evaluationCapture) offerToolCalls(records []ToolCallRecord) {
 }
 
 // apply returns the evaluation item of the example the capture watched, with the traces it
-// recorded and its reflection values redacted with everything it collected.
-func (c *evaluationCapture) apply(item EvaluationItem) EvaluationItem {
+// recorded and its reflection values redacted with everything it collected. numbers holds the
+// iteration numbers of the step that SideInfo's "reads" come from. It is nil when the item has no
+// such step.
+func (c *evaluationCapture) apply(item EvaluationItem, numbers iterationNumbers) EvaluationItem {
 	if trace := evaluationTrace(c.recorder); trace != nil {
 		item.Trace = trace
 	}
 	c.mu.Lock()
 	redaction := evaluationRedaction{
-		redactors:  slices.Clone(c.redactors),
-		types:      maps.Clone(c.types),
-		mapSteps:   slices.Clone(c.mapSteps),
-		values:     slices.Clone(c.values),
-		details:    slices.Clone(c.details),
-		toolCalls:  cloneRecords(c.toolCalls),
-		iterations: maps.Clone(c.iterations),
+		redactors: slices.Clone(c.redactors),
+		types:     maps.Clone(c.types),
+		mapSteps:  slices.Clone(c.mapSteps),
+		values:    slices.Clone(c.values),
+		details:   slices.Clone(c.details),
+		toolCalls: cloneRecords(c.toolCalls),
+		numbers:   numbers,
 	}
 	c.mu.Unlock()
 	return redaction.apply(item)

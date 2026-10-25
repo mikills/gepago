@@ -265,7 +265,7 @@ func (f *flowRun) succeeded(i int, visit stepVisit) (int, error) {
 	f.taken(rule)
 	switch {
 	case rule.to == failTarget:
-		return 0, failStep(node, reads, PermanentError(fmt.Errorf("%s to %s", rule.describe(f.p.steps), Fail)))
+		return 0, failStep(f.ctx, node, reads, PermanentError(fmt.Errorf("%s to %s", rule.describe(f.p.steps), Fail)))
 	case rule.to == endTarget:
 		return len(f.p.steps), nil
 	case rule.rewind:
@@ -295,7 +295,7 @@ func (f *flowRun) failed(i int, visit stepVisit) (int, error) {
 	}
 	err := visit.err
 	if f.ctx.Err() != nil {
-		return 0, failStep(node, reads, err)
+		return 0, failStep(f.ctx, node, reads, err)
 	}
 	view := readOnlyView(visit.view, node.readTypes)
 	exhausted := visit.maxed
@@ -307,7 +307,7 @@ evaluate:
 			}
 			match, whenErr := callWhen(rule, f.p.steps, view, err)
 			if whenErr != nil {
-				return 0, failStep(node, reads, fmt.Errorf("%w; %w", err, whenErr))
+				return 0, failStep(f.ctx, node, reads, fmt.Errorf("%w; %w", err, whenErr))
 			}
 			if !match {
 				continue
@@ -320,13 +320,13 @@ evaluate:
 				}
 				var amendErr error
 				if amended, amendErr = f.callAmend(rule, visit.view, node.readTypes); amendErr != nil {
-					return 0, failStep(node, reads, fmt.Errorf("%w; %w", err, amendErr))
+					return 0, failStep(f.ctx, node, reads, fmt.Errorf("%w; %w", err, amendErr))
 				}
 			}
 			f.taken(rule)
 			switch {
 			case rule.to == failTarget:
-				return 0, failStep(node, reads, PermanentError(
+				return 0, failStep(f.ctx, node, reads, PermanentError(
 					fmt.Errorf("%s to %s: %w", rule.describe(f.p.steps), Fail, err),
 				))
 			case rule.to == endTarget:
@@ -336,7 +336,7 @@ evaluate:
 			}
 			return rule.to, nil
 		}
-		return 0, failStep(node, reads, err)
+		return 0, failStep(f.ctx, node, reads, err)
 	}
 }
 

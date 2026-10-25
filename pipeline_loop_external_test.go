@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -240,4 +241,53 @@ func TestLoopIterationNumberInNestedPipelinesStaysInErrorText(t *testing.T) {
 			require.Equal(t, "order 1234 failed with HTTP 512", step.Err)
 		})
 	}
+}
+
+func TestLoopBodyThatRunsAMapOverTheIterationKeyRedactsEachItem(t *testing.T) {
+	pages := gepa.Key[[]int]{Name: "pages"}
+	note := gepa.Key[string]{Name: "note"}
+	notes := gepa.Key[[]string]{Name: "notes"}
+	check := gepa.NewStep("check", refs(pageKey.Ref()), refs(note.Ref()), func(_ context.Context, s gepa.State) error {
+		page, err := pageKey.Get(s)
+		if err != nil {
+			return err
+		}
+		return errors.New("code " + strconv.Itoa(page) + " rejected")
+	})
+	each := gepa.Map("each", pages, pageKey, check, notes, gepa.MapOptions{})
+	// the body runs the Map itself, so Build sees no Map whose item key is the iteration key.
+	body := gepa.NewStep("each_page", refs(pageKey.Ref(), pages.Ref()), refs(notes.Ref()),
+		func(ctx context.Context, s gepa.State) error {
+			page, err := pageKey.Get(s)
+			if err != nil || page < 3 {
+				notes.Set(s, nil)
+				return err
+			}
+			return each.Run(ctx, s)
+		})
+	observer := &errorObserver{}
+	pipeline := fpBuild(t, gepa.PipelineSpec{
+		Steps: []gepa.Step{gepa.Loop("scan", body, func(gepa.State) (bool, error) { return false, nil },
+			gepa.LoopOptions{MaxIterations: 5, Iteration: pageKey})},
+		Defaults: []gepa.Default{gepa.DefaultValue(pages, []int{3})},
+		Redactor: func(key string, value any) any {
+			if key == "page" {
+				return gepa.RedactedText
+			}
+			return value
+		},
+		Observers: []gepa.PipelineObserver{observer},
+	})
+
+	_, err := pipeline.RunCandidate(context.Background(), nil, gepa.Prediction{})
+
+	require.ErrorContains(
+		t,
+		err,
+		`pipeline step "each_page": pipeline step "each": element 0: pipeline step "check": code 3 rejected`,
+	)
+	observer.mu.Lock()
+	defer observer.mu.Unlock()
+	require.Contains(t, observer.errs, "check: code [redacted] rejected",
+		"in the element the item is a value under the key, not the running iteration number")
 }

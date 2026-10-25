@@ -227,6 +227,87 @@ func TestSchemasGiveAnImageOnlyNull(t *testing.T) {
 		"an input image is the label of an attached image, so its schema stays {}")
 	format, err := signature.Signature.JSONSchema()
 	require.NoError(t, err)
-	require.JSONEq(t, `{"type":"object","properties":{"caption":{"type":"string"},"figure":{"type":"null"}},`+
-		`"required":["caption","figure"],"additionalProperties":false}`, string(format))
+	require.JSONEq(t, `{"type":"object","properties":{"caption":{"type":"string"},`+
+		`"figure":{"anyOf":[{"type":"null"},{"type":"null"}]}},`+
+		`"required":["caption","figure"],"additionalProperties":false}`, string(format),
+		"an optional output takes the usual null wrap, as a hand-written one does")
+}
+
+func TestTypedPredictImageOutputSchemaSurvivesAJSONRoundTrip(t *testing.T) {
+	type question struct {
+		Q string `json:"q"`
+	}
+	type figureOut struct {
+		Caption string      `json:"caption"`
+		Figure  *gepa.Image `json:"figure"`
+	}
+	derived, err := gepa.TypedPredict[question, figureOut]{LM: gepatest.NewFakeGenerator()}.ProgramSignature()
+	require.NoError(t, err)
+	data, err := json.Marshal(derived.Signature)
+	require.NoError(t, err)
+	var reloaded gepa.Signature
+	require.NoError(t, json.Unmarshal(data, &reloaded))
+
+	schema, err := derived.Signature.JSONSchema()
+	require.NoError(t, err)
+	reloadedSchema, err := reloaded.JSONSchema()
+	require.NoError(t, err)
+	require.Equal(t, string(schema), string(reloadedSchema))
+	require.Contains(t, string(schema), `"figure":{"anyOf":[{"type":"null"},{"type":"null"}]}`)
+	prompt, err := gepa.Predict{Signature: derived.Signature}.BuildPrompt(nil, gepa.Prediction{"q": "x"})
+	require.NoError(t, err)
+	reloadedPrompt, err := gepa.Predict{Signature: reloaded}.BuildPrompt(nil, gepa.Prediction{"q": "x"})
+	require.NoError(t, err)
+	require.Equal(t, prompt, reloadedPrompt, "a reloaded signature builds the same prompt")
+}
+
+func TestSignatureKeepsTheV090SchemaOfAHandWrittenNullOutput(t *testing.T) {
+	// the bytes that v0.9.0 (c9b557e) gives for each field.
+	tests := []struct {
+		name  string
+		field gepa.Field
+		want  string
+	}{
+		{
+			name:  "without a description",
+			field: gepa.Field{Name: "nothing", Schema: json.RawMessage(`{"type":"null"}`), Optional: true},
+			want:  `{"anyOf":[{"type":"null"},{"type":"null"}]}`,
+		},
+		{
+			name: "with a field description",
+			field: gepa.Field{
+				Name:        "nothing",
+				Description: "always null",
+				Schema:      json.RawMessage(`{"type":"null"}`),
+				Optional:    true,
+			},
+			want: `{"anyOf":[{"type":"null"},{"type":"null"}]}`,
+		},
+		{
+			name: "with a description in the schema",
+			field: gepa.Field{
+				Name:     "nothing",
+				Schema:   json.RawMessage(`{"type":"null","description":"always null"}`),
+				Optional: true,
+			},
+			want: `{"anyOf":[{"type":"null","description":"always null"},{"type":"null"}]}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			signature := gepa.Signature{Inputs: []gepa.Field{{Name: "q"}}, Outputs: []gepa.Field{tt.field}}
+
+			schema, err := signature.JSONSchema()
+
+			require.NoError(t, err)
+			want := `{"type":"object","properties":{"nothing":` + tt.want +
+				`},"required":["nothing"],"additionalProperties":false}`
+			require.Equal(t, want, string(schema))
+			prompt, err := gepa.Predict{Signature: signature}.BuildPrompt(nil, gepa.Prediction{"q": "x"})
+			require.NoError(t, err)
+			indented, err := json.MarshalIndent(json.RawMessage(want), "", "  ")
+			require.NoError(t, err)
+			require.Contains(t, prompt, string(indented), "the prompt keeps the v0.9.0 schema")
+		})
+	}
 }

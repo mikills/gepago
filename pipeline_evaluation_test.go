@@ -271,7 +271,7 @@ func TestEvaluationCaptureRedactsWhatTheRunsLeft(t *testing.T) {
 	capture.offer(map[string]any{"letter": "yours truly"})
 	item := capture.apply(EvaluationItem{SideInfo: map[string]any{
 		"feedback": "dear sir, classified and top secret, yours truly",
-	}})
+	}}, nil)
 	require.Equal(t, "[letter], [note] and [note], [letter]", item.SideInfo["feedback"])
 
 	plain, err := PipelineSpec{Inputs: refs(docKey.Ref()), Steps: []Step{lengthStep()}}.Build()
@@ -286,7 +286,7 @@ func TestEvaluationCaptureRedactsWhatTheRunsLeft(t *testing.T) {
 	require.Empty(t, bare.details)
 	require.Nil(t, bare.join(pipeline, false))
 	bare.offer(map[string]any{"letter": "yours truly"})
-	item = bare.apply(EvaluationItem{SideInfo: map[string]any{"feedback": "dear sir, yours truly"}})
+	item = bare.apply(EvaluationItem{SideInfo: map[string]any{"feedback": "dear sir, yours truly"}}, nil)
 	require.Equal(
 		t,
 		"dear sir, [letter]",

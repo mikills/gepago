@@ -97,7 +97,7 @@ func (p *parallelStep) Run(ctx context.Context, s State) error {
 }
 
 func (p *parallelStep) runCandidate(ctx context.Context, candidate Candidate, s State) (err error) {
-	defer func() { err = nameItself(p.name, p.reads, s, err) }()
+	defer func() { err = nameItself(ctx, p.name, p.reads, s, err) }()
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	results := make([]stepResult, len(p.steps))

@@ -1102,11 +1102,13 @@ func joinJSONPath(path, key string) string {
 }
 
 // jsonField is one JSON object key of a struct. index is the path of the struct field it
-// resolves to, quoted reports the ",string" tag option, and description holds the field's
-// description tag for JSON Schema.
+// resolves to. quoted reports the ",string" tag option. description holds the field's
+// description tag for JSON Schema. optional reports the omitempty or omitzero tag option, and
+// omitzero reports omitzero alone.
 type jsonField struct {
 	typ         reflect.Type
 	optional    bool
+	omitzero    bool
 	quoted      bool
 	description string
 	index       []int
@@ -1209,6 +1211,7 @@ func addJSONFieldCandidates(
 			field: jsonField{
 				typ:         field.Type,
 				optional:    slices.Contains(opts, "omitempty") || slices.Contains(opts, "omitzero"),
+				omitzero:    slices.Contains(opts, "omitzero"),
 				quoted:      slices.Contains(opts, "string"),
 				description: field.Tag.Get("description"),
 				index:       index,

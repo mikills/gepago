@@ -122,21 +122,6 @@ func unconstrainedJSON(schema json.RawMessage) bool {
 	return true
 }
 
-// nullJSON reports whether a JSON schema object admits only null: the type null, with annotations
-// at most.
-func nullJSON(schema json.RawMessage) bool {
-	var object map[string]any
-	if err := json.Unmarshal(schema, &object); err != nil || object["type"] != "null" {
-		return false
-	}
-	for key := range object {
-		if key != "type" && key != "description" && key != "title" {
-			return false
-		}
-	}
-	return true
-}
-
 func typeNode(name string) schemaNode {
 	return schemaNode{{key: "type", value: name}}
 }

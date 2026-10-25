@@ -654,6 +654,9 @@ type StepError struct {
 	Err     error
 	Details map[string]any
 	Reads   map[string]any
+	// numbers holds the iteration numbers that were in effect where the step ran. So reflection
+	// tells an iteration number among Reads as the step's events do.
+	numbers iterationNumbers
 }
 
 func (e *StepError) Error() string {

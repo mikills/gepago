@@ -359,3 +359,37 @@ func TestToolEncodesWriteWhatJSONMarshalWrites(t *testing.T) {
 		}
 	}
 }
+
+// timesTool is a text-only tool whose output holds 100,000 values that have their own JSON
+// methods.
+func timesTool() ToolProvider {
+	times := make([]time.Time, 100_000)
+	for i := range times {
+		times[i] = time.Unix(int64(i), 0).UTC()
+	}
+	return NewTool("times", "List times", func(context.Context, struct{}) ([]time.Time, error) { return times, nil })
+}
+
+func TestToolEncodesTextOnlyOutputWithoutAnAllocationPerValue(t *testing.T) {
+	tool := timesTool()
+	call := ToolCall{Name: "times", Arguments: `{}`}
+
+	allocs := testing.AllocsPerRun(5, func() {
+		if _, err := tool.Invoke(context.Background(), call); err != nil {
+			panic(err)
+		}
+	})
+
+	require.Less(t, allocs, 1000.0, "the image check looks at Image values only, not at each value with a method")
+}
+
+func BenchmarkToolEncodesTextOnlyOutput(b *testing.B) {
+	tool := timesTool()
+	call := ToolCall{Name: "times", Arguments: `{}`}
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := tool.Invoke(context.Background(), call); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

@@ -89,7 +89,7 @@ func (p *policyStep) Run(ctx context.Context, s State) error {
 }
 
 func (p *policyStep) runCandidate(ctx context.Context, candidate Candidate, s State) (err error) {
-	defer func() { err = nameWrapped(s, p.child, err) }()
+	defer func() { err = nameWrapped(ctx, s, p.child, err) }()
 	attempts := max(p.policy.Retry.MaxAttempts, 1)
 	values := s.childView(p)
 	for attempt := 1; ; attempt++ {

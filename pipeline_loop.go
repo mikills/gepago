@@ -286,7 +286,7 @@ func (l *loopStep) holdsIterationKey(s State) bool {
 }
 
 func (l *loopStep) runCandidate(ctx context.Context, candidate Candidate, s State) (err error) {
-	defer func() { err = nameItself(l.name, l.reads, s, err) }()
+	defer func() { err = nameItself(ctx, l.name, l.reads, s, err) }()
 	if err := l.checkRun(s); err != nil {
 		return err
 	}
@@ -308,12 +308,11 @@ func (l *loopStep) runCandidate(ctx context.Context, candidate Candidate, s Stat
 		view := maps.Clone(carry)
 		if l.iteration.Name != "" {
 			view[l.iteration.Name] = iteration
-			evaluationCaptureFrom(loopCtx).offerIteration(l.iteration.Name, iteration)
 		}
 		iterationCtx := withIteration(loopCtx, l.iteration.Name, iteration)
 		result, err := runNode(iterationCtx, childCandidate(candidate, l.body), l.body, view, nil)
 		if err != nil {
-			return fmt.Errorf("iteration %d: %w", iteration, failStep(l.body, view, err))
+			return fmt.Errorf("iteration %d: %w", iteration, failStep(iterationCtx, l.body, view, err))
 		}
 		maps.Copy(carry, result.writes)
 		stage.add(result.staged)
@@ -460,12 +459,6 @@ func (n iterationNumbers) ordinary(values map[string]any) map[string]any {
 	return out
 }
 
-// numberFilter reports whether a value under a key is an iteration number, whose text the run
-// must not remove from error messages.
-type numberFilter interface {
-	holds(key string, value any) bool
-}
-
 // withIteration returns ctx for the executions of the iteration numbered number, from one, and of
 // the executions nested in them. key is the Loop's iteration key.
 func withIteration(ctx context.Context, key string, number int) context.Context {
@@ -540,7 +533,7 @@ func (r *runObservation) redactNumber(key string, value any) any {
 // inputs, as the run's events carry them. A value that numbers holds is an iteration number, so
 // it passes through redactNumber. Every other value passes through redact. The caller holds the
 // trace lock.
-func (r *runObservation) redactStateValues(values map[string]any, numbers numberFilter) map[string]any {
+func (r *runObservation) redactStateValues(values map[string]any, numbers iterationNumbers) map[string]any {
 	if len(values) == 0 {
 		return nil
 	}

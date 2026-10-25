@@ -3,6 +3,7 @@ package gepa_test
 import (
 	"context"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"strings"
 	"testing"
@@ -360,76 +361,100 @@ func TestToolStepPassesTextOnlyMessagesFromState(t *testing.T) {
 	require.Equal(t, history, got)
 }
 
-// framed embeds an Image, so it gets the Image's MarshalJSON and encodes as its summary.
-type framed struct {
+// embedded embeds an Image, so it gets the Image's MarshalJSON and encodes as its summary.
+type embedded struct {
 	gepa.Image
 }
 
-// framedPointer embeds a *Image.
-type framedPointer struct {
-	*gepa.Image
+// ownJSON holds an Image but writes its caption with its own MarshalJSON.
+type ownJSON struct {
+	Caption string     `json:"caption"`
+	Photo   gepa.Image `json:"photo"`
 }
 
-// unexportedFrame embeds an Image through an unexported struct.
-type unexportedFrame struct {
-	framed
-	Caption string
+func (o ownJSON) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]string{"caption": o.Caption})
 }
 
-// ownFrame embeds an Image but writes its caption with its own MarshalJSON.
-type ownFrame struct {
+// ownJSONTo holds an Image but writes its caption with its own MarshalJSONTo.
+type ownJSONTo struct {
+	Caption string     `json:"caption"`
+	Photo   gepa.Image `json:"photo"`
+}
+
+func (o ownJSONTo) MarshalJSONTo(enc *jsontext.Encoder) error {
+	return enc.WriteToken(jsontext.String(o.Caption))
+}
+
+// ownText holds an Image but writes its caption with its own MarshalText.
+type ownText struct {
+	Caption string     `json:"caption"`
+	Photo   gepa.Image `json:"photo"`
+}
+
+func (o ownText) MarshalText() ([]byte, error) {
+	return []byte(o.Caption), nil
+}
+
+// pointerOwn has its MarshalJSON on the pointer receiver. json.Marshal does not call it for a
+// value, so it writes the fields of a value.
+type pointerOwn struct {
+	Photo gepa.Image `json:"photo"`
+}
+
+func (p *pointerOwn) MarshalJSON() ([]byte, error) {
+	return []byte(`"own"`), nil
+}
+
+// panicky embeds an Image. Its own MarshalJSON reads Meta, so it panics for a value without one.
+type panicky struct {
 	gepa.Image
-	Caption string
+	Meta *panickyMeta
 }
 
-func (f ownFrame) MarshalJSON() ([]byte, error) {
-	return json.Marshal(map[string]string{"caption": f.Caption})
+type panickyMeta struct {
+	Name string
 }
 
-func TestNewToolRefusesImageTypesAtRegistration(t *testing.T) {
+func (p panicky) MarshalJSON() ([]byte, error) {
+	return json.Marshal(p.Meta.Name)
+}
+
+// chartOut holds a *Image field without omitzero.
+type chartOut struct {
+	Chart *gepa.Image `json:"chart"`
+}
+
+func TestNewToolRefusesAnImageThatEveryValueWouldFailAtRegistration(t *testing.T) {
 	type photoArgs struct {
 		Photo gepa.Image `json:"photo"`
 	}
-	type photosArgs struct {
-		Photos map[string][]*gepa.Image `json:"photos"`
+	type pointerArgs struct {
+		Photo *gepa.Image `json:"photo,omitempty"`
 	}
-	type frameArgs struct {
-		Frame framed `json:"frame"`
-	}
-	type chartOut struct {
-		Chart *gepa.Image `json:"chart"`
-	}
-	type frameOut struct {
-		Frame []unexportedFrame `json:"frame"`
-	}
-	noArgs := func(context.Context, struct{}) (string, error) { return "", nil }
 	tests := []struct {
 		tool    gepa.ToolProvider
 		wantErr string
 	}{
 		{
 			tool:    gepa.NewTool("t", "d", func(context.Context, photoArgs) (string, error) { return "", nil }),
-			wantErr: `argument "photo" has the type gepa.Image, which holds an Image`,
+			wantErr: `argument "photo" has the type gepa.Image, which holds an Image, but tool arguments travel`,
 		},
 		{
-			tool:    gepa.NewTool("t", "d", func(context.Context, photosArgs) (string, error) { return "", nil }),
-			wantErr: `argument "photos" has the type map[string][]*gepa.Image, which holds an Image`,
-		},
-		{
-			tool:    gepa.NewTool("t", "d", func(context.Context, frameArgs) (string, error) { return "", nil }),
-			wantErr: `argument "frame" has the type gepa_test.framed, which holds an Image`,
-		},
-		{
-			tool:    gepa.NewTool("t", "d", func(context.Context, struct{}) ([]gepa.Image, error) { return nil, nil }),
-			wantErr: `output type []gepa.Image holds an Image`,
+			tool:    gepa.NewTool("t", "d", func(context.Context, pointerArgs) (string, error) { return "", nil }),
+			wantErr: `argument "photo" has the type *gepa.Image, which holds an Image, but tool arguments travel`,
 		},
 		{
 			tool: gepa.NewTool(
 				"t",
 				"d",
-				func(context.Context, struct{}) (*framedPointer, error) { return nil, nil },
+				func(context.Context, struct{}) (gepa.Image, error) { return gepa.Image{}, nil },
 			),
-			wantErr: `output type *gepa_test.framedPointer holds an Image`,
+			wantErr: `output type gepa.Image holds an Image, but tool output travels`,
+		},
+		{
+			tool:    gepa.NewTool("t", "d", func(context.Context, struct{}) (*gepa.Image, error) { return nil, nil }),
+			wantErr: `output type *gepa.Image holds an Image, but tool output travels`,
 		},
 		{
 			tool: gepa.NewTool(
@@ -437,34 +462,61 @@ func TestNewToolRefusesImageTypesAtRegistration(t *testing.T) {
 				"d",
 				func(context.Context, struct{}) (chartOut, error) { return chartOut{}, nil },
 			),
-			wantErr: `output field "chart" has the type *gepa.Image, which holds an Image`,
+			wantErr: `output field "chart" has the type *gepa.Image, which holds an Image, but tool output travels`,
 		},
 		{
-			tool: gepa.NewTool(
-				"t",
-				"d",
-				func(context.Context, struct{}) (frameOut, error) { return frameOut{}, nil },
-			),
-			wantErr: `output field "frame" has the type []gepa_test.unexportedFrame, which holds an Image`,
+			tool:    gepa.NewTool("t", "d", func(context.Context, struct{}) (*chartOut, error) { return nil, nil }),
+			wantErr: `output field "chart" has the type *gepa.Image, which holds an Image, but tool output travels`,
+		},
+		{
+			tool: gepa.NewTool("t", "d", func(context.Context, struct{}) (pointerOwn, error) {
+				return pointerOwn{}, nil
+			}),
+			wantErr: `output field "photo" has the type gepa.Image, which holds an Image, but tool output travels`,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.wantErr, func(t *testing.T) {
 			_, err := gepa.NewToolRegistry(tt.tool)
 
-			require.ErrorContains(t, err, `register tool: tool "t": `+tt.wantErr+", but tool ")
-			require.ErrorContains(t, err, " travel")
+			require.ErrorContains(t, err, `register tool: tool "t": `+tt.wantErr+" as JSON without image data")
 		})
 	}
+}
+
+func TestNewToolRegistersTypesThatHoldAnImageElsewhere(t *testing.T) {
+	type photosArgs struct {
+		Photos map[string][]*gepa.Image `json:"photos"`
+	}
+	type optionalOut struct {
+		Photo gepa.Image `json:"photo,omitzero"`
+	}
 	for name, tool := range map[string]gepa.ToolProvider{
+		"a map of images": gepa.NewTool("t", "d", func(context.Context, photosArgs) ([]gepa.Image, error) {
+			return nil, nil
+		}),
+		"an omitzero image": gepa.NewTool("t", "d", func(context.Context, struct{}) (optionalOut, error) {
+			return optionalOut{}, nil
+		}),
 		"messages": gepa.NewTool("t", "d", func(context.Context, historyArgs) ([]gepa.Message, error) {
 			return nil, nil
 		}),
-		"an own MarshalJSON": gepa.NewTool("t", "d", func(context.Context, struct{}) (ownFrame, error) {
-			return ownFrame{}, nil
+		"an any": gepa.NewTool("t", "d", func(context.Context, struct{}) (any, error) { return nil, nil }),
+		"an embedded image": gepa.NewTool("t", "d", func(context.Context, struct{}) (embedded, error) {
+			return embedded{}, nil
 		}),
-		"an image in an any": gepa.NewTool("t", "d", func(context.Context, struct{}) (any, error) { return nil, nil }),
-		"a nested image":     gepa.NewTool("t", "d", noArgs),
+		"an own MarshalJSON": gepa.NewTool("t", "d", func(context.Context, struct{}) (ownJSON, error) {
+			return ownJSON{}, nil
+		}),
+		"an own MarshalJSONTo": gepa.NewTool("t", "d", func(context.Context, struct{}) (ownJSONTo, error) {
+			return ownJSONTo{}, nil
+		}),
+		"an own MarshalText": gepa.NewTool("t", "d", func(context.Context, struct{}) (ownText, error) {
+			return ownText{}, nil
+		}),
+		"a pointer with its own MarshalJSON": gepa.NewTool("t", "d", func(context.Context, struct{}) (*pointerOwn, error) {
+			return nil, nil
+		}),
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := gepa.NewToolRegistry(tool)
@@ -473,57 +525,84 @@ func TestNewToolRefusesImageTypesAtRegistration(t *testing.T) {
 	}
 }
 
-func TestToolOutputRefusesAValueThatPromotesAnImage(t *testing.T) {
-	photo := gepatest.PNG("photo")
-	for name, tt := range map[string]struct {
-		out     any
-		outType string
-	}{
-		"an embedded Image":                   {out: framed{photo}, outType: "gepa_test.framed"},
-		"an embedded *Image":                  {out: []any{framedPointer{&photo}}, outType: "[]interface {}"},
-		"an Image under an unexported struct": {out: unexportedFrame{framed{photo}, "x"}, outType: "gepa_test.unexportedFrame"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			_, err := imageInvoke[any](t, tt.out)
+func TestNewToolTakesAndReturnsATextPart(t *testing.T) {
+	var got gepa.Part
+	tool := gepa.NewTool("echo", "Echo a part", func(_ context.Context, part gepa.Part) (gepa.Part, error) {
+		got = part
+		return part, nil
+	})
+	_, err := gepa.NewToolRegistry(tool)
+	require.NoError(t, err, "the image of a part is omitzero")
 
-			require.EqualError(t, err, `encode output of tool "render": `+tt.outType+
-				" holds an Image, but tool output travels as JSON without image data")
-			require.True(t, gepa.IsPermanent(err))
-			require.NotContains(t, err.Error(), photo.SHA256())
+	result, err := tool.Invoke(context.Background(), gepa.ToolCall{Name: "echo", Arguments: `{"text":"x"}`})
+
+	require.NoError(t, err)
+	require.Equal(t, gepa.Part{Text: "x"}, got)
+	require.Equal(t, `{"text":"x"}`, string(result.Output))
+}
+
+func TestNewToolDoesNotCallMarshalJSONWhileItBuildsATool(t *testing.T) {
+	var tool gepa.ToolProvider
+	require.NotPanics(t, func() {
+		tool = gepa.NewTool("render", "Render", func(context.Context, struct{}) (panicky, error) {
+			return panicky{Meta: &panickyMeta{Name: "chart"}}, nil
 		})
-	}
+	})
+	_, err := gepa.NewToolRegistry(tool)
+	require.NoError(t, err)
+
+	result, err := tool.Invoke(context.Background(), gepa.ToolCall{Name: "render", Arguments: `{}`})
+
+	require.NoError(t, err)
+	require.Equal(t, `"chart"`, string(result.Output))
+}
+
+func TestToolEncodesAnImageBehindAMethodAsJSONMarshalWrites(t *testing.T) {
+	photo := gepatest.PNG("photo")
+	summary, err := json.Marshal(photo)
+	require.NoError(t, err)
 	for name, tt := range map[string]struct {
 		out  any
 		want string
 	}{
-		"a zero embedded Image": {out: framed{}, want: `null`},
-		"an own MarshalJSON":    {out: ownFrame{Image: photo, Caption: "chart"}, want: `{"caption":"chart"}`},
+		"an embedded Image":       {out: embedded{photo}, want: string(summary)},
+		"an own MarshalJSON":      {out: ownJSON{Caption: "chart", Photo: photo}, want: `{"caption":"chart"}`},
+		"an own MarshalJSONTo":    {out: ownJSONTo{Caption: "chart", Photo: photo}, want: `"chart"`},
+		"an own MarshalText":      {out: ownText{Caption: "chart", Photo: photo}, want: `"chart"`},
+		"a pointer's MarshalJSON": {out: &pointerOwn{Photo: photo}, want: `"own"`},
 	} {
 		t.Run(name, func(t *testing.T) {
 			output, err := imageInvoke[any](t, tt.out)
 
-			require.NoError(t, err)
+			require.NoError(t, err, "the model gets at most the image's summary, never the image")
 			require.Equal(t, tt.want, string(output))
+			marshalled, err := json.Marshal(tt.out)
+			require.NoError(t, err)
+			require.Equal(t, string(marshalled), string(output))
 		})
 	}
+	_, err = imageInvoke[any](t, pointerOwn{Photo: photo})
+	require.EqualError(t, err, `encode output of tool "render": gepa_test.pointerOwn holds an Image, `+
+		"but tool output travels as JSON without image data", "json.Marshal writes the fields of a value")
 }
 
-func TestToolStepRefusesAnArgumentThatPromotesAnImage(t *testing.T) {
+func TestToolStepSendsAnEmbeddedImageAsItsSummary(t *testing.T) {
 	var calls []string
 	registry, err := gepa.NewToolRegistry(anyArguments("frame", &calls))
 	require.NoError(t, err)
-	frameKey := gepa.Key[framed]{Name: "frame"}
+	frameKey := gepa.Key[embedded]{Name: "frame"}
 	count := gepa.Key[int]{Name: "count"}
 	pipeline := fpBuild(t, gepa.PipelineSpec{
 		Inputs: refs(frameKey.Ref()),
 		Steps:  []gepa.Step{gepa.ToolStep("frame", "frame", refs(frameKey.Ref()), refs(count.Ref()))},
 		Tools:  registry,
 	})
+	photo := gepatest.PNG("photo")
+	summary, err := json.Marshal(photo)
+	require.NoError(t, err)
 
-	_, err = pipeline.RunCandidate(context.Background(), nil, gepa.Prediction{"frame": framed{gepatest.PNG("photo")}})
+	_, err = pipeline.RunCandidate(context.Background(), nil, gepa.Prediction{"frame": embedded{photo}})
 
-	require.EqualError(t, err, `pipeline step "frame": encode arguments of tool "frame": state key "frame": `+
-		"gepa_test.framed holds an Image, but tool arguments travel as JSON without image data")
-	require.True(t, gepa.IsPermanent(err))
-	require.Empty(t, calls)
+	require.NoError(t, err)
+	require.Equal(t, []string{`{"frame":` + string(summary) + `}`}, calls, "the tool gets the summary, never the image")
 }
