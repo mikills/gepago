@@ -135,8 +135,7 @@ func headOffsets(char byte) []int {
 	return offsets
 }
 
-// These constants tune holdsImageSummary. A false hit of an anchor costs a call of
-// bytes.IndexByte, about 9 ns. An anchor is dense when its hits are more than denseHits plus one
+// these constants tune holdsImageSummary. An anchor is dense when its hits are more than denseHits plus one
 // for each denseSpan bytes that its search covered. The search then tries the next anchor. Each
 // search counts its hits afresh, and it ends at the end of its window of scanWindow bytes. So a
 // hit count covers at most one window and the bytes that the switches before it went back.
@@ -144,15 +143,13 @@ func headOffsets(char byte) []int {
 // When every anchor proves dense in one window, the search keeps the sparsest one for the rest of
 // the window. That search proves dense when its hits are more than denseHits plus one for each
 // fallbackSpan bytes. Then, or when the sparsest anchor was already that dense, bytes.Index finds
-// imageSummarySize itself in the rest of the window. bytes.Index costs at most about 9 ns for each
-// 16 bytes. For text that holds many of its first byte, it costs about 0.3 ns a byte.
+// imageSummaryHead in the rest of the window. The head avoids a restart at each common "size" key.
 //
 // A switch goes back anchorReach bytes. A switch between anchors must go back at least 15 bytes.
 // The reason is that the quote of a summary 11 bytes before imageSummarySize can make the quote
-// anchor dense. That quote is 14 bytes after the "{" that starts the summary. After bytes.Index,
-// the next window must go back at least 25 bytes, the distance from imageSummarySize back to that
-// "{". The search goes back 64 bytes to keep a margin, and the tests catch a back-up of 24 bytes.
-// So it misses no summary.
+// anchor dense. That quote is 14 bytes after the "{" that starts the summary. A switch to the head
+// search must also cover the distance from the last anchor back to the "{". The search goes back
+// 64 bytes to cover every anchor and the head.
 const (
 	scanWindow   = 4096
 	denseHits    = 2
@@ -185,9 +182,8 @@ const (
 //
 // It searches for one of summaryAnchors with bytes.IndexByte, which skips text that does not hold
 // the anchor at memory speed. It checks for a summary around each hit. When an anchor proves dense,
-// it tries the next one, and it decides again in each window (see scanWindow). So no JSON costs
-// more than about 0.6 ns a byte on an Apple M4, about 9 ns for each 16 bytes. JSON that seldom
-// holds an anchor costs about 0.01 to 0.02 ns a byte.
+// it tries the next one, and it decides again in each window (see scanWindow). Dense windows use
+// a search for imageSummaryHead. The cost depends on the input, including partial summary heads.
 func holdsImageSummary(data []byte) bool {
 	scan := summaryScan{data: data}
 	for {
@@ -242,7 +238,7 @@ func (s *summaryScan) window() scanResult {
 		}
 		s.offset = max(0, stop-anchorReach)
 	}
-	if sizeKeyBefore(s.data, s.offset, end) {
+	if summaryHeadBefore(s.data, s.offset, end) {
 		return scanFound
 	}
 	if end >= len(s.data) {
@@ -252,22 +248,30 @@ func (s *summaryScan) window() scanResult {
 	return scanWindowEnd
 }
 
-// imageSummarySizeBytes is imageSummarySize as bytes, for bytes.Index.
-var imageSummarySizeBytes = []byte(imageSummarySize)
+// imageSummaryHead is the common media type key and value prefix in imageSummaryTypes. It omits
+// the object punctuation, so other object starts need no full comparison.
+const imageSummaryHead = `media_type":"image/`
 
-// sizeKeyBefore reports whether data holds a summary whose imageSummarySize starts at an index
-// from from up to end. It finds each imageSummarySize there with bytes.Index.
-func sizeKeyBefore(data []byte, from, end int) bool {
-	limit := min(len(data), end+len(imageSummarySize)-1)
+// imageSummaryHeadBytes is imageSummaryHead as bytes, for bytes.Index.
+var imageSummaryHeadBytes = []byte(imageSummaryHead)
+
+// summaryHeadBefore reports whether data holds a summary whose imageSummaryHead starts at an
+// index from from up to end. It finds each imageSummaryHead there with bytes.Index.
+func summaryHeadBefore(data []byte, from, end int) bool {
+	limit := min(len(data), end+len(imageSummaryHead)-1)
 	for offset := from; ; {
-		i := bytes.Index(data[offset:limit], imageSummarySizeBytes)
+		i := bytes.Index(data[offset:limit], imageSummaryHeadBytes)
 		if i < 0 {
 			return false
 		}
-		if imageSummaryAt(data, offset+i) {
-			return true
+		if at := offset + i - 2; at >= 0 {
+			for _, head := range imageSummaryTypes {
+				if textAt(data, at, head) && imageSummaryAt(data, at+len(head)) {
+					return true
+				}
+			}
 		}
-		offset += i + 1
+		offset += i + len(imageSummaryHead)
 	}
 }
 

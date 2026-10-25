@@ -244,6 +244,18 @@ func fileRecords(n int) []any {
 	return files
 }
 
+// denseRecords returns n small records with an "_id" and a "size" key.
+func denseRecords(n int) []any {
+	rows := make([]any, n)
+	for i := range rows {
+		rows[i] = struct {
+			ID   string `json:"_id"`
+			Size int    `json:"size"`
+		}{ID: "a" + strconv.Itoa(i), Size: i}
+	}
+	return rows
+}
+
 // anyOf returns the values of values as a []any.
 func anyOf[T any](values []T) []any {
 	out := make([]any, len(values))
@@ -273,6 +285,11 @@ func mixedValues(n int) []any {
 // json.Marshal of the value. The values hold the bytes that the image scan looks for.
 func BenchmarkToolOutputShapes(b *testing.B) {
 	const n = 20_000
+	dense := denseRecords(40_000)
+	rawDense, err := json.Marshal(dense)
+	if err != nil {
+		b.Fatal(err)
+	}
 	shapes := []struct {
 		name  string
 		value any
@@ -308,6 +325,11 @@ func BenchmarkToolOutputShapes(b *testing.B) {
 		{name: "a sparsest anchor that turns dense", value: map[string]any{"t": sparsestAnchorAttack()}},
 		{name: "a log with a z every 71 bytes", value: map[string]any{
 			"log": strings.Repeat("GET /images/photo.png?size=large&format=webp HTTP/1.1 200 1234 bytes\n", 15_000),
+		}},
+		{name: "dense records", value: dense},
+		{name: "dense raw records", value: map[string]any{"body": json.RawMessage(rawDense)}},
+		{name: "repeated size keys", value: map[string]any{
+			"body": json.RawMessage(`{` + strings.Repeat(`"size":"{_",`, 1<<16) + `"size":"{_"}`),
 		}},
 	}
 	for _, shape := range shapes {

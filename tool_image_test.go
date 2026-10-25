@@ -1221,3 +1221,26 @@ func TestToolRefusesAnImageAfterValuesThatOnlyLookLikeASummary(t *testing.T) {
 		require.Equal(t, string(want), string(output), name)
 	}
 }
+
+func TestToolEncodesDenseTextAndRefusesAnImageAfterIt(t *testing.T) {
+	for name, raw := range map[string]json.RawMessage{
+		"records":                json.RawMessage(`[` + strings.Repeat(`{"_id":"a","size":1},`, 1000) + `{}]`),
+		"repeated size keys":     json.RawMessage(`{` + strings.Repeat(`"size":"{_",`, 1000) + `"size":"{_"}`),
+		"incomplete image heads": json.RawMessage(`[` + strings.Repeat(`{"media_type":"image/png","size":1},`, 1000) + `{}]`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			out := map[string]any{"body": raw, "photo": gepa.Image{}}
+			want, err := json.Marshal(out)
+			require.NoError(t, err)
+			got, err := imageInvoke(t, out)
+			require.NoError(t, err)
+			require.Equal(t, string(want), string(got))
+
+			out["photo"] = gepatest.PNG("photo")
+			got, err = imageInvoke(t, out)
+			require.EqualError(t, err, `encode output of tool "render": map[string]interface {} holds an Image, `+
+				"but tool output travels as JSON without image data")
+			require.Empty(t, got)
+		})
+	}
+}

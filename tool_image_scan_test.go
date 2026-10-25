@@ -221,6 +221,45 @@ func switchingBases() map[string]string {
 		"a sparsest z that turns dense":     sparsestAttack('z', 50)[:9000],
 		"a sparsest { that turns dense":     sparsestAttack('{', 50)[:9000],
 		"a sparsest colon that turns dense": sparsestAttack(':', 64)[:9000],
+		"dense records":                     filler(`{"_id":"a","size":1},`, 9000),
+		"repeated size keys":                filler(`"size":"{_",`, 9000),
+		"incomplete image heads":            filler(`{"media_type":"image/png","size":1},`, 9000),
+		"partial image heads":               filler(`{"media_type":"image/","size":"{_"},`, 9000),
+	}
+}
+
+func TestSummaryHeadBeforeChecksTheWholeShapeAtItsBounds(t *testing.T) {
+	for _, mediaType := range []string{"image/png", "image/jpeg", "image/webp"} {
+		summary := `{"media_type":"` + mediaType + `","size":12,"sha256":"` + strings.Repeat("0a", 32) + `"}`
+		prefix := strings.Repeat("a", anchorReach)
+		data := []byte(prefix + summary)
+		at := len(prefix) + 2
+		for _, bounds := range []struct {
+			name      string
+			from, end int
+			want      bool
+		}{
+			{name: "at the start", from: at, end: at + 1, want: true},
+			{name: "before the end", from: 0, end: at + 1, want: true},
+			{name: "at the end", from: 0, end: at},
+			{name: "before the start", from: at + 1, end: len(data)},
+		} {
+			require.Equal(
+				t,
+				bounds.want,
+				summaryHeadBefore(data, bounds.from, bounds.end),
+				"%s: %s",
+				mediaType,
+				bounds.name,
+			)
+		}
+		for cut := 0; cut < len(summary); cut++ {
+			partial := []byte(summary[:cut])
+			require.False(t, summaryHeadBefore(partial, 0, len(partial)), "%s: cut at %d", mediaType, cut)
+		}
+	}
+	for _, text := range []string{imageSummaryHead, `x"` + imageSummaryHead + `png","size":12,"sha256":"` + strings.Repeat("0a", 32) + `"}`} {
+		require.False(t, summaryHeadBefore([]byte(text), 0, len(text)), "the object must start with a brace")
 	}
 }
 
@@ -248,6 +287,29 @@ func TestHoldsImageSummaryFindsASummaryAtEveryPlaceAroundTheSwitches(t *testing.
 				require.False(t, summaryPattern.Match(data), "%s: the near miss at %d makes no summary", name, at)
 			}
 		}
+	}
+}
+
+func BenchmarkImageSummaryDenseJSON(b *testing.B) {
+	for name, text := range map[string]string{
+		"records":                `[` + strings.Repeat(`{"_id":"a","size":1},`, 50_000) + `{}]`,
+		"repeated size keys":     `{` + strings.Repeat(`"size":"{_",`, 1<<16) + `"size":"{_"}`,
+		"incomplete image heads": `[` + strings.Repeat(`{"media_type":"image/png","size":1},`, 30_000) + `{}]`,
+		"partial image heads":    `[` + strings.Repeat(`{"media_type":"image/","size":"{_"},`, 30_000) + `{}]`,
+	} {
+		b.Run(name, func(b *testing.B) {
+			data := []byte(text)
+			if !json.Valid(data) {
+				b.Fatal("invalid JSON")
+			}
+			b.SetBytes(int64(len(data)))
+			b.ReportAllocs()
+			for b.Loop() {
+				if holdsImageSummary(data) {
+					b.Fatal("unexpected summary")
+				}
+			}
+		})
 	}
 }
 
