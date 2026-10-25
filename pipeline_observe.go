@@ -400,7 +400,7 @@ func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any,
 			RunContext: lane.runContext,
 			Inputs:     lane.redactStateValues(inputs, numbers),
 		}
-		observerCtx := lane.observerContext(ctx)
+		observerCtx := lane.observerContext(withTracedNumbers(ctx, numbers.inputs(inputs)))
 		lane.deliver(func(observer PipelineObserver) {
 			event := event
 			event.RunContext = event.RunContext.clone()
@@ -547,6 +547,7 @@ func observeStep(ctx context.Context, node *stepNode, attempt, visit int, values
 		lane.ctx = ctx
 		iteration := iterationFrom(ctx)
 		lane.reads = lane.run.redactStateValues(reads, iteration.numbers)
+		traced := withTracedNumbers(ctx, iteration.numbers.inputs(reads))
 		lane.attributes = executionAttributes(ctx, visit)
 		if iteration.number > 0 && !lane.run.keepsAttribute(iteration.key, iteration.number) {
 			delete(lane.attributes, "iteration")
@@ -560,7 +561,7 @@ func observeStep(ctx context.Context, node *stepNode, attempt, visit int, values
 			Lane:       scope.lane,
 			Attributes: lane.attributes,
 		}
-		observerCtx := lane.run.observerContext(ctx)
+		observerCtx := lane.run.observerContext(traced)
 		lane.run.deliver(func(observer PipelineObserver) {
 			event := event
 			event.RunContext = event.RunContext.clone()

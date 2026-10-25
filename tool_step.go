@@ -214,27 +214,19 @@ func (s *toolStep) Run(ctx context.Context, state State) error {
 
 // encodeToolArguments encodes args, the value of each read under its key, as json.Marshal does.
 // The JSON form of an Image holds no image data. So an Image from NewImage in a value fails the
-// encode with a Permanent error (see imageRefusalOptions). The error names the key and the Go type
-// of the value. A zero Image encodes as null. When no value can hold an Image, args encodes with
-// json.Marshal itself.
+// encode with a Permanent error (see encodeRefusingImages). The error names the key whose value
+// fails when it encodes alone, and the Go type of that value. It names no key when no value fails
+// alone. A zero Image encodes as null.
 func encodeToolArguments(args map[string]any) ([]byte, error) {
-	check := false
-	for _, value := range args {
-		if valueMayHoldImage(value) {
-			check = true
-			break
-		}
-	}
-	arguments, err := encodeRefusingImages(args, check)
-	refused := refusedImage(err)
-	if refused == nil {
+	arguments, err := encodeRefusingImages(args)
+	if !errors.Is(err, errImageRefused) {
 		return arguments, err
 	}
-	// args is an object, so the first token of the image's place is the key that holds it.
-	key := ""
-	for token := range refused.at.Tokens() {
-		key = token
-		break
+	key, found := refusedArgument(args)
+	if !found {
+		return nil, PermanentError(errors.New(
+			"tool arguments hold an Image, but tool arguments travel as JSON without image data",
+		))
 	}
 	return nil, PermanentError(fmt.Errorf(
 		"state key %q: %T holds an Image, but tool arguments travel as JSON without image data",

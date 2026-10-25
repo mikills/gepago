@@ -72,6 +72,27 @@ func BenchmarkToolOutputAnySlice(b *testing.B) {
 	benchInvoke(b, values)
 }
 
+// benchMessages returns n text-only messages.
+func benchMessages(n int) []gepa.Message {
+	messages := make([]gepa.Message, n)
+	for i := range messages {
+		messages[i] = gepa.Message{Role: gepa.RoleUser, Content: "message " + strconv.Itoa(i)}
+	}
+	return messages
+}
+
+func BenchmarkToolOutputMessages(b *testing.B) {
+	benchInvoke(b, benchMessages(5000))
+}
+
+func BenchmarkToolOutputMap(b *testing.B) {
+	values := make(map[string]any, 2000)
+	for i := range 2000 {
+		values["key "+strconv.Itoa(i)] = map[string]any{"id": i, "name": "name " + strconv.Itoa(i)}
+	}
+	benchInvoke(b, values)
+}
+
 // benchToolStep reports the cost of a pipeline run whose one ToolStep reads key with value.
 func benchToolStep[T any](b *testing.B, key gepa.Key[T], value T) {
 	b.Helper()
@@ -109,4 +130,8 @@ func BenchmarkToolStepArgumentsSmall(b *testing.B) {
 
 func BenchmarkToolStepArgumentsStructs(b *testing.B) {
 	benchToolStep(b, gepa.Key[[]benchRecord]{Name: "records"}, benchRecords(20_000))
+}
+
+func BenchmarkToolStepArgumentsMessages(b *testing.B) {
+	benchToolStep(b, gepa.Key[[]gepa.Message]{Name: "history"}, benchMessages(5000))
 }

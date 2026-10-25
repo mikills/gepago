@@ -172,20 +172,18 @@ func (p Provenance) Validate() error {
 // call a remote tool host serves.
 //
 // The tool's Validate method reports a schema that JSONSchemaFor cannot derive, an empty name or
-// description, and a nil fn. So ToolRegistry.Register refuses such a tool. Validate also reports
-// an Out of the type Image or *Image, also behind a pointer. It reports a top-level JSON field of
-// Out of one of these types that JSON writes in every output. That is an Image without the
-// omitzero option, or a *Image without omitempty or omitzero. It reports a top-level JSON field of
-// Args of the type Image without omitempty or omitzero, since no model reply decodes into it. A
-// field that JSON can leave out, such as the Image of Part, can carry values with no image. A value
-// with an image then fails at call time. The fields of an Out that json.Marshal writes with its own
-// method do not count. A field of another type that holds an Image, such as []Image, passes too,
-// and the call checks its value.
+// description, and a nil fn. So ToolRegistry.Register refuses such a tool. Images follow two
+// rules. Validate reports Args that no JSON value can decode into, because the decode requires an
+// Image there and JSON holds no image data. An example is a field of the type Image without
+// omitempty or omitzero. A *Image, a slice and a map take null, so they pass. Every other Image
+// fails at call time, when a value holds one. That covers every Out, since a value without an image
+// always encodes.
 //
 // Tool arguments and output travel as JSON, and the JSON form of an Image holds no image data.
 // So an Image from NewImage in fn's output fails the call with a Permanent error. The error names
 // the tool and the Go type of the output. The encode finds an Image where json.Marshal encodes
-// one, also in an interface value. It skips unexported fields and fields tagged "-". A type that
+// one, also in an interface value. It skips unexported fields and fields tagged "-". The encode
+// calls json.Marshal first, so a text-only output costs what json.Marshal costs. A type that
 // embeds an Image or a *Image, or that writes its own JSON, encodes as json.Marshal writes it. So
 // the model gets at most the image's summary, and never the image. But a MarshalJSONTo that
 // encodes an Image it holds through its encoder still fails, since the encoder refuses that Image.
@@ -199,7 +197,7 @@ func NewTool[Args, Out any](name, description string, fn func(context.Context, A
 		err = fmt.Errorf("arguments type %s must be a struct, so its JSON form is an object", reflect.TypeFor[Args]())
 	}
 	if err == nil {
-		err = checkToolTypes(reflect.TypeFor[Args](), reflect.TypeFor[Out]())
+		err = checkToolArguments(reflect.TypeFor[Args]())
 	}
 	if err != nil {
 		tool.err = fmt.Errorf("tool %q: %w", name, err)
@@ -262,12 +260,12 @@ func (t *typedTool[Args, Out]) Invoke(ctx context.Context, call ToolCall) (ToolR
 
 // encodeToolOutput encodes out, the output of the tool named tool, as json.Marshal does. The JSON
 // form of an Image holds no image data. So an Image from NewImage in out fails the encode with a
-// Permanent error (see imageRefusalOptions). The error names the tool and the type of out. A zero
-// Image encodes as null. An out whose type cannot hold an Image encodes with json.Marshal itself.
+// Permanent error (see encodeRefusingImages). The error names the tool and the type of out. A zero
+// Image encodes as null.
 func encodeToolOutput(tool string, out any) ([]byte, error) {
-	output, err := encodeRefusingImages(out, valueMayHoldImage(out))
+	output, err := encodeRefusingImages(out)
 	switch {
-	case refusedImage(err) != nil:
+	case errors.Is(err, errImageRefused):
 		return nil, PermanentError(fmt.Errorf(
 			"encode output of tool %q: %T holds an Image, but tool output travels as JSON without image data",
 			tool,

@@ -445,19 +445,15 @@ func reflectWithTraces(t *testing.T, program Program, traces bool) EvaluationIte
 }
 
 // iterationTrace returns the trace of the body's execution in the given iteration of the Loop
-// that is the top-level step named loop.
+// that is the top-level step named loop. A Loop's iterations start in order, so it finds the
+// execution by its place, also when a Redactor leaves the "iteration" attribute out.
 func iterationTrace(t *testing.T, item EvaluationItem, loop string, iteration int) StepTrace {
 	t.Helper()
 	trace, ok := item.Trace.(PipelineTrace)
 	require.True(t, ok, "one trace")
 	for _, step := range trace.Steps {
-		if step.Step != loop {
-			continue
-		}
-		for _, body := range step.Steps {
-			if body.Attributes["iteration"] == iteration {
-				return body
-			}
+		if step.Step == loop && len(step.Steps) >= iteration {
+			return step.Steps[iteration-1]
 		}
 	}
 	t.Fatalf("no iteration %d of %s", iteration, loop)
@@ -527,6 +523,21 @@ func TestReflectionKeepsTheIterationNumberWithAndWithoutTraces(t *testing.T) {
 		},
 		Defaults: []Default{DefaultValue(loopCountKey, 0), DefaultValue(ticket, "T-77")},
 	})
+	// the Loop's own Redactor keeps the number but turns it into a float64 in the events.
+	asFloat := func(key string, value any) any {
+		if number, ok := value.(int); ok && key == "page" {
+			return float64(number)
+		}
+		return value
+	}
+	floated := build(PipelineSpec{
+		Steps: []Step{
+			NewProgramStep("lookup", nested, nil, refs(greeting.Ref())),
+			pagedLoop(body, 100, 5),
+		},
+		Defaults: []Default{DefaultValue(loopCountKey, 0)},
+		Redactor: asFloat,
+	})
 	tests := []struct {
 		name     string
 		pipeline Pipeline
@@ -544,6 +555,12 @@ func TestReflectionKeepsTheIterationNumberWithAndWithoutTraces(t *testing.T) {
 			pipeline: another,
 			want:     "code 3 rejected for [redacted]",
 			reads:    map[string]any{"count": float64(2), "page": RedactedText, "ticket": RedactedText},
+		},
+		{
+			name:     "a Redactor of the Loop's pipeline that changes the number's type",
+			pipeline: floated,
+			want:     "code 3 rejected",
+			reads:    map[string]any{"count": float64(2), "page": RedactedText},
 		},
 	}
 	for _, tt := range tests {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -440,4 +441,48 @@ func BenchmarkEncodeToolArguments(b *testing.B) {
 			}
 		}
 	})
+}
+
+// BenchmarkEncodeTextOnlyValues compares encodeToolOutput and encodeToolArguments with
+// json.Marshal, which v0.9.0 called, on text-only messages, a []any and a map[string]any.
+func BenchmarkEncodeTextOnlyValues(b *testing.B) {
+	messages := make([]Message, 5000)
+	for i := range messages {
+		messages[i] = Message{Role: RoleUser, Content: "message " + strconv.Itoa(i)}
+	}
+	values := make([]any, 20_000)
+	for i := range values {
+		values[i] = map[string]any{"id": i, "ok": true}
+	}
+	objects := make(map[string]any, 2000)
+	for i := range 2000 {
+		objects["key "+strconv.Itoa(i)] = map[string]any{"id": i}
+	}
+	for name, value := range map[string]any{"messages": messages, "any slice": values, "map": objects} {
+		b.Run(name+"/json.Marshal", func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := json.Marshal(value); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+		b.Run(name+"/encodeToolOutput", func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := encodeToolOutput("t", value); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+		b.Run(name+"/encodeToolArguments", func(b *testing.B) {
+			args := map[string]any{"value": value}
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := encodeToolArguments(args); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
 }

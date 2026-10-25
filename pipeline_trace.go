@@ -113,8 +113,9 @@ type RecordingObserver struct {
 	steps  map[string]*recordedStep
 }
 
-// recordedRun is a run that a RecordingObserver records. numbers holds each input key whose value
-// the run kept as an iteration number, nil when there is none (see withRunNumbers).
+// recordedRun is a run that a RecordingObserver records. numbers holds each input key whose raw
+// value the run kept as an iteration number. observeRun decided it (see withTracedNumbers). It is
+// nil when there is none.
 type recordedRun struct {
 	trace   PipelineTrace
 	steps   []*recordedStep
@@ -122,7 +123,8 @@ type recordedRun struct {
 }
 
 // recordedStep is an execution that a RecordingObserver records. numbers holds each read key whose
-// value the execution read as an iteration number, nil when there is none.
+// raw value the execution read as an iteration number. observeStep decided it (see
+// withTracedNumbers). It is nil when there is none.
 type recordedStep struct {
 	trace   StepTrace
 	steps   []*recordedStep
@@ -145,7 +147,7 @@ func (r *RecordingObserver) RunStarted(ctx context.Context, event RunStartedEven
 		RunContext: event.RunContext.clone(),
 		StartedAt:  event.Span.StartedAt,
 		Inputs:     traceValues(event.Inputs),
-	}, numbers: tracedNumbers(ctx, event.Inputs)}
+	}, numbers: tracedNumbers(ctx)}
 	r.runs[event.Span.ID] = run
 	if parent, ok := r.steps[event.Span.ParentID]; ok {
 		parent.runs = append(parent.runs, run)
@@ -167,7 +169,7 @@ func (r *RecordingObserver) StepStarted(ctx context.Context, event StepStartedEv
 		Reads:      traceValues(event.Reads),
 		Lane:       event.Lane,
 		Attributes: traceAttributes(event.Attributes),
-	}, numbers: tracedNumbers(ctx, event.Reads)}
+	}, numbers: tracedNumbers(ctx)}
 	if run, ok := r.runs[event.Span.ParentID]; ok {
 		run.steps = append(run.steps, step)
 	} else if parent, ok := r.steps[event.Span.ParentID]; ok {
@@ -229,12 +231,26 @@ func (r *RecordingObserver) lastStep(runID string) *recordedStep {
 	return run.steps[len(run.steps)-1]
 }
 
-// tracedNumbers returns the iteration numbers in effect in ctx, the context of an observed run or
-// execution. It keeps only the keys of values that hold their number, and returns nil when no key
-// does. values are the run's inputs or the execution's reads as the events carry them. A trace
-// holds them as JSON decodes them, so the key alone then tells an iteration number apart.
-func tracedNumbers(ctx context.Context, values map[string]any) iterationNumbers {
-	return iterationFrom(ctx).numbers.inputs(values)
+// tracedNumbersKey carries the keys whose raw values a run or an execution took as iteration
+// numbers to a RecordingObserver (see withTracedNumbers).
+type tracedNumbersKey struct{}
+
+// withTracedNumbers returns ctx with numbers, the keys whose raw inputs or reads the run or the
+// execution took as iteration numbers. observeRun and observeStep decide them on the raw values,
+// before a Redactor changes them, and pass ctx to the observers. A trace holds the redacted values
+// as JSON decodes them, so the key alone then tells an iteration number apart. Without numbers it
+// returns ctx as it is.
+func withTracedNumbers(ctx context.Context, numbers iterationNumbers) context.Context {
+	if len(numbers) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, tracedNumbersKey{}, numbers)
+}
+
+// tracedNumbers returns the numbers that withTracedNumbers put in ctx, or nil.
+func tracedNumbers(ctx context.Context) iterationNumbers {
+	numbers, _ := ctx.Value(tracedNumbersKey{}).(iterationNumbers)
+	return numbers
 }
 
 // traceAttributes returns a copy of attributes, or nil when there are none.
