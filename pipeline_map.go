@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -27,9 +26,11 @@ type MapOptions struct {
 // nested steps included, and Duration how long it ran. Error is a string so results serialise
 // into traces and artefacts.
 type MapResult[Out any] struct {
-	Index    int           `json:"index"`
-	Value    Out           `json:"value"`
-	Error    string        `json:"error,omitempty"`
+	Index int    `json:"index"`
+	Value Out    `json:"value"`
+	Error string `json:"error,omitempty"`
+	// Skipped marks an element that MapCollectUntil did not start after its stop predicate matched.
+	Skipped  bool          `json:"skipped,omitempty"`
 	Usage    Usage         `json:"usage"`
 	Duration time.Duration `json:"duration"`
 }
@@ -96,7 +97,7 @@ func Map[In, Out any](
 	results Key[[]Out],
 	opts MapOptions,
 ) Step {
-	return newMapStep(name, items, item, body, results.Ref(), reflect.TypeFor[Out](), opts, false, joinValues[Out])
+	return newMapStep(name, items, item, body, results.Ref(), reflect.TypeFor[Out](), opts, false, joinValues[Out], nil)
 }
 
 // MapCollect is Map, except that it runs every element whatever the others do and writes a
@@ -114,7 +115,39 @@ func MapCollect[In, Out any](
 	results Key[[]MapResult[Out]],
 	opts MapOptions,
 ) Step {
-	return newMapStep(name, items, item, body, results.Ref(), reflect.TypeFor[Out](), opts, true, joinResults[Out])
+	return newMapStep(name, items, item, body, results.Ref(), reflect.TypeFor[Out](), opts, true, joinResults[Out], nil)
+}
+
+// MapCollectUntil collects elements in input order until stop returns true for a completed element.
+// Build requires stop and rejects MaxConcurrency above one. Zero and one both run sequentially.
+// stop receives the completed result and its original error, or nil after success.
+// The result's Error follows the run's redaction policy. The original error is for local decisions only.
+// A panic in stop fails the map and drops all results and staged tool writes.
+//
+// The terminal result and all earlier results commit. Later results have Skipped set, with zero Value, Error, Usage and Duration.
+// Only successful elements commit their staged tool writes. Skipped elements produce no executions or usage.
+// A PanicError, budget failure or policy timeout fails the map before stop runs.
+// An element failure after context cancellation also fails the map before stop runs.
+// A successful result may match stop after ordinary context cancellation and still commit the collection.
+// Without that match, cancellation fails the collection. Budget limits and policy timeouts still apply.
+func MapCollectUntil[In, Out any](
+	name string,
+	items Key[[]In],
+	item Key[In],
+	body Step,
+	results Key[[]MapResult[Out]],
+	opts MapOptions,
+	stop func(MapResult[Out], error) bool,
+) Step {
+	policy := &mapStopPolicy{}
+	if stop != nil {
+		policy.when = func(index int, outcome elementOutcome) bool {
+			result := mapResult[Out](index, outcome)
+			result.Value, _ = deepCopy(result.Value).(Out)
+			return stop(result, outcome.err)
+		}
+	}
+	return newMapStep(name, items, item, body, results.Ref(), reflect.TypeFor[Out](), opts, true, joinResults[Out], policy)
 }
 
 func newMapStep[In any](
@@ -127,6 +160,7 @@ func newMapStep[In any](
 	opts MapOptions,
 	collect bool,
 	join func([]elementOutcome) any,
+	stop *mapStopPolicy,
 ) Step {
 	m := &mapStep{
 		name:    strings.TrimSpace(name),
@@ -140,6 +174,7 @@ func newMapStep[In any](
 		split:   splitList[In],
 		single:  singleList[In],
 		join:    join,
+		stop:    stop,
 	}
 	others := slices.DeleteFunc(slices.Clone(m.body.reads), func(key KeyRef) bool { return key.Name == m.item.Name })
 	m.reads = unionKeys([]KeyRef{m.items}, others)
@@ -176,16 +211,26 @@ func joinValues[Out any](outcomes []elementOutcome) any {
 func joinResults[Out any](outcomes []elementOutcome) any {
 	results := make([]MapResult[Out], len(outcomes))
 	for i, outcome := range outcomes {
-		value, _ := outcome.value.(Out)
-		results[i] = MapResult[Out]{
-			Index:    i,
-			Value:    value,
-			Error:    outcome.message,
-			Usage:    outcome.usage,
-			Duration: outcome.duration,
-		}
+		results[i] = mapResult[Out](i, outcome)
 	}
 	return results
+}
+
+func mapResult[Out any](index int, outcome elementOutcome) MapResult[Out] {
+	value, _ := outcome.value.(Out)
+	return MapResult[Out]{
+		Index:    index,
+		Value:    value,
+		Error:    outcome.message,
+		Skipped:  outcome.skipped,
+		Usage:    outcome.usage,
+		Duration: outcome.duration,
+	}
+}
+
+// mapStopPolicy holds the predicate for sequential collection. A nil policy keeps the default map behaviour.
+type mapStopPolicy struct {
+	when func(int, elementOutcome) bool
 }
 
 // mapStep is a Map or, with collect set, a MapCollect. out is the type body writes, split
@@ -204,6 +249,7 @@ type mapStep struct {
 	split   func(any) []any
 	single  func(any) any
 	join    func([]elementOutcome) any
+	stop    *mapStopPolicy
 }
 
 // elementOutcome is how one element ended: the value body wrote and what it staged for tools
@@ -217,6 +263,7 @@ type elementOutcome struct {
 	message  string
 	usage    Usage
 	duration time.Duration
+	skipped  bool
 }
 
 // errMapElementFailed is the cause of the cancellation an element that stops its map sends to
@@ -240,6 +287,10 @@ func (m *mapStep) Validate() error {
 		return fmt.Errorf("map MaxConcurrency %d must not be negative", m.opts.MaxConcurrency)
 	case m.opts.MaxItems < 0:
 		return fmt.Errorf("map MaxItems %d must not be negative", m.opts.MaxItems)
+	case m.stop != nil && m.stop.when == nil:
+		return errors.New("map collect stop predicate is required")
+	case m.stop != nil && m.opts.MaxConcurrency > 1:
+		return errors.New("map collect stop predicate requires MaxConcurrency zero or one")
 	case m.items.Name == "":
 		return errors.New("map items key is required")
 	case m.item.Name == "":
@@ -380,6 +431,9 @@ func (m *mapStep) runElements(ctx context.Context, candidate Candidate, elements
 	[]elementOutcome,
 	error,
 ) {
+	if m.stop != nil {
+		return m.runUntil(ctx, candidate, elements, values)
+	}
 	outcomes := make([]elementOutcome, len(elements))
 	elementsCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -415,6 +469,39 @@ func (m *mapStep) runElements(ctx context.Context, candidate Candidate, elements
 		return outcomes, stop
 	case started < len(elements):
 		return outcomes, contextEnd(ctx)
+	}
+	return outcomes, nil
+}
+
+// runUntil stops after a completed element matches the predicate, before any later element starts.
+func (m *mapStep) runUntil(ctx context.Context, candidate Candidate, elements []any, values map[string]any) (
+	[]elementOutcome,
+	error,
+) {
+	outcomes := make([]elementOutcome, len(elements))
+	for i, element := range elements {
+		if err := stepCanStart(ctx); err != nil {
+			return outcomes, err
+		}
+		outcome := m.runElement(ctx, candidate, i, element, values)
+		outcomes[i] = outcome
+		var panicked *PanicError
+		var timeout *stepTimeoutError
+		if errors.As(outcome.err, &panicked) || errors.As(outcome.err, &timeout) {
+			return outcomes, outcome.failure
+		}
+		if failure := m.stopsWith(ctx, outcome); failure != nil {
+			return outcomes, failure
+		}
+		if m.stop.when(i, outcome) {
+			for j := i + 1; j < len(outcomes); j++ {
+				outcomes[j].skipped = true
+			}
+			return outcomes, nil
+		}
+		if ctx.Err() != nil {
+			return outcomes, contextEnd(ctx)
+		}
 	}
 	return outcomes, nil
 }
@@ -471,10 +558,7 @@ func (m *mapStep) runElement(ctx context.Context, candidate Candidate, index int
 	start := time.Now()
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			outcome = elementOutcome{err: WithStepDetails(
-				fmt.Errorf("step panicked: %v", recovered),
-				map[string]any{"stack": string(debug.Stack())},
-			)}
+			outcome = elementOutcome{err: recoveredPanic(recovered, "step panicked")}
 		}
 		outcome.usage, outcome.duration = usage.total(), time.Since(start)
 		if outcome.err == nil {

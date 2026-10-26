@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
-	"runtime/debug"
 	"slices"
 	"strings"
 )
@@ -297,6 +296,7 @@ func (l *loopStep) runCandidate(ctx context.Context, candidate Candidate, s Stat
 	}
 	// the iterations see only the keys s exposes, as the body would through s.
 	carry := s.visibleValues(l.body.reads)
+	written := make(map[string]bool, len(l.body.writes))
 	// the iterations stage for tools in a stage of the loop's own, which commits only when until
 	// holds. So a failed loop drops what they staged, whoever runs it.
 	loopCtx, stage := beginStepStage(ctx)
@@ -315,6 +315,9 @@ func (l *loopStep) runCandidate(ctx context.Context, candidate Candidate, s Stat
 			return fmt.Errorf("iteration %d: %w", iteration, failStep(iterationCtx, l.body, view, err))
 		}
 		maps.Copy(carry, result.writes)
+		for key := range result.writes {
+			written[key] = true
+		}
 		stage.add(result.staged)
 		done, err := l.callUntil(iteration, overlay(view, result.writes))
 		if err != nil {
@@ -322,7 +325,11 @@ func (l *loopStep) runCandidate(ctx context.Context, candidate Candidate, s Stat
 		}
 		if done {
 			for _, key := range l.body.writes {
-				s.store(key.Name, key.Type, carry[key.Name], true)
+				if written[key.Name] {
+					s.store(key.Name, key.Type, carry[key.Name], true)
+				} else if err := s.preserve(key.Name, key.Type); err != nil {
+					return err
+				}
 			}
 			commitLoopTools(ctx, s, stage.snapshot())
 			return nil
@@ -361,10 +368,7 @@ func (l *loopStep) callUntil(iteration int, values map[string]any) (done bool, e
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			done = false
-			err = WithStepDetails(
-				fmt.Errorf("iteration %d: until panicked: %v", iteration, recovered),
-				map[string]any{"stack": string(debug.Stack())},
-			)
+			err = recoveredPanic(recovered, fmt.Sprintf("iteration %d: until panicked", iteration))
 		}
 	}()
 	view := readOnlyView(values, l.untilTypes)
@@ -534,6 +538,9 @@ func (r *runObservation) redactNumber(key string, value any) any {
 // it passes through redactNumber. Every other value passes through redact. The caller holds the
 // trace lock.
 func (r *runObservation) redactStateValues(values map[string]any, numbers iterationNumbers) map[string]any {
+	if r.metadataOnly {
+		return metadataValues(values)
+	}
 	if len(values) == 0 {
 		return nil
 	}

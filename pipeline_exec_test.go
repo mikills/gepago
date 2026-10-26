@@ -9,7 +9,7 @@ import (
 )
 
 func TestStepResultCloneIsIndependent(t *testing.T) {
-	result := stepResult{writes: map[string]any{"notes": []string{"a"}}}
+	result := stepResult{writes: map[string]any{"notes": []string{"a"}}, preserved: map[string]bool{"count": true}}
 
 	clone := result.clone()
 	require.Equal(t, result, clone)
@@ -18,7 +18,9 @@ func TestStepResultCloneIsIndependent(t *testing.T) {
 	require.True(t, ok)
 	notes[0] = "changed"
 	clone.writes["decision"] = "added"
+	delete(clone.preserved, "count")
 	require.Equal(t, map[string]any{"notes": []string{"a"}}, result.writes)
+	require.Equal(t, map[string]bool{"count": true}, result.preserved)
 }
 
 func TestStepDoesNotStartOnceABudgetIsSpent(t *testing.T) {

@@ -171,10 +171,11 @@ func (p Predict) runChat(
 	check func(Prediction) error,
 ) (Prediction, error) {
 	chat := &predictChat{
-		subject:    fmt.Sprintf("signature %q", p.Signature.Name),
-		client:     p.LM.(ChatClient),
-		transcript: []Message{first},
-		maxTurns:   p.MaxToolTurns,
+		subject:      fmt.Sprintf("signature %q", p.Signature.Name),
+		client:       p.LM.(ChatClient),
+		transcript:   []Message{first},
+		maxTurns:     p.MaxToolTurns,
+		outputPolicy: p.OutputPolicy,
 	}
 	if p.chats() {
 		env, err := p.chatEnv(ctx)
@@ -195,18 +196,18 @@ func (p Predict) runChat(
 	if format.Strict {
 		chat.format = &format
 	}
-	raw, err := chat.reply(ctx)
+	generation, err := chat.reply(ctx)
 	if err != nil {
 		return nil, err
 	}
-	prediction, err := p.parseAndCheck(raw, check)
-	for attempt := 0; err != nil && attempt < p.MaxParseRetries; attempt++ {
-		chat.transcript = append(chat.transcript, Message{Role: RoleUser, Content: p.RepairPrompt("", raw, err)})
+	prediction, err := p.parseGeneration(generation, check)
+	for attempt := 0; err != nil && generation.FinishReason != FinishLength && attempt < p.MaxParseRetries; attempt++ {
+		chat.transcript = append(chat.transcript, Message{Role: RoleUser, Content: p.RepairPrompt("", generation.Text, err)})
 		var replyErr error
-		if raw, replyErr = chat.reply(ctx); replyErr != nil {
+		if generation, replyErr = chat.reply(ctx); replyErr != nil {
 			return nil, replyErr
 		}
-		prediction, err = p.parseAndCheck(raw, check)
+		prediction, err = p.parseGeneration(generation, check)
 	}
 	return prediction, err
 }
@@ -245,31 +246,32 @@ func (p Predict) chatEnv(ctx context.Context) (*toolEnv, error) {
 
 // predictChat is one Predict call's chat: its transcript and the tool turns it has used.
 type predictChat struct {
-	subject    string
-	client     ChatClient
-	tools      []Tool
-	format     *ResponseFormat
-	session    *ToolSession
-	transcript []Message
-	maxTurns   int
-	toolTurns  int
+	subject      string
+	client       ChatClient
+	tools        []Tool
+	format       *ResponseFormat
+	session      *ToolSession
+	transcript   []Message
+	maxTurns     int
+	toolTurns    int
+	outputPolicy OutputPolicy
 }
 
-// reply chats until the model replies without calling a tool and returns that reply's text.
-func (c *predictChat) reply(ctx context.Context) (string, error) {
+// reply chats until the model replies without calling a tool and returns its generation.
+func (c *predictChat) reply(ctx context.Context) (Generation, error) {
 	for {
 		resp, err := c.chat(ctx)
 		if err != nil {
-			return "", err
+			return Generation{}, err
 		}
 		message := cloneMessage(resp.Message)
 		message.Role = RoleAssistant
 		if len(message.ToolCalls) == 0 {
 			c.transcript = append(c.transcript, message)
-			return message.Content, nil
+			return Generation{Text: message.Content, Usage: resp.Usage, Model: resp.ResolvedModel, FinishReason: resp.FinishReason}, nil
 		}
 		if c.toolTurns >= c.maxTurns {
-			return "", BudgetError(fmt.Errorf(
+			return Generation{}, BudgetError(fmt.Errorf(
 				"%w: %s: the model called tools in more than %d replies",
 				ErrToolTurnLimit,
 				c.subject,
@@ -280,7 +282,7 @@ func (c *predictChat) reply(ctx context.Context) (string, error) {
 		c.transcript = append(c.transcript, message)
 		for _, call := range message.ToolCalls {
 			if !slices.ContainsFunc(c.tools, func(tool Tool) bool { return tool.Name == call.Name }) {
-				return "", PermanentError(fmt.Errorf(
+				return Generation{}, PermanentError(fmt.Errorf(
 					"%w %q: %s offers only %q",
 					ErrUnknownTool,
 					call.Name,
@@ -290,7 +292,7 @@ func (c *predictChat) reply(ctx context.Context) (string, error) {
 			}
 			result, _, err := c.session.Call(ctx, call)
 			if err != nil {
-				return "", err
+				return Generation{}, err
 			}
 			c.transcript = append(c.transcript, Message{
 				Role:       RoleTool,
@@ -302,7 +304,7 @@ func (c *predictChat) reply(ctx context.Context) (string, error) {
 }
 
 // chat makes one chat call: admitted against the run budget, its usage recorded once, and a
-// truncated or refused reply rejected.
+// refused reply rejected. The output policy governs a truncated reply without tool calls.
 func (c *predictChat) chat(ctx context.Context) (ChatResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return ChatResponse{}, err
@@ -325,7 +327,8 @@ func (c *predictChat) chat(ctx context.Context) (ChatResponse, error) {
 		Model:        resp.ResolvedModel,
 		FinishReason: resp.FinishReason,
 	}
-	if err := FinishReasonError(generation, c.subject); err != nil {
+	acceptLength := c.outputPolicy == AcceptValidTruncatedOutput && resp.FinishReason == FinishLength && len(resp.Message.ToolCalls) == 0
+	if err := FinishReasonError(generation, c.subject); err != nil && !acceptLength {
 		return resp, err
 	}
 	return resp, nil

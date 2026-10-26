@@ -69,7 +69,10 @@ func (c *cacheStep) runCandidate(ctx context.Context, candidate Candidate, s Sta
 	if keyErr == nil {
 		if result, ok := run.cached(c.child.name, key); ok {
 			finish := beginStandIn(ctx, cacheHit, c.child, values)
-			result.commitTo(s, c.child)
+			if err := result.commitTo(s, c.child); err != nil {
+				finish(stepResult{}, err)
+				return err
+			}
 			finish(result, nil)
 			return nil
 		}
@@ -84,8 +87,7 @@ func (c *cacheStep) runCandidate(ctx context.Context, candidate Candidate, s Sta
 		stored := result.clone()
 		finishHoldFrom(ctx).whenSucceeded(func() { run.storeCached(c.child.name, key, stored) })
 	}
-	result.commitTo(s, c.child)
-	return nil
+	return result.commitTo(s, c.child)
 }
 
 // cacheKey builds the key for the reads in view. A panic while building it, in key or in a

@@ -121,7 +121,9 @@ func (p *parallelStep) runCandidate(ctx context.Context, candidate Candidate, s 
 	wg.Wait()
 	if len(failures) == 0 {
 		for i, node := range p.steps {
-			results[i].commitTo(s, node)
+			if err := results[i].commitTo(s, node); err != nil {
+				return err
+			}
 		}
 		return nil
 	}

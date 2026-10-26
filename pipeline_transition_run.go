@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
-	"runtime/debug"
 	"slices"
 )
 
@@ -127,6 +126,7 @@ func (f *flowRun) run() error {
 		} else {
 			next, err = f.succeeded(i, visit)
 		}
+		f.observed.resolveStep(f.ctx)
 		if err != nil {
 			f.endRewind(true)
 			return err
@@ -555,10 +555,7 @@ func callAccept(rule *transitionRule, steps []*stepNode, prev, next map[string]a
 func callHook(rule *transitionRule, steps []*stepNode, hook string, call func() error) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			err = WithStepDetails(
-				fmt.Errorf("%s: %s panicked: %v", rule.describe(steps), hook, recovered),
-				map[string]any{"stack": string(debug.Stack())},
-			)
+			err = recoveredPanic(recovered, fmt.Sprintf("%s: %s panicked", rule.describe(steps), hook))
 		}
 	}()
 	if err := call(); err != nil {

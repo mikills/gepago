@@ -1,6 +1,9 @@
 package gepa
 
-import "reflect"
+import (
+	"context"
+	"reflect"
+)
 
 // SignatureProgram is a Program that a signature describes. Predict, ChainOfThought and
 // TypedPredict implement it, so a pipeline can check the reads and writes a step declares for
@@ -8,6 +11,13 @@ import "reflect"
 type SignatureProgram interface {
 	Program
 	ProgramSignature() (ProgramSignature, error)
+}
+
+// OutputPresenceProgram returns typed outputs without adding fields that the reply omitted.
+// Programme steps use it with PreserveExistingOutputs. Other callers keep the normal Program output contract.
+type OutputPresenceProgram interface {
+	Program
+	RunCandidateWithPresence(ctx context.Context, candidate Candidate, inputs Prediction) (Prediction, error)
 }
 
 // ProgramSignature describes the inputs and outputs of a SignatureProgram.

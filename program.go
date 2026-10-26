@@ -106,9 +106,9 @@ func refusalText(text string) string {
 
 // Predict is a prompt-backed programme: signature + instruction + model call + JSON parsing.
 // It records the usage of every model call, repair calls and failed calls included, into the
-// context's UsageCollector. A reply that stops at the token limit fails with ErrOutputTruncated,
-// and one a content policy withheld or refused fails with ErrContentFiltered; neither is sent
-// for repair.
+// context's UsageCollector. By default, a reply that stops at the token limit fails with ErrOutputTruncated.
+// OutputPolicy can accept complete, schema-valid output at that limit. Invalid truncated replies do not enter the repair loop.
+// A reply that a content policy withheld or refused fails with ErrContentFiltered and never enters the repair loop.
 //
 // When LM (or RepairLM, for repairs) is a StructuredGenerator, Predict passes it the
 // signature's ResponseFormat; otherwise it sends the prompt alone. Either way it checks the
@@ -138,6 +138,9 @@ type Predict struct {
 	Demos           []Demo
 	MaxParseRetries int
 	RepairLM        Generator
+	// OutputPolicy controls replies that stop at the output token limit.
+	// Its zero value rejects them. AcceptValidTruncatedOutput requires complete, valid output.
+	OutputPolicy OutputPolicy
 	// Tools names the tools the model may call while it answers. Predict then sends the prompt
 	// as a chat through LM, which must be a ChatClient, with the tools' schemas and the
 	// signature's ResponseFormat when it is strict. It runs the calls of each reply in order,
@@ -186,6 +189,9 @@ func (p Predict) Validate() error {
 		return errors.New("predict language model is required")
 	}
 	if err := p.validateImages(); err != nil {
+		return err
+	}
+	if err := p.validateOutputPolicy(); err != nil {
 		return err
 	}
 	return p.validateChat()
@@ -247,27 +253,27 @@ func (p Predict) run(
 	case p.chats():
 		return p.runChat(ctx, Message{Role: RoleUser, Content: prompt}, format, check)
 	}
-	raw, err := p.generate(ctx, p.LM, prompt, format)
+	generation, err := p.generate(ctx, p.LM, prompt, format)
 	if err != nil {
 		return nil, err
 	}
-	return p.parseOrRepair(ctx, prompt, raw, format, check)
+	return p.parseOrRepair(ctx, prompt, generation, format, check)
 }
 
-// generate makes one model call, records its usage and rejects a truncated or refused reply.
-func (p Predict) generate(ctx context.Context, lm Generator, prompt string, format ResponseFormat) (string, error) {
+// generate makes one model call and records its usage. The output policy governs truncated replies.
+func (p Predict) generate(ctx context.Context, lm Generator, prompt string, format ResponseFormat) (Generation, error) {
 	if err := AdmitModelCall(ctx); err != nil {
-		return "", err
+		return Generation{}, err
 	}
 	generation, err := GenerateWithFormat(ctx, lm, prompt, format)
 	RecordUsage(ctx, generation.Usage)
 	if err != nil {
-		return "", err
+		return generation, err
 	}
-	if err := FinishReasonError(generation, fmt.Sprintf("signature %q", p.Signature.Name)); err != nil {
-		return "", err
+	if err := p.finishReasonError(generation); err != nil {
+		return generation, err
 	}
-	return generation.Text, nil
+	return generation, nil
 }
 
 // BuildPrompt renders the signature, candidate text, demos, and inputs into a model prompt.
@@ -343,12 +349,12 @@ func schemaInstruction(schema json.RawMessage) string {
 func (p Predict) parseOrRepair(
 	ctx context.Context,
 	prompt string,
-	raw string,
+	generation Generation,
 	format ResponseFormat,
 	check func(Prediction) error,
 ) (Prediction, error) {
-	prediction, err := p.parseAndCheck(raw, check)
-	if err == nil || p.MaxParseRetries <= 0 {
+	prediction, err := p.parseGeneration(generation, check)
+	if err == nil || p.MaxParseRetries <= 0 || generation.FinishReason == FinishLength {
 		return prediction, err
 	}
 	repairLM := p.RepairLM
@@ -356,15 +362,15 @@ func (p Predict) parseOrRepair(
 		repairLM = p.LM
 	}
 	for attempt := 0; attempt < p.MaxParseRetries; attempt++ {
-		repaired, repairErr := p.generate(ctx, repairLM, p.RepairPrompt(prompt, raw, err), format)
+		repaired, repairErr := p.generate(ctx, repairLM, p.RepairPrompt(prompt, generation.Text, err), format)
 		if repairErr != nil {
 			return nil, repairErr
 		}
-		prediction, err = p.parseAndCheck(repaired, check)
-		if err == nil {
-			return prediction, nil
+		prediction, err = p.parseGeneration(repaired, check)
+		if err == nil || repaired.FinishReason == FinishLength {
+			return prediction, err
 		}
-		raw = repaired
+		generation = repaired
 	}
 	return prediction, err
 }
