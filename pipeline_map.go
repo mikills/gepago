@@ -147,7 +147,18 @@ func MapCollectUntil[In, Out any](
 			return stop(result, outcome.err)
 		}
 	}
-	return newMapStep(name, items, item, body, results.Ref(), reflect.TypeFor[Out](), opts, true, joinResults[Out], policy)
+	return newMapStep(
+		name,
+		items,
+		item,
+		body,
+		results.Ref(),
+		reflect.TypeFor[Out](),
+		opts,
+		true,
+		joinResults[Out],
+		policy,
+	)
 }
 
 func newMapStep[In any](

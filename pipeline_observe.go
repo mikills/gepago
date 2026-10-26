@@ -724,7 +724,12 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 func (r *runObservation) transitionTaken(ctx context.Context, event TransitionTakenEvent) {
 	r.deliverTransition(ctx, func(lane *runObservation) {
 		if state := lane.resolution; state != nil && state.pending != nil {
-			state.pending.Transition = &TransitionTrace{From: event.From, To: event.To, Rule: event.Rule, Rewind: event.Rewind}
+			state.pending.Transition = &TransitionTrace{
+				From:   event.From,
+				To:     event.To,
+				Rule:   event.Rule,
+				Rewind: event.Rewind,
+			}
 		}
 	}, func(observer TransitionObserver, rc RunContext, observerCtx context.Context) {
 		event := event

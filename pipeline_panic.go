@@ -25,7 +25,10 @@ func (e *PanicError) Error() string {
 // recoveredPanic retains the panic and attaches its stack to the existing step details.
 func recoveredPanic(value any, prefix string) error {
 	stack := debug.Stack()
-	return WithStepDetails(&PanicError{Value: value, Stack: stack, message: fmt.Sprintf("%s: %v", prefix, value)}, map[string]any{
-		"stack": string(stack),
-	})
+	return WithStepDetails(
+		&PanicError{Value: value, Stack: stack, message: fmt.Sprintf("%s: %v", prefix, value)},
+		map[string]any{
+			"stack": string(stack),
+		},
+	)
 }

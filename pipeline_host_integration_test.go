@@ -86,13 +86,15 @@ func TestMapUntilMiddlewarePanic(t *testing.T) {
 		t.Run(location, func(t *testing.T) {
 			value := errors.New("runtime panic")
 			running, predicateCalls := false, 0
-			tool := NewToolFunc(Tool{Name: "measure", Description: "measure a word", Parameters: []byte(`{"type":"object"}`)},
+			tool := NewToolFunc(
+				Tool{Name: "measure", Description: "measure a word", Parameters: []byte(`{"type":"object"}`)},
 				func(context.Context, ToolCall) (ToolResult, error) {
 					if location == "attempt" {
 						panic(value)
 					}
 					return ToolResult{Output: []byte(`{"length":1}`)}, nil
-				})
+				},
+			)
 			registry := middlewareRegistry(t, map[string]ToolMiddleware{
 				"fault": func(next ToolProvider) ToolProvider {
 					if running && location == "constructor" {
@@ -101,12 +103,16 @@ func TestMapUntilMiddlewarePanic(t *testing.T) {
 					if running && location == "schema" {
 						return hostSchemaPanicTool{ToolProvider: next, value: value}
 					}
-					return aroundTool(func(ctx context.Context, call ToolCall, provider ToolProvider) (ToolResult, error) {
-						if location == "middleware" {
-							panic(value)
-						}
-						return provider.Invoke(ctx, call)
-					})(next)
+					return aroundTool(
+						func(ctx context.Context, call ToolCall, provider ToolProvider) (ToolResult, error) {
+							if location == "middleware" {
+								panic(value)
+							}
+							return provider.Invoke(ctx, call)
+						},
+					)(
+						next,
+					)
 				},
 			}, tool)
 			body := ToolStep("read", "measure", refs(mapWordKey.Ref()), refs(mapLengthKey.Ref()))

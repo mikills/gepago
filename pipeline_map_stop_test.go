@@ -54,14 +54,22 @@ func TestMapCollectUntil(t *testing.T) {
 					return true
 				})
 			collected := Key[int]{Name: "completed"}
-			after := NewStep("collect", refs(mapCollectedKey.Ref()), refs(collected.Ref()), func(_ context.Context, s State) error {
-				results, err := mapCollectedKey.Get(s)
-				if err != nil {
-					return err
-				}
-				collected.Set(s, len(slices.DeleteFunc(results, func(result MapResult[int]) bool { return result.Skipped })))
-				return nil
-			})
+			after := NewStep(
+				"collect",
+				refs(mapCollectedKey.Ref()),
+				refs(collected.Ref()),
+				func(_ context.Context, s State) error {
+					results, err := mapCollectedKey.Get(s)
+					if err != nil {
+						return err
+					}
+					collected.Set(
+						s,
+						len(slices.DeleteFunc(results, func(result MapResult[int]) bool { return result.Skipped })),
+					)
+					return nil
+				},
+			)
 			log := &eventLog{}
 			pipeline := fpBuild(t, PipelineSpec{
 				Inputs: refs(mapWordsKey.Ref()), Steps: []Step{step, after}, Observers: []PipelineObserver{log},
@@ -121,10 +129,28 @@ func TestMapCollectUntilLimits(t *testing.T) {
 	}{
 		{name: "a successful terminal result survives cancellation", cancel: true, match: true, wantChecks: 2},
 		{name: "cancellation without a terminal result fails", cancel: true, wantErr: context.Canceled, wantChecks: 2},
-		{name: "a failed element cannot override cancellation", cancel: true, fail: true, match: true, wantErr: context.Canceled, wantChecks: 1},
-		{name: "a terminal result cannot override a budget failure", match: true, budget: RunBudget{MaxTokens: 1}, wantChecks: 1},
+		{
+			name:       "a failed element cannot override cancellation",
+			cancel:     true,
+			fail:       true,
+			match:      true,
+			wantErr:    context.Canceled,
+			wantChecks: 1,
+		},
+		{
+			name:       "a terminal result cannot override a budget failure",
+			match:      true,
+			budget:     RunBudget{MaxTokens: 1},
+			wantChecks: 1,
+		},
 		{name: "a terminal result cannot swallow a panic", match: true, panic: true, wantChecks: 1},
-		{name: "a terminal result cannot swallow a body timeout", match: true, timeout: true, wantErr: context.DeadlineExceeded, wantChecks: 1},
+		{
+			name:       "a terminal result cannot swallow a body timeout",
+			match:      true,
+			timeout:    true,
+			wantErr:    context.DeadlineExceeded,
+			wantChecks: 1,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -154,12 +180,22 @@ func TestMapCollectUntilLimits(t *testing.T) {
 				if tt.timeout {
 					body = WithPolicy(body, StepPolicy{Timeout: time.Second})
 				}
-				step := MapCollectUntil("lengths", mapWordsKey, mapWordKey, body, mapCollectedKey, MapOptions{MaxConcurrency: 1},
+				step := MapCollectUntil(
+					"lengths",
+					mapWordsKey,
+					mapWordKey,
+					body,
+					mapCollectedKey,
+					MapOptions{MaxConcurrency: 1},
 					func(result MapResult[int], _ error) bool {
 						checked++
 						return tt.match && result.Value == len("stop")
-					})
-				pipeline := fpBuild(t, PipelineSpec{Inputs: refs(mapWordsKey.Ref()), Steps: []Step{step}, Budget: tt.budget})
+					},
+				)
+				pipeline := fpBuild(
+					t,
+					PipelineSpec{Inputs: refs(mapWordsKey.Ref()), Steps: []Step{step}, Budget: tt.budget},
+				)
 				got, err := pipeline.RunCandidate(ctx, nil, wordsInput("a", "stop", "after"))
 				require.Equal(t, 2, ran)
 				require.Equal(t, tt.wantChecks, checked)
@@ -206,6 +242,22 @@ func TestMapCollectUntilBuild(t *testing.T) {
 		})
 	}
 	plain := mapPipeline(t, collectLengths(measureWith(wordLength), MapOptions{}))
-	stopping := mapPipeline(t, MapCollectUntil("lengths", mapWordsKey, mapWordKey, measureWith(wordLength), mapCollectedKey, MapOptions{}, stop))
-	require.NotEqual(t, plain.Fingerprint(), stopping.Fingerprint(), "the collection policy is part of the pipeline shape")
+	stopping := mapPipeline(
+		t,
+		MapCollectUntil(
+			"lengths",
+			mapWordsKey,
+			mapWordKey,
+			measureWith(wordLength),
+			mapCollectedKey,
+			MapOptions{},
+			stop,
+		),
+	)
+	require.NotEqual(
+		t,
+		plain.Fingerprint(),
+		stopping.Fingerprint(),
+		"the collection policy is part of the pipeline shape",
+	)
 }

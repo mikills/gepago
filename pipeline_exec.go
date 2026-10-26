@@ -168,7 +168,11 @@ type stepResult struct {
 }
 
 func (r stepResult) clone() stepResult {
-	out := stepResult{writes: make(map[string]any, len(r.writes)), preserved: maps.Clone(r.preserved), staged: r.staged.clone()}
+	out := stepResult{
+		writes:    make(map[string]any, len(r.writes)),
+		preserved: maps.Clone(r.preserved),
+		staged:    r.staged.clone(),
+	}
 	for key, value := range r.writes {
 		out.writes[key] = deepCopy(value)
 	}

@@ -34,15 +34,30 @@ func TestProgramOutputUpdates(t *testing.T) {
 					lm := replyModel(reply)
 					var program gepa.Program = gepa.Predict{
 						Signature: gepa.Signature{Inputs: []gepa.Field{{Name: "q"}}, Outputs: []gepa.Field{
-							{Name: "answer"}, {Name: "score", Type: "int"}, {Name: "note", Type: "string", Optional: true},
+							{
+								Name: "answer",
+							}, {Name: "score", Type: "int"}, {Name: "note", Type: "string", Optional: true},
 						}}, LM: lm,
 					}
 					if typed {
 						program = gepa.TypedPredict[typedStepIn, typedStepOut]{LM: lm}
 					}
-					step := gepa.NewProgramStep("update", program, refs(stepQuestion.Ref()),
-						refs(stepAnswer.Ref(), stepScore.Ref(), stepNote.Ref()), gepa.PreserveExistingOutputs(stepNote.Ref()))
-					pipeline, err := gepa.PipelineSpec{Inputs: refs(stepQuestion.Ref()), Defaults: []gepa.Default{gepa.DefaultValue(stepNote, "prior")}, Steps: []gepa.Step{step}}.Build()
+					step := gepa.NewProgramStep(
+						"update",
+						program,
+						refs(stepQuestion.Ref()),
+						refs(
+							stepAnswer.Ref(),
+							stepScore.Ref(),
+							stepNote.Ref(),
+						),
+						gepa.PreserveExistingOutputs(stepNote.Ref()),
+					)
+					pipeline, err := gepa.PipelineSpec{
+						Inputs:   refs(stepQuestion.Ref()),
+						Defaults: []gepa.Default{gepa.DefaultValue(stepNote, "prior")},
+						Steps:    []gepa.Step{step},
+					}.Build()
 					require.NoError(t, err)
 					out, err := pipeline.Run(context.Background(), gepa.NewState(gepa.Prediction{"q": "?"}))
 					require.NoError(t, err)
@@ -79,8 +94,17 @@ func TestProgramUpdateBuild(t *testing.T) {
 
 	t.Run("preservation changes the fingerprint when read dependencies match", func(t *testing.T) {
 		build := func(options ...gepa.ProgramStepOption) gepa.Pipeline {
-			step := gepa.NewProgramStep("update", updateProgram{}, refs(stepQuestion.Ref(), stepNote.Ref()), refs(stepNote.Ref()), options...)
-			pipeline, err := gepa.PipelineSpec{Inputs: refs(stepQuestion.Ref()), Defaults: []gepa.Default{gepa.DefaultValue(stepNote, "prior")}, Steps: []gepa.Step{step}}.Build()
+			step := gepa.NewProgramStep(
+				"update",
+				updateProgram{},
+				refs(stepQuestion.Ref(), stepNote.Ref()),
+				refs(stepNote.Ref()),
+				options...)
+			pipeline, err := gepa.PipelineSpec{
+				Inputs:   refs(stepQuestion.Ref()),
+				Defaults: []gepa.Default{gepa.DefaultValue(stepNote, "prior")},
+				Steps:    []gepa.Step{step},
+			}.Build()
 			require.NoError(t, err)
 			return pipeline
 		}
@@ -100,10 +124,20 @@ func TestProgramOutputPreservation(t *testing.T) {
 			return gepa.WithPolicy(step, gepa.StepPolicy{})
 		}},
 		{name: "cache", wrap: func(step gepa.Step) gepa.Step { return gepa.WithCache(step, nil) }},
-		{name: "amendable", amendable: true, wrap: func(step gepa.Step) gepa.Step { return gepa.WithAmendable(step, count.Ref()) }},
+		{
+			name:      "amendable",
+			amendable: true,
+			wrap:      func(step gepa.Step) gepa.Step { return gepa.WithAmendable(step, count.Ref()) },
+		},
 		{name: "parallel", wrap: func(step gepa.Step) gepa.Step { return gepa.Parallel("fan", step) }},
 		{name: "nested wrappers", amendable: true, wrap: func(step gepa.Step) gepa.Step {
-			return gepa.WithAmendable(gepa.WithCache(gepa.WithPolicy(gepa.Parallel("fan", gepa.WithCache(step, nil)), gepa.StepPolicy{}), nil), count.Ref())
+			return gepa.WithAmendable(
+				gepa.WithCache(
+					gepa.WithPolicy(gepa.Parallel("fan", gepa.WithCache(step, nil)), gepa.StepPolicy{}),
+					nil,
+				),
+				count.Ref(),
+			)
 		}},
 	}
 	for _, wrapper := range wrappers {
@@ -116,7 +150,13 @@ func TestProgramOutputPreservation(t *testing.T) {
 				t.Run(name, func(t *testing.T) {
 					mergeCalls := 0
 					recorder := &gepa.RecordingObserver{}
-					preserve := gepa.NewProgramStep("preserve", updateProgram{}, nil, refs(count.Ref()), gepa.PreserveExistingOutputs(count.Ref()))
+					preserve := gepa.NewProgramStep(
+						"preserve",
+						updateProgram{},
+						nil,
+						refs(count.Ref()),
+						gepa.PreserveExistingOutputs(count.Ref()),
+					)
 					spec := gepa.PipelineSpec{
 						Defaults: []gepa.Default{gepa.DefaultValue(count, 3)},
 						Merges: []gepa.MergeRule{gepa.MergeWith(count, func(prev, next int) (int, error) {
@@ -126,17 +166,29 @@ func TestProgramOutputPreservation(t *testing.T) {
 						Observers: []gepa.PipelineObserver{recorder},
 					}
 					if committed {
-						spec.Steps = append(spec.Steps, gepa.NewStep("seed", nil, refs(count.Ref()), func(_ context.Context, state gepa.State) error {
-							count.Set(state, 3)
-							return nil
-						}))
+						spec.Steps = append(
+							spec.Steps,
+							gepa.NewStep(
+								"seed",
+								nil,
+								refs(count.Ref()),
+								func(_ context.Context, state gepa.State) error {
+									count.Set(state, 3)
+									return nil
+								},
+							),
+						)
 					}
 					preserveIndex := len(spec.Steps)
 					wrapped := wrapper.wrap(preserve)
-					spec.Steps = append(spec.Steps, wrapped, gepa.NewStep("write", nil, refs(count.Ref()), func(_ context.Context, state gepa.State) error {
-						count.Set(state, 2)
-						return nil
-					}))
+					spec.Steps = append(
+						spec.Steps,
+						wrapped,
+						gepa.NewStep("write", nil, refs(count.Ref()), func(_ context.Context, state gepa.State) error {
+							count.Set(state, 2)
+							return nil
+						}),
+					)
 					if wrapper.amendable {
 						spec.Transitions = []gepa.Transition{{From: "write", To: wrapped.Name(),
 							When: func(gepa.State, error) bool { return false }, Amend: func(gepa.State) error { return nil }}}
@@ -154,7 +206,12 @@ func TestProgramOutputPreservation(t *testing.T) {
 					}
 					require.Equal(t, want, got)
 					require.Equal(t, wantMerges, mergeCalls)
-					require.NotContains(t, recorder.Traces()[0].Steps[preserveIndex].Writes, count.Name, "preservation is not a real write")
+					require.NotContains(
+						t,
+						recorder.Traces()[0].Steps[preserveIndex].Writes,
+						count.Name,
+						"preservation is not a real write",
+					)
 				})
 			}
 		})
@@ -162,8 +219,15 @@ func TestProgramOutputPreservation(t *testing.T) {
 
 	t.Run("a cached omission keeps the current value after another write", func(t *testing.T) {
 		calls := 0
-		cached := gepa.WithCache(gepa.NewProgramStep("preserve", countingUpdateProgram{calls: &calls}, nil,
-			refs(count.Ref()), gepa.PreserveExistingOutputs(count.Ref())), func(gepa.State) (string, error) { return "same", nil })
+		cached := gepa.WithCache(gepa.NewProgramStep(
+			"preserve",
+			countingUpdateProgram{calls: &calls},
+			nil,
+			refs(
+				count.Ref(),
+			),
+			gepa.PreserveExistingOutputs(count.Ref()),
+		), func(gepa.State) (string, error) { return "same", nil })
 		state := gepa.NewState(gepa.Prediction{"count": 3})
 		driver := gepa.NewStep("driver", nil, nil, func(ctx context.Context, _ gepa.State) error {
 			if err := cached.Run(ctx, state); err != nil {
@@ -186,7 +250,13 @@ func TestProgramOutputPreservation(t *testing.T) {
 		items := gepa.Key[[]string]{Name: "items"}
 		item := gepa.Key[string]{Name: "item"}
 		results := gepa.Key[[]gepa.MapResult[int]]{Name: "results"}
-		body := gepa.NewProgramStep("preserve", updateProgram{}, refs(item.Ref()), refs(count.Ref()), gepa.PreserveExistingOutputs(count.Ref()))
+		body := gepa.NewProgramStep(
+			"preserve",
+			updateProgram{},
+			refs(item.Ref()),
+			refs(count.Ref()),
+			gepa.PreserveExistingOutputs(count.Ref()),
+		)
 		_, err := gepa.PipelineSpec{
 			Inputs: refs(items.Ref()), Defaults: []gepa.Default{gepa.DefaultValue(count, 3)},
 			Steps: []gepa.Step{gepa.MapCollect("map", items, item, body, results, gepa.MapOptions{})},

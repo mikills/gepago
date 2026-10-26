@@ -364,14 +364,20 @@ func applyToolMiddleware(name string, middleware ToolMiddleware, next ToolProvid
 ) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			wrapped, err = nil, recoveredPanic(recovered, fmt.Sprintf("tool middleware %q panicked on tool %q", name, schema.Name))
+			wrapped, err = nil, recoveredPanic(
+				recovered,
+				fmt.Sprintf("tool middleware %q panicked on tool %q", name, schema.Name),
+			)
 		}
 	}()
 	wrapped = middleware(next)
 	if isNil(wrapped) {
 		return nil, fmt.Errorf("tool middleware %q returned a nil provider for tool %q", name, schema.Name)
 	}
-	got, schemaErr := schemaOf(wrapped, fmt.Sprintf("tool middleware %q: schema of tool %q panicked", name, schema.Name))
+	got, schemaErr := schemaOf(
+		wrapped,
+		fmt.Sprintf("tool middleware %q: schema of tool %q panicked", name, schema.Name),
+	)
 	if schemaErr != nil {
 		return nil, schemaErr
 	}

@@ -27,12 +27,28 @@ func TestValidatedTruncatedOutput(t *testing.T) {
 		{name: "trailing content", reply: `{"answer":{"label":"ok","count":1}} trailing`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			lm := script(gepatest.Reply{Text: tc.reply, FinishReason: gepa.FinishLength, Usage: gepa.Usage{CompletionTokens: 42}})
+			lm := script(
+				gepatest.Reply{
+					Text:         tc.reply,
+					FinishReason: gepa.FinishLength,
+					Usage:        gepa.Usage{CompletionTokens: 42},
+				},
+			)
 			predict := qaPredict(lm, 2)
 			predict.OutputPolicy = gepa.AcceptValidTruncatedOutput
-			predict.Signature.Outputs[0].Schema = json.RawMessage(`{"type":"object","properties":{"label":{"type":"string","enum":["ok"]},"count":{"type":"integer"}},"required":["label","count"],"additionalProperties":false}`)
-			step := gepa.NewProgramStep("answer", predict, refs(gepa.Key[string]{Name: "question"}.Ref()), refs(gepa.Key[any]{Name: "answer"}.Ref()))
-			pipeline, err := gepa.PipelineSpec{Inputs: refs(gepa.Key[string]{Name: "question"}.Ref()), Steps: []gepa.Step{step}}.Build()
+			predict.Signature.Outputs[0].Schema = json.RawMessage(
+				`{"type":"object","properties":{"label":{"type":"string","enum":["ok"]},"count":{"type":"integer"}},"required":["label","count"],"additionalProperties":false}`,
+			)
+			step := gepa.NewProgramStep(
+				"answer",
+				predict,
+				refs(gepa.Key[string]{Name: "question"}.Ref()),
+				refs(gepa.Key[any]{Name: "answer"}.Ref()),
+			)
+			pipeline, err := gepa.PipelineSpec{
+				Inputs: refs(gepa.Key[string]{Name: "question"}.Ref()),
+				Steps:  []gepa.Step{step},
+			}.Build()
 			require.NoError(t, err)
 			ctx, usage := gepa.WithUsageCollector(context.Background())
 			_, err = pipeline.Run(ctx, gepa.NewState(gepa.Prediction{"question": "?"}))
@@ -85,7 +101,11 @@ func TestTruncatedOutputPolicies(t *testing.T) {
 	})
 	t.Run("typed validation still rejects an invalid domain value", func(t *testing.T) {
 		lm := script(gepatest.Reply{Text: `{"amount":1,"currency":""}`, FinishReason: gepa.FinishLength})
-		p := gepa.TypedPredict[typedStepIn, validatedObligation]{LM: lm, OutputPolicy: gepa.AcceptValidTruncatedOutput, MaxParseRetries: 2}
+		p := gepa.TypedPredict[typedStepIn, validatedObligation]{
+			LM:              lm,
+			OutputPolicy:    gepa.AcceptValidTruncatedOutput,
+			MaxParseRetries: 2,
+		}
 		_, err := p.Run(context.Background(), typedStepIn{Q: "?"})
 		require.ErrorIs(t, err, gepa.ErrOutputTruncated)
 		require.ErrorContains(t, err, "currency is required")
@@ -147,12 +167,18 @@ func TestImageChatOutputPolicies(t *testing.T) {
 				registry, err := gepa.NewToolRegistry(lookupTool(&tools))
 				require.NoError(t, err)
 				require.NoError(t, registry.RegisterMiddleware("count", func(next gepa.ChatClient) gepa.ChatClient {
-					return gepa.ChatClientFunc(func(ctx context.Context, request gepa.ChatRequest) (gepa.ChatResponse, error) {
-						middleware.Add(1)
-						return next.Chat(ctx, request)
-					})
+					return gepa.ChatClientFunc(
+						func(ctx context.Context, request gepa.ChatRequest) (gepa.ChatResponse, error) {
+							middleware.Add(1)
+							return next.Chat(ctx, request)
+						},
+					)
 				}))
-				predict.Tools, predict.Middleware, predict.ToolRegistry = []string{"lookup_order"}, []string{"count"}, registry
+				predict.Tools, predict.Middleware, predict.ToolRegistry = []string{
+					"lookup_order",
+				}, []string{
+					"count",
+				}, registry
 			}
 			photo := gepatest.PNG("policy")
 			got, err := predict.Run(context.Background(), gepa.Prediction{"photo": photo, "hint": "x"})

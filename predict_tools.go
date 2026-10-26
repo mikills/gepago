@@ -202,7 +202,10 @@ func (p Predict) runChat(
 	}
 	prediction, err := p.parseGeneration(generation, check)
 	for attempt := 0; err != nil && generation.FinishReason != FinishLength && attempt < p.MaxParseRetries; attempt++ {
-		chat.transcript = append(chat.transcript, Message{Role: RoleUser, Content: p.RepairPrompt("", generation.Text, err)})
+		chat.transcript = append(
+			chat.transcript,
+			Message{Role: RoleUser, Content: p.RepairPrompt("", generation.Text, err)},
+		)
 		var replyErr error
 		if generation, replyErr = chat.reply(ctx); replyErr != nil {
 			return nil, replyErr
@@ -268,7 +271,12 @@ func (c *predictChat) reply(ctx context.Context) (Generation, error) {
 		message.Role = RoleAssistant
 		if len(message.ToolCalls) == 0 {
 			c.transcript = append(c.transcript, message)
-			return Generation{Text: message.Content, Usage: resp.Usage, Model: resp.ResolvedModel, FinishReason: resp.FinishReason}, nil
+			return Generation{
+				Text:         message.Content,
+				Usage:        resp.Usage,
+				Model:        resp.ResolvedModel,
+				FinishReason: resp.FinishReason,
+			}, nil
 		}
 		if c.toolTurns >= c.maxTurns {
 			return Generation{}, BudgetError(fmt.Errorf(
@@ -327,7 +335,8 @@ func (c *predictChat) chat(ctx context.Context) (ChatResponse, error) {
 		Model:        resp.ResolvedModel,
 		FinishReason: resp.FinishReason,
 	}
-	acceptLength := c.outputPolicy == AcceptValidTruncatedOutput && resp.FinishReason == FinishLength && len(resp.Message.ToolCalls) == 0
+	acceptLength := c.outputPolicy == AcceptValidTruncatedOutput && resp.FinishReason == FinishLength &&
+		len(resp.Message.ToolCalls) == 0
 	if err := FinishReasonError(generation, c.subject); err != nil && !acceptLength {
 		return resp, err
 	}

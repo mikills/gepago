@@ -78,7 +78,11 @@ func TestPanicError(t *testing.T) {
 					continue
 				}
 				var exposed *PanicError
-				require.False(t, errors.As(event.Err, &exposed), "redacted errors do not expose the original panic or stack")
+				require.False(
+					t,
+					errors.As(event.Err, &exposed),
+					"redacted errors do not expose the original panic or stack",
+				)
 				require.NotContains(t, event.Err.Error(), secretEmail)
 			}
 			var exposed *PanicError

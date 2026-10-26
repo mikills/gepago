@@ -64,7 +64,10 @@ func (s programStep) validatePreservedOutputs() error {
 			return err
 		}
 		for _, key := range s.preserve {
-			index := slices.IndexFunc(signature.Signature.Outputs, func(field Field) bool { return field.Name == key.Name })
+			index := slices.IndexFunc(
+				signature.Signature.Outputs,
+				func(field Field) bool { return field.Name == key.Name },
+			)
 			if index < 0 || !signature.Signature.Outputs[index].Optional {
 				return fmt.Errorf("preserved output %q must be an Optional signature output", key.Name)
 			}
