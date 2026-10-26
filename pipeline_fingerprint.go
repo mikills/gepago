@@ -127,6 +127,7 @@ type stepShape struct {
 	Amendable []keyShape   `json:"amendable,omitempty"`
 	Map       *mapShape    `json:"map,omitempty"`
 	Loop      *loopShape   `json:"loop,omitempty"`
+	Preserve  []keyShape   `json:"preserve,omitempty"`
 }
 
 // mapShape is the shape a Map or MapCollect adds to its body: the read that holds the items,
@@ -137,6 +138,7 @@ type mapShape struct {
 	Results        string   `json:"results"`
 	MaxConcurrency int      `json:"max_concurrency,omitempty"`
 	MaxItems       int      `json:"max_items,omitempty"`
+	StopWhen       bool     `json:"stop_when,omitempty"`
 }
 
 // loopShape is the shape a Loop adds to its body: its cap and its iteration key. The key is the
@@ -198,6 +200,7 @@ func shapeOf(node *stepNode) stepShape {
 			Results:        s.results.Name,
 			MaxConcurrency: s.opts.MaxConcurrency,
 			MaxItems:       s.opts.MaxItems,
+			StopWhen:       s.stop != nil,
 		}
 		shape.Children = []childShape{{Label: "body", Step: shapeOf(s.body)}}
 	case *loopStep:
@@ -209,6 +212,7 @@ func shapeOf(node *stepNode) stepShape {
 		shape.Children = []childShape{{Label: "body", Step: shapeOf(s.body)}}
 	case programStep:
 		shape.Program = programFingerprint(s.program)
+		shape.Preserve = keyShapes(s.preserve)
 	case compositeStep:
 		// a composite this function does not know yet still contributes its children, under
 		// the labels Build gives them.

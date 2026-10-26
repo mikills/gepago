@@ -129,6 +129,9 @@ const (
 // redactValues returns copies of values as the run's events carry them. The caller holds the
 // trace lock.
 func (r *runObservation) redactValues(values map[string]any) map[string]any {
+	if r.metadataOnly {
+		return metadataValues(values)
+	}
 	if len(values) == 0 {
 		return nil
 	}
@@ -142,6 +145,9 @@ func (r *runObservation) redactValues(values map[string]any) map[string]any {
 // redact returns a copy of value as the run's events carry it, and remembers its text when the
 // run's redactors change it. The caller holds the trace lock.
 func (r *runObservation) redact(key string, value any) any {
+	if r.metadataOnly {
+		return nil
+	}
 	if len(r.redactors) == 0 {
 		return deepCopy(value)
 	}
@@ -169,6 +175,9 @@ func applyRedactors(redactors []Redactor, key string, value any) (out any) {
 // redactRunContext returns a copy of rc as the run's events carry it, each attribute passed
 // through the redactors under its attributeKey. The caller holds the trace lock.
 func (r *runObservation) redactRunContext(rc RunContext) RunContext {
+	if r.metadataOnly {
+		return metadataRunContext(rc)
+	}
 	rc = rc.clone()
 	for name, value := range rc.Attributes {
 		rc.Attributes[name] = toolText(r.redact(attributeKey(name), value))
@@ -218,6 +227,9 @@ func (r *runObservation) redactEntries(details map[string]any) map[string]any {
 // detail redacted by redactEntry, and the redacted text removed from every string in them. The
 // caller holds the trace lock.
 func (r *runObservation) redactDetails(details map[string]any) map[string]any {
+	if r.metadataOnly {
+		return nil
+	}
 	out := r.redactEntries(details)
 	if r.redacting() {
 		out = r.scrubValues(out)
@@ -409,6 +421,19 @@ type traceMapping struct {
 
 // mapTrace returns a copy of trace, its nested runs included, with mapping applied.
 func mapTrace(trace PipelineTrace, mapping traceMapping) PipelineTrace {
+	if trace.MetadataOnly {
+		mapping = traceMapping{
+			reads:  func(values map[string]any, _ string) map[string]any { return metadataValues(values) },
+			values: metadataValues, details: func(map[string]any) map[string]any { return nil }, tools: metadataToolCalls,
+			text: func(text string) string {
+				if text != "" {
+					return RedactedText
+				}
+				return ""
+			},
+			runContext: metadataRunContext,
+		}
+	}
 	trace.RunContext = mapping.runContext(trace.RunContext)
 	trace.Inputs = mapping.reads(trace.Inputs, trace.SpanID)
 	trace.Err = mapping.text(trace.Err)
@@ -456,6 +481,9 @@ func (r *runObservation) scrubRunContext(rc RunContext) RunContext {
 // remembers their text when the redactors change them. A call whose Text is its output's JSON
 // keeps the redacted output's JSON as its Text. The caller holds the trace lock.
 func (r *runObservation) redactToolCalls(records []ToolCallRecord) []ToolCallRecord {
+	if r.metadataOnly {
+		return metadataToolCalls(records)
+	}
 	records = cloneRecords(records)
 	if len(r.redactors) == 0 {
 		return records
@@ -801,10 +829,13 @@ func (s *jsonScrubber) value(token json.Token) {
 // redacted, and otherwise a copy with the redacted text removed from its message. The caller
 // holds the trace lock.
 func (r *runObservation) redactError(err error) error {
-	if err == nil || !r.redacting() {
+	if err == nil || (!r.metadataOnly && !r.redacting()) {
 		return err
 	}
-	redacted := &redactedError{message: r.trace.scrub(err.Error())}
+	redacted := &redactedError{message: RedactedText}
+	if !r.metadataOnly {
+		redacted.message = r.trace.scrub(err.Error())
+	}
 	for _, target := range []error{ErrInvalidOutput, context.Canceled, context.DeadlineExceeded} {
 		if errors.Is(err, target) {
 			redacted.matches = append(redacted.matches, target)
@@ -830,6 +861,9 @@ func eventErrorText(ctx context.Context, err error) string {
 	}
 	run.trace.mu.Lock()
 	defer run.trace.mu.Unlock()
+	if run.metadataOnly && !run.redacting() {
+		return err.Error()
+	}
 	return run.redactError(err).Error()
 }
 

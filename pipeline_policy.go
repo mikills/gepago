@@ -95,8 +95,7 @@ func (p *policyStep) runCandidate(ctx context.Context, candidate Candidate, s St
 	for attempt := 1; ; attempt++ {
 		result, err := p.attempt(ctx, candidate, values, attempt)
 		if err == nil {
-			result.commitTo(s, p.child)
-			return nil
+			return result.commitTo(s, p.child)
 		}
 		if ctx.Err() != nil {
 			return err

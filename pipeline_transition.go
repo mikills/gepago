@@ -164,8 +164,7 @@ func (a *amendableStep) runCandidate(ctx context.Context, candidate Candidate, s
 	if err != nil {
 		return nameWrapped(ctx, s, a.child, err)
 	}
-	result.commitTo(s, a.child)
-	return nil
+	return result.commitTo(s, a.child)
 }
 
 // unwrapComposite returns the composite behind the candidate plumbing asComponentStep adds, or

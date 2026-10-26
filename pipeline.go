@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
-	"runtime/debug"
 	"slices"
 	"strings"
 )
@@ -78,15 +77,24 @@ func (s funcStep) Run(ctx context.Context, state State) error {
 // be omitted or null: the step then commits the zero value of the write's key type, which
 // must pass that type's Validate method, if it has one. Which outputs are optional is fixed
 // when Build checks the step, so the built pipeline keeps it even if the programme changes.
-func NewProgramStep(name string, program Program, reads, writes []KeyRef) ComponentStep {
-	return programStep{name: name, program: program, reads: slices.Clone(reads), writes: slices.Clone(writes)}
+// PreserveExistingOutputs keeps prior state values for absent outputs.
+// It adds state reads without adding programme inputs. The other output checks still apply.
+func NewProgramStep(name string, program Program, reads, writes []KeyRef, options ...ProgramStepOption) ComponentStep {
+	step := programStep{name: name, program: program, reads: slices.Clone(reads), writes: slices.Clone(writes)}
+	for _, option := range options {
+		if option != nil {
+			option(&step)
+		}
+	}
+	return step
 }
 
 type programStep struct {
-	name    string
-	program Program
-	reads   []KeyRef
-	writes  []KeyRef
+	name     string
+	program  Program
+	reads    []KeyRef
+	writes   []KeyRef
+	preserve []KeyRef
 }
 
 // optionalOutputs returns the outputs the signature of program marks Optional, if program is a
@@ -110,7 +118,7 @@ func optionalOutputs(program Program) map[string]bool {
 }
 
 func (s programStep) Name() string     { return s.name }
-func (s programStep) Reads() []KeyRef  { return s.reads }
+func (s programStep) Reads() []KeyRef  { return s.stateReads() }
 func (s programStep) Writes() []KeyRef { return s.writes }
 
 func (s programStep) Validate() error {
@@ -118,6 +126,9 @@ func (s programStep) Validate() error {
 		return errors.New("program is required")
 	}
 	if err := s.program.Validate(); err != nil {
+		return err
+	}
+	if err := s.validatePreservedOutputs(); err != nil {
 		return err
 	}
 	signed, ok := s.program.(SignatureProgram)
@@ -234,7 +245,13 @@ func (s programStep) RunCandidate(ctx context.Context, candidate Candidate, stat
 		}
 		inputs[key.Name] = deepCopy(value)
 	}
-	outputs, err := s.program.RunCandidate(ctx, candidate, inputs)
+	var outputs Prediction
+	var err error
+	if program, ok := s.program.(OutputPresenceProgram); ok && len(s.preserve) > 0 {
+		outputs, err = program.RunCandidateWithPresence(ctx, candidate, inputs)
+	} else {
+		outputs, err = s.program.RunCandidate(ctx, candidate, inputs)
+	}
 	if err != nil {
 		return err
 	}
@@ -243,6 +260,12 @@ func (s programStep) RunCandidate(ctx context.Context, candidate Candidate, stat
 		optional = optionalOutputs(s.program)
 	}
 	for _, key := range s.writes {
+		if _, present := outputs[key.Name]; !present && s.preserves(key.Name) {
+			if err := state.preserve(key.Name, key.Type); err != nil {
+				return WithStepDetails(err, map[string]any{"output": clonePrediction(outputs)})
+			}
+			continue
+		}
 		value, err := programOutput(outputs, key, optional[key.Name])
 		if err != nil {
 			return WithStepDetails(err, map[string]any{"output": clonePrediction(outputs)})
@@ -322,8 +345,10 @@ func DefaultValue[T any](k Key[T], value T) Default {
 // runs. A run fails when its inputs hold a key that is not declared in Inputs, unless
 // AllowExtraInputs is set, in which case such keys are dropped.
 type PipelineSpec struct {
-	Inputs []KeyRef
-	Steps  []Step
+	// Finalizer runs bounded host bookkeeping after the steps finish. Nil disables it.
+	Finalizer *PipelineFinalizer
+	Inputs    []KeyRef
+	Steps     []Step
 	// Transitions move a run from a top-level step to another in place of the next one in order;
 	// see Transition.
 	Transitions []Transition
@@ -374,6 +399,13 @@ type PipelineSpec struct {
 	ToolMiddleware []string
 	// Observers receive the events of every run, in this order; see PipelineObserver.
 	Observers []PipelineObserver
+	// MetadataOnly omits payloads from observation before copying or redaction indexing.
+	// Events keep key names with nil values, tool names, usage, timing and error kinds.
+	// RunContext attribute values, error details and tool payloads are omitted.
+	// The policy also applies to nested runs and evaluation traces, including their own observers.
+	// Evaluation outputs and reflection redaction still follow the programme's Redactors.
+	// Under a Redactor, MapCollect uses RedactedText for element error messages in its output.
+	MetadataOnly bool
 	// Redactor rewrites the values events carry; see Redactor. Nil lets them through.
 	Redactor Redactor
 }
@@ -385,6 +417,7 @@ type PipelineSpec struct {
 // RunContext, which its steps find with RunContextFrom. Steps shared between concurrent runs, or
 // run side by side by Parallel or Map, must themselves be safe for concurrent use.
 type Pipeline struct {
+	finalizer        *PipelineFinalizer
 	inputs           []KeyRef
 	inputTypes       map[string]reflect.Type
 	allowExtraInputs bool
@@ -397,6 +430,7 @@ type Pipeline struct {
 	toolPolicy       ToolPolicy
 	toolMiddleware   []string
 	observers        []PipelineObserver
+	metadataOnly     bool
 	redactor         Redactor
 	// optional holds, for each programme step, the outputs its signature marked Optional when
 	// Build checked it.
@@ -464,6 +498,9 @@ func (s PipelineSpec) Build() (Pipeline, error) {
 // build is Build. When work is not nil, it receives the iterations that Build's passes over the
 // transitions and the steps made (see transitionFacts), which a test bounds.
 func (s PipelineSpec) build(work *int) (Pipeline, error) {
+	if err := s.Finalizer.validate(); err != nil {
+		return Pipeline{}, err
+	}
 	if len(s.Steps) == 0 {
 		return Pipeline{}, errors.New("pipeline requires at least one step")
 	}
@@ -543,6 +580,7 @@ func (s PipelineSpec) build(work *int) (Pipeline, error) {
 		defaultValues[name] = def.Value
 	}
 	return Pipeline{
+		finalizer:        s.Finalizer.clone(),
 		inputs:           slices.Clone(s.Inputs),
 		inputTypes:       inputs,
 		allowExtraInputs: s.AllowExtraInputs,
@@ -556,6 +594,7 @@ func (s PipelineSpec) build(work *int) (Pipeline, error) {
 		toolMiddleware:   slices.Clone(s.ToolMiddleware),
 		optional:         builder.optional,
 		observers:        slices.Clone(s.Observers),
+		metadataOnly:     s.MetadataOnly,
 		redactor:         s.Redactor,
 	}, nil
 }
@@ -815,12 +854,12 @@ func (p Pipeline) execute(ctx context.Context, candidate Candidate, inputs Predi
 	maps.Copy(values, seeded)
 	state := State{values: values}
 	flow := newFlowRun(p, ctx, candidate, state, defaulted, observed)
-	if err := flow.run(); err != nil {
-		observed.finish(ctx, err)
-		return state, run, err
+	runErr := flow.run()
+	if finalErr := p.finalize(caller, state, runErr); finalErr != nil {
+		runErr = errors.Join(runErr, finalErr)
 	}
-	observed.finish(ctx, nil)
-	return state, run, nil
+	observed.finish(ctx, runErr)
+	return state, run, runErr
 }
 
 func (p Pipeline) checkUndeclaredInputs(inputs Prediction) error {
@@ -852,10 +891,7 @@ func (p Pipeline) mergeWrites(node *stepNode, result stepResult, values map[stri
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			committed = nil
-			err = WithStepDetails(
-				fmt.Errorf("step panicked: %v", recovered),
-				map[string]any{"stack": string(debug.Stack())},
-			)
+			err = recoveredPanic(recovered, "step panicked")
 		}
 	}()
 	committed = make(map[string]any, len(result.writes))

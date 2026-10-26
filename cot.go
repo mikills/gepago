@@ -17,6 +17,8 @@ type ChainOfThought struct {
 	ReasoningField  string
 	MaxParseRetries int
 	RepairLM        Generator
+	// OutputPolicy controls truncated replies as it does on Predict.
+	OutputPolicy OutputPolicy
 }
 
 // Validate checks the underlying Predict programme produced by ToPredict.
@@ -43,6 +45,7 @@ func (c ChainOfThought) ToPredict() Predict {
 		Demos:           c.Demos,
 		MaxParseRetries: c.MaxParseRetries,
 		RepairLM:        c.RepairLM,
+		OutputPolicy:    c.OutputPolicy,
 	}
 }
 

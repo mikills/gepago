@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"runtime/debug"
+	"maps"
 	"sync"
 	"time"
 )
@@ -159,15 +159,20 @@ func (r *pipelineRun) endCacheJournal(keep bool) {
 	}
 }
 
-// stepResult is what a successful step leaves to commit: its pending writes, already copies
-// of their declared types, and the tool memory writes and cached tool results it staged.
+// stepResult holds a successful step's pending writes and the tool results it staged.
+// The preserved set holds unchanged outputs. Those keys do not enter merges or replace defaults.
 type stepResult struct {
-	writes map[string]any
-	staged stagedTools
+	writes    map[string]any
+	preserved map[string]bool
+	staged    stagedTools
 }
 
 func (r stepResult) clone() stepResult {
-	out := stepResult{writes: make(map[string]any, len(r.writes)), staged: r.staged.clone()}
+	out := stepResult{
+		writes:    make(map[string]any, len(r.writes)),
+		preserved: maps.Clone(r.preserved),
+		staged:    r.staged.clone(),
+	}
 	for key, value := range r.writes {
 		out.writes[key] = deepCopy(value)
 	}
@@ -176,13 +181,19 @@ func (r stepResult) clone() stepResult {
 
 // commitTo copies a child's result into the view of the composite step that ran it, and what
 // it staged for tools into the composite's stage.
-func (r stepResult) commitTo(s State, child *stepNode) {
+func (r stepResult) commitTo(s State, child *stepNode) error {
 	for key, value := range r.writes {
 		s.store(key, child.writeTypes[key], value, true)
+	}
+	for key := range r.preserved {
+		if err := s.preserve(key, child.writeTypes[key]); err != nil {
+			return err
+		}
 	}
 	if s.scope != nil && s.scope.stage != nil {
 		s.scope.stage.add(r.staged)
 	}
+	return nil
 }
 
 // commitStaged applies what a top-level step of a pipeline run staged for tools, once its
@@ -402,10 +413,7 @@ func runNode(
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			result = stepResult{}
-			err = WithStepDetails(
-				fmt.Errorf("step panicked: %v", recovered),
-				map[string]any{"stack": string(debug.Stack())},
-			)
+			err = recoveredPanic(recovered, "step panicked")
 		}
 	}()
 	if err := stepCanStart(ctx); err != nil {
@@ -438,11 +446,11 @@ func runNode(
 		return stepResult{}, scope.err
 	}
 	for _, key := range node.writeNames {
-		if _, ok := scope.pending[key]; !ok {
+		if _, ok := scope.pending[key]; !ok && !scope.preserved[key] {
 			return stepResult{}, fmt.Errorf("step did not write declared state key %q", key)
 		}
 	}
-	result = stepResult{writes: scope.pending, staged: scope.stage.snapshot()}
+	result = stepResult{writes: scope.pending, preserved: scope.preserved, staged: scope.stage.snapshot()}
 	if commit == nil {
 		return result, nil
 	}

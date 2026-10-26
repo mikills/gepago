@@ -357,6 +357,45 @@ scan := gepa.Loop("scan", readPage, done, gepa.LoopOptions{MaxIterations: 50, It
 
 Each iteration runs the body on its own view of the keys it reads. `Iteration` holds the number of the iteration, from one, and never reaches the state. A key that the body reads and writes carries from one iteration to the next, and starts from its `Default` or an earlier write. A `Default` is the usual seed. An earlier write also needs a `MergeRule`. The Loop's value already holds the seed, so a rule that adds or appends counts the seed twice. After each iteration the condition (`done` here) reads the body's keys. When it holds, the Loop commits the writes of that iteration. `Build` refuses a Loop without `MaxIterations` or a condition, and a body that writes nothing. A Loop that reaches its cap fails with a Permanent error that wraps `ErrMaxIterations` and commits nothing, and an `OnError` transition can catch it. So write the condition to hold when the work ends, found or not, and keep the cap as a guard. A failed iteration fails the Loop with the kind of its error and commits nothing. Cancellation or a spent budget stops the Loop before the next iteration. Each iteration sees the tool memory and cached tool results of the iterations before it, and its events carry `Attributes["iteration"]`. A `Redactor` that hides the iteration key also hides that attribute and the Loop's `"iterations"`. Events, traces and the run report then leave them out. The Loop's error names the running iteration, so the run keeps that number in error text where the iteration reads the key. It also keeps it where a nested pipeline takes the number as an `int` input under the key's name. The run redacts any other value under that name, such as a `Default` or a write, as any other value. When another hidden value has the same text, the run still removes the number. It removes it from the events of the whole trace and from reflection for the whole example. A Loop can be the body of a `Map` or `MapCollect`. There the keys it writes cannot have a seed. To carry a key in each element, run the Loop in a nested pipeline whose `Defaults` seed it. Then make `NewProgramStep` of that pipeline the Map's body. To retry a step, use a rewind with `MaxVisits` instead.
 
+### Host integration
+
+Use `MapCollectUntil` to read items in order and stop after a terminal result.
+It takes the `MapCollect` arguments followed by `func(MapResult[Out], error) bool`.
+A true result retains completed results and marks unstarted entries `Skipped`.
+It accepts concurrency zero or one. Budget failures, timeouts and recovered panics remain fatal.
+A successful terminal result may be retained after caller cancellation. Ordinary `MapCollect` keeps its existing behaviour.
+
+Pass `PreserveExistingOutputs(key.Ref())` to `NewProgramStep` to retain a prior value when the programme omits that output.
+The key must be an available declared write. A signed programme must mark it optional.
+Explicit zero and null values still follow the normal output checks.
+Preserved dependencies enter the step's reads, but do not add inputs to the programme's prompt.
+
+Set `Predict.OutputPolicy`, `TypedPredict.OutputPolicy` or `ChainOfThought.OutputPolicy` to `AcceptValidTruncatedOutput` to accept a complete, validated token-limit reply.
+The default remains `RejectTruncatedOutput`.
+The opt-in policy checks the output schema, rejects incomplete output without repair, and keeps the provider's finish reason.
+Content-filtered replies still fail.
+
+A recovered execution panic is available through `errors.As` as `*PanicError`, with its original `Value` and `Stack`.
+Redacted observations do not expose those fields.
+
+`PipelineSpec.Finalizer` runs host bookkeeping once after a started run ends, before `RunFinished`:
+
+```go
+spec.Finalizer = &gepa.PipelineFinalizer{
+    Timeout: 5 * time.Second,
+    Run: func(ctx context.Context, state gepa.State, runErr error) error {
+        return recordCompletion(ctx, state.Prediction(), runErr)
+    },
+}
+```
+
+The callback receives read-only committed state, including inputs and defaults.
+Its context ignores caller cancellation and has its own positive timeout.
+It does not inherit pipeline observation, usage collection, budgets or tool sessions.
+Its error matches `ErrFinalization` and joins the original run error. It cannot turn failure into success or change pipeline outputs.
+The timeout is cooperative, so the callback must respect its context.
+Invalid inputs do not start a run and do not call the finalizer.
+
 ## Tools
 
 Register tools once and refer to them by name:
@@ -441,6 +480,18 @@ An attempt turns a panic of the tool into the error `tool panicked: ...`. It fai
 The middleware must keep the schema of the tool it wraps. `Build` applies it to each tool the pipeline's steps name, and `Agent.Validate` to each tool of the agent. Both fail on middleware that panics, returns nil or changes a schema. A run applies it again to each tool on the tool's first call. If that fails, only the calls to that tool fail. So give the function no side effects. State in the provider it returns lasts one tool for one run. Only the session that makes a call wraps it. An agent in a step, or a nested pipeline with its own `Tools`, uses its own tool middleware and not that of the enclosing run. The enclosing `ToolPolicy` still governs those calls. `ToolRegistry.WrapTool` applies middleware to one provider, for example to register the result elsewhere or to check it with `gepatest.CheckToolProvider`. Its result carries no usage, since the attempts recorded it. `gepatest.CheckToolMiddleware` checks your middleware against these rules (see Test kit).
 
 ## Observability and redaction
+
+Set `PipelineSpec.MetadataOnly` when observers need names, timings and usage without payloads.
+Observation then omits input/output values, tool payloads, attribute values and raw error details before copying or indexing them.
+Names remain available as map keys, and errors retain their kind.
+This policy also applies to nested observation and recorded trace lanes.
+Evaluation outputs and their redaction remain separate from trace capture.
+With an explicit or inherited redactor, collected error messages use a conservative redacted marker.
+
+An observer that implements `StepResolvedObserver` receives each execution's `StepResolvedEvent` with its finished span and routing decision.
+The final execution of a top-level step resolves after its transition events and before the next top-level step starts.
+Earlier retry attempts and nested executions resolve without a top-level routing decision.
+Existing observer event order stays unchanged.
 
 `PipelineSpec.Observers` receive `RunStarted`, `StepStarted`, `StepFinished` and `RunFinished` events. A `TransitionObserver` also receives `TransitionTaken` and `RewindRejected`. `StepFinished` carries the duration, usage and unbudgeted usage, error, reads, writes, tool calls and attempt. It also carries attributes, such as the visit, a Map element's index and a Loop iteration's number, and whether a cache gave the result. An observer that panics does not fail the run. `RecordingObserver` turns the events into serialisable `PipelineTrace`s, which `WriteHTMLRunReport` renders step by step and `TraceDatasetBuilder` turns into reflection records during `Compile`.
 

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"runtime/debug"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -430,7 +429,7 @@ func checkToolResult(result ToolResult) error {
 // toolPanicError is the error of a tool call whose tool panics with recovered. It names the
 // value, and it holds the stack in its step details.
 func toolPanicError(recovered any) error {
-	return WithStepDetails(fmt.Errorf("tool panicked: %v", recovered), map[string]any{"stack": string(debug.Stack())})
+	return recoveredPanic(recovered, "tool panicked")
 }
 
 // cacheKey returns the cache key of call, when the policy caches and its arguments parse.

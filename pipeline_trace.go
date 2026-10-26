@@ -28,7 +28,9 @@ type PipelineTrace struct {
 	EndedAt    time.Time      `json:"ended_at,omitzero"`
 	Duration   time.Duration  `json:"duration"`
 	Inputs     map[string]any `json:"inputs,omitempty"`
-	Usage      Usage          `json:"usage"`
+	// MetadataOnly preserves the payload omission policy when an evaluation processes the trace again.
+	MetadataOnly bool  `json:"metadata_only,omitempty"`
+	Usage        Usage `json:"usage"`
 	// Unbudgeted is the run's unbudgeted usage, apart from Usage; see RunFinishedEvent.
 	Unbudgeted Usage `json:"unbudgeted,omitzero"`
 	// Failed reports that the run failed. Err is its error's message, which may be empty.
@@ -141,12 +143,13 @@ func (r *RecordingObserver) RunStarted(ctx context.Context, event RunStartedEven
 		r.steps = map[string]*recordedStep{}
 	}
 	run := &recordedRun{trace: PipelineTrace{
-		TraceID:    event.Span.TraceID,
-		SpanID:     event.Span.ID,
-		ParentID:   event.Span.ParentID,
-		RunContext: event.RunContext.clone(),
-		StartedAt:  event.Span.StartedAt,
-		Inputs:     traceValues(event.Inputs),
+		TraceID:      event.Span.TraceID,
+		SpanID:       event.Span.ID,
+		ParentID:     event.Span.ParentID,
+		RunContext:   event.RunContext.clone(),
+		StartedAt:    event.Span.StartedAt,
+		Inputs:       traceValues(event.Inputs),
+		MetadataOnly: event.MetadataOnly,
 	}, numbers: tracedNumbers(ctx)}
 	r.runs[event.Span.ID] = run
 	if parent, ok := r.steps[event.Span.ParentID]; ok {

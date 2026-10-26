@@ -108,6 +108,24 @@ type TransitionObserver interface {
 	RewindRejected(ctx context.Context, event RewindRejectedEvent)
 }
 
+// StepResolvedObserver receives the final observation of each execution, including its transition decision.
+// Nested executions resolve after StepFinished. A top-level execution resolves after its transition events,
+// before the next top-level execution starts or RunFinished. Retry attempts resolve before the next attempt starts.
+// Calls follow the serialisation, context, copy and panic rules of PipelineObserver.
+type StepResolvedObserver interface {
+	PipelineObserver
+	StepResolved(ctx context.Context, event StepResolvedEvent)
+}
+
+// StepResolvedEvent identifies one finished execution and the transition decision that followed it.
+// Transition and RewindRejected are nil when no matching decision followed this execution.
+// A rejected rewind can precede a different transition, so both fields can be set.
+type StepResolvedEvent struct {
+	StepFinishedEvent
+	Transition     *TransitionTrace
+	RewindRejected *RewindRejectedEvent
+}
+
 // TransitionTakenEvent reports that a transition matched after its From step finished.
 type TransitionTakenEvent struct {
 	// RunContext is the RunContext of the run, as RunStarted reported it.
@@ -143,6 +161,8 @@ type RunStartedEvent struct {
 	RunContext RunContext
 	// Inputs holds the run's inputs after redaction.
 	Inputs map[string]any
+	// MetadataOnly reports that this run omits payloads under PipelineSpec.MetadataOnly or an enclosing run's policy.
+	MetadataOnly bool
 }
 
 // RunFinishedEvent reports the end of a pipeline run.
@@ -345,16 +365,25 @@ type traceObservation struct {
 // the run has finished. recording, when set, reports the same run to the RecordingObserver of an
 // evaluation that records traces, in an observation of its own (see observeScope).
 type runObservation struct {
-	trace      *traceObservation
-	observers  []PipelineObserver
-	redactors  []Redactor
-	span       UsageSpan
-	runContext RunContext
-	numbers    iterationNumbers
-	start      time.Time
-	life       context.Context
-	endLife    context.CancelFunc
-	recording  *runObservation
+	trace        *traceObservation
+	observers    []PipelineObserver
+	redactors    []Redactor
+	span         UsageSpan
+	runContext   RunContext
+	numbers      iterationNumbers
+	start        time.Time
+	life         context.Context
+	endLife      context.CancelFunc
+	recording    *runObservation
+	metadataOnly bool
+	resolution   *stepResolution
+}
+
+// stepResolution holds the latest top-level execution until its transition decision is complete.
+// Copies made by hideElements share this state. The trace lock guards it.
+type stepResolution struct {
+	pending *StepResolvedEvent
+	ctx     context.Context
 }
 
 // observeRun starts observing a run of p over its converted inputs, with rc as its RunContext,
@@ -396,6 +425,10 @@ func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any,
 		}
 		run = p.startRun(parent.run, parent.span, caller, p.observers, lock, rc)
 	}
+	// Separate evaluation lanes still inherit the enclosing observation's payload policy.
+	if recording != nil && parent.run != nil && parent.run.metadataOnly {
+		recording.metadataOnly = true
+	}
 	scope := &observeScope{}
 	if recording != nil {
 		scope.recording, scope.recordingSpan = recording, recording.span.ID
@@ -416,9 +449,10 @@ func (p Pipeline) observeRun(ctx, caller context.Context, inputs map[string]any,
 	for lane := run; lane != nil; lane = lane.recording {
 		lane.runContext = lane.redactRunContext(rc)
 		event := RunStartedEvent{
-			Span:       lane.span,
-			RunContext: lane.runContext,
-			Inputs:     lane.redactStateValues(inputs, numbers),
+			Span:         lane.span,
+			RunContext:   lane.runContext,
+			Inputs:       lane.redactStateValues(inputs, numbers),
+			MetadataOnly: lane.metadataOnly,
 		}
 		lane.numbers = numbers.inputs(inputs)
 		observerCtx := lane.observerContext(ctx, lane.numbers)
@@ -448,10 +482,13 @@ func (p Pipeline) startRun(
 	lock *sync.Mutex,
 	rc RunContext,
 ) *runObservation {
-	if parent == nil && len(observers) == 0 && p.redactor == nil {
+	if parent == nil && len(observers) == 0 && p.redactor == nil && !p.metadataOnly {
 		return nil
 	}
-	run := &runObservation{observers: appendObservers(nil, observers...), start: time.Now(), life: caller}
+	run := &runObservation{
+		observers: appendObservers(nil, observers...), start: time.Now(), life: caller,
+		metadataOnly: p.metadataOnly,
+	}
 	if p.redactor != nil {
 		run.redactors = []Redactor{p.redactor}
 	}
@@ -460,11 +497,18 @@ func (p Pipeline) startRun(
 		run.observers = appendObservers(run.observers, parent.observers...)
 		run.redactors = append(run.redactors, parent.redactors...)
 		run.life = parent.life
+		run.metadataOnly = run.metadataOnly || parent.metadataOnly
 	} else {
 		if lock == nil {
 			lock = &sync.Mutex{}
 		}
 		run.trace = &traceObservation{mu: lock}
+	}
+	for _, observer := range run.observers {
+		if _, ok := observer.(StepResolvedObserver); ok {
+			run.resolution = &stepResolution{}
+			break
+		}
 	}
 	if limit := p.budget.MaxDuration; limit > 0 {
 		run.life, run.endLife = context.WithDeadline(run.life, run.start.Add(limit))
@@ -487,6 +531,7 @@ func (r *runObservation) finish(ctx context.Context, err error) {
 	r.trace.mu.Lock()
 	defer r.trace.mu.Unlock()
 	for lane := r; lane != nil; lane = lane.recording {
+		lane.resolvePending()
 		laneErr := lane.redactError(err)
 		event := RunFinishedEvent{
 			Span:       finishSpan(lane.span, duration, usage, unbudgeted, laneErr),
@@ -568,6 +613,9 @@ func observeStep(ctx context.Context, node *stepNode, attempt, visit int, values
 			lanes[i-1].recording = lane
 		}
 		lane.ctx = ctx
+		if lane.span.ParentID == lane.run.span.ID {
+			lane.run.resolvePending()
+		}
 		iteration := iterationFrom(ctx)
 		lane.reads = lane.run.redactStateValues(reads, iteration.numbers)
 		lane.numbers = iteration.numbers.inputs(reads)
@@ -619,7 +667,7 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 	defer s.run.trace.mu.Unlock()
 	for lane := s; lane != nil; lane = lane.recording {
 		run := lane.run
-		if outcome.Err != nil {
+		if outcome.Err != nil && !run.metadataOnly {
 			for _, write := range attempted {
 				run.redact(write.key, write.value)
 			}
@@ -660,13 +708,30 @@ func (s *stepObservation) finish(outcome stepOutcome, result stepResult, attempt
 			event.Attributes = maps.Clone(event.Attributes)
 			observer.StepFinished(observerCtx, event)
 		})
+		if run.resolution != nil {
+			resolved := StepResolvedEvent{StepFinishedEvent: event}
+			if lane.span.ParentID == run.span.ID {
+				run.resolution.pending, run.resolution.ctx = &resolved, observerCtx
+			} else {
+				run.deliverResolved(observerCtx, resolved)
+			}
+		}
 	}
 }
 
 // transitionTaken emits TransitionTaken to the observers that are TransitionObservers. ctx is
 // the run's context.
 func (r *runObservation) transitionTaken(ctx context.Context, event TransitionTakenEvent) {
-	r.deliverTransition(ctx, func(observer TransitionObserver, rc RunContext, observerCtx context.Context) {
+	r.deliverTransition(ctx, func(lane *runObservation) {
+		if state := lane.resolution; state != nil && state.pending != nil {
+			state.pending.Transition = &TransitionTrace{
+				From:   event.From,
+				To:     event.To,
+				Rule:   event.Rule,
+				Rewind: event.Rewind,
+			}
+		}
+	}, func(observer TransitionObserver, rc RunContext, observerCtx context.Context) {
 		event := event
 		event.RunContext = rc
 		observer.TransitionTaken(observerCtx, event)
@@ -676,7 +741,13 @@ func (r *runObservation) transitionTaken(ctx context.Context, event TransitionTa
 // rewindRejected emits RewindRejected to the observers that are TransitionObservers. ctx is
 // the run's context.
 func (r *runObservation) rewindRejected(ctx context.Context, event RewindRejectedEvent) {
-	r.deliverTransition(ctx, func(observer TransitionObserver, rc RunContext, observerCtx context.Context) {
+	r.deliverTransition(ctx, func(lane *runObservation) {
+		if state := lane.resolution; state != nil && state.pending != nil {
+			event := event
+			event.RunContext = lane.runContext
+			state.pending.RewindRejected = &event
+		}
+	}, func(observer TransitionObserver, rc RunContext, observerCtx context.Context) {
 		event := event
 		event.RunContext = rc
 		observer.RewindRejected(observerCtx, event)
@@ -687,6 +758,7 @@ func (r *runObservation) rewindRejected(ctx context.Context, event RewindRejecte
 // a copy of the run's RunContext as its events carry it.
 func (r *runObservation) deliverTransition(
 	ctx context.Context,
+	prepare func(*runObservation),
 	call func(TransitionObserver, RunContext, context.Context),
 ) {
 	if r == nil {
@@ -695,6 +767,7 @@ func (r *runObservation) deliverTransition(
 	r.trace.mu.Lock()
 	defer r.trace.mu.Unlock()
 	for lane := r; lane != nil; lane = lane.recording {
+		prepare(lane)
 		observerCtx := lane.observerContext(ctx, lane.numbers)
 		lane.deliver(func(observer PipelineObserver) {
 			if transitions, ok := observer.(TransitionObserver); ok {
@@ -702,6 +775,56 @@ func (r *runObservation) deliverTransition(
 			}
 		})
 	}
+}
+
+// resolveStep reports the last top-level execution after the flow has completed its decision.
+func (r *runObservation) resolveStep(_ context.Context) {
+	if r == nil {
+		return
+	}
+	r.trace.mu.Lock()
+	defer r.trace.mu.Unlock()
+	for lane := r; lane != nil; lane = lane.recording {
+		lane.resolvePending()
+	}
+}
+
+// resolvePending delivers and clears the execution held by the run. The caller holds the trace lock.
+func (r *runObservation) resolvePending() {
+	state := r.resolution
+	if state == nil || state.pending == nil {
+		return
+	}
+	event, ctx := *state.pending, state.ctx
+	state.pending, state.ctx = nil, nil
+	r.deliverResolved(ctx, event)
+}
+
+// deliverResolved gives each resolved observer a separate event copy. The caller holds the trace lock.
+func (r *runObservation) deliverResolved(ctx context.Context, event StepResolvedEvent) {
+	r.deliver(func(observer PipelineObserver) {
+		resolved, ok := observer.(StepResolvedObserver)
+		if !ok {
+			return
+		}
+		event := event
+		event.RunContext = event.RunContext.clone()
+		event.Reads = copyValues(event.Reads)
+		event.Writes = copyValues(event.Writes)
+		event.Details = copyValues(event.Details)
+		event.ToolCalls = cloneRecords(event.ToolCalls)
+		event.Attributes = maps.Clone(event.Attributes)
+		if event.Transition != nil {
+			transition := *event.Transition
+			event.Transition = &transition
+		}
+		if event.RewindRejected != nil {
+			rejected := *event.RewindRejected
+			rejected.RunContext = rejected.RunContext.clone()
+			event.RewindRejected = &rejected
+		}
+		resolved.StepResolved(ctx, event)
+	})
 }
 
 // deliver calls each observer, recovering any panic so it neither fails the run nor keeps the

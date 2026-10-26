@@ -67,6 +67,8 @@ type TypedPredict[In, Out any] struct {
 	Demos           []Demo
 	MaxParseRetries int
 	RepairLM        Generator
+	// OutputPolicy uses the Predict policy and also requires Out's decoder and Validate method to accept the reply.
+	OutputPolicy OutputPolicy
 	// Tools, MaxToolTurns, Middleware, ToolRegistry and ToolPolicy give the programme a bounded
 	// tool loop, as they do on Predict.
 	Tools        []string
@@ -117,6 +119,25 @@ func (p TypedPredict[In, Out]) RunCandidate(
 	candidate Candidate,
 	inputs Prediction,
 ) (Prediction, error) {
+	return p.runCandidate(ctx, candidate, inputs, false)
+}
+
+// RunCandidateWithPresence keeps absent fields out of the returned prediction.
+// Explicit nulls remain typed zero values. All typed output checks still apply.
+func (p TypedPredict[In, Out]) RunCandidateWithPresence(
+	ctx context.Context,
+	candidate Candidate,
+	inputs Prediction,
+) (Prediction, error) {
+	return p.runCandidate(ctx, candidate, inputs, true)
+}
+
+func (p TypedPredict[In, Out]) runCandidate(
+	ctx context.Context,
+	candidate Candidate,
+	inputs Prediction,
+	presence bool,
+) (Prediction, error) {
 	in, err := decodeTypedValue[In](map[string]any(inputs), fromState)
 	if err != nil {
 		return nil, fmt.Errorf("typed predict inputs: %w", err)
@@ -129,7 +150,15 @@ func (p TypedPredict[In, Out]) RunCandidate(
 	if err != nil {
 		return reply, err
 	}
-	return typedOutputs(out, reply), nil
+	outputs := typedOutputs(out, reply)
+	if presence {
+		for name := range outputs {
+			if _, present := reply[name]; !present {
+				delete(outputs, name)
+			}
+		}
+	}
+	return outputs, nil
 }
 
 // ProgramSignature implements SignatureProgram. It returns the derived signature and the Go type of
@@ -237,6 +266,7 @@ func (p TypedPredict[In, Out]) predict() (Predict, error) {
 		Demos:           p.Demos,
 		MaxParseRetries: p.MaxParseRetries,
 		RepairLM:        p.RepairLM,
+		OutputPolicy:    p.OutputPolicy,
 		Tools:           p.Tools,
 		MaxToolTurns:    p.MaxToolTurns,
 		Middleware:      p.Middleware,

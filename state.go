@@ -37,11 +37,12 @@ type State struct {
 // step succeeds. rejected holds copies of the values the step tried to write but was refused,
 // which the observer events of a failed step redact.
 type stepScope struct {
-	reads    map[string]reflect.Type
-	writes   map[string]reflect.Type
-	pending  map[string]any
-	rejected []stateWrite
-	err      error
+	reads     map[string]reflect.Type
+	writes    map[string]reflect.Type
+	pending   map[string]any
+	preserved map[string]bool
+	rejected  []stateWrite
+	err       error
 	// stage holds what the step stages for tools until it commits.
 	stage *stepStage
 	// attributes holds what the step reports about its execution, which its StepFinished adds
@@ -267,7 +268,35 @@ func (s State) store(key string, typ reflect.Type, value any, fresh bool) {
 			}
 		}
 		scope.pending[key] = value
+		delete(scope.preserved, key)
 	}
+}
+
+// preserve marks a declared output as unchanged. It does not replace an earlier pending write.
+func (s State) preserve(key string, typ reflect.Type) error {
+	value, err := s.lookup(key)
+	if err != nil {
+		return err
+	}
+	if _, err := convertValue(key, typ, value, fromState); err != nil {
+		return err
+	}
+	if scope := s.scope; scope != nil {
+		declared, ok := scope.writes[key]
+		if !ok {
+			return fmt.Errorf("state key %q is not a declared write", key)
+		}
+		if typ != declared {
+			return fmt.Errorf("state key %q is declared as %s but preserved as %s", key, declared, typ)
+		}
+		if _, written := scope.pending[key]; !written {
+			if scope.preserved == nil {
+				scope.preserved = map[string]bool{}
+			}
+			scope.preserved[key] = true
+		}
+	}
+	return nil
 }
 
 // Key is a typed handle on one State value. Name is the state key and T is the value shape.

@@ -282,9 +282,9 @@ func (r *ToolRegistry) WrapTool(provider ToolProvider, names ...string) (ToolPro
 	if err := r.checkToolMiddleware(names); err != nil {
 		return nil, err
 	}
-	schema, panicked := schemaOf(provider)
-	if panicked != nil {
-		return nil, fmt.Errorf("wrap tool: tool schema panicked: %v", panicked)
+	schema, schemaErr := schemaOf(provider, "wrap tool: tool schema panicked")
+	if schemaErr != nil {
+		return nil, schemaErr
 	}
 	tool := &wrappedTool{provider: provider, schema: cloneTool(schema)}
 	var wrapped ToolProvider = innerTool{tool: tool}
@@ -364,16 +364,22 @@ func applyToolMiddleware(name string, middleware ToolMiddleware, next ToolProvid
 ) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			wrapped, err = nil, fmt.Errorf("tool middleware %q panicked on tool %q: %v", name, schema.Name, recovered)
+			wrapped, err = nil, recoveredPanic(
+				recovered,
+				fmt.Sprintf("tool middleware %q panicked on tool %q", name, schema.Name),
+			)
 		}
 	}()
 	wrapped = middleware(next)
 	if isNil(wrapped) {
 		return nil, fmt.Errorf("tool middleware %q returned a nil provider for tool %q", name, schema.Name)
 	}
-	got, panicked := schemaOf(wrapped)
-	if panicked != nil {
-		return nil, fmt.Errorf("tool middleware %q: schema of tool %q panicked: %v", name, schema.Name, panicked)
+	got, schemaErr := schemaOf(
+		wrapped,
+		fmt.Sprintf("tool middleware %q: schema of tool %q panicked", name, schema.Name),
+	)
+	if schemaErr != nil {
+		return nil, schemaErr
 	}
 	changed := ""
 	switch {
@@ -393,9 +399,13 @@ func applyToolMiddleware(name string, middleware ToolMiddleware, next ToolProvid
 	return wrapped, nil
 }
 
-// schemaOf returns the provider's schema, or the value its Schema method panicked with.
-func schemaOf(provider ToolProvider) (schema Tool, panicked any) {
-	defer func() { panicked = recover() }()
+// schemaOf returns the schema or a typed panic error with the supplied message prefix.
+func schemaOf(provider ToolProvider, prefix string) (schema Tool, err error) {
+	defer func() {
+		if value := recover(); value != nil {
+			err = recoveredPanic(value, prefix)
+		}
+	}()
 	return provider.Schema(), nil
 }
 
