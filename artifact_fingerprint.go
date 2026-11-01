@@ -3,10 +3,11 @@ package gepa
 import "fmt"
 
 // Fingerprinter is implemented by a Program whose shape has a stable fingerprint, such as
-// Pipeline. CompiledProgram.Artifact and ProgramRegistry.TrainAndSave store the fingerprint on
-// the artefacts they build, and LoadCompiledProgram and ProgramRegistry.LoadCompiled refuse an
-// artefact whose fingerprint differs from the programme's. A programme opts in by returning a
-// fingerprint that changes whenever a trained candidate stops fitting it; "" means it has none.
+// Pipeline, Predict and ChainOfThought. CompiledProgram.Artifact and
+// ProgramRegistry.TrainAndSave store the fingerprint on the artefacts they build, and
+// LoadCompiledProgram and ProgramRegistry.LoadCompiled refuse an artefact whose fingerprint
+// differs from the programme's. A programme opts in by returning a fingerprint that changes
+// whenever a trained candidate stops fitting it; "" means it has none.
 type Fingerprinter interface {
 	Fingerprint() string
 }

@@ -2,6 +2,7 @@ package gepa_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -73,6 +74,51 @@ func TestLoadCompiledProgramRejectsAnotherShape(t *testing.T) {
 	got, err := compiled.Run(context.Background(), gepa.Prediction{"document": "x"})
 	require.NoError(t, err)
 	require.Equal(t, gepa.Prediction{"instruction": "trained"}, got)
+}
+
+func TestArtifactFingerprint(t *testing.T) {
+	classify := func(labels string) gepa.Predict {
+		return gepa.Predict{
+			Signature: gepa.Signature{
+				Inputs: []gepa.Field{{Name: "document"}},
+				Outputs: []gepa.Field{
+					{Name: "label", Schema: json.RawMessage(`{"type":"string","enum":[` + labels + `]}`)},
+				},
+			},
+			LM: replyModel(`{"label": "a"}`),
+		}
+	}
+	pipeline := func(labels string) gepa.Program {
+		return fpBuild(t, gepa.PipelineSpec{
+			Inputs: refs(docKey.Ref()),
+			Steps: []gepa.Step{
+				gepa.NewProgramStep("classify", classify(labels), refs(docKey.Ref()), refs(labelKey.Ref())),
+			},
+		})
+	}
+	cases := map[string]func(labels string) gepa.Program{
+		"predict":  func(labels string) gepa.Program { return classify(labels) },
+		"pipeline": pipeline,
+	}
+	for name, program := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "classify.json")
+			trained, reordered, changed := program(`"a","b","c"`), program(`"c","b","a"`), program(`"a","b","d"`)
+			artifact := gepa.CompiledProgram{Program: trained, Candidate: trained.SeedCandidate()}.Artifact("classify")
+			require.Len(t, artifact.Fingerprint, 64)
+			require.NoError(t, gepa.SaveProgramArtifact(path, artifact))
+
+			_, _, err := gepa.LoadCompiledProgram(path, changed)
+			var mismatch *gepa.FingerprintMismatchError
+			require.ErrorAs(t, err, &mismatch)
+			require.Equal(t, artifact.Fingerprint, mismatch.ArtifactFingerprint)
+			require.Len(t, mismatch.ProgramFingerprint, 64)
+			require.NotEqual(t, artifact.Fingerprint, mismatch.ProgramFingerprint)
+
+			_, _, err = gepa.LoadCompiledProgram(path, reordered)
+			require.NoError(t, err)
+		})
+	}
 }
 
 func TestLoadCompiledProgramRejectsAProgrammeWithoutFingerprint(t *testing.T) {

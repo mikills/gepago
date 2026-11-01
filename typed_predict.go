@@ -25,9 +25,10 @@ import (
 // The reply is decoded into Out with the strict rules Key.Get uses: unknown fields, fields that
 // match only by case, missing fields not tagged omitempty or omitzero, nulls in non-nullable
 // positions and lossy numbers are errors, and Out's Validate method, if it has one, must
-// accept the value. A reply that fails to decode is an ErrInvalidOutput and, when
-// MaxParseRetries is above zero, goes through Predict's repair loop like any other invalid
-// reply.
+// accept the value. The decode stands in for Predict's Schema check, since the derived schemas
+// list as required, for strict providers, the fields a reply may leave out. A reply that fails
+// to decode is an ErrInvalidOutput and, when MaxParseRetries is above zero, goes through
+// Predict's repair loop like any other invalid reply.
 //
 // In may hold Images, as described on Predict. A derived input of type Image has the Type "image",
 // so it must hold an Image from NewImage. A field of another type that holds Images, such as *Image

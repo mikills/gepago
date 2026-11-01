@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // State holds the values passed between Pipeline steps. Outside a run it is unrestricted;
@@ -262,6 +263,10 @@ func (s State) store(key string, typ reflect.Type, value any, fresh bool) {
 	default:
 		if !fresh {
 			value = deepCopy(value)
+			if err := checkStateEnums(typ, value); err != nil {
+				scope.reject(key, value, fmt.Errorf("state key %q: %w", key, err))
+				return
+			}
 			if err := validateStateValue(value); err != nil {
 				scope.reject(key, value, fmt.Errorf("state key %q: %w", key, err))
 				return
@@ -316,6 +321,11 @@ func (s State) preserve(key string, typ reflect.Type) error {
 // `json:"-,"`, or with a ",string" field that is not a boolean, number or string or whose type
 // has its own unmarshal method (json.Number aside), is refused for every object.
 //
+// Enum tags (see JSONSchemaFor) are checked on converted and already-typed values, including
+// nested fields, slice items and concrete values held in interfaces. Nulls and omitted optional
+// fields remain valid; an optional field's zero Go value represents an omission. An invalid enum
+// definition is refused even behind an absent field, a nil pointer or an empty collection.
+//
 // An Image's JSON form is a summary without its data. So an Image converts only from a value that
 // holds the same Image. Get converts between Image and *Image, and into a struct, slice, map or any
 // that holds Images. It takes each Image from the stored value by its digest. A summary of an image
@@ -349,8 +359,8 @@ func (k Key[T]) Get(s State) (T, error) {
 }
 
 // Set stores a copy of v under k. Inside a step, writing a key the step did not declare,
-// writing it as a type other than the declared one, or writing a value its Validate method
-// rejects fails the step.
+// writing it as a type other than the declared one, or writing a value its enum tags or Validate
+// method reject fails the step.
 func (k Key[T]) Set(s State, v T) {
 	s.store(k.Name, reflect.TypeFor[T](), v, false)
 }
@@ -375,9 +385,15 @@ func convertValue(key string, typ reflect.Type, value any, source valueSource) (
 			return nil, fmt.Errorf("state key %q is null, want %s", key, typ)
 		}
 		out = reflect.Zero(typ).Interface()
+		if err := enumValidationFor(typ).err; err != nil {
+			return nil, fmt.Errorf("state key %q: %w", key, err)
+		}
 	case reflect.TypeOf(value) == typ,
 		typ.Kind() == reflect.Interface && reflect.TypeOf(value).Implements(typ):
 		out = deepCopy(value)
+		if err := checkStateEnums(reflect.TypeOf(out), out); err != nil {
+			return nil, fmt.Errorf("state key %q: %w", key, err)
+		}
 	default:
 		decoded, err := decodeValue(typ, value, source)
 		if err != nil {
@@ -555,14 +571,69 @@ func stringOptionError(typ reflect.Type) error {
 	return nil
 }
 
+// enumTagError reports the first field of the struct type typ, in encoding order, whose enum
+// tag JSONSchemaFor cannot apply. The tag applies to a string, of a named string type too, a
+// pointer to one or a slice of them, where neither the field's type nor the string type has its
+// own unmarshal method (json.Number has one), and not with the ",string" option, which nests a
+// JSON string in the string. It lists UTF-8 values separated by commas, with spaces preserved,
+// and none may be empty or repeated.
+func enumTagError(typ reflect.Type) error {
+	fields := jsonFields(typ)
+	for _, name := range jsonFieldOrder(fields) {
+		field := fields[name]
+		if field.enum == nil {
+			continue
+		}
+		goName := typ.FieldByIndex(field.index).Name
+		switch {
+		case !enumType(field.typ):
+			return fmt.Errorf(
+				"struct field %s of type %s cannot have an enum tag, which applies only to strings, "+
+					"pointers to strings and slices of strings without their own unmarshal method",
+				goName,
+				field.typ,
+			)
+		case field.quoted:
+			return fmt.Errorf(
+				"struct field %s of type %s cannot have both an enum tag and the `string` tag option",
+				goName,
+				field.typ,
+			)
+		case len(field.enum) == 1 && field.enum[0] == "":
+			return fmt.Errorf("struct field %s has an empty enum tag", goName)
+		}
+		tag := strings.Join(field.enum, ",")
+		for i, value := range field.enum {
+			switch {
+			case !utf8.ValidString(value):
+				return fmt.Errorf("struct field %s has the enum tag %q, which lists invalid UTF-8", goName, tag)
+			case value == "":
+				return fmt.Errorf("struct field %s has the enum tag %q, which lists an empty value", goName, tag)
+			case slices.Contains(field.enum[:i], value):
+				return fmt.Errorf("struct field %s has the enum tag %q, which lists %q twice", goName, tag, value)
+			}
+		}
+	}
+	return nil
+}
+
+// enumType reports whether an enum tag applies to a field of typ (see enumTagError).
+func enumType(typ reflect.Type) bool {
+	if typ.Kind() == reflect.Pointer || typ.Kind() == reflect.Slice && !ownUnmarshaler(typ) {
+		typ = typ.Elem()
+	}
+	return typ.Kind() == reflect.String && !ownUnmarshaler(typ)
+}
+
 // structDefinitionError returns the error encoding/json/v2 gives for every JSON object decoded
 // into the struct type typ when it refuses typ's definition, which encoding/json accepted: an
 // unexported field with a json tag, an embedded non-struct type without a JSON name, an
 // embedded struct with tag options or marshal methods, a malformed or repeated tag option, two
 // fields with one JSON name, or no exported fields at all. It also refuses a json tag that the
-// two read differently (see tagOptionError) and a field with a ",string" option that v2 does not
-// apply as encoding/json did (see stringOptionError). It returns nil when typ decodes. The error
-// names the struct type and the reason, as definitionError finds them.
+// two read differently (see tagOptionError), a field with a ",string" option that v2 does not
+// apply as encoding/json did (see stringOptionError) and an enum tag that JSONSchemaFor cannot
+// apply (see enumTagError). It returns nil when typ decodes. The error names the struct type and
+// the reason, as definitionError finds them.
 func structDefinitionError(typ reflect.Type) error {
 	if refused := definitionError(typ); refused != nil {
 		return fmt.Errorf("%s cannot be decoded from JSON: %w", refused.GoType, refused.Err)
@@ -606,6 +677,9 @@ func findDefinitionError(typ reflect.Type) *jsonv2.SemanticError {
 	if reason := stringOptionError(typ); reason != nil {
 		return &jsonv2.SemanticError{JSONKind: '{', GoType: typ, Err: reason}
 	}
+	if reason := enumTagError(typ); reason != nil {
+		return &jsonv2.SemanticError{JSONKind: '{', GoType: typ, Err: reason}
+	}
 	return nil
 }
 
@@ -619,6 +693,7 @@ var encodingJSONTagOptions = []string{"omitempty", "omitzero", "string"}
 // embeds, whose json tag encoding/json and encoding/json/v2 read differently, with the struct
 // that declares it: a tag option encoding/json did not define, which it ignored and v2 may
 // apply, or the tag `json:"-,"`, which names a field "-" in encoding/json and which v2 refuses.
+// An enum tag on a promoted embedded struct is refused before promotion discards it.
 // An empty option, as in `json:"a,"`, is left to v2, which refuses it as malformed.
 func tagOptionError(typ reflect.Type) (reflect.Type, error) {
 	queue, seen := []reflect.Type{typ}, map[reflect.Type]bool{typ: true}
@@ -662,9 +737,15 @@ func tagOptionError(typ reflect.Type) (reflect.Type, error) {
 			if inner.Kind() == reflect.Pointer && inner.Name() == "" {
 				inner = inner.Elem()
 			}
-			if field.Anonymous && name == "" && inner.Kind() == reflect.Struct && !seen[inner] {
-				seen[inner] = true
-				queue = append(queue, inner)
+			if field.Anonymous && name == "" && inner.Kind() == reflect.Struct {
+				if _, ok := field.Tag.Lookup("enum"); ok {
+					return structType, fmt.Errorf("embedded struct field %s of type %s cannot have an enum tag",
+						field.Name, field.Type)
+				}
+				if !seen[inner] {
+					seen[inner] = true
+					queue = append(queue, inner)
+				}
 			}
 		}
 	}
@@ -728,6 +809,9 @@ func decodeValue(typ reflect.Type, value any, source valueSource) (any, error) {
 	}
 	if err != nil {
 		return nil, decodeError(typ, err)
+	}
+	if err := enumValidationFor(typ).err; err != nil {
+		return nil, err
 	}
 	return out.Elem().Interface(), nil
 }
@@ -961,11 +1045,12 @@ func (p jsonPath) element(i int) jsonPath {
 // checkJSONShape reports drift that encoding/json/v2 accepts silently: required struct fields
 // that are missing, nulls decoded into values that cannot hold them, floats that underflow to
 // zero, and in a ",string" field the string "null" or a number outside the JSON grammar. It
-// also refuses arrays of the wrong length, which v2 refuses without saying how many elements it
-// found, objects for maps that encoding/json refused (see checkJSONMapKeys), and objects for a
-// struct whose definition is refused (see structDefinitionError). Those last two are
-// *jsonv2.SemanticError values, which decodeError words as the *json.UnmarshalTypeError that
-// encoding/json reported for such a map and that v2 reports for such a struct.
+// also refuses strings outside their field's enum tag (see checkJSONEnum), arrays of the wrong
+// length, which v2 refuses without saying how many elements it found, objects for maps that
+// encoding/json refused (see checkJSONMapKeys), and objects for a struct whose definition is
+// refused (see structDefinitionError). Those last two are *jsonv2.SemanticError values, which
+// decodeError words as the *json.UnmarshalTypeError that encoding/json reported for such a map
+// and that v2 reports for such a struct.
 func checkJSONShape(typ reflect.Type, value any, path jsonPath) error {
 	if value == nil {
 		if path.text != "" && !nillable(typ) {
@@ -1067,16 +1152,20 @@ func checkJSONObject(typ reflect.Type, object map[string]any, path jsonPath) err
 // jsonNumber matches the JSON number grammar.
 var jsonNumber = regexp.MustCompile(jsonNumberPattern)
 
-// checkJSONField checks the value of one struct field. A field with the ",string" option holds
-// the JSON encoding of a boolean, number or string inside a string. Under the encoding/json
-// ",string" semantics decodeOptions keeps, v2 silently decodes the string "null" there as no
-// value, leaving a zero or a nil pointer, parses a number there with strconv, which admits
-// text JSON does not, such as "01", "1." or "-Inf", and decodes a float in it that underflows
-// as 0. All three are rejected, as the field's schema pattern rejects the first two and Get
-// rejects an unquoted underflow. A json.Number there must hold a JSON number, or a JSON string
-// holding one (see decodeQuotedNumber): encoding/json kept other text that starts like a
-// number, such as "0x10", "01" or "1.", as it was.
+// checkJSONField checks the value of one struct field. A string outside the field's enum tag is
+// refused (see checkJSONEnum). A field with the ",string" option holds the JSON encoding of a
+// boolean, number or string inside a string. Under the encoding/json ",string" semantics
+// decodeOptions keeps, v2 silently decodes the string "null" there as no value, leaving a zero
+// or a nil pointer, parses a number there with strconv, which admits text JSON does not, such
+// as "01", "1." or "-Inf", and decodes a float in it that underflows as 0. All three are
+// rejected, as the field's schema pattern rejects the first two and Get rejects an unquoted
+// underflow. A json.Number there must hold a JSON number, or a JSON string holding one (see
+// decodeQuotedNumber): encoding/json kept other text that starts like a number, such as
+// "0x10", "01" or "1.", as it was.
 func checkJSONField(field jsonField, value any, path jsonPath) error {
+	if err := checkJSONEnum(field, value, path); err != nil {
+		return err
+	}
 	text, isString := value.(string)
 	if !isString || !field.quoted || !quotable(field.typ) {
 		return checkJSONShape(field.typ, value, path)
@@ -1103,6 +1192,30 @@ func checkJSONField(field jsonField, value any, path jsonPath) error {
 		}
 	}
 	return checkJSONShape(typ, json.Number(text), path)
+}
+
+// checkJSONEnum refuses a string outside the field's enum tag: the field's value, or an item of a
+// slice field. A value of another kind is left to the decoder, which refuses it.
+func checkJSONEnum(field jsonField, value any, path jsonPath) error {
+	if field.enum == nil {
+		return nil
+	}
+	slice := field.typ.Kind() == reflect.Slice
+	items := []any{value}
+	if slice {
+		items, _ = value.([]any)
+	}
+	for i, item := range items {
+		text, ok := item.(string)
+		if !ok || slices.Contains(field.enum, text) {
+			continue
+		}
+		if slice {
+			path = path.element(i)
+		}
+		return fmt.Errorf("field %q is %q, which is not one of %q", path.text, text, field.enum)
+	}
+	return nil
 }
 
 // underflows reports whether a non-zero JSON number rounds to zero at the given float size,
@@ -1132,14 +1245,16 @@ func joinJSONPath(path, key string) string {
 
 // jsonField is one JSON object key of a struct. index is the path of the struct field it
 // resolves to. quoted reports the ",string" tag option. description holds the field's
-// description tag for JSON Schema. optional reports the omitempty or omitzero tag option, and
-// omitzero reports omitzero alone.
+// description tag for JSON Schema, and enum the comma-separated values of its enum tag, nil
+// without one. optional reports the omitempty or omitzero tag option, and omitzero reports
+// omitzero alone.
 type jsonField struct {
 	typ         reflect.Type
 	optional    bool
 	omitzero    bool
 	quoted      bool
 	description string
+	enum        []string
 	index       []int
 }
 
@@ -1236,6 +1351,10 @@ func addJSONFieldCandidates(
 			name = field.Name
 		}
 		opts := strings.Split(options, ",")
+		var enum []string
+		if values, ok := field.Tag.Lookup("enum"); ok {
+			enum = strings.Split(values, ",")
+		}
 		candidate := jsonFieldCandidate{
 			field: jsonField{
 				typ:         field.Type,
@@ -1243,6 +1362,7 @@ func addJSONFieldCandidates(
 				omitzero:    slices.Contains(opts, "omitzero"),
 				quoted:      slices.Contains(opts, "string"),
 				description: field.Tag.Get("description"),
+				enum:        enum,
 				index:       index,
 			},
 			depth:  depth,
@@ -1278,6 +1398,156 @@ func dominantJSONField(found []jsonFieldCandidate) (jsonField, bool) {
 		return tagged[0].field, true
 	}
 	return jsonField{}, false
+}
+
+type enumValidation struct {
+	needed bool
+	err    error
+}
+
+var enumValidations sync.Map
+
+// enumValidationFor caches reachable enum definitions and whether values need inspection.
+// Interfaces need inspection because their concrete types may carry enum tags.
+func enumValidationFor(typ reflect.Type) enumValidation {
+	if cached, ok := enumValidations.Load(typ); ok {
+		return cached.(enumValidation)
+	}
+	validation := enumValidation{needed: reachesEnum(typ, false, map[reflect.Type]bool{})}
+	if validation.needed {
+		validation.err = reachableDefinitionError(typ, "", map[reflect.Type]bool{})
+	} else {
+		validation.needed = reachesEnum(typ, true, map[reflect.Type]bool{})
+	}
+	cached, _ := enumValidations.LoadOrStore(typ, validation)
+	return cached.(enumValidation)
+}
+
+func reachesEnum(typ reflect.Type, dynamic bool, seen map[reflect.Type]bool) bool {
+	if seen[typ] || customJSON(typ) {
+		return false
+	}
+	seen[typ] = true
+	switch typ.Kind() {
+	case reflect.Interface:
+		return dynamic
+	case reflect.Pointer, reflect.Slice, reflect.Array, reflect.Map:
+		return reachesEnum(typ.Elem(), dynamic, seen)
+	case reflect.Struct:
+		for i := range typ.NumField() {
+			field := typ.Field(i)
+			if field.Tag.Get("json") == "-" || !field.IsExported() && !field.Anonymous {
+				continue
+			}
+			if _, ok := field.Tag.Lookup("enum"); ok {
+				return true
+			}
+			if field.Anonymous && reachesEnum(field.Type, dynamic, seen) {
+				return true
+			}
+		}
+		for _, field := range jsonFields(typ) {
+			if reachesEnum(field.typ, dynamic, seen) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func checkStateEnums(typ reflect.Type, value any) error {
+	if typ.Kind() == reflect.Interface && value != nil {
+		typ = reflect.TypeOf(value)
+	}
+	validation := enumValidationFor(typ)
+	if validation.err != nil || !validation.needed {
+		return validation.err
+	}
+	return checkTypedEnums(reflect.ValueOf(value), jsonPath{}, map[copyKey]bool{})
+}
+
+func checkTypedEnums(value reflect.Value, path jsonPath, seen map[copyKey]bool) error {
+	if !value.IsValid() {
+		return nil
+	}
+	if value.Kind() == reflect.Interface {
+		return checkTypedEnums(value.Elem(), path, seen)
+	}
+	validation := enumValidationFor(value.Type())
+	if validation.err != nil {
+		return fmt.Errorf("%s%w", pathPrefix(path.text), validation.err)
+	}
+	if !validation.needed {
+		return nil
+	}
+	switch value.Kind() {
+	case reflect.Pointer, reflect.Slice, reflect.Map:
+		if value.IsNil() {
+			return nil
+		}
+		key := copyKey{ptr: value.Pointer(), typ: value.Type()}
+		if value.Kind() == reflect.Slice {
+			key.len = value.Len()
+		}
+		if seen[key] {
+			return nil
+		}
+		seen[key] = true
+	}
+	switch value.Kind() {
+	case reflect.Pointer:
+		return checkTypedEnums(value.Elem(), path, seen)
+	case reflect.Slice, reflect.Array:
+		for i := range value.Len() {
+			if err := checkTypedEnums(value.Index(i), path.element(i), seen); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		keys := value.MapKeys()
+		slices.SortFunc(keys, func(a, b reflect.Value) int {
+			return strings.Compare(fmt.Sprint(a.Interface()), fmt.Sprint(b.Interface()))
+		})
+		for _, key := range keys {
+			if err := checkTypedEnums(value.MapIndex(key), path.member(fmt.Sprint(key.Interface())), seen); err != nil {
+				return err
+			}
+		}
+	case reflect.Struct:
+		fields := jsonFields(value.Type())
+		for _, name := range jsonFieldOrder(fields) {
+			field := fields[name]
+			item, err := value.FieldByIndexErr(field.index)
+			if err != nil || field.optional && item.IsZero() {
+				continue
+			}
+			fieldPath := path.member(name)
+			if field.enum != nil {
+				if item.Kind() == reflect.Pointer {
+					if item.IsNil() {
+						continue
+					}
+					item = item.Elem()
+				}
+				var generic any
+				if item.Kind() == reflect.Slice {
+					items := make([]any, item.Len())
+					for i := range item.Len() {
+						items[i] = item.Index(i).String()
+					}
+					generic = items
+				} else {
+					generic = item.String()
+				}
+				if err := checkJSONEnum(field, generic, fieldPath); err != nil {
+					return err
+				}
+			} else if err := checkTypedEnums(item, fieldPath, seen); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 type stateValueValidator interface{ Validate() error }

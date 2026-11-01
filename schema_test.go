@@ -9,9 +9,11 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -860,4 +862,339 @@ func TestJSONSchemaForArraysBoundTheLength(t *testing.T) {
 		}
 		require.EqualError(t, err, tt.wantErr)
 	}
+}
+
+type enumImpact string
+
+type enumDetails struct {
+	Impact   string     `json:"impact"             enum:"outage,degraded,none" description:"how customers are affected"`
+	Named    enumImpact `json:"named"              enum:"outage,none"`
+	Maybe    *string    `json:"maybe"              enum:"a,b"`
+	Tags     []string   `json:"tags"               enum:"x,y"`
+	Optional string     `json:"optional,omitempty" enum:"p,q"`
+	Plain    string     `json:"plain"`
+}
+
+type enumOnCount struct {
+	Count int `json:"count" enum:"1,2"`
+}
+
+func TestEnumTag(t *testing.T) {
+	schema, err := JSONSchemaFor[enumDetails]()
+	require.NoError(t, err)
+
+	t.Run("schema", func(t *testing.T) {
+		require.Equal(t, `{"type":"object","properties":{`+
+			`"impact":{"type":"string","enum":["outage","degraded","none"],"description":"how customers are affected"},`+
+			`"named":{"type":"string","enum":["outage","none"]},`+
+			`"maybe":{"anyOf":[{"type":"string","enum":["a","b"]},{"type":"null"}]},`+
+			`"tags":{"anyOf":[{"type":"array","items":{"type":"string","enum":["x","y"]}},{"type":"null"}]},`+
+			`"optional":{"anyOf":[{"type":"string","enum":["p","q"]},{"type":"null"}]},`+
+			`"plain":{"type":"string"}},`+
+			`"required":["impact","named","maybe","tags","optional","plain"],"additionalProperties":false}`,
+			string(schema))
+	})
+
+	t.Run("strict", func(t *testing.T) {
+		require.True(t, StrictJSONSchema(schema))
+		signature, err := typedSignature(Signature{Name: "details"}, reflect.TypeFor[stateObligation](),
+			reflect.TypeFor[enumDetails]())
+		require.NoError(t, err)
+		format, err := signature.ResponseFormat()
+		require.NoError(t, err)
+		require.True(t, format.Strict)
+		require.Contains(t, string(format.Schema), `"impact":{"type":"string","enum":["outage","degraded","none"]`)
+	})
+
+	t.Run("key get", func(t *testing.T) {
+		const prefix = `state key "v": decode as gepa.enumDetails: `
+		predict := Predict{Signature: Signature{Outputs: []Field{{Name: "v", Schema: schema}}}}
+		tests := []struct {
+			name    string
+			field   string
+			value   any
+			wantErr string
+		}{
+			{name: "listed values"},
+			{name: "null pointer", field: "maybe", value: nil},
+			{name: "null optional", field: "optional", value: nil},
+			{name: "empty slice", field: "tags", value: []any{}},
+			{
+				name:    "string",
+				field:   "impact",
+				value:   "down",
+				wantErr: prefix + `field "impact" is "down", which is not one of ["outage" "degraded" "none"]`,
+			},
+			{
+				name:    "other case",
+				field:   "impact",
+				value:   "Outage",
+				wantErr: prefix + `field "impact" is "Outage", which is not one of ["outage" "degraded" "none"]`,
+			},
+			{
+				name:    "named string",
+				field:   "named",
+				value:   "degraded",
+				wantErr: prefix + `field "named" is "degraded", which is not one of ["outage" "none"]`,
+			},
+			{
+				name:    "pointer",
+				field:   "maybe",
+				value:   "c",
+				wantErr: prefix + `field "maybe" is "c", which is not one of ["a" "b"]`,
+			},
+			{
+				name:    "slice item",
+				field:   "tags",
+				value:   []any{"x", "z"},
+				wantErr: prefix + `field "tags[1]" is "z", which is not one of ["x" "y"]`,
+			},
+			{
+				name:    "empty optional",
+				field:   "optional",
+				value:   "",
+				wantErr: prefix + `field "optional" is "", which is not one of ["p" "q"]`,
+			},
+			{
+				name:    "number",
+				field:   "impact",
+				value:   5,
+				wantErr: prefix + "json: cannot unmarshal number into Go struct field enumDetails.impact of type string",
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				value := map[string]any{
+					"impact": "outage", "named": "none", "maybe": "a", "tags": []any{"y", "x"}, "optional": "q",
+					"plain": "any",
+				}
+				if tt.field != "" {
+					value[tt.field] = tt.value
+				}
+				_, err := Key[enumDetails]{Name: "v"}.Get(NewState(Prediction{"v": value}))
+				reply, marshalErr := json.Marshal(map[string]any{"v": value})
+				require.NoError(t, marshalErr)
+				_, schemaErr := predict.ParseOutput(string(reply))
+
+				require.Equal(t, err == nil, schemaErr == nil, "the schema check agrees with Key.Get: %v", schemaErr)
+				if tt.wantErr == "" {
+					require.NoError(t, err)
+					return
+				}
+				require.EqualError(t, err, tt.wantErr)
+			})
+		}
+	})
+
+	t.Run("refusals", func(t *testing.T) {
+		const kind = "cannot have an enum tag, which applies only to strings, pointers to strings and slices of " +
+			"strings without their own unmarshal method"
+		tests := []struct {
+			name   string
+			typ    reflect.Type
+			tag    reflect.StructTag
+			reason string
+		}{
+			{"integer", reflect.TypeFor[int](), `json:"v" enum:"1,2"`, "struct field V of type int " + kind},
+			{"bool", reflect.TypeFor[bool](), `json:"v" enum:"true"`, "struct field V of type bool " + kind},
+			{"array", reflect.TypeFor[[2]string](), `json:"v" enum:"a"`, "struct field V of type [2]string " + kind},
+			{
+				"map",
+				reflect.TypeFor[map[string]string](),
+				`json:"v" enum:"a"`,
+				"struct field V of type map[string]string " + kind,
+			},
+			{"interface", reflect.TypeFor[any](), `json:"v" enum:"a"`, "struct field V of type interface {} " + kind},
+			{
+				"double pointer",
+				reflect.TypeFor[**string](),
+				`json:"v" enum:"a"`,
+				"struct field V of type **string " + kind,
+			},
+			{
+				"pointer to slice",
+				reflect.TypeFor[*[]string](),
+				`json:"v" enum:"a"`,
+				"struct field V of type *[]string " + kind,
+			},
+			{
+				"slice of pointers",
+				reflect.TypeFor[[]*string](),
+				`json:"v" enum:"a"`,
+				"struct field V of type []*string " + kind,
+			},
+			{
+				"json.Number",
+				reflect.TypeFor[json.Number](),
+				`json:"v" enum:"1"`,
+				"struct field V of type json.Number " + kind,
+			},
+			{
+				"UnmarshalText",
+				reflect.TypeFor[refusingLabel](),
+				`json:"v" enum:"a"`,
+				"struct field V of type gepa.refusingLabel " + kind,
+			},
+			{
+				"slice of UnmarshalText",
+				reflect.TypeFor[[]refusingLabel](),
+				`json:"v" enum:"a"`,
+				"struct field V of type []gepa.refusingLabel " + kind,
+			},
+			{
+				"string option",
+				reflect.TypeFor[string](),
+				`json:"v,string" enum:"a"`,
+				"struct field V of type string cannot have both an enum tag and the `string` tag option",
+			},
+			{"empty tag", reflect.TypeFor[string](), `json:"v" enum:""`, "struct field V has an empty enum tag"},
+			{
+				"empty value",
+				reflect.TypeFor[string](),
+				`json:"v" enum:"a,,b"`,
+				`struct field V has the enum tag "a,,b", which lists an empty value`,
+			},
+			{
+				"trailing comma",
+				reflect.TypeFor[*string](),
+				`json:"v" enum:"a,"`,
+				`struct field V has the enum tag "a,", which lists an empty value`,
+			},
+			{
+				"repeated value",
+				reflect.TypeFor[[]string](),
+				`json:"v" enum:"a,b,a"`,
+				`struct field V has the enum tag "a,b,a", which lists "a" twice`,
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				typ := structWithTag("V", tt.typ, tt.tag)
+
+				_, _, err := newSchemaBuilder().typeSchema(typ, "")
+				require.EqualError(t, err, typ.String()+" cannot be decoded from JSON: "+tt.reason)
+				_, err = decodeJSONValue(typ, map[string]any{})
+				require.EqualError(
+					t,
+					err,
+					"json: cannot unmarshal object into Go value of type "+typ.String()+": "+tt.reason,
+				)
+			})
+		}
+
+		const reason = "gepa.enumOnCount cannot be decoded from JSON: struct field Count of type int " + kind
+		_, err := JSONSchemaFor[enumOnCount]()
+		require.EqualError(t, err, "json schema for gepa.enumOnCount: "+reason)
+		require.EqualError(
+			t,
+			TypedPredict[stateObligation, enumOnCount]{LM: textModel(nil)}.Validate(),
+			"typed predict outputs: "+reason,
+		)
+		_, err = Key[enumOnCount]{Name: "v"}.Get(NewState(Prediction{"v": map[string]any{"count": 1}}))
+		require.EqualError(
+			t,
+			err,
+			`state key "v": decode as gepa.enumOnCount: json: cannot unmarshal object into Go value of type `+
+				"gepa.enumOnCount: struct field Count of type int "+kind,
+		)
+	})
+}
+
+func TestEnumCache(t *testing.T) {
+	t.Run("dynamic contents", func(t *testing.T) {
+		type plain struct {
+			Text    string `json:"text"`
+			Ignored any    `json:"-"`
+		}
+		type valid struct {
+			Impact string `json:"impact" enum:"outage,none"`
+		}
+		type invalid struct {
+			Count int `json:"count" enum:"1,2"`
+		}
+		type envelope struct {
+			Payload any `json:"payload"`
+		}
+		cycle := map[string]any{"details": valid{Impact: "outage"}}
+		cycle["self"] = cycle
+		var wg sync.WaitGroup
+		for range 16 {
+			wg.Go(func() {
+				for range 50 {
+					key := Key[envelope]{Name: "v"}
+					for _, value := range []any{nil, plain{Text: "ok", Ignored: (*invalid)(nil)}, cycle} {
+						_, err := key.Get(NewState(Prediction{"v": envelope{Payload: value}}))
+						assert.NoError(t, err)
+					}
+					_, err := key.Get(NewState(Prediction{"v": envelope{Payload: (*invalid)(nil)}}))
+					assert.ErrorContains(t, err, `field "payload"`)
+					assert.ErrorContains(t, err, "cannot have an enum tag")
+					_, err = key.Get(NewState(Prediction{"v": envelope{Payload: valid{Impact: "down"}}}))
+					assert.ErrorContains(t, err, `field "payload.impact"`)
+					assert.ErrorContains(t, err, "not one of")
+				}
+			})
+		}
+		wg.Wait()
+		require.False(t, enumValidationFor(reflect.TypeFor[plain]()).needed)
+		_, checked := definitionErrors.Load(reflect.TypeFor[plain]())
+		require.False(t, checked, "enum-free types need no definition check")
+		validation := enumValidationFor(reflect.TypeFor[envelope]())
+		require.True(t, validation.needed)
+		require.NoError(t, validation.err, "a concrete value's error must not poison its interface holder")
+		cached := enumValidationFor(reflect.TypeFor[*invalid]()).err
+		require.ErrorContains(t, cached, "cannot have an enum tag")
+		require.Same(t, cached, enumValidationFor(reflect.TypeFor[*invalid]()).err)
+		require.Empty(t, definitionError(reflect.TypeFor[invalid]()).JSONPointer)
+	})
+
+	t.Run("concurrent recursive types", func(t *testing.T) {
+		type valid struct {
+			Next  *valid `json:"next"`
+			Value string `json:"value" enum:"a,b"`
+		}
+		type invalid struct {
+			Next  *invalid `json:"next"`
+			Value int      `json:"value" enum:"1,2"`
+		}
+		type wrapper struct {
+			Valid   *valid    `json:"valid"`
+			Invalid []invalid `json:"invalid"`
+		}
+		types := []reflect.Type{reflect.TypeFor[valid](), reflect.TypeFor[invalid](), reflect.TypeFor[wrapper]()}
+		var wg sync.WaitGroup
+		for range 16 {
+			wg.Go(func() {
+				for range 50 {
+					_, err := JSONSchemaFor[valid]()
+					assert.NoError(t, err)
+					_, err = Key[valid]{Name: "v"}.Get(NewState(Prediction{"v": valid{Value: "a"}}))
+					assert.NoError(t, err)
+					_, err = Key[wrapper]{Name: "v"}.Get(NewState(Prediction{
+						"v": map[string]any{"valid": nil, "invalid": []any{}},
+					}))
+					assert.ErrorContains(t, err, "cannot have an enum tag")
+					_, err = JSONSchemaFor[wrapper]()
+					assert.ErrorContains(t, err, "cannot have an enum tag")
+					for _, typ := range types {
+						assert.True(t, enumValidationFor(typ).needed)
+					}
+				}
+			})
+		}
+		wg.Wait()
+		for _, typ := range types {
+			cached, ok := enumValidations.Load(typ)
+			require.True(t, ok)
+			require.Equal(t, cached, enumValidationFor(typ))
+		}
+		refused := definitionError(reflect.TypeFor[invalid]())
+		require.NotNil(t, refused)
+		require.Empty(t, refused.JSONPointer)
+		err := checkJSONShape(reflect.TypeFor[wrapper](), map[string]any{
+			"valid": nil, "invalid": []any{map[string]any{"value": 1}},
+		}, jsonPath{})
+		require.Error(t, err)
+		require.Empty(t, refused.JSONPointer, "locating a cached error must not mutate it")
+	})
 }

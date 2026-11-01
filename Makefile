@@ -24,8 +24,10 @@ modernize:
 		(cd $$module && $(MODERNIZE) -mapsloop -fix ./...); \
 	done
 
+# golines leaves internal/jsonschema, a patched copy of an upstream module, as upstream wrote it.
 fmt: modernize
-	$(GOLINES) --max-len=$(MAX_LEN) -w .
+	$(GOLINES) --max-len=$(MAX_LEN) --ignored-dirs=vendor --ignored-dirs=node_modules --ignored-dirs=.git \
+		--ignored-dirs=jsonschema -w .
 	$(GOFMT) -w $(GOFILES)
 
 test:

@@ -31,9 +31,11 @@ const pipelineFingerprintVersion = 1
 //   - the body of a Map or MapCollect, the read that holds its items, its item key by name and
 //     type, its results key and MapOptions
 //   - the body of a Loop, its MaxIterations and its iteration key by name and type
-//   - for a NewProgramStep whose programme is a Fingerprinter, such as a nested Pipeline, that
+//   - for a NewProgramStep whose programme is a Fingerprinter, such as a nested Pipeline or a
+//     Predict or ChainOfThought whose outputs set Schema (see Predict.Fingerprint), that
 //     programme's fingerprint
-//   - the transitions, in order, by From, To, OnError and which of When, Amend and Accept they set
+//   - the transitions, in order, by From, To, OnError and which of When, Amend, Accept and
+//     RestoreOnError they set
 //   - MaxVisits
 //   - the amendable keys of each step (see WithAmendable)
 //
@@ -41,7 +43,7 @@ const pipelineFingerprintVersion = 1
 // fits the pipeline:
 //   - candidate components and their text (instructions, demos and other prompts)
 //   - the Go type and code of each step
-//   - the code of a transition's When, Amend and Accept, and of a Loop's until
+//   - the code of a transition's When, Amend, Accept and RestoreOnError, and of a Loop's until
 //   - a programme that is not a Fingerprinter
 //   - merge functions, Defaults, Budget and AllowExtraInputs
 //   - the timeout and retries of a WithPolicy
@@ -51,8 +53,8 @@ const pipelineFingerprintVersion = 1
 // order keeps the fingerprint. The fingerprint identifies a named type by its package path and
 // name, not by its definition. So changing the fields of a named struct type keeps the
 // fingerprint. Give the artefact and the loader a ProgramVersion when such a change matters. A
-// pipeline without transitions, MaxVisits or amendable keys has the fingerprint v0.8.0 gave it,
-// so its artefacts still load.
+// pipeline without transitions, MaxVisits, amendable keys or a Predict or ChainOfThought step
+// whose outputs set Schema has the fingerprint v0.8.0 gave it, so its artefacts still load.
 func (p Pipeline) Fingerprint() string {
 	if p.Validate() != nil {
 		return ""
@@ -69,6 +71,7 @@ func (p Pipeline) Fingerprint() string {
 			When:    rule.when != nil,
 			Amend:   rule.amend != nil,
 			Accept:  rule.accept != nil,
+			Restore: rule.restore != nil,
 		})
 	}
 	for i, limit := range p.flow.maxVisits {
@@ -100,6 +103,7 @@ type transitionShape struct {
 	When    bool   `json:"when,omitempty"`
 	Amend   bool   `json:"amend,omitempty"`
 	Accept  bool   `json:"accept,omitempty"`
+	Restore bool   `json:"restore,omitempty"`
 }
 
 // visitsShape is a step's MaxVisits.

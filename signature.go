@@ -13,14 +13,22 @@ import (
 
 // Field describes one named input or output in a programme signature.
 //
-// Type and Schema constrain the field's value. Type is a Go kind name and maps to a JSON Schema
-// type: "bool" to boolean; "int", "int8", "int16", "int32", "int64", "uint", "uint8",
-// "uint16", "uint32" and "uint64" to integer; "float32" and "float64" to number; "string" to
-// string; "slice" to an array of any values; "map" to an object of any values. Predict checks
-// an output's value against its Type as Key.Get would decode it into that Go type, so 2.5 is
-// not an int and 300 is not an int8. Schema is an explicit JSON Schema for the value; Predict
-// passes it to the model but does not check values against it. Set one or neither: a field
-// with neither accepts any JSON value.
+// Type and Schema constrain the field's value. Set one or neither: a field with neither accepts
+// any JSON value. Type is a Go kind name and maps to a JSON Schema type: "bool" to boolean; "int",
+// "int8", "int16", "int32", "int64", "uint", "uint8", "uint16", "uint32" and "uint64" to integer;
+// "float32" and "float64" to number; "string" to string; "slice" to an array of any values; "map"
+// to an object of any values. Predict checks an output's value against its Type as Key.Get would
+// decode it into that Go type, so 2.5 is not an int and 300 is not an int8. Schema is an explicit
+// JSON Schema for the value. Predict passes it to the model and checks a present, non-null output
+// against it where Signature.JSONSchema holds it, under the reply's properties. There "#" means
+// the reply, so give definitions an $id and refer to that. The draft is 2020-12: a Schema that
+// declares another draft needs its own $id, or the declaration is ignored, and format is checked
+// only under a draft before 2019-09. A reference cannot load another document, so
+// Signature.Validate refuses an output Schema with a $ref to one. Predict checks a recursive anyOf
+// or oneOf in time and memory linear in the reply's size plus the size of the problems it finds,
+// unless it recurses through $dynamicRef or $recursiveRef. When no branch matches, the problems
+// name only the branches the value could have meant, judged by its type and by a const or enum
+// that every such branch sets, such as on "type".
 //
 // An output is required: Predict fails when the reply omits it or sets it to null. Optional
 // lets the reply set it to null or leave it out; strict providers need every property listed
@@ -72,7 +80,8 @@ type Signature struct {
 }
 
 // Validate checks that a signature has unique input and output field names and that every
-// field's Type, Schema and Optional settings are usable.
+// field's Type, Schema and Optional settings are usable. Each output's Schema must compile where
+// JSONSchema holds it, since Predict checks replies there; an input's is not compiled.
 func (s Signature) Validate() error {
 	if len(s.Inputs) == 0 {
 		return errors.New("signature requires at least one input field")
@@ -98,6 +107,11 @@ func (s Signature) Validate() error {
 			return fmt.Errorf("field %q used as both %s and output", field.Name, owner)
 		}
 		seen[field.Name] = "output"
+	}
+	if slices.ContainsFunc(s.Outputs, func(field Field) bool { return len(field.Schema) > 0 }) {
+		if _, err := s.replySchema(); err != nil {
+			return fmt.Errorf(`reply schema, in which a "#" reference means the reply: %w`, err)
+		}
 	}
 	return nil
 }

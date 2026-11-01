@@ -46,22 +46,39 @@ import (
 // When of From then fail From, the snapshot is restored all the same before From's OnError
 // transitions are evaluated, and so it is when Accept itself panics. If the run leaves the
 // range before From succeeds again, through a skip past From, End, Fail or a failure, Accept is
-// not called and the new writes stand. Usage of every visit, rejected ones included, counts in
-// the run's usage, trace and budget; a PerStepTokens limit counts the tokens of all the visits
-// of a step together.
+// not called and the new writes stand, unless RestoreOnError keeps the visit before.
+//
+// RestoreOnError is called when a step of the range fails before From succeeds again, once the
+// step's execution has ended, after the retries of a WithPolicy, and before the step's OnError
+// transitions. For the primary step of a Fallback, the Whens of the OnError transitions
+// declared before the Fallback's run first: RestoreOnError is called before the first of them
+// that matches is taken, not at all when none does and the Fallback falls back, and otherwise
+// before the transitions after the Fallback's. So when the primary falls back, only the
+// secondary's failure counts. When RestoreOnError returns true, the run rejects the new visit
+// as an Accept that returns false does, without running the rest of the range, and
+// RewindRejected carries the step's error. When it returns false, the step's OnError
+// transitions are evaluated as they are without it. It is not called once the run's context
+// has ended.
+//
+// Usage of every visit, rejected ones included, counts in the run's usage, trace and budget; a
+// PerStepTokens limit counts the tokens of all the visits of a step together.
 //
 // Build checks every transition: From and To name top-level steps, End or Fail; a rewind's
-// target has MaxVisits of at least 2; Amend and Accept are set only on rewinds, Accept only on
-// one without OnError, since a failed From has no writes for Accept to keep or restore, and
-// Amend only when the target has amendable keys (see WithAmendable); and any two rewinds have
-// the same target and From or ranges that do not overlap, because one rewind range runs at a time
-// and nested ranges are not supported in this release. A step that a transition skips over, or
-// that has an OnError transition to a later step or End, may not write: a later step can read
-// its writes only through a Default. No step may be named End or Fail.
+// target has MaxVisits of at least 2; Amend, Accept and RestoreOnError are set only on rewinds,
+// Accept and RestoreOnError only on one without OnError, since a failed From has no writes for
+// them to keep or restore, and Amend only when the target has amendable keys (see
+// WithAmendable); and any two rewinds have the same target and From or ranges that do not
+// overlap, because one rewind range runs at a time and nested ranges are not supported in this
+// release. A step that a transition skips over, or that has an OnError transition to a later
+// step or End, may not write: a later step can read its writes only through a Default. No step
+// may be named End or Fail.
 //
-// When, Amend and Accept run on the run's goroutine. One that panics fails From with the panic's
-// value in the error and the stack under Details["stack"], as a panicking step does; From's
-// execution, the last attempt under a WithPolicy, ends with that error.
+// When, Amend, Accept and RestoreOnError run on the run's goroutine. A When, Amend or Accept
+// that panics fails From with the panic's value in the error and the stack under
+// Details["stack"], as a panicking step does; From's execution, the last attempt under a
+// WithPolicy, ends with that error. A RestoreOnError that panics, or a When of From that panics
+// after it restored, fails the run with a StepError that names the step that failed and holds
+// its error and the panic's.
 type Transition struct {
 	// From names the top-level step whose finish the transition follows.
 	From string
@@ -84,6 +101,15 @@ type Transition struct {
 	// again: prev holds the values the steps from the target through From had committed when the
 	// rewind was taken, next their values now, both read-only. Nil means accept.
 	Accept func(prev, next State) bool
+	// RestoreOnError, on a rewind without OnError only, decides whether the run keeps the visit
+	// before the rewind when a step of the range fails before From succeeds again: it gets the
+	// step's name and error, and true restores the snapshot as an Accept that returns false
+	// does. Nil means the new writes stand.
+	RestoreOnError func(step string, err error) bool
+
+	// fallback marks the OnError transition that Fallback adds from its primary step to its
+	// secondary step.
+	fallback bool
 }
 
 const (
@@ -205,15 +231,17 @@ const (
 // values a rewind snapshots and resets; rewinds with the same range share it, and Build's pass
 // over steps fills it.
 type transitionRule struct {
-	index   int
-	from    int
-	to      int
-	rewind  bool
-	onError bool
-	when    func(State, error) bool
-	amend   func(State) error
-	accept  func(prev, next State) bool
-	keys    map[string]reflect.Type
+	index    int
+	from     int
+	to       int
+	rewind   bool
+	onError  bool
+	when     func(State, error) bool
+	amend    func(State) error
+	accept   func(prev, next State) bool
+	restore  func(step string, err error) bool
+	fallback bool
+	keys     map[string]reflect.Type
 }
 
 // describe names the rule as transition errors do.
@@ -246,7 +274,9 @@ func (r *transitionRule) skips(i, n int) bool {
 
 // transitionTable is what a run needs of a pipeline's transitions: every rule in declaration
 // order and, by top-level step index, the rules to evaluate on success and on failure, the
-// MaxVisits of each step, whether a rewind may land on it, and its amendable keys.
+// MaxVisits of each step, whether a rewind may land on it, its amendable keys, and, for the
+// primary step of a Fallback, the position in its failure rules of the last rule that Fallback
+// marked, or -1.
 type transitionTable struct {
 	rules     []*transitionRule
 	success   [][]*transitionRule
@@ -254,6 +284,7 @@ type transitionTable struct {
 	maxVisits []int
 	target    []bool
 	amendable []map[string]reflect.Type
+	fallback  []int
 }
 
 // rewindRange is the steps from a rewind's target, start, through its From, end, which the
@@ -535,6 +566,7 @@ func (b *pipelineBuilder) checkTransitions(
 		maxVisits: make([]int, n),
 		target:    make([]bool, n),
 		amendable: make([]map[string]reflect.Type, n),
+		fallback:  slices.Repeat([]int{-1}, n),
 	}
 	facts := newTransitionFacts(n, table.target)
 	for _, name := range slices.Sorted(maps.Keys(maxVisits)) {
@@ -572,6 +604,9 @@ func (b *pipelineBuilder) checkTransitions(
 		}
 		rules = append(rules, rule)
 		if rule.onError {
+			if rule.fallback {
+				table.fallback[rule.from] = len(table.failure[rule.from])
+			}
 			table.failure[rule.from] = append(table.failure[rule.from], rule)
 		} else {
 			table.success[rule.from] = append(table.success[rule.from], rule)
@@ -607,12 +642,14 @@ func compileTransition(
 		return nil, fmt.Errorf("transition %d: From %q is not a top-level step of this pipeline", i, transition.From)
 	}
 	rule := &transitionRule{
-		index:   i,
-		from:    from,
-		onError: transition.OnError,
-		when:    transition.When,
-		amend:   transition.Amend,
-		accept:  transition.Accept,
+		index:    i,
+		from:     from,
+		onError:  transition.OnError,
+		when:     transition.When,
+		amend:    transition.Amend,
+		accept:   transition.Accept,
+		restore:  transition.RestoreOnError,
+		fallback: transition.fallback,
 	}
 	switch to := strings.TrimSpace(transition.To); to {
 	case End:
@@ -631,9 +668,9 @@ func compileTransition(
 		rule.to, rule.rewind = target, target <= from
 	}
 	if !rule.rewind {
-		if rule.amend != nil || rule.accept != nil {
+		if rule.amend != nil || rule.accept != nil || rule.restore != nil {
 			return nil, fmt.Errorf(
-				"%s to %q: Amend and Accept apply to rewinds only",
+				"%s to %q: Amend, Accept and RestoreOnError apply to rewinds only",
 				rule.describe(steps),
 				rule.target(steps),
 			)
@@ -645,6 +682,14 @@ func compileTransition(
 		return nil, fmt.Errorf(
 			"%s rewinds to %q on error with an Accept; Accept applies only to a rewind taken when "+
 				"its From succeeds, since a failed From has no writes for a rejection to restore",
+			rule.describe(steps),
+			target,
+		)
+	}
+	if rule.onError && rule.restore != nil {
+		return nil, fmt.Errorf(
+			"%s rewinds to %q on error with a RestoreOnError; RestoreOnError applies only to a rewind "+
+				"taken when its From succeeds, since a failed From has no writes for a restore to keep",
 			rule.describe(steps),
 			target,
 		)

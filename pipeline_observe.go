@@ -101,7 +101,9 @@ type PipelineObserver interface {
 // observes (see Transition), with the same ordering, serialisation, context and panic rules as
 // the other events: TransitionTaken follows the StepFinished of the last execution of the step
 // the transition leaves, after any RewindRejected for it, and comes before the next StepStarted
-// of the run. RecordingObserver is one.
+// of the run. After a RewindRejected for a step that failed (see Transition.RestoreOnError), the
+// transition the rewind's From takes follows that step's StepFinished instead. RecordingObserver
+// is one.
 type TransitionObserver interface {
 	PipelineObserver
 	TransitionTaken(ctx context.Context, event TransitionTakenEvent)
@@ -139,15 +141,21 @@ type TransitionTakenEvent struct {
 	Rewind bool
 }
 
-// RewindRejectedEvent reports that a rewind's Accept kept the visit before it: the values the
-// rewind's range committed before it are restored and the run goes on past Step.
+// RewindRejectedEvent reports that a rewind kept the visit before it, because its Accept
+// rejected the new visit or its RestoreOnError restored the old one after a step of the range
+// failed: the values the rewind's range committed before it are restored and the run goes on
+// past the rewind's From.
 type RewindRejectedEvent struct {
 	// RunContext is the RunContext of the run, as RunStarted reported it.
 	RunContext RunContext
-	// Step is the From step of the rejected rewind.
+	// Step is the step whose visit ended the rewind: its From when Accept rejected it, the step
+	// that failed when RestoreOnError restored.
 	Step string
 	// Rule is the rewind's index in PipelineSpec.Transitions.
 	Rule int
+	// Err is the error RestoreOnError got when it restored, redacted as the step's
+	// StepFinishedEvent error is, and nil when Accept rejected the visit.
+	Err error
 }
 
 // RunStartedEvent reports the start of a pipeline run.
@@ -741,15 +749,19 @@ func (r *runObservation) transitionTaken(ctx context.Context, event TransitionTa
 // rewindRejected emits RewindRejected to the observers that are TransitionObservers. ctx is
 // the run's context.
 func (r *runObservation) rewindRejected(ctx context.Context, event RewindRejectedEvent) {
+	var laneErr error
 	r.deliverTransition(ctx, func(lane *runObservation) {
+		laneErr = lane.redactError(event.Err)
 		if state := lane.resolution; state != nil && state.pending != nil {
 			event := event
 			event.RunContext = lane.runContext
+			event.Err = laneErr
 			state.pending.RewindRejected = &event
 		}
 	}, func(observer TransitionObserver, rc RunContext, observerCtx context.Context) {
 		event := event
 		event.RunContext = rc
+		event.Err = laneErr
 		observer.RewindRejected(observerCtx, event)
 	})
 }

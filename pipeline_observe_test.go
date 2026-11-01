@@ -104,7 +104,11 @@ func (l *eventLog) TransitionTaken(_ context.Context, event TransitionTakenEvent
 func (l *eventLog) RewindRejected(_ context.Context, event RewindRejectedEvent) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.lines = append(l.lines, fmt.Sprintf("rewind %d rejected at %s", event.Rule, event.Step))
+	line := fmt.Sprintf("rewind %d rejected at %s", event.Rule, event.Step)
+	if event.Err != nil {
+		line += " err: " + event.Err.Error()
+	}
+	l.lines = append(l.lines, line)
 }
 
 func (l *eventLog) Lines() []string {

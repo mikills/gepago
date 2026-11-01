@@ -907,14 +907,19 @@ func textForms(value any) []string {
 	return forms
 }
 
-// stringForms returns each string value holds, as it is, quoted and JSON-encoded.
+// stringForms returns each string value holds, as it is, quoted and JSON-encoded with and
+// without HTML escaping.
 func stringForms(value any) []string {
 	var forms []string
 	walkStrings(reflect.ValueOf(value), map[uintptr]bool{}, func(text string) {
 		quoted := strconv.Quote(text)
 		forms = append(forms, text, quoted[1:len(quoted)-1])
-		if data, err := json.Marshal(text); err == nil {
-			forms = append(forms, string(data[1:len(data)-1]))
+		escaped, err := json.Marshal(text)
+		if err == nil {
+			forms = append(forms, string(escaped[1:len(escaped)-1]))
+		}
+		if plain, err := marshalMetricJSON(text); err == nil && !bytes.Equal(plain, escaped) {
+			forms = append(forms, string(plain[1:len(plain)-1]))
 		}
 	})
 	return forms

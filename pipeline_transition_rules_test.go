@@ -959,7 +959,17 @@ func TestTransitionBuildErrors(t *testing.T) {
 				Steps:       []Step{writeAmount("a", 1), readAmount("b"), writeNotes("c")},
 				Transitions: []Transition{{From: "a", To: "c", Amend: setHint}},
 			},
-			wantErr: `transition 0 from "a" to "c": Amend and Accept apply to rewinds only`,
+			wantErr: `transition 0 from "a" to "c": Amend, Accept and RestoreOnError apply to rewinds only`,
+		},
+		{
+			name: "RestoreOnError on a forward transition",
+			spec: PipelineSpec{
+				Steps: []Step{writeAmount("a", 1), readAmount("b"), writeNotes("c")},
+				Transitions: []Transition{
+					{From: "a", To: "c", RestoreOnError: func(string, error) bool { return true }},
+				},
+			},
+			wantErr: `transition 0 from "a" to "c": Amend, Accept and RestoreOnError apply to rewinds only`,
 		},
 		{
 			name: "Accept on End",
@@ -967,7 +977,7 @@ func TestTransitionBuildErrors(t *testing.T) {
 				Steps:       []Step{writeAmount("a", 1)},
 				Transitions: []Transition{{From: "a", To: End, Accept: func(State, State) bool { return true }}},
 			},
-			wantErr: `transition 0 from "a" to "$end": Amend and Accept apply to rewinds only`,
+			wantErr: `transition 0 from "a" to "$end": Amend, Accept and RestoreOnError apply to rewinds only`,
 		},
 		{
 			name: "Amend to a step without amendable keys",
@@ -1104,6 +1114,18 @@ func TestTransitionBuildErrors(t *testing.T) {
 			},
 			wantErr: `transition 0 from "a" rewinds to "a" on error with an Accept; Accept applies only to a ` +
 				`rewind taken when its From succeeds, since a failed From has no writes for a rejection to restore`,
+		},
+		{
+			name: "RestoreOnError on an OnError rewind",
+			spec: PipelineSpec{
+				Steps: []Step{writeAmount("a", 1), readAmount("b")},
+				Transitions: []Transition{
+					{From: "b", OnError: true, To: "a", RestoreOnError: func(string, error) bool { return true }},
+				},
+				MaxVisits: map[string]int{"a": 2},
+			},
+			wantErr: `transition 0 from "b" rewinds to "a" on error with a RestoreOnError; RestoreOnError applies ` +
+				`only to a rewind taken when its From succeeds, since a failed From has no writes for a restore to keep`,
 		},
 		{
 			name:    "a step named End",
