@@ -34,16 +34,17 @@ Never commit API keys, reports, `.diago` output, or local notes.
 
 ## Releases
 
-The root module and `programs/crucible` are tagged separately, as `vX.Y.Z` and
-`programs/crucible/vX.Y.Z`. When crucible requires a root version that is not tagged yet,
-`go.work` replaces that version with the workspace module so the workspace builds. Release in
-this order:
+The root module and the programs `programs/crucible` and `programs/classify` are tagged
+separately, as `vX.Y.Z`, `programs/crucible/vX.Y.Z` and `programs/classify/vX.Y.Z`. When a
+program requires a root version that is not tagged yet, `go.work` replaces that version with
+the workspace module so the workspace builds. Release in this order:
 
 1. Tag the root module: `make release VERSION=vX.Y.Z`.
-2. In `programs/crucible`, run `GOWORK=off go mod tidy` to add the new version's `go.sum`
-   lines, remove the `replace` for it from `go.work`, and commit both.
-3. Tag crucible: `make release-crucible VERSION=vA.B.C`. The target and the release-crucible
-   workflow test crucible with `GOWORK=off` on that commit, so they fail until step 2 is in.
+2. In each program that requires the new version, run `GOWORK=off go mod tidy` to add its
+   `go.sum` lines. Remove the `replace` for the version from `go.work`, and commit them all.
+3. Tag the programs: `make release-crucible VERSION=vA.B.C` and
+   `make release-classify VERSION=vA.B.C`. The targets and their release workflows test each
+   program with `GOWORK=off` on that commit, so they fail until step 2 is in.
 
 ## Design guidelines
 

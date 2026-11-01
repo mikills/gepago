@@ -1,4 +1,4 @@
-.PHONY: fmt modernize test vet staticcheck diago wasm-build wasm-test verify check release release-major release-crucible
+.PHONY: fmt modernize test vet staticcheck diago wasm-build wasm-test verify check release release-major release-crucible release-classify
 
 GOFILES := $(shell find . -name '*.go' \
 	-not -path './testdata/*' \
@@ -16,7 +16,7 @@ MODERNIZE := go run golang.org/x/tools/go/analysis/passes/modernize/cmd/moderniz
 STATICCHECK := go run honnef.co/go/tools/cmd/staticcheck@v0.8.2
 MAX_LEN ?= 120
 DIAGO_OUTPUT ?= .diago/audit.txt
-WORK_MODULES := . ./programs/crucible
+WORK_MODULES := . ./programs/crucible ./programs/classify
 WASM_PACKAGE := packages/gepago/wasm
 
 modernize:
@@ -118,6 +118,32 @@ release-crucible: test
 	fi; \
 	tag="programs/crucible/$$version"; \
 	echo "latest Crucible tag: $$latest"; \
+	echo "release tag: $$tag"; \
+	if git rev-parse -q --verify "refs/tags/$$tag" >/dev/null; then \
+		echo "tag already exists: $$tag" >&2; exit 1; \
+	fi; \
+	if [[ -n "$(DRY_RUN)" ]]; then \
+		echo "dry run: git tag $$tag && git push origin $$tag"; \
+		exit 0; \
+	fi; \
+	git tag "$$tag"; \
+	git push origin "$$tag"
+
+# Release the nested Classify module, tagged as programs/classify/vX.Y.Z.
+# Examples:
+#   make release-classify VERSION=v0.1.0
+#   make release-classify VERSION=v0.1.0 DRY_RUN=1
+release-classify: test
+	cd programs/classify && GOWORK=off go test ./... -count=1
+	@set -euo pipefail; \
+	latest="$$(git tag --list 'programs/classify/v[0-9]*' --sort=-version:refname | head -n 1)"; \
+	if [[ -z "$$latest" ]]; then latest="programs/classify/v0.0.0"; fi; \
+	version="$(VERSION)"; \
+	if [[ ! "$$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$$ ]]; then \
+		echo "invalid Classify version: $$version (expected vX.Y.Z)" >&2; exit 1; \
+	fi; \
+	tag="programs/classify/$$version"; \
+	echo "latest Classify tag: $$latest"; \
 	echo "release tag: $$tag"; \
 	if git rev-parse -q --verify "refs/tags/$$tag" >/dev/null; then \
 		echo "tag already exists: $$tag" >&2; exit 1; \

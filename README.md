@@ -26,6 +26,7 @@ Original paper:
 - Load parsed text documents into examples for extraction-focused optimisation.
 - Build reflective datasets from evaluation feedback, pipeline traces and agent traces.
 - Use built-in exact-match, contains, numeric, classification, and LLM judge metrics.
+- Build a text classifier with [`programs/classify`](programs/classify), a module of its own. It falls back to a second model, abstains when unsure, and trains its instruction and label definitions.
 - Compile a `Predict`, `ChainOfThought`, `TypedPredict` or `Pipeline` from examples, a metric, and a reflection model.
 - Select candidates from a Pareto frontier or current-best strategy, accept or reject them with configurable score criteria, and resume optimisation from persisted state.
 - Save trained candidates as fingerprinted artefacts and load them at runtime.
@@ -633,6 +634,11 @@ This separates reusable programme shape from trained candidate text. The artefac
 For service-style deployments, reusable programme families can implement `ProgramTemplate` and be registered with `RegisterTemplate`. GEPAgo also includes helpers for JSONL training data (`LoadJSONLExamples`), artefact indexes (`WriteProgramArtifactManifest`), before/after prompt reports (`WriteCandidateDiffReport`), a minimal HTTP runner (`ProgramHTTPHandler`), and cross-process runtime-training locks (`FileTrainLock`, `LoadOrTrainLocked`).
 
 Lower-level optimiser APIs remain available when you need full control.
+
+## Classifiers
+
+[`programs/classify`](programs/classify) builds a text classifier on a `Pipeline`. It falls back to a second model, abstains when unsure and trains its prompt with `Compile`.
+It is a module of its own, `github.com/mikills/gepago/programs/classify`, and [its README](programs/classify/README.md) covers it.
 
 ## Test kit
 
