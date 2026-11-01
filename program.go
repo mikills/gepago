@@ -11,6 +11,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/mikills/gepago/internal/jsonschema"
 )
 
 const (
@@ -113,10 +115,10 @@ func refusalText(text string) string {
 // When LM (or RepairLM, for repairs) is a StructuredGenerator, Predict passes it the
 // signature's ResponseFormat; otherwise it sends the prompt alone. Either way it checks the
 // reply with ParseOutput before returning: each output not marked Optional must be present and
-// not null, an output with a Type must hold a value of that type, and the reply must have no
-// other fields. When MaxParseRetries is above zero, a reply that fails to parse or fails the
-// check is sent for repair up to MaxParseRetries times, with the original request, the error
-// and the JSON schema (see RepairPrompt).
+// not null, an output with a Type must hold a value of that type, one with a Schema a value that
+// matches it, and the reply must have no other fields. When MaxParseRetries is above zero, a
+// reply that fails to parse or fails the check is sent for repair up to MaxParseRetries times,
+// with the original request, the error and the JSON schema (see RepairPrompt).
 //
 // A Predict with Tools or Middleware chats instead: LM must also be a ChatClient, and the call
 // is a bounded tool loop described on Tools.
@@ -221,8 +223,8 @@ func (p Predict) RunCandidate(ctx context.Context, candidate Candidate, inputs P
 	return p.run(ctx, candidate, inputs, nil)
 }
 
-// run is RunCandidate with an extra output check, which TypedPredict uses to decode the reply
-// inside the repair loop. check runs only on replies that pass ParseOutput.
+// run is RunCandidate with check in place of the outputs' Schema check; TypedPredict passes one
+// that decodes the reply into Out. check runs only on replies that pass the other output checks.
 func (p Predict) run(
 	ctx context.Context,
 	candidate Candidate,
@@ -378,7 +380,11 @@ func (p Predict) parseOrRepair(
 // parseAndCheck parses and checks a reply. A reply that parses but fails a check carries
 // itself as the "output" step detail, so a pipeline's StepError shows what the model returned.
 func (p Predict) parseAndCheck(raw string, check func(Prediction) error) (Prediction, error) {
-	prediction, err := p.ParseOutput(raw)
+	prediction, err := ParsePrediction(raw)
+	if err != nil {
+		return nil, err
+	}
+	err = p.Signature.checkOutputs(prediction, check == nil)
 	if err == nil && check != nil {
 		err = check(prediction)
 	}
@@ -390,16 +396,17 @@ func (p Predict) parseAndCheck(raw string, check func(Prediction) error) (Predic
 
 // ParseOutput parses a model reply as ParsePrediction does and checks it against the
 // signature's outputs: each output not marked Optional must be present and not null, an output
-// with a Type must hold a value of that type, and the reply must have no other fields. A reply
-// that parses but fails the check is returned together with an error that matches
-// ErrInvalidOutput and names every offending field. It is exported so resumable integrations
-// can apply Predict's checks without duplicating them.
+// with a Type must hold a value of that type, one with a Schema a value that matches it, and the
+// reply must have no other fields. A reply that parses but fails the check is returned together
+// with an error that matches ErrInvalidOutput and names every offending field, one clause per
+// problem separated by semicolons, such as `output "label" is "x", not one of "a", "b"`. It is
+// exported so resumable integrations can apply Predict's checks without duplicating them.
 func (p Predict) ParseOutput(raw string) (Prediction, error) {
 	prediction, err := ParsePrediction(raw)
 	if err != nil {
 		return nil, err
 	}
-	return prediction, p.Signature.checkOutputs(prediction)
+	return prediction, p.Signature.checkOutputs(prediction, true)
 }
 
 // RepairPrompt renders the prompt that asks a language model to repair an output ParseOutput
@@ -429,9 +436,18 @@ func (p Predict) RepairPrompt(prompt, raw string, outputErr error) string {
 }
 
 // checkOutputs reports every way prediction breaks the signature's outputs, as one error that
-// matches ErrInvalidOutput.
-func (s Signature) checkOutputs(prediction Prediction) error {
-	var problems []string
+// matches ErrInvalidOutput. It checks values against their Schema when schemas is set.
+func (s Signature) checkOutputs(prediction Prediction, schemas bool) error {
+	var (
+		problems []string
+		reply    *jsonschema.Schema
+	)
+	if schemas && slices.ContainsFunc(s.Outputs, func(field Field) bool { return len(field.Schema) > 0 }) {
+		var err error
+		if reply, err = s.replySchema(); err != nil {
+			problems = append(problems, fmt.Sprintf("the reply schema does not compile: %v", err))
+		}
+	}
 	outputs := make(map[string]bool, len(s.Outputs))
 	for _, field := range s.Outputs {
 		outputs[field.Name] = true
@@ -445,6 +461,8 @@ func (s Signature) checkOutputs(prediction Prediction) error {
 			if _, err := decodeValue(fieldTypes[field.Type], value, fromText); err != nil {
 				problems = append(problems, fmt.Sprintf("output %q is not a valid %s: %v", field.Name, field.Type, err))
 			}
+		case value != nil && reply != nil && len(field.Schema) > 0:
+			problems = append(problems, field.schemaProblems(reply, value)...)
 		}
 	}
 	for _, key := range slices.Sorted(maps.Keys(prediction)) {

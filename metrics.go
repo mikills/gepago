@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"encoding/json/jsontext"
 	"errors"
+	"fmt"
 	"maps"
 	"math"
 	"reflect"
@@ -140,16 +141,16 @@ func (m ClassificationMetric) Score(_ context.Context, expected Prediction, actu
 	if field == "" {
 		field = "label"
 	}
-	positive := m.normalise(m.PositiveLabel)
+	positive := normaliseLabel(m.PositiveLabel, m.TrimSpace, m.IgnoreCase)
 	if positive == "" {
 		positive = "positive"
 	}
-	negative := m.normalise(m.NegativeLabel)
+	negative := normaliseLabel(m.NegativeLabel, m.TrimSpace, m.IgnoreCase)
 	if negative == "" {
 		negative = "negative"
 	}
-	want, wantOK := m.normaliseValue(expected[field])
-	got, gotOK := m.normaliseValue(actual[field])
+	want, wantOK := labelValue(expected[field], m.TrimSpace, m.IgnoreCase)
+	got, gotOK := labelValue(actual[field], m.TrimSpace, m.IgnoreCase)
 	correct := wantOK == gotOK && want == got
 	kind := boolKind(correct)
 	if wantOK && gotOK {
@@ -173,10 +174,89 @@ func (m ClassificationMetric) Score(_ context.Context, expected Prediction, actu
 	return result, nil
 }
 
-// normaliseValue returns the normalised label of value, and false when value is nil.
-func (m ClassificationMetric) normaliseValue(value any) (string, bool) {
+// LabelMetric scores a classification into one of any number of labels: 1 when the expected
+// and actual labels match and 0 otherwise. Labels are compared as ClassificationMetric compares
+// them. The objective "accuracy" is the score, and each Critical label adds two objectives that
+// are 1 unless the label is mistaken: "missed:<label>" is 0 when the expected label is it and
+// the actual label is not, and "false_alarm:<label>" is 0 when the actual label is it and the
+// expected label is not. Every result has every objective. ClassificationMetric is the binary
+// form, with true and false positive objectives.
+type LabelMetric struct {
+	// Field is the label's field; empty means "label".
+	Field string
+	// Labels, when set, are the valid labels: the feedback and details report an actual label
+	// outside them as unknown.
+	Labels     []string
+	Critical   []string
+	TrimSpace  bool
+	IgnoreCase bool
+}
+
+// Score compares the expected and actual labels.
+func (m LabelMetric) Score(_ context.Context, expected Prediction, actual Prediction) (MetricResult, error) {
+	field := m.Field
+	if field == "" {
+		field = "label"
+	}
+	want, wantOK := labelValue(expected[field], m.TrimSpace, m.IgnoreCase)
+	got, gotOK := labelValue(actual[field], m.TrimSpace, m.IgnoreCase)
+	correct := wantOK == gotOK && want == got
+	kind := boolKind(correct)
+	known := func(label string) bool { return normaliseLabel(label, m.TrimSpace, m.IgnoreCase) == got }
+	if !correct && gotOK && len(m.Labels) > 0 && !slices.ContainsFunc(m.Labels, known) {
+		kind = "unknown_label"
+	}
+	scores := map[string]float64{"accuracy": boolScore(correct)}
+	for _, label := range m.Critical {
+		critical := normaliseLabel(label, m.TrimSpace, m.IgnoreCase)
+		expectedIt := wantOK && want == critical
+		actualIt := gotOK && got == critical
+		scores["missed:"+label] = boolScore(!expectedIt || actualIt)
+		scores["false_alarm:"+label] = boolScore(!actualIt || expectedIt)
+	}
+	result := MetricResult{
+		Score:           boolScore(correct),
+		ObjectiveScores: scores,
+		Details: map[string]any{
+			"field":    field,
+			"expected": detailLabel(want, wantOK),
+			"actual":   detailLabel(got, gotOK),
+			"kind":     kind,
+		},
+	}
+	if !correct {
+		result.Feedback = fmt.Sprintf("expected %s, got %s", feedbackLabel(want, wantOK), feedbackLabel(got, gotOK))
+		if kind == "unknown_label" {
+			result.Feedback += ", which is not one of the labels"
+		}
+	}
+	return result, nil
+}
+
+// labelValue returns the canonical text form of value, normalised by normaliseLabel, and false
+// when value is nil.
+func labelValue(value any, trimSpace, ignoreCase bool) (string, bool) {
 	text, ok := metricText(value)
-	return m.normalise(text), ok
+	return normaliseLabel(text, trimSpace, ignoreCase), ok
+}
+
+// normaliseLabel applies a label metric's TrimSpace and IgnoreCase options to a label.
+func normaliseLabel(label string, trimSpace, ignoreCase bool) string {
+	if trimSpace {
+		label = strings.TrimSpace(label)
+	}
+	if ignoreCase {
+		label = strings.ToLower(label)
+	}
+	return label
+}
+
+// feedbackLabel is a label as feedback names it: quoted, or "no label" for a nil value.
+func feedbackLabel(label string, ok bool) string {
+	if !ok {
+		return "no label"
+	}
+	return strconv.Quote(label)
 }
 
 // boolKind is the classification kind of a pair that is not two labels.
@@ -193,16 +273,6 @@ func detailLabel(label string, ok bool) any {
 		return nil
 	}
 	return label
-}
-
-func (m ClassificationMetric) normalise(value string) string {
-	if m.TrimSpace {
-		value = strings.TrimSpace(value)
-	}
-	if m.IgnoreCase {
-		value = strings.ToLower(value)
-	}
-	return value
 }
 
 // Score returns the fraction of fields whose numeric values are within the tolerance.

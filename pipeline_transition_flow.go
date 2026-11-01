@@ -192,10 +192,11 @@ func Fallback(name string, primary, secondary Step) Flow {
 		flow.Transitions = []Transition{
 			{From: join.primary.name, To: join.name},
 			{
-				From:    join.primary.name,
-				OnError: true,
-				When:    func(_ State, err error) bool { return !IsPermanent(err) },
-				To:      join.secondary.name,
+				From:     join.primary.name,
+				OnError:  true,
+				When:     func(_ State, err error) bool { return !IsPermanent(err) },
+				To:       join.secondary.name,
+				fallback: true,
 			},
 		}
 	}

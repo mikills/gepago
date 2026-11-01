@@ -29,14 +29,19 @@ import (
 //   - a field with the ",string" tag option is a string with a pattern for the JSON encoding
 //     of its value, such as "12" for an int or "\"bob\"" for a string; a json.Number, whose
 //     kind is string, has a string's pattern, such as "\"12\"";
-//   - a field's description tag becomes its property's description.
+//   - a field's description tag becomes its property's description;
+//   - a field's enum tag, its values separated by commas, becomes its property's enum:
+//     `enum:"low,high"` gives "enum":["low","high"]. It applies to a string, of a named string
+//     type too, and to a pointer to one. On a slice of strings it applies to the items. Get
+//     refuses any other string there. Spaces are part of each value.
 //
 // A value Get accepts with every field present matches the schema, and a value that matches
 // the schema decodes with Get, except where the schema is unconstrained, where a number does
 // not fit its type (300 for an int8, 1e39 or 1e-50 for a float32), which Get refuses, and in a
 // ",string" json.Number, where Get also takes the number without inner quotes ("12") and
 // refuses a string that holds no number ("\"x\""). The array bounds and patterns fall outside
-// the strict subset (see StrictJSONSchema), so providers do not enforce them.
+// the strict subset (see StrictJSONSchema), so providers do not enforce them; an enum falls
+// inside it, so strict providers do.
 //
 // Channels, functions, complex numbers and maps whose keys cannot come from a JSON object key
 // have no JSON form and return an error. So does a struct whose definition encoding/json/v2
@@ -44,8 +49,10 @@ import (
 // or that has a json tag option other than omitempty, omitzero and string (encoding/json ignored
 // the others, and v2 may apply them), the tag `json:"-,"`, which v2 refuses, or a ",string"
 // field that is not a boolean, number or string (or an unnamed pointer to one) or whose type
-// has its own unmarshal method (json.Number aside), at any depth, since Get refuses every object
-// for it.
+// has its own unmarshal method (json.Number aside). So does a struct with an enum tag on another
+// kind of field, on a ",string" field or on a type with its own unmarshal method (json.Number
+// included), or with an empty enum tag or one that lists an empty, repeated or invalid UTF-8
+// value. Invalid enum definitions are refused at any depth, even when the value is absent.
 func JSONSchemaFor[T any]() (json.RawMessage, error) {
 	typ := reflect.TypeFor[T]()
 	node, nullable, err := newSchemaBuilder().typeSchema(typ, "")
@@ -272,8 +279,8 @@ func (b *schemaBuilder) propertySchema(field jsonField, path string) (schemaNode
 	return node, nil
 }
 
-// fieldSchema returns the schema of a struct field's value without null, with its
-// description, and whether null decodes into it.
+// fieldSchema returns the schema of a struct field's value without null, with its enum and
+// description, and whether null decodes into it. The enum of a slice field is on its items.
 func (b *schemaBuilder) fieldSchema(field jsonField, path string) (schemaNode, bool, error) {
 	node, nullable, err := b.typeSchema(field.typ, path)
 	if err != nil {
@@ -281,6 +288,12 @@ func (b *schemaBuilder) fieldSchema(field jsonField, path string) (schemaNode, b
 	}
 	if field.quoted && quotable(field.typ) {
 		node = quotedSchema(field.typ)
+	}
+	if field.enum != nil && enumType(field.typ) {
+		node = typeNode("string").with("enum", field.enum)
+		if field.typ.Kind() == reflect.Slice {
+			node = typeNode("array").with("items", node)
+		}
 	}
 	if field.description != "" {
 		node = node.with("description", field.description)
@@ -513,7 +526,7 @@ func schemaPath(path string) string {
 }
 
 func jsonText(value any) string {
-	data, err := json.Marshal(value)
+	data, err := marshalMetricJSON(value)
 	if err != nil {
 		return fmt.Sprint(value)
 	}

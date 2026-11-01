@@ -99,7 +99,7 @@ type ExpectedStep struct {
 	// Transition is the transition the run took after the execution, compared in full; nil means
 	// none (see gepa.StepTrace.Transition).
 	Transition *gepa.TransitionTrace `json:"transition,omitempty"`
-	// RewindRejected reports that Accept rejected the rewind the execution ended.
+	// RewindRejected reports that the rewind the execution ended kept the visit before it.
 	RewindRejected bool `json:"rewind_rejected,omitempty"`
 }
 

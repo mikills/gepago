@@ -556,6 +556,12 @@ func TestPipelineFingerprintCoversFlowsAndTransitions(t *testing.T) {
 				return true
 			}}}, map[string]int{"a": 2}),
 		},
+		"RestoreOnError added": {
+			spec(plain, []Transition{{From: "b", When: amountIs(1), To: "a"}}, map[string]int{"a": 2}),
+			spec(plain, []Transition{{From: "b", When: amountIs(1), To: "a", RestoreOnError: func(string, error) bool {
+				return true
+			}}}, map[string]int{"a": 2}),
+		},
 		"amendable keys added": {
 			spec(hinted, []Transition{{From: "b", When: amountIs(1), To: "a"}}, map[string]int{"a": 2},
 				DefaultValue(hint, "")),

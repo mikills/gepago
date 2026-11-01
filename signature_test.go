@@ -2,6 +2,7 @@ package gepa
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -206,8 +207,15 @@ func TestSchemaNameIsSafeAndBounded(t *testing.T) {
 	require.Equal(t, strings.Repeat("x", 64), schemaName(strings.Repeat("x", 80)))
 }
 
+// replySchemaError starts the error Validate gives for an output Schema that does not compile.
+const replySchemaError = `reply schema, in which a "#" reference means the reply: `
+
 func TestSignatureValidateFieldSettings(t *testing.T) {
 	valid := Signature{Inputs: []Field{{Name: "document"}}, Outputs: []Field{{Name: "answer"}}}
+	values := []string{"1e-9999999"}
+	for i := range 24 {
+		values = append(values, fmt.Sprint(i))
+	}
 	tests := []struct {
 		name    string
 		mutate  func(*Signature)
@@ -325,6 +333,97 @@ func TestSignatureValidateFieldSettings(t *testing.T) {
 			wantErr: `output field "answer" schema: "$defs.a" must be a schema object or a boolean`,
 		},
 		{
+			name:   "schema that does not compile",
+			mutate: func(s *Signature) { s.Outputs[0].Schema = json.RawMessage(`{"type":"string","pattern":"("}`) },
+			wantErr: replySchemaError + `"/properties/answer/pattern": '(' is not valid regex: ` +
+				"error parsing regexp: missing closing ): `(`",
+		},
+		{
+			name:   "pattern with a newline",
+			mutate: func(s *Signature) { s.Outputs[0].Schema = json.RawMessage(`{"pattern":"(\n"}`) },
+			wantErr: replySchemaError + `"/properties/answer/pattern": '(\n' is not valid regex: ` +
+				"error parsing regexp: missing closing ): `(\\n`",
+		},
+		{
+			name: "keyword not valid for its draft",
+			mutate: func(s *Signature) {
+				s.Outputs[0].Schema = json.RawMessage(`{"properties":{"a/b~c":{"minLength":-1}}}`)
+			},
+			wantErr: replySchemaError + `"/properties/answer/properties/a~1b~0c/minLength": minimum: got -1, want 0`,
+		},
+		{
+			name: "declared draft without an $id",
+			mutate: func(s *Signature) {
+				s.Outputs[0].Schema = json.RawMessage(
+					`{"$schema":"http://json-schema.org/draft-07/schema#","items":[{"type":"string"}]}`,
+				)
+			},
+			wantErr: replySchemaError + `"/properties/answer/items": got array, want boolean or object`,
+		},
+		{
+			name:    "relative reference",
+			mutate:  func(s *Signature) { s.Outputs[0].Schema = json.RawMessage(`{"$ref":"label.json"}`) },
+			wantErr: replySchemaError + `failing loading "gepago:///label.json": no URLLoader set`,
+		},
+		{
+			name:    "reference named like the schema's location",
+			mutate:  func(s *Signature) { s.Outputs[0].Schema = json.RawMessage(`{"$ref":"output.json"}`) },
+			wantErr: replySchemaError + `failing loading "gepago:///output.json": no URLLoader set`,
+		},
+		{
+			name:    "missing local reference",
+			mutate:  func(s *Signature) { s.Outputs[0].Schema = json.RawMessage(`{"$ref":"#/$defs/tag"}`) },
+			wantErr: replySchemaError + `json-pointer in "gepago:///#/$defs/tag" not found`,
+		},
+		{
+			name: "local reference that the reply schema cannot resolve",
+			mutate: func(s *Signature) {
+				s.Outputs[0].Schema = json.RawMessage(
+					`{"$defs":{"tag":{"enum":["x"]}},"type":"array","items":{"$ref":"#/$defs/tag"}}`,
+				)
+			},
+			wantErr: replySchemaError + `json-pointer in "gepago:///#/$defs/tag" not found`,
+		},
+		{
+			name:    "patternProperties key",
+			mutate:  func(s *Signature) { s.Outputs[0].Schema = json.RawMessage(`{"patternProperties":{"(":{}}}`) },
+			wantErr: replySchemaError + `invalid propertyName '('`,
+		},
+		{
+			name: "external reference",
+			mutate: func(s *Signature) {
+				s.Outputs[0].Schema = json.RawMessage(`{"$ref":"https://example.com/label.json"}`)
+			},
+			wantErr: replySchemaError + `failing loading "https://example.com/label.json": no URLLoader set`,
+		},
+		{
+			name: "number below the range of a float64",
+			mutate: func(s *Signature) {
+				s.Outputs[0].Schema = json.RawMessage(`{"type":"number","multipleOf":1e-9999999}`)
+			},
+			wantErr: replySchemaError + `a number the schema check cannot read`,
+		},
+		{
+			name:    "length bound above the largest int",
+			mutate:  func(s *Signature) { s.Outputs[0].Schema = json.RawMessage(`{"type":"string","maxLength":1e19}`) },
+			wantErr: replySchemaError + `a number the schema check cannot read`,
+		},
+		{
+			name: "zero with an exponent beyond int64",
+			mutate: func(s *Signature) {
+				s.Outputs[0].Schema = json.RawMessage(`{"type":"number","multipleOf":0e99999999999999999999}`)
+			},
+			wantErr: replySchemaError + `a number the schema check cannot read`,
+		},
+		{
+			name: "enum of a declared draft with a number below the range of a float64",
+			mutate: func(s *Signature) {
+				s.Outputs[0].Schema = json.RawMessage(`{"$schema":"http://json-schema.org/draft-07/schema#",` +
+					`"$id":"e.json","enum":[` + strings.Join(values, ",") + `]}`)
+			},
+			wantErr: replySchemaError + `a number the schema check cannot read`,
+		},
+		{
 			name:    "optional input",
 			mutate:  func(s *Signature) { s.Inputs[0].Optional = true },
 			wantErr: `input field "document" cannot be optional; Optional applies to outputs`,
@@ -358,6 +457,72 @@ func TestSignatureValidateAcceptsSchemaKeywords(t *testing.T) {
 		}`)}},
 	}
 	require.NoError(t, signature.Validate())
+}
+
+func TestSignatureValidate(t *testing.T) {
+	t.Run("input schemas not compiled", func(t *testing.T) {
+		signature := Signature{
+			Inputs:  []Field{{Name: "document", Schema: json.RawMessage(`{"type":"string","pattern":"("}`)}},
+			Outputs: []Field{{Name: "answer"}},
+		}
+		require.NoError(t, signature.Validate())
+	})
+
+	t.Run("one compile error", func(t *testing.T) {
+		tests := []struct {
+			name    string
+			schema  string
+			wantErr string
+		}{
+			{
+				name:    "several bad keywords",
+				schema:  `{"pattern":"(","minLength":-1,"maxLength":-2,"title":3}`,
+				wantErr: `"/properties/answer/maxLength": minimum: got -2, want 0`,
+			},
+			{
+				name: "patternProperties key among other keywords",
+				schema: `{"type":"object","minProperties":1,"maxProperties":3,"required":[],` +
+					`"patternProperties":{"(":{}}}`,
+				wantErr: `invalid propertyName '('`,
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				signature := Signature{
+					Inputs:  []Field{{Name: "document"}},
+					Outputs: []Field{{Name: "answer", Schema: json.RawMessage(tt.schema)}},
+				}
+				for range 100 {
+					require.EqualError(t, signature.Validate(), replySchemaError+tt.wantErr)
+				}
+			})
+		}
+	})
+
+	t.Run("reference to another output", func(t *testing.T) {
+		signature := Signature{
+			Inputs: []Field{{Name: "document"}},
+			Outputs: []Field{
+				{Name: "label", Schema: json.RawMessage(`{"enum":["a","b"]}`)},
+				{Name: "other", Schema: json.RawMessage(`{"$ref":"#/properties/label"}`)},
+			},
+		}
+		require.NoError(t, signature.Validate())
+
+		_, err := Predict{Signature: signature}.ParseOutput(`{"label": "a", "other": "c"}`)
+
+		require.EqualError(t, err, `invalid programme output: output "other" is "c", not one of "a", "b"`)
+	})
+
+	t.Run("bundled schema", func(t *testing.T) {
+		signature := Signature{
+			Inputs: []Field{{Name: "document"}},
+			Outputs: []Field{{Name: "tags", Schema: json.RawMessage(
+				`{"$defs":{"tag":{"$id":"tag.json","enum":["x","y"]}},"type":"array","items":{"$ref":"tag.json"}}`,
+			)}},
+		}
+		require.NoError(t, signature.Validate())
+	})
 }
 
 func TestFieldJSONRoundTrip(t *testing.T) {

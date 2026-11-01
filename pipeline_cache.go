@@ -18,8 +18,9 @@ import (
 // retry of an enclosing WithPolicy, where a Parallel that failed in one part does
 // not repeat the model calls of the parts that already succeeded. Failed executions are not
 // cached, among them a visit of a top-level step that a transition from it fails or whose
-// writes cannot be merged into the state; and when Accept rejects a rewind, or fails, the
-// results that the visits of its range cached are dropped with their writes (see Transition).
+// writes cannot be merged into the state; and when Accept rejects a rewind, or fails, or
+// RestoreOnError restores it, the results that the visits of its range cached are dropped with
+// their writes (see Transition).
 // Concurrent runs and nested pipelines have caches of their own.
 //
 // The cache never makes a working step fail: when the key cannot be built, because key returns

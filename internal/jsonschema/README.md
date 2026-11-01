@@ -1,0 +1,17 @@
+# internal/jsonschema
+
+A patched copy of [github.com/santhosh-tekuri/jsonschema/v6](https://github.com/santhosh-tekuri/jsonschema) v6.0.3, the JSON Schema validator that checks output schemas. Upstream licenses it under the Apache License 2.0, in [LICENSE](LICENSE).
+
+The copy holds upstream's non-test `.go` files, `kind/`, `metaschemas/` and `LICENSE`. A line at the top of each changed file says it was changed.
+
+## Changes
+
+- `output.go`, `util.go` and `validator.go` import `kind` from this copy.
+- `validator.go`: `anyOf` and `oneOf` check their branches for a verdict alone first, and work out the branches' errors only when no branch matches. Upstream works out every branch's errors, so a branch that fails on a discriminator still checks every member it shares with the others.
+- `validator.go`: within one `Validate` call, the validator works out the result of a subschema on an object or array once. It keeps the verdict when it checks for the verdict alone. Below a union whose error reports more than one branch, it keeps the error of a non-empty member that fails a full check, and reuses it only at the same location. It keeps no result whose working read the dynamic scope (`$recursiveRef` or `$dynamicRef`), ran a vocabulary extension or found a reference cycle, whose error names the path of schemas that led to it. Any other error names only the instance location and the schema's absolute location, so a reused error is the same whichever path reaches it. It compares a deep location token by token only if the value holds a non-empty object or array twice, which decoded JSON never does. Otherwise a member's address fixes its location.
+- `validator.go`: an error with causes takes its location from the start of a cause's location, capped so that an append copies it. Upstream copies the location for every error, which costs the depth for each error on a deep path. It does not take the location of a `propertyNames` or `contentSchema` error, which upstream points at a slice it goes on to reuse, or any location once a vocabulary extension has run.
+- `validator.go`: when no branch of an `anyOf` or `oneOf` matches, the error leaves out each branch that fails on the value's `type`, and each that fails on a discriminator. A discriminator is a `const` or `enum` at the value or at one of its scalar properties. It counts only when every branch that allows the value's `type` sets one there. If every branch would be left out, the error keeps them all. The check follows `$ref` and `allOf`, which a branch must meet, and no keyword that could hold another way, such as `anyOf` or `not`. A `const` or `enum` that some branch lacks is an ordinary constraint, so a branch that fails it may still be the one the value meant.
+- `output.go`: since branches share the errors of the members they check alike, the errors form a graph. `Error` and `GoString` print each error once. `BasicOutput` and `DetailedOutput` still walk a shared error once per path; gepago calls them only on an error without causes.
+- `position.go`, `root.go` and `roots.go` use `maps.Copy` in place of copy loops, because gepago's `modernize` check requires it.
+
+With these changes a reply's check against a recursive union takes time and memory linear in the reply's size plus the size of the errors it reports, valid or not, unless the union recurses through `$dynamicRef` or `$recursiveRef`. The verdicts match upstream's on the JSON-Schema-Test-Suite and on upstream's Extra-Test-Suite.

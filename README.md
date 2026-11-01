@@ -72,6 +72,65 @@ Provider errors carry a kind: `gepa.IsTransient` (429, 5xx and network errors), 
 
 Use `gepa.GeneratorFunc` to turn a function into a `Generator`, and `gepa.AdaptLanguageModel` to wrap an older `LanguageModel` that returns a string.
 
+To use a client of your own, write an adapter. Mark the errors a retry can fix with `gepa.TransientError` and those no retry can fix with `gepa.PermanentError`. An error with no kind is not retried, but a `Fallback` still answers. Report the finish reason and the usage:
+
+```go
+// Client calls a model endpoint of your own.
+type Client struct {
+    URL   string
+    Model string
+}
+
+// Generate sends the prompt and returns the reply, its usage and why the model stopped.
+func (c Client) Generate(ctx context.Context, prompt string) (gepa.Generation, error) {
+    body, err := json.Marshal(map[string]string{"model": c.Model, "prompt": prompt})
+    if err != nil {
+        return gepa.Generation{}, gepa.PermanentError(err)
+    }
+    req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.URL, bytes.NewReader(body))
+    if err != nil {
+        return gepa.Generation{}, gepa.PermanentError(err)
+    }
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        return gepa.Generation{}, gepa.TransientError(err)
+    }
+    defer resp.Body.Close()
+    if resp.StatusCode != http.StatusOK {
+        err := fmt.Errorf("model %s: %s", c.Model, resp.Status)
+        if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+            return gepa.Generation{}, gepa.TransientError(err)
+        }
+        return gepa.Generation{}, gepa.PermanentError(err)
+    }
+    var reply struct {
+        Text         string `json:"text"`
+        Stop         string `json:"stop"`
+        InputTokens  int    `json:"input_tokens"`
+        OutputTokens int    `json:"output_tokens"`
+    }
+    if err := json.NewDecoder(resp.Body).Decode(&reply); err != nil {
+        return gepa.Generation{}, err
+    }
+    finish := map[string]gepa.FinishReason{
+        "end":        gepa.FinishStop,
+        "max_tokens": gepa.FinishLength,
+        "refusal":    gepa.FinishContentFilter,
+    }
+    return gepa.Generation{
+        Text:         reply.Text,
+        FinishReason: finish[reply.Stop],
+        Usage: gepa.Usage{
+            PromptTokens:     reply.InputTokens,
+            CompletionTokens: reply.OutputTokens,
+            TotalTokens:      reply.InputTokens + reply.OutputTokens,
+        },
+    }, nil
+}
+```
+
+Pass it wherever gepago takes a `Generator`, such as `Predict.LM` or `RetryingLanguageModel.LM`. Implement `GenerateStructured` too, as a `StructuredGenerator`, when the provider can constrain its reply to a JSON schema.
+
 ## Programme layer
 
 For common prompt-optimisation workflows, define a task signature, a `Predict` programme,
@@ -119,6 +178,7 @@ compiled, state, err := gepa.Compile(ctx, config)
 Use `ChainOfThought` when the programme should expose a concise reasoning field.
 Use `DemosFromExamples` and the `demos` component when you want examples optimised with the instruction.
 Use `LLMJudgeMetric` when exact labels are too rigid for the task.
+Use `LabelMetric` for a label from a fixed set: its feedback names both labels, and each `Critical` label adds `missed:<label>` and `false_alarm:<label>` objectives.
 
 ## Structured output
 
@@ -135,9 +195,9 @@ signature := gepa.Signature{
 }
 ```
 
-`Signature.JSONSchema` returns the strict reply schema. Providers that implement `StructuredGenerator` (OpenAI and Claude) receive it as the response format; others get it in the prompt. `Predict` checks every reply before returning it: a missing or null required output, an extra field or a value that does not fit its `Type` fails with `ErrInvalidOutput` naming the field, and the repair prompt carries the schema.
+`Signature.JSONSchema` returns the strict reply schema. Providers that implement `StructuredGenerator` (OpenAI and Claude) receive it as the response format; others get it in the prompt. `Predict` checks every reply before returning it. A missing or null required output, an extra field, a value that does not fit its `Type` and a value that breaks its `Schema` fail with `ErrInvalidOutput`. The error names the field and says what is wrong, such as `output "label" is "refund", not one of "billing", "shipping"`. The repair prompt carries it with the schema. `Predict` checks a `Schema` where the reply schema holds it, under JSON Schema draft 2020-12. A `$ref` that starts with `#` resolves against the reply schema, so give shared definitions an `$id` and refer to that. A `Schema` that declares another draft needs its own `$id`, and `format` is checked only under drafts before 2019-09. A `pattern` uses Go regexp syntax. `Predict` checks a recursive `anyOf` or `oneOf` in time and memory linear in the reply's size plus the size of the problems it finds, unless it recurses through `$dynamicRef` or `$recursiveRef`. When no branch matches, the error names only the branches the value could have meant, judged by its `type` and by a `const` or `enum` that every such branch sets, such as on `"type"`. `Signature.Validate` refuses an output `Schema` that does not compile, such as one with a `$ref` to another document.
 
-`TypedPredict[In, Out]` works with Go structs and decodes the reply with the strict rules `Key.Get` uses:
+`TypedPredict[In, Out]` works with Go structs. It decodes the reply with the strict rules `Key.Get` uses, in place of the `Schema` check:
 
 ```go
 type Document struct {
@@ -146,7 +206,8 @@ type Document struct {
 
 type Extraction struct {
     Amount int    `json:"amount"`
-    Note   string `json:"note,omitempty"`
+    Kind   string `json:"kind" enum:"bond,loan,lease"`
+    Note   string `json:"note,omitempty" description:"anything the amount leaves out"`
 }
 
 extract := gepa.TypedPredict[Document, Extraction]{
@@ -156,6 +217,8 @@ extract := gepa.TypedPredict[Document, Extraction]{
 }
 result, err := extract.Run(ctx, Document{Document: "Bond obligation for 125,000."})
 ```
+
+`JSONSchemaFor` gives each output its schema. Call it yourself for a `Field.Schema`, and `NewTool` uses it for arguments. A `description` tag becomes the property's description. An `enum` tag lists, separated by commas, the strings a field may hold. Spaces are part of each value. It works on a string, a pointer to one, or a slice of strings, where it applies to each item. Strict providers write only those strings. `Key.Get` refuses any other, so `MaxParseRetries` repairs it. Typed values are checked too, including concrete values inside interfaces.
 
 ### Image inputs
 
@@ -288,7 +351,7 @@ pipeline, err := gepa.PipelineSpec{
 
 A step that a transition skips over, or that has an `OnError` transition to a later step or `End`, may not write. A key is guaranteed at a step when it is an input, has a `Default` or is written by an earlier step that always writes, and `Build` fails on any read of a key that is not guaranteed, naming the step and the key. A key written by a step that may not write needs a `Default` if any later step reads it, even when another step always writes it. Above, `review` may be skipped, so `decide` can read `approved` only because it has a default.
 
-On a rewind, `Amend` may set only the keys the target declared with `WithAmendable`; the target reads them on its next visit only, and they are never committed. When the run reaches `From` again, `Accept(prev, next)` compares the values the range wrote before and after: true keeps the new ones, false restores the old ones, emits `RewindRejected` and goes on past `From`. The usage of every visit counts. Step events carry the visit in `Attributes["visit"]`, and a `TransitionObserver`, such as `RecordingObserver`, also receives `TransitionTaken` and `RewindRejected`.
+On a rewind, `Amend` may set only the keys the target declared with `WithAmendable`; the target reads them on its next visit only, and they are never committed. When the run reaches `From` again, `Accept(prev, next)` compares the values the range wrote before and after: true keeps the new ones, false restores the old ones, emits `RewindRejected` and goes on past `From`. If a step of the range fails first, the new values stand unless `RestoreOnError(step, err)` returns true. Then the run restores the old values the same way, and `RewindRejected` carries the step's error. The run asks `RestoreOnError` after the step's retries, and never for a `Fallback` primary that falls back. The usage of every visit counts. Step events carry the visit in `Attributes["visit"]`, and a `TransitionObserver`, such as `RecordingObserver`, also receives `TransitionTaken` and `RewindRejected`.
 
 `Branch` and `Fallback` build a `Flow` of ordinary steps and transitions, which `PipelineSpec.Add` appends:
 
@@ -534,7 +597,7 @@ artifact := compiled.Artifact("internal-program")
 err := gepa.SaveProgramArtifact("internal-program.program.json", artifact)
 ```
 
-`compiled.Artifact` records the programme's fingerprint. `Pipeline.Fingerprint()` covers the step names, keys and types, the transitions, `MaxVisits` and amendable keys. It also covers each `Map`'s keys and `MapOptions` (so changing `MaxConcurrency` changes it) and each `Loop`'s `MaxIterations` and iteration key. Every loader refuses an artefact whose fingerprint differs from the programme's with a `*FingerprintMismatchError` that shows both. So a renamed key or step never silently picks up a stale prompt. Artefacts saved before v0.8.0 have no fingerprint and still load. To load an artefact across a shape change you know is compatible, record the same `ProgramVersion` on the artefact and pass it to `LoadCompiledProgramVersion` or `LoadCompiledVersion`.
+`compiled.Artifact` records the programme's fingerprint. `Pipeline.Fingerprint()` covers the step names, keys and types, the transitions, `MaxVisits` and amendable keys. It also covers each `Map`'s keys and `MapOptions` (so changing `MaxConcurrency` changes it) and each `Loop`'s `MaxIterations` and iteration key. A `Predict` or `ChainOfThought` whose outputs set `Schema` has a fingerprint of its own, which its pipeline step includes. It covers the signature's fields and the output schemas. Adding, removing or renaming an enum value changes it. Reordering the enum or editing a description does not. Every loader refuses an artefact whose fingerprint differs from the programme's with a `*FingerprintMismatchError` that shows both. So a renamed key or step never silently picks up a stale prompt. Artefacts saved before v0.8.0 have no fingerprint and still load. To load an artefact across a shape change you know is compatible, record the same `ProgramVersion` on the artefact and pass it to `LoadCompiledProgramVersion` or `LoadCompiledVersion`.
 
 At runtime, register factories that inject app dependencies such as models, tools, stores, or retrievers:
 

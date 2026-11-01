@@ -4,6 +4,96 @@ All notable changes to `gepago` will be documented in this file.
 
 The project follows semantic versioning once public tags are published.
 
+## v0.12.0
+
+`Predict` and `ChainOfThought` now check each output against its `Field.Schema`, and `Pipeline.Fingerprint` covers those schemas, so artefacts saved from such pipelines need retraining. `LabelMetric` scores a label from any number of classes. `JSONSchemaFor` reads an `enum` struct tag, and `Key.Get` enforces it. A rewind can now keep the visit before it when the new visit fails.
+
+### Breaking changes
+
+- `Predict` now checks each output that sets `Field.Schema` against that schema. Before, it sent the schema to the model but did not check values against it. A present, non-null value that breaks the schema fails with `ErrInvalidOutput`. The error names the field and says what is wrong, one clause per problem separated by semicolons, such as `output "label" is "neutral", not one of "positive", "negative"`. So `MaxParseRetries` repairs the reply, a pipeline step fails with the error, and `Compile` scores the example zero with the error as feedback. `ChainOfThought`, the tool loop, repairs and WASM predict jobs check it too. An optional output that is absent or null is not checked, and an output value that holds a number the schema check cannot read, such as one beyond the range of a float64, fails. `Predict` reads the schema where `Signature.JSONSchema` holds it, under the reply's `properties`, as the model does, so a `#` reference means the reply. A schema that declares another draft with `$schema` needs its own `$id`, or the declaration is ignored. `format` is asserted only under drafts before 2019-09. `Predict` checks a recursive `anyOf` or `oneOf` in time and memory linear in the reply's size plus the size of the problems it finds, unless it recurses through `$dynamicRef` or `$recursiveRef`. When no branch matches, the error leaves out each branch that fails on the value's `type`, and each that fails on a discriminator. A discriminator is a `const` or `enum` at the value or at one of its scalar properties, such as `"type"`. It counts only when every branch that allows the value's `type` sets one there, directly or through `$ref` or `allOf`. If every branch would be left out, the error keeps them all. `TypedPredict` still judges a reply by decoding it into `Out`. A reply that passed before can now fail. Fix the schema or the instruction, or set `MaxParseRetries`.
+- `Signature.Validate` now refuses an output `Schema` that does not compile where `Signature.JSONSchema` holds it, which is where `Predict` checks it. It does not compile input schemas. So a schema that v0.11.0 accepted fails when a `$ref` points to another document, by URL or by a relative path, or when a local `$ref` does not resolve. A `$ref` that starts with `#` resolves against the reply schema, where the field's schema sits under `properties`, so `#/$defs/tag` in a field's schema is refused unless that schema has its own `$id`. Give such definitions an `$id` and refer to that, as in `{"$defs":{"tag":{"$id":"tag.json",...}},"items":{"$ref":"tag.json"}}`. A schema also fails when a `pattern` or a `patternProperties` key is not Go regexp (RE2) syntax, so lookaround and backreferences are refused, when a keyword holds a value its draft does not allow, such as `"description": 5` or `"minLength": -1`, when `$schema` names a draft the validator does not know, when two schemas share an `$id` or an `$anchor`, and when a schema holds a number the schema check cannot read, such as one beyond the range of a float64 or a `maxLength`, `minItems` or other length or count bound above the largest `int`. The error is one line, such as `reply schema, in which a "#" reference means the reply: "/properties/label/pattern": '(' is not valid regex: ...`.
+- `Pipeline.Fingerprint` now covers the signature and output schemas of each `Predict` or `ChainOfThought` step whose outputs set `Schema`. Such a pipeline gets a new fingerprint, and the loaders refuse the artefacts it saved before with a `*FingerprintMismatchError`. Retrain them, or record the same `ProgramVersion` on the artefact and pass it to `LoadCompiledProgramVersion` or `LoadCompiledVersion`. A pipeline whose steps set no output `Schema` keeps its fingerprint. Artefacts saved for a `Predict` or `ChainOfThought` run on its own had no fingerprint, so they still load.
+- A programme type that embeds `gepa.Predict` or `gepa.ChainOfThought` and has no `Fingerprint` method of its own now gets theirs. When an output of the embedded signature sets `Schema`, a pipeline that runs the type gets a new fingerprint, as above, and `CompiledProgram.Artifact` records a fingerprint for the type when it runs on its own. Give the type its own `Fingerprint` method when the embedded signature is not the one it runs.
+- `Key.Get` now enforces an `enum` struct tag (see Added), and so do `TypedPredict` and `NewTool`, which decode with its rules. A struct that already had an `enum` tag for another library now has its strings checked against it. `Get` refuses every object for the struct when the tag sits on a field that is not a string, a pointer to one or a slice of them. Rename the tag, or keep it on string fields with the values they may hold.
+- These structs gain fields, so unkeyed struct literals of them break: `Transition` (`RestoreOnError`) and `RewindRejectedEvent` (`Err`). `Transition` gains an unexported field, so an unkeyed literal of it breaks too. Use keyed literals. Callers cannot set that field.
+
+### Added
+
+#### Fingerprints
+
+- `Predict` and `ChainOfThought` implement `Fingerprinter`. When an output sets `Schema`, the fingerprint covers the signature's inputs and outputs by name, `Type` and `Optional`, and each output's schema. Adding, removing or renaming an enum value changes it. Reordering an enum or a `required` list, or editing a `description`, `title` or `examples`, does not. `CompiledProgram.Artifact` records it, so an artefact trained for the labels `a`, `b` and `c` no longer loads into a programme with `a`, `b` and `d`. The `ChainOfThought` fingerprint includes its reasoning field.
+
+#### Metrics
+
+- `LabelMetric` scores a label from any number of classes, 1 for a match and 0 otherwise. Its feedback names both labels, and says so when the actual label is not one of `Labels`. Each `Critical` label adds two objectives, `missed:<label>` and `false_alarm:<label>`, so the Pareto frontier keeps candidates that avoid either mistake.
+
+#### Rewinds
+
+- `Transition.RestoreOnError(step, err)` lets a rewind keep the visit before it when the new visit fails. The run calls it when a step of the rewind's range fails before `From` succeeds again. It waits for the step's `WithPolicy` retries. On a `Fallback`'s primary it runs after the Whens of the `OnError` transitions declared before the Fallback's, and not at all when the primary falls back, so then only the secondary's failure counts. True restores the range's earlier values and goes on past `From`, as an `Accept` that returns false does. False, or a nil `RestoreOnError`, leaves the new values in place, as before. The run does not call it once its context has ended. `Build` allows it only on a rewind without `OnError`, and the pipeline fingerprint records whether a transition sets it.
+- `RewindRejectedEvent.Err` holds the failed step's error when `RestoreOnError` restored, redacted as the step's own events redact it. It is nil when `Accept` rejected. After a restore, `RewindRejectedEvent.Step` names the step that failed, and `RecordingObserver` sets that step's `StepTrace.RewindRejected`.
+
+#### Structured output
+
+- `JSONSchemaFor` reads an `enum` struct tag next to `description`. It lists the values separated by commas, so `enum:"outage,data_loss,degraded,none"` gives the property `"enum":["outage","data_loss","degraded","none"]`. Spaces are part of each value. It applies to a string field, of a named string type too, and to a pointer to one. On a slice of strings it applies to the items. The schema stays strict and in field order, so OpenAI and Claude strict modes block any other value. `Key.Get` refuses a string outside the enum, including already-typed values and concrete values inside interfaces, and a pipeline rejects such a write. So `TypedPredict` and `NewTool` refuse it too, and `MaxParseRetries` repairs it. `JSONSchemaFor` and `Key.Get` refuse a tag on another kind of field, on a `,string` field or on a type with its own unmarshal method, such as `json.Number`. The same goes for an empty tag and for one that lists an empty, repeated or invalid UTF-8 value. Invalid enum definitions are refused even behind absent fields, nil pointers and empty collections.
+
+### Dependencies
+
+- The root module no longer requires `github.com/santhosh-tekuri/jsonschema/v6`. `Predict` checks output schemas with a patched copy of its v6.0.3 in `internal/jsonschema`. It gives upstream's verdicts without upstream's exponential cost on recursive unions. `golang.org/x/text` v0.41.0 is now a direct dependency.
+
+## v0.11.0
+
+`Pipeline` gains opt-in controls for hosts that embed it. `MapCollectUntil` stops a sequential collection after a terminal result. `PreserveExistingOutputs` keeps a state value that a programme leaves out. `AcceptValidTruncatedOutput` accepts a complete, schema-valid reply that hit the token limit. A `PipelineFinalizer` runs bookkeeping once after every started run. `MetadataOnly` observation drops payloads, and a `StepResolvedObserver` sees each execution with its routing decision. A panic in a step, a tool, a hook or a finalizer is now a `*PanicError`, with the same error text. The rest is off by default, so a pipeline that uses none of it runs as before.
+
+### Breaking changes
+
+- `NewProgramStep` takes options (`NewProgramStep(name, program, reads, writes, options ...ProgramStepOption)`), so a variable of type `func(string, gepa.Program, []gepa.KeyRef, []gepa.KeyRef) gepa.ComponentStep` no longer holds it. Call it directly or wrap it in a function literal.
+- These structs gain fields, so unkeyed struct literals of them break: `PipelineSpec` (`Finalizer`, `MetadataOnly`), `Predict`, `ChainOfThought` and `TypedPredict` (`OutputPolicy`), `MapResult` (`Skipped`), `RunStartedEvent` (`MetadataOnly`) and `PipelineTrace` (`MetadataOnly`). Use keyed literals.
+
+### Added
+
+#### Map
+
+- `MapCollectUntil(name, items, item, body, results, opts, stop)` runs its elements one at a time, in order, and stops after the first completed element for which `stop(result, err)` returns true. Decide on `err`, which is nil after success, not on `result.Error`, which a `Redactor` can change. `Build` requires `stop` and refuses `MaxConcurrency` above one.
+- The terminal element and every earlier one commit. Later elements never start: their `Skipped` (JSON `skipped`) is true, with zero `Value`, `Error`, `Usage` and `Duration`.
+- A panic, a budget failure, a policy timeout or an element failure after the context ends fails the step before `stop` runs. If the caller cancels, a successful element that matches `stop` still commits the collection; otherwise cancellation fails it. A panic in `stop` fails the step and drops every result.
+- `Pipeline.Fingerprint` records whether a `MapCollect` has a stop predicate. Pipelines without `MapCollectUntil` keep their fingerprint.
+
+#### Programme steps
+
+- `PreserveExistingOutputs(keys...)`, an option of `NewProgramStep`, keeps a key's prior value when the programme leaves that output out. The step reads each preserved key, but the programme does not get it as an input. An explicit zero or null still commits the zero value. Each key must be a declared write, and a `SignatureProgram` must mark it `Optional`. `Build` refuses a key with no prior value. Preserving a key does not call its `MergeRule`, but a key that an earlier step also writes still needs one for this step's explicit writes.
+- Preservation works the same inside `WithPolicy`, `WithCache`, `WithAmendable`, `Parallel` and a Loop. `Pipeline.Fingerprint` covers the preserved keys. Steps without them keep their fingerprint.
+- `OutputPresenceProgram` returns only the outputs the reply held. A step with `PreserveExistingOutputs` calls its `RunCandidateWithPresence`. `TypedPredict` implements it.
+
+#### Truncated output
+
+- `OutputPolicy` on `Predict`, `ChainOfThought` and `TypedPredict`. The zero value, `RejectTruncatedOutput`, keeps the old behaviour: a reply that stops at the token limit fails with `ErrOutputTruncated`. `AcceptValidTruncatedOutput` accepts such a reply when it parses, passes the output checks and validates against the signature's response schema. So the reply must hold every output, and an `Optional` one may be null. `TypedPredict` also requires `Out`'s decoder and `Validate` method to accept the reply.
+- An invalid truncated reply fails with `ErrOutputTruncated` and never goes to repair. Its step details hold `finish_reason`, `completion_tokens` and `output`. An invalid truncated repair reply ends the repairs the same way. Content-filtered replies still fail. A truncated chat reply that calls tools still fails, so its calls never run.
+- The schema check uses JSON Schema draft 2020-12 unless the schema declares a draft, and external references are disabled. `Validate` refuses an unknown policy, and under `AcceptValidTruncatedOutput` a response schema that does not compile.
+
+#### Finalizer
+
+- `PipelineSpec.Finalizer` takes a `*PipelineFinalizer{Timeout, Run}`. `Run(ctx, state, runErr)` runs once after the steps of a started run end, on success, failure or cancellation, before `RunFinished`. Invalid inputs start no run and call no finalizer. `Build` requires `Run` and a positive `Timeout`.
+- The state is read-only and holds the committed values, inputs and defaults included. A write to it fails the finalizer, and so the run. The context keeps the caller's own values but not gepago's: `RunContextFrom` finds none, and it carries no tool memory, budget, usage collection or tool session. It ignores the caller's cancellation and ends after `Timeout`. The timeout is cooperative: the run waits for `Run` to return, and a callback that returns after its deadline fails even when it returns nil.
+- A finalizer's error or panic matches the new `ErrFinalization` and is joined to the run's error, which `RunFinished` reports. So a failed finalizer fails a run whose steps succeeded. It cannot change the run's outputs or turn a failure into success.
+
+#### Observability
+
+- `PipelineSpec.MetadataOnly` drops payloads from observation. Events keep key names with nil values, usage, timings, error kinds and their `Attributes`, such as the visit and a Map element's index. Tool calls keep their step, name, usage, duration and cache flag. Values, tool arguments and output, `RunContext` attribute values and step details are left out, and error text reads `RedactedText`. Event errors still match `ErrInvalidOutput`, `context.Canceled` and `context.DeadlineExceeded`.
+- Nested runs and evaluation traces inherit `MetadataOnly`, their own observers included. `RunStartedEvent.MetadataOnly` and `PipelineTrace.MetadataOnly` (JSON `metadata_only`) report it. Evaluation outputs and reflection redaction still follow the programme's `Redactor`s. Under `MetadataOnly` with a `Redactor`, the run's own or an enclosing run's, a `MapCollect` element's `MapResult.Error` reads `RedactedText`. With `MetadataOnly` alone it keeps the full error text, and with a `Redactor` alone it is scrubbed as before.
+- `StepResolvedObserver` adds `StepResolved(ctx, StepResolvedEvent)`. The event is the execution's `StepFinishedEvent` with the `Transition` taken after it and any `RewindRejected`; each is nil when none followed, and both can be set. A top-level execution resolves after its transition events and before the next top-level step starts or `RunFinished`. An earlier retry attempt resolves before the next attempt, and a nested execution right after its `StepFinished`, both without a decision. Other observers get the same events in the same order as before.
+
+#### Panics
+
+- `PanicError{Value, Stack}` holds a recovered panic from a step, a `Map` element, a tool, tool middleware, a finalizer, or a callback such as a `MergeRule`, a Loop's `until` or a transition's `When`. `errors.As` finds it in a run's error, and the error text is unchanged. Redacted events carry only the message and the error kind.
+
+### Fixed
+
+- A panic while tool middleware wraps a tool, in the middleware or in the tool's `Schema`, now carries its stack in the step details, as other recovered panics do.
+
+### Dependencies
+
+- The library requires `github.com/santhosh-tekuri/jsonschema/v6` v6.0.3 to check truncated replies against the response schema. It brings in `golang.org/x/text` v0.41.0 as an indirect dependency.
+
 ## v0.10.0
 
 `Pipeline` can repeat a step, wrap its tools and read images. A bounded `Loop` runs a body step until a typed condition on the state holds. Tool middleware wraps every tool call that a pipeline run or an agent run makes through its own session. So you write limiting, logging, auditing and fallback once. User chat messages and `Predict` inputs carry PNG, JPEG and WebP images to the OpenAI, Claude and Google chat clients.

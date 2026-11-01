@@ -74,8 +74,9 @@ type StepTrace struct {
 	// Transition is the transition the run took after this execution, the last of a top-level
 	// step's visit, as TransitionTakenEvent reported it.
 	Transition *TransitionTrace `json:"transition,omitempty"`
-	// RewindRejected reports that Accept rejected the rewind this execution ended, as
-	// RewindRejectedEvent reported it.
+	// RewindRejected reports that the rewind this execution ended kept the visit before it, as
+	// RewindRejectedEvent reported it: Accept rejected the new visit, or RestoreOnError restored
+	// the old one after this execution failed.
 	RewindRejected bool `json:"rewind_rejected,omitempty"`
 	// ToolCalls holds the tool calls the execution made, as StepFinishedEvent reported them,
 	// with each Output compacted as encoding/json writes it, or stored as a JSON string when it
