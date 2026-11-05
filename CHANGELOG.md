@@ -4,6 +4,10 @@ All notable changes to `gepago` will be documented in this file.
 
 The project follows semantic versioning once public tags are published.
 
+## v0.12.1
+
+The module now requires Go 1.27.0 instead of 1.27.1, so modules that depend on it can build with any Go 1.27 release. Nothing else changed.
+
 ## v0.12.0
 
 The new module `programs/classify` builds a text classifier on a `Pipeline`. The model picks one label from a fixed set, and the classifier abstains when the model refuses, fails or is unsure. It can ask again with a hint, fall back to a second model, measure its confidence by votes and return more fields from the same reply. `Train` optimises the prompt with `Compile` and picks the confidence threshold that reaches a target accuracy on a holdout. `Predict` and `ChainOfThought` now check each output against its `Field.Schema`, and `Pipeline.Fingerprint` covers those schemas, so artefacts saved from such pipelines need retraining. `LabelMetric` scores a label from any number of classes. `JSONSchemaFor` reads an `enum` struct tag, and `Key.Get` enforces it. A rewind can now keep the visit before it when the new visit fails.
