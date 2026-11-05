@@ -1,9 +1,9 @@
 module github.com/mikills/gepago/programs/classify
 
-go 1.27.1
+go 1.27.0
 
 require (
-	github.com/mikills/gepago v0.12.0
+	github.com/mikills/gepago v0.12.1
 	github.com/stretchr/testify v1.12.1
 )
 
