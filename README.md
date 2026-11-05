@@ -47,7 +47,7 @@ packages/gepago/wasm                       Node.js ESM WASM packages
 ```
 
 The root package is intentionally provider-neutral and does not depend on the agent runtime.
-Use subpackages only for the integrations you need. The module requires Go 1.27.1 or later.
+Use subpackages only for the integrations you need. The module requires Go 1.27.0 or later.
 
 ## Core flow
 
